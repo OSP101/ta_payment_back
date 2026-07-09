@@ -588,15 +588,20 @@ type TARequestSummary struct {
 	TeachingCourseID uuid.UUID  `json:"teaching_course_id"`
 	LecturerName     string     `json:"lecturer_name"`
 	TACount          int        `json:"ta_count"`
+	TermID           uuid.UUID  `json:"term_id"`
+	AcademicYear     int        `json:"academic_year"`
+	Semester         int        `json:"semester"`
 }
 
 const requestSummarySelect = `
 	SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.reject_reason, r.teaching_course_id,
 	       u.first_name || ' ' || u.last_name,
-	       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id)
+	       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
+	       tc.term_id, at.academic_year, at.semester
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 	JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+	JOIN academic_terms at ON at.id = tc.term_id
 	JOIN users u ON u.id = r.lecturer_id`
 
 func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
@@ -604,7 +609,7 @@ func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
 	out := []TARequestSummary{}
 	for rows.Next() {
 		var t TARequestSummary
-		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount); err != nil {
+		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -624,6 +629,18 @@ func (s *TARequestService) ListForLecturer(ctx context.Context, lecturerID uuid.
 func (s *TARequestService) ListPending(ctx context.Context) ([]TARequestSummary, error) {
 	rows, err := s.pool.Query(ctx,
 		requestSummarySelect+` WHERE r.status = 'submitted' ORDER BY r.submitted_at`)
+	if err != nil {
+		return nil, err
+	}
+	return scanRequestSummaries(rows)
+}
+
+// ListAll returns every request across every lecturer. Intended for the staff
+// approvals dashboard so decided requests remain visible as history rather than
+// disappearing from view once acted on.
+func (s *TARequestService) ListAll(ctx context.Context) ([]TARequestSummary, error) {
+	rows, err := s.pool.Query(ctx,
+		requestSummarySelect+` ORDER BY COALESCE(r.submitted_at, r.created_at) DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -817,7 +834,7 @@ func (s *TARequestService) ListWindows(ctx context.Context, termID *uuid.UUID) (
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Window
+	out := []Window{}
 	for rows.Next() {
 		var w Window
 		if err := rows.Scan(&w.ID, &w.TermID, &w.OpensAt, &w.ClosesAt, &w.IsOpen, &w.Note); err != nil {
@@ -826,4 +843,26 @@ func (s *TARequestService) ListWindows(ctx context.Context, termID *uuid.UUID) (
 		out = append(out, w)
 	}
 	return out, nil
+}
+
+func (s *TARequestService) DeleteWindow(ctx context.Context, actor, id uuid.UUID) error {
+	// Refuse if any live TA request was filed under this window; deleting it
+	// would break audit/traceability.
+	var used int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_requests WHERE window_id = $1`, id).Scan(&used); err != nil {
+		return err
+	}
+	if used > 0 {
+		return errors.New("ช่วงเวลานี้ถูกอ้างอิงจากคำขอ TA แล้ว ไม่สามารถลบได้ (แนะนำให้ปิดชั่วคราวแทน)")
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM ta_request_windows WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("ไม่พบช่วงเวลารับสมัครนี้")
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_window.delete", Entity: "ta_window", EntityID: id.String()})
+	return nil
 }

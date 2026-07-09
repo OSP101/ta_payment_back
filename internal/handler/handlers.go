@@ -590,8 +590,18 @@ func (h *TeachingHandler) Budget(c *fiber.Ctx) error {
 type TARequestHandler struct{ Svc *service.Container }
 
 func (h *TARequestHandler) List(c *fiber.Ctx) error {
-	if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) && c.Query("pending") == "1" {
-		out, err := h.Svc.TARequest.ListPending(c.Context())
+	isStaff := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if isStaff {
+		// Staff sees the full history by default so decided requests remain
+		// visible; ?scope=pending (or legacy ?pending=1) narrows to submitted.
+		if c.Query("scope") == "pending" || c.Query("pending") == "1" {
+			out, err := h.Svc.TARequest.ListPending(c.Context())
+			if err != nil {
+				return err
+			}
+			return c.JSON(out)
+		}
+		out, err := h.Svc.TARequest.ListAll(c.Context())
 		if err != nil {
 			return err
 		}
@@ -689,6 +699,17 @@ func (h *TARequestHandler) UpsertWindow(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(out)
+}
+
+func (h *TARequestHandler) DeleteWindow(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.TARequest.DeleteWindow(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 // -------------------- Docs --------------------

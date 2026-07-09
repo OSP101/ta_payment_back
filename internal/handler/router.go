@@ -83,6 +83,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	rh := &TARequestHandler{Svc: svc}
 	authed.Get("/ta-request/windows", rh.ListWindows)
 	authed.Post("/ta-request/windows", adminOrStaff, rh.UpsertWindow)
+	authed.Delete("/ta-request/windows/:id", adminOrStaff, rh.DeleteWindow)
 
 	// TA requests
 	authed.Get("/ta-requests", rh.List)
