@@ -132,12 +132,23 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Notifications
 	nh := &NotifyHandler{Svc: svc}
 	authed.Get("/me/notifications", nh.List)
+	authed.Get("/me/notifications/unread-count", nh.UnreadCount)
 	authed.Post("/me/notifications/:id/read", nh.MarkRead)
+	authed.Post("/me/notifications/read-all", nh.MarkAllRead)
 
-	// Announcements
+	// Announcements. Image endpoints sit under the same group so the auth
+	// wall applies uniformly — a would-be scraper still needs a session.
+	// Register the more specific image routes first: Fiber matches in
+	// declaration order, so /:id would swallow "images/..." if placed above.
 	ah := &AnnounceHandler{Svc: svc}
+	authed.Post("/announcements/upload-image", adminOrStaff, ah.UploadImage)
+	authed.Get("/announcements/images/*", ah.ServeImage)
 	authed.Get("/announcements", ah.List)
 	authed.Post("/announcements", adminOrStaff, ah.Upsert)
+	authed.Get("/announcements/:id", ah.Get)
+	authed.Delete("/announcements/:id", adminOrStaff, ah.Delete)
+	authed.Post("/announcements/:id/publish", adminOrStaff, ah.Publish)
+	authed.Post("/announcements/:id/unpublish", adminOrStaff, ah.Unpublish)
 
 	// Dashboard
 	dashH := &DashboardHandler{Svc: svc}

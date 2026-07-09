@@ -92,6 +92,12 @@ func main() {
 	}()
 	log.Printf("TA Payment API listening on :%s", cfg.Port)
 
+	// Background sweep for scheduled-but-not-yet-fanned-out announcements.
+	// Lazy fanout on GET /announcements handles the common case; this loop
+	// covers windows where no one is reading, so a scheduled 08:00 post
+	// still lands in inboxes if the office opens at 08:15.
+	go services.Announce.RunScheduler(ctx)
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig

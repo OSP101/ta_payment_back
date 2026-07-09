@@ -97,7 +97,8 @@ func NewLocalWithKey(root string, key []byte) (*Local, error) {
 }
 
 var allowedMIMEExt = map[string]bool{
-	".pdf": true, ".jpg": true, ".jpeg": true, ".png": true, ".xlsx": true, ".zip": true, ".docx": true,
+	".pdf": true, ".jpg": true, ".jpeg": true, ".png": true, ".webp": true,
+	".xlsx": true, ".zip": true, ".docx": true,
 }
 
 func (l *Local) Encrypted() bool { return l.aead != nil }

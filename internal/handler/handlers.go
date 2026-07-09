@@ -1041,11 +1041,20 @@ type NotifyHandler struct{ Svc *service.Container }
 
 func (h *NotifyHandler) List(c *fiber.Ctx) error {
 	limit, _ := strconv.Atoi(c.Query("limit", "20"))
-	out, err := h.Svc.Notify.List(c.Context(), UserID(c), limit)
+	unreadOnly := c.Query("unread") == "1" || c.Query("unread") == "true"
+	out, err := h.Svc.Notify.List(c.Context(), UserID(c), limit, unreadOnly)
 	if err != nil {
 		return err
 	}
 	return c.JSON(out)
+}
+
+func (h *NotifyHandler) UnreadCount(c *fiber.Ctx) error {
+	n, err := h.Svc.Notify.UnreadCount(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"count": n})
 }
 
 func (h *NotifyHandler) MarkRead(c *fiber.Ctx) error {
@@ -1059,34 +1068,261 @@ func (h *NotifyHandler) MarkRead(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+func (h *NotifyHandler) MarkAllRead(c *fiber.Ctx) error {
+	n, err := h.Svc.Notify.MarkAllRead(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true, "count": n})
+}
+
 // -------------------- Announce --------------------
 
 type AnnounceHandler struct{ Svc *service.Container }
 
+// List branches on caller role: staff/admin get every row (drafts + scheduled
+// + expired) so the composer can act on them; everyone else sees only the
+// live window for their own role.
 func (h *AnnounceHandler) List(c *fiber.Ctx) error {
+	roles := Roles(c)
+	isStaff := rbac.Has(roles, rbac.RoleAdmin, rbac.RoleStaff)
+	scope := c.Query("scope")
+	includeAll := isStaff && (scope == "" || scope == "all")
+
 	role := c.Query("role")
-	if role == "" {
-		if roles := Roles(c); len(roles) > 0 {
+	if !isStaff {
+		// Non-staff always filter to their own primary role; the query param
+		// is ignored so a curious client can't peek at another audience.
+		if len(roles) > 0 {
 			role = roles[0]
 		}
 	}
-	out, err := h.Svc.Announce.List(c.Context(), role)
+	if !includeAll && role == "" && len(roles) > 0 {
+		role = roles[0]
+	}
+	out, err := h.Svc.Announce.List(c.Context(), service.ListFilter{
+		RoleFilter: role,
+		IncludeAll: includeAll,
+	})
 	if err != nil {
 		return err
 	}
 	return c.JSON(out)
 }
 
+// Get returns one announcement. Non-staff callers can only see it if the row
+// is live for their role — this makes /announcements/:id direct links safe.
+func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	a, err := h.Svc.Announce.Get(c.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		if a.Status != "live" {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		roles := Roles(c)
+		matched := false
+		for _, want := range a.Audience {
+			for _, have := range roles {
+				if want == have {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
+	return c.JSON(a)
+}
+
 func (h *AnnounceHandler) Upsert(c *fiber.Ctx) error {
-	var in service.Announcement
+	var in service.UpsertInput
 	if err := c.BodyParser(&in); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	id, err := h.Svc.Announce.Upsert(c.Context(), UserID(c), in)
 	if err != nil {
-		return err
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	return c.JSON(fiber.Map{"id": id})
+}
+
+func (h *AnnounceHandler) Delete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Announce.Delete(c.Context(), UserID(c), id); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+func (h *AnnounceHandler) Publish(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Announce.Publish(c.Context(), UserID(c), id); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+func (h *AnnounceHandler) Unpublish(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Announce.Unpublish(c.Context(), UserID(c), id); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// Allowed cover-image content types. WebP is included because the FE resizer
+// can output it to keep upload sizes small on modern browsers.
+var announceImageMIME = map[string]string{
+	"image/jpeg": ".jpg",
+	"image/jpg":  ".jpg",
+	"image/png":  ".png",
+	"image/webp": ".webp",
+}
+
+// Hard cap on upload size. Bigger than that and we return 413 instead of
+// silently storing megabytes of PII-adjacent binary. FE targets ~1600x900
+// after resize, which comfortably fits under 4 MB even for photography.
+const announceImageMaxBytes = 5 * 1024 * 1024
+
+// UploadImage accepts a cover image, validates MIME + magic bytes + size,
+// and stores it via the shared encrypted-at-rest store. Returns the key so
+// the composer can attach it to the announcement.
+func (h *AnnounceHandler) UploadImage(c *fiber.Ctx) error {
+	fh, err := c.FormFile("file")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "file required")
+	}
+	if fh.Size > announceImageMaxBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 5MB")
+	}
+	mime := strings.ToLower(fh.Header.Get("Content-Type"))
+	ext, ok := announceImageMIME[mime]
+	if !ok {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType, "รองรับเฉพาะ JPEG / PNG / WebP")
+	}
+	src, err := fh.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	// Sniff the first bytes to confirm MIME. Header-only trust is a common
+	// upload attack vector; verifying the magic makes a client-lied MIME
+	// harmless.
+	head := make([]byte, 12)
+	n, _ := src.Read(head)
+	if !imageMagicMatches(head[:n], ext) {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType, "ประเภทไฟล์ไม่ตรงกับเนื้อหา")
+	}
+	// Rewind — the sniff consumed the head bytes.
+	if _, err := src.Seek(0, 0); err != nil {
+		return err
+	}
+
+	// Preserve the true extension based on the sniffed MIME rather than the
+	// (possibly forged) filename.
+	stored := uuid.New().String() + ext
+	key, size, err := h.Svc.Storage.Save("announcements", stored, src)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"key":  key,
+		"size": size,
+		"url":  "/api/v1/announcements/images/" + key,
+	})
+}
+
+// ServeImage streams a stored cover image back through the same auth wall
+// as the rest of the API. Cache is public within the session — same image
+// per announcement is stable enough that a small cache saves round trips.
+func (h *AnnounceHandler) ServeImage(c *fiber.Ctx) error {
+	key := c.Params("*")
+	if key == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "key required")
+	}
+	// Reject any traversal attempt; the stored layout is strictly
+	// "announcements/YYYY/MM/DD/<uuid>.ext[.enc]".
+	if strings.Contains(key, "..") || !strings.HasPrefix(key, "announcements/") {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid key")
+	}
+	rc, err := h.Svc.Storage.Open(key)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบรูปภาพ")
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	// Content-Type from stored extension. Strip the encryption suffix.
+	k := strings.TrimSuffix(key, ".enc")
+	switch strings.ToLower(k[strings.LastIndex(k, "."):]) {
+	case ".jpg", ".jpeg":
+		c.Set("Content-Type", "image/jpeg")
+	case ".png":
+		c.Set("Content-Type", "image/png")
+	case ".webp":
+		c.Set("Content-Type", "image/webp")
+	default:
+		c.Set("Content-Type", "application/octet-stream")
+	}
+	c.Set("Cache-Control", "private, max-age=3600")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Send(body)
+}
+
+// imageMagicMatches sniffs the first bytes of an upload and returns true if
+// they match the expected format. Keeps the check tight — no autodetection
+// fallback, so a corrupted or mislabeled upload never lands.
+func imageMagicMatches(head []byte, ext string) bool {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return len(head) >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff
+	case ".png":
+		return len(head) >= 8 &&
+			head[0] == 0x89 && head[1] == 0x50 && head[2] == 0x4e && head[3] == 0x47 &&
+			head[4] == 0x0d && head[5] == 0x0a && head[6] == 0x1a && head[7] == 0x0a
+	case ".webp":
+		return len(head) >= 12 &&
+			string(head[0:4]) == "RIFF" && string(head[8:12]) == "WEBP"
+	}
+	return false
 }
 
 // -------------------- Dashboard --------------------

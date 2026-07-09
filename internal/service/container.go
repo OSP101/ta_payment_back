@@ -43,7 +43,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Workload = &WorkloadService{pool: pool}
 	c.WorkLog = &WorkLogService{pool: pool, aud: auditor}
 	c.Export = &ExportService{pool: pool, store: store}
-	c.Announce = &AnnounceService{pool: pool, aud: auditor}
+	c.Announce = &AnnounceService{pool: pool, aud: auditor, notify: c.Notify}
 	c.Dashboard = &DashboardService{pool: pool}
 	return c
 }
