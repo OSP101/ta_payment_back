@@ -487,6 +487,36 @@ func (h *TeachingHandler) DeleteSection(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// ReplaceSectionSchedules writes the full weekly schedule for one section.
+// Body: [{ kind, day_of_week, start_time, end_time, room? }, ...]
+// Empty array clears the schedule entirely.
+func (h *TeachingHandler) ReplaceSectionSchedules(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	sectionID, err := uuid.Parse(c.Params("sectionId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
+	}
+	var body struct {
+		Schedules []service.SectionSchedule `json:"schedules"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.Teaching.ReplaceSectionSchedules(c.Context(), UserID(c), tcID, sectionID, body.Schedules); err != nil {
+		if errors.Is(err, service.ErrCourseLocked) {
+			return fiber.NewError(fiber.StatusConflict, "รายวิชานี้ถูกล็อกหลังส่งออกไฟล์แล้ว")
+		}
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบ section")
+		}
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *TeachingHandler) AddMakeup(c *fiber.Ctx) error {
 	sectionID, err := uuid.Parse(c.Params("sectionId"))
 	if err != nil {

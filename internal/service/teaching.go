@@ -126,6 +126,11 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	if in.FacultyCourseID == uuid.Nil || in.TermID == uuid.Nil {
 		return uuid.Nil, ErrInvalidInput
 	}
+	for _, sec := range in.Sections {
+		if err := validateSectionSchedules(sec.Schedules); err != nil {
+			return uuid.Nil, err
+		}
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return uuid.Nil, err
@@ -467,10 +472,11 @@ func (s *TeachingService) recomputeAggregate(ctx context.Context, tx pgx.Tx, tcI
 }
 
 type AddSectionInput struct {
-	SecNo       string  `json:"sec_no"`
-	Track       string  `json:"track"`
-	Room        *string `json:"room,omitempty"`
-	NumStudents int     `json:"num_students"`
+	SecNo       string            `json:"sec_no"`
+	Track       string            `json:"track"`
+	Room        *string           `json:"room,omitempty"`
+	NumStudents int               `json:"num_students"`
+	Schedules   []SectionSchedule `json:"schedules,omitempty"`
 }
 
 // AddSection adds a new section to a course. Returns ErrCourseLocked if the
@@ -478,6 +484,9 @@ type AddSectionInput struct {
 func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID, in AddSectionInput) (uuid.UUID, error) {
 	if in.SecNo == "" || (in.Track != "regular" && in.Track != "special") {
 		return uuid.Nil, ErrInvalidInput
+	}
+	if err := validateSectionSchedules(in.Schedules); err != nil {
+		return uuid.Nil, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -494,6 +503,14 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 		id, tcID, in.SecNo, in.Track, in.Room, in.NumStudents); err != nil {
 		return uuid.Nil, err
 	}
+	for _, sch := range in.Schedules {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO section_schedules (id, section_id, kind, day_of_week, start_time, end_time, room)
+			 VALUES ($1,$2,$3,$4,$5::time,$6::time,$7)`,
+			uuid.New(), id, sch.Kind, sch.DayOfWeek, sch.StartTime, sch.EndTime, sch.Room); err != nil {
+			return uuid.Nil, err
+		}
+	}
 	if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
 		return uuid.Nil, err
 	}
@@ -503,6 +520,118 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "section.add",
 		Entity: "teaching_course", EntityID: tcID.String(), After: in})
 	return id, nil
+}
+
+// ReplaceSectionSchedules atomically clears and rewrites the schedule rows for
+// one section. Gated on the course not being exported. Rejects unknown kinds,
+// out-of-range days, malformed times, and any pair of blocks that overlap
+// within the same day.
+func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tcID, sectionID uuid.UUID, schedules []SectionSchedule) error {
+	if err := validateSectionSchedules(schedules); err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := s.assertNotExported(ctx, tx, tcID); err != nil {
+		return err
+	}
+	var owned bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM sections WHERE id=$1 AND teaching_course_id=$2)`,
+		sectionID, tcID).Scan(&owned); err != nil {
+		return err
+	}
+	if !owned {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM section_schedules WHERE section_id=$1`, sectionID); err != nil {
+		return err
+	}
+	for _, sch := range schedules {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO section_schedules (id, section_id, kind, day_of_week, start_time, end_time, room)
+			 VALUES ($1,$2,$3,$4,$5::time,$6::time,$7)`,
+			uuid.New(), sectionID, sch.Kind, sch.DayOfWeek, sch.StartTime, sch.EndTime, sch.Room); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "section.schedules.replace",
+		Entity: "section", EntityID: sectionID.String(), After: schedules})
+	return nil
+}
+
+// validateSectionSchedules enforces the same rules the lecturer UI enforces so
+// stray API callers can't skip them. Only intra-section overlap is checked —
+// cross-section conflicts are the lecturer's judgement call and are surfaced
+// later when TAs try to take a request that would collide.
+func validateSectionSchedules(schedules []SectionSchedule) error {
+	for i, sch := range schedules {
+		if sch.Kind != "lecture" && sch.Kind != "lab" {
+			return errors.New("ประเภทคาบต้องเป็นบรรยาย (lecture) หรือปฏิบัติการ (lab) เท่านั้น")
+		}
+		if sch.DayOfWeek < 0 || sch.DayOfWeek > 6 {
+			return errors.New("วันในสัปดาห์ต้องเป็น 0–6")
+		}
+		if !isHHMM(sch.StartTime) || !isHHMM(sch.EndTime) {
+			return errors.New("รูปแบบเวลาต้องเป็น HH:MM")
+		}
+		if sch.StartTime >= sch.EndTime {
+			return errors.New("เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม")
+		}
+		for j := 0; j < i; j++ {
+			other := schedules[j]
+			if other.DayOfWeek != sch.DayOfWeek {
+				continue
+			}
+			if sch.StartTime < other.EndTime && other.StartTime < sch.EndTime {
+				return errors.New("มีช่วงเวลาที่ทับซ้อนกันภายใน section เดียวกัน")
+			}
+		}
+	}
+	return nil
+}
+
+// isHHMM accepts either "HH:MM" or "HH:MM:SS" so callers may send whichever the
+// picker widget emits. Postgres will parse both when we cast to TIME.
+func isHHMM(v string) bool {
+	if len(v) != 5 && len(v) != 8 {
+		return false
+	}
+	if v[2] != ':' {
+		return false
+	}
+	for _, r := range v[:2] + v[3:5] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	h := (int(v[0]-'0'))*10 + int(v[1]-'0')
+	m := (int(v[3]-'0'))*10 + int(v[4]-'0')
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return false
+	}
+	if len(v) == 8 {
+		if v[5] != ':' {
+			return false
+		}
+		for _, r := range v[6:8] {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		sec := (int(v[6]-'0'))*10 + int(v[7]-'0')
+		if sec < 0 || sec > 59 {
+			return false
+		}
+	}
+	return true
 }
 
 type UpdateSectionInput struct {
