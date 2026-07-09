@@ -1431,6 +1431,45 @@ func (h *AuditHandler) List(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// -------------------- Admin officers (executive roster) --------------------
+
+type AdminOfficerHandler struct{ Svc *service.Container }
+
+func (h *AdminOfficerHandler) List(c *fiber.Ctx) error {
+	includeInactive := c.Query("include_inactive") == "1"
+	out, err := h.Svc.AdminOfficers.List(c.Context(), includeInactive)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+func (h *AdminOfficerHandler) Upsert(c *fiber.Ctx) error {
+	var in service.AdminOfficer
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	out, err := h.Svc.AdminOfficers.Upsert(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+func (h *AdminOfficerHandler) Delete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.AdminOfficers.Delete(c.Context(), UserID(c), id); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "admin officer not found")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func firstNonEmpty(s ...string) string {
 	for _, v := range s {
 		if v != "" {

@@ -178,6 +178,14 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Admin-only escape hatch to undo an accidental export lock.
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 
+	// Admin officers (executive roster used on generated official docs).
+	// GET is open to any authenticated user so document templates can render
+	// with the current roster; writes are staff/admin only.
+	aoH := &AdminOfficerHandler{Svc: svc}
+	authed.Get("/settings/admin-officers", aoH.List)
+	authed.Post("/settings/admin-officers", adminOrStaff, aoH.Upsert)
+	authed.Delete("/settings/admin-officers/:id", adminOrStaff, aoH.Delete)
+
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}
 	authed.Get("/audit-logs", RequireRole(rbac.RoleAdmin), audH.List)

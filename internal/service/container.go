@@ -29,6 +29,7 @@ type Container struct {
 	Announce   *AnnounceService
 	Notify     *NotifyService
 	Dashboard  *DashboardService
+	AdminOfficers *AdminOfficerService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config) *Container {
@@ -45,5 +46,6 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Export = &ExportService{pool: pool, store: store}
 	c.Announce = &AnnounceService{pool: pool, aud: auditor, notify: c.Notify}
 	c.Dashboard = &DashboardService{pool: pool}
+	c.AdminOfficers = &AdminOfficerService{pool: pool, aud: auditor}
 	return c
 }
