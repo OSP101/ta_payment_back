@@ -575,6 +575,26 @@ func (h *TARequestHandler) List(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+func (h *TARequestHandler) Detail(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.TARequest.Detail(c.Context(), id)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, err.Error())
+	}
+	// Staff/admin can view anything; lecturers only their own requests.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		var owner uuid.UUID
+		if err := h.Svc.Pool.QueryRow(c.Context(),
+			`SELECT lecturer_id FROM ta_requests WHERE id = $1`, id).Scan(&owner); err != nil || owner != UserID(c) {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
+	return c.JSON(out)
+}
+
 func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 	var in service.CreateTARequestInput
 	if err := c.BodyParser(&in); err != nil {
