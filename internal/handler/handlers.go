@@ -690,14 +690,45 @@ func (h *DocsHandler) UploadDoc(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"id": id})
 }
 
-func (h *DocsHandler) CreditorForm(c *fiber.Ctx) error {
-	body, name, err := h.Svc.Docs.BuildCreditorForm(c.Context(), UserID(c), h.Svc.Cfg.CreditorTemplatePath)
+// CreditorFormPDF renders the filled creditor-form PDF inline so the TA can
+// preview it in the browser (<iframe>) before confirming attachment. Any
+// authenticated caller may pass ?grid=1 to overlay a calibration grid on
+// their own preview — the grid draws over the caller's own filled data, so
+// it's not an information leak; it just makes on-form measurement possible.
+func (h *DocsHandler) CreditorFormPDF(c *fiber.Ctx) error {
+	grid := c.Query("grid") == "1"
+	body, name, err := h.Svc.Docs.BuildCreditorFormPDF(c.Context(), UserID(c),
+		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir, grid)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	c.Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-	c.Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	c.Set("Content-Type", "application/pdf")
+	c.Set("Content-Disposition", "inline; filename=\""+name+"\"")
+	c.Set("X-Content-Type-Options", "nosniff")
+	// Never let a browser or intermediary cache a PDF containing PII.
+	c.Set("Cache-Control", "no-store")
 	return c.Send(body)
+}
+
+// ConfirmCreditorForm generates the PDF server-side and attaches it as the
+// TA's creditor_form document (superseding any prior version), so the review
+// pipeline treats it identically to a manually-uploaded file.
+func (h *DocsHandler) ConfirmCreditorForm(c *fiber.Ctx) error {
+	id, err := h.Svc.Docs.AttachGeneratedCreditorForm(c.Context(), UserID(c),
+		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"id": id})
+}
+
+// BlankCreditorForm serves the untouched PDF template so a TA who doesn't
+// trust the overlay can print, fill by hand, and upload manually. No PII;
+// safe to serve without cache-control headers.
+func (h *DocsHandler) BlankCreditorForm(c *fiber.Ctx) error {
+	c.Set("Content-Type", "application/pdf")
+	c.Set("Content-Disposition", "attachment; filename=\"creditor_form_blank.pdf\"")
+	return c.SendFile(h.Svc.Cfg.CreditorTemplatePath)
 }
 
 func (h *DocsHandler) Download(c *fiber.Ctx) error {
@@ -705,18 +736,55 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	rc, filename, mime, err := h.Svc.Docs.OpenStored(c.Context(), id)
+	rc, filename, mime, ownerID, err := h.Svc.Docs.OpenStored(c.Context(), id)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
+
+	// Only the owning TA, staff, or admin may fetch the file. Lecturers do
+	// not review documents in this workflow and are blocked to keep PDPA
+	// exposure minimal.
+	caller := UserID(c)
+	if caller != ownerID && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		return fiber.NewError(fiber.StatusForbidden, "forbidden")
+	}
+
 	body, err := io.ReadAll(rc)
 	if err != nil {
 		return err
 	}
+	// Inline preview is fine for staff review; browsers will download
+	// anything they can't render. `Content-Disposition: inline` gives them
+	// the choice while still setting a filename for downloads.
 	c.Set("Content-Type", firstNonEmpty(mime, "application/octet-stream"))
-	c.Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	c.Set("Content-Disposition", "inline; filename=\""+filename+"\"")
+	c.Set("X-Content-Type-Options", "nosniff")
 	return c.Send(body)
+}
+
+// History returns the full submission trail for a TA (all profile snapshots +
+// all documents including superseded ones). Staff-only.
+func (h *DocsHandler) History(c *fiber.Ctx) error {
+	uid, err := uuid.Parse(c.Params("userId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	hist, err := h.Svc.Docs.GetHistory(c.Context(), uid)
+	if err != nil {
+		return err
+	}
+	return c.JSON(hist)
+}
+
+// SelfHistory returns the caller's own submission history. Lets a TA review
+// what they've submitted across rounds without exposing it to peers.
+func (h *DocsHandler) SelfHistory(c *fiber.Ctx) error {
+	hist, err := h.Svc.Docs.GetHistory(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(hist)
 }
 
 func (h *DocsHandler) ListPending(c *fiber.Ctx) error {

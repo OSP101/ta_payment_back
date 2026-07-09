@@ -61,6 +61,7 @@ type Config struct {
 	SSOSecret    string
 	SSORedirect  string
 	CreditorTemplatePath string
+	FontDir              string
 	// TADocsEncKey is a 32-byte AES-256 key (base64) used to encrypt TA
 	// documents at rest. Optional — when empty, files are stored unencrypted.
 	TADocsEncKey string
@@ -91,7 +92,8 @@ func Load() (Config, error) {
 		SSOClientID: env("SSO_CLIENT_ID", ""),
 		SSOSecret:   env("SSO_CLIENT_SECRET", ""),
 		SSORedirect: env("SSO_REDIRECT", ""),
-		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.docx"),
+		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.pdf"),
+		FontDir:              env("FONT_DIR", "./assets/fonts"),
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
 	}
 	c.SSOEnabled = c.SSOAuthURL != "" && c.SSOClientID != ""
