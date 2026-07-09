@@ -9,6 +9,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
+	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/rbac"
 	"ta-payment-back/internal/service"
 )
@@ -120,6 +121,17 @@ func (h *UserHandler) Deactivate(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "confirmation email does not match")
 	}
 	if err := h.Svc.Users.Deactivate(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+func (h *UserHandler) Activate(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Users.Activate(c.Context(), UserID(c), id); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -653,7 +665,7 @@ func (h *TARequestHandler) Approve(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	if err := h.Svc.TARequest.Approve(c.Context(), UserID(c), id); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -670,7 +682,7 @@ func (h *TARequestHandler) Reject(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	if err := h.Svc.TARequest.Reject(c.Context(), UserID(c), id, body.Reason); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -730,7 +742,7 @@ func (h *DocsHandler) UpsertProfile(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	if err := h.Svc.Docs.UpsertProfile(c.Context(), UserID(c), p); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -895,7 +907,7 @@ func (h *DocsHandler) ReviewProfile(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	if err := h.Svc.Docs.ReviewProfile(c.Context(), UserID(c), uid, body.Approve, body.Reason); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -913,7 +925,7 @@ func (h *DocsHandler) ReviewDoc(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	if err := h.Svc.Docs.Review(c.Context(), UserID(c), id, body.Approve, body.Reason); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -970,7 +982,8 @@ func (h *WorkLogHandler) List(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	out, err := h.Svc.WorkLog.List(c.Context(), id)
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	out, err := h.Svc.WorkLog.List(c.Context(), UserID(c), id, privileged)
 	if err != nil {
 		return err
 	}
@@ -982,18 +995,18 @@ func (h *WorkLogHandler) Upsert(c *fiber.Ctx) error {
 	if err := c.BodyParser(&w); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	if w.AssignmentID == uuid.Nil {
-		id, err := uuid.Parse(c.Params("id"))
-		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-		}
-		w.AssignmentID = id
-	}
-	id, err := h.Svc.WorkLog.Upsert(c.Context(), UserID(c), w)
+	// Always trust the URL param for the assignment id — never the body — so a
+	// TA cannot target another TA's assignment by forging the payload.
+	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	return c.JSON(fiber.Map{"id": id})
+	w.AssignmentID = id
+	wid, err := h.Svc.WorkLog.Upsert(c.Context(), UserID(c), w)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"id": wid})
 }
 
 func (h *WorkLogHandler) Submit(c *fiber.Ctx) error {
@@ -1012,7 +1025,8 @@ func (h *WorkLogHandler) Approve(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	if err := h.Svc.WorkLog.Approve(c.Context(), UserID(c), id); err != nil {
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if err := h.Svc.WorkLog.Approve(c.Context(), UserID(c), id, privileged); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -1029,8 +1043,9 @@ func (h *WorkLogHandler) Reject(c *fiber.Ctx) error {
 	if err := c.BodyParser(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	if err := h.Svc.WorkLog.Reject(c.Context(), UserID(c), id, body.Reason); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if err := h.Svc.WorkLog.Reject(c.Context(), UserID(c), id, body.Reason, privileged); err != nil {
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -1361,9 +1376,24 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// course's section list + student counts. Non-fatal if it fails; the
 	// download still succeeds and staff can mark it manually if needed.
 	_ = h.Svc.Teaching.MarkExported(c.Context(), id)
+	// The export contains national IDs + bank details — audit who pulled it and
+	// when (PII access trail, M5).
+	actor := UserID(c)
+	h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.course", Entity: "teaching_course", EntityID: id.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")})
 	c.Set("Content-Type", "application/zip")
 	c.Set("Content-Disposition", "attachment; filename=\""+name+"\"")
 	return c.Send(body)
+}
+
+func (h *ExportHandler) UnlockCourse(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Teaching.Unexport(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 // -------------------- Audit --------------------

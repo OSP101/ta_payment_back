@@ -22,6 +22,7 @@ type User struct {
 	LastName           string    `json:"last_name"`
 	Phone              *string   `json:"phone,omitempty"`
 	StudyLevel         *string   `json:"study_level,omitempty"`
+	StudyYear          *int      `json:"study_year,omitempty"`
 	StudentID          *string   `json:"student_id,omitempty"`
 	Department         *string   `json:"department,omitempty"`
 	IsActive           bool      `json:"is_active"`
@@ -46,6 +47,7 @@ type CreateUserInput struct {
 	LastName   string   `json:"last_name"`
 	Roles      []string `json:"roles"`
 	StudyLevel *string  `json:"study_level,omitempty"`
+	StudyYear  *int     `json:"study_year,omitempty"`
 	Password   *string  `json:"password,omitempty"`
 }
 
@@ -55,11 +57,37 @@ type CreateUserResult struct {
 }
 
 func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUserInput) (*CreateUserResult, error) {
+	in.Email = strings.TrimSpace(in.Email)
+	in.FirstName = strings.TrimSpace(in.FirstName)
+	in.LastName = strings.TrimSpace(in.LastName)
 	if in.Email == "" || in.FirstName == "" || in.LastName == "" {
-		return nil, errors.New("missing required fields")
+		return nil, Invalid("กรุณากรอกอีเมล ชื่อ และนามสกุลให้ครบ")
+	}
+	if !validEmail(in.Email) {
+		return nil, Invalid("รูปแบบอีเมลไม่ถูกต้อง")
 	}
 	if len(in.Roles) == 0 {
-		return nil, errors.New("at least one role required")
+		return nil, Invalid("ต้องระบุบทบาทอย่างน้อย 1 บทบาท")
+	}
+	if err := validateRoles(in.Roles); err != nil {
+		return nil, err
+	}
+	// Only an admin may create another admin.
+	if containsRole(in.Roles, "admin") {
+		actorAdmin, err := hasRole(ctx, s.pool, actor, "admin")
+		if err != nil {
+			return nil, err
+		}
+		if !actorAdmin {
+			return nil, Forbidden("เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่สร้างบัญชี admin ได้")
+		}
+	}
+	// Enforce the same minimum password policy staff-supplied passwords must meet.
+	if in.Password != nil && *in.Password != "" && len(*in.Password) < 8 {
+		return nil, Invalid("รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร")
+	}
+	if err := validateStudyYear(in.StudyYear); err != nil {
+		return nil, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -85,9 +113,9 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 	}
 	id := uuid.New()
 	_, err = tx.Exec(ctx,
-		`INSERT INTO users (id, email, title, first_name, last_name, study_level, password_hash, must_change_password)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE)`,
-		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.StudyLevel, pwHash)
+		`INSERT INTO users (id, email, title, first_name, last_name, study_level, study_year, password_hash, must_change_password)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE)`,
+		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.StudyLevel, in.StudyYear, pwHash)
 	if err != nil {
 		return nil, err
 	}
@@ -111,9 +139,9 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	u := &User{ID: id}
 	err := s.pool.QueryRow(ctx,
-		`SELECT email, title, first_name, last_name, phone, study_level::text, student_id, department, is_active, profile_completed, must_change_password
+		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
-		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword,
+		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -189,7 +217,7 @@ func (s *UserService) List(ctx context.Context, role, search string, limit, offs
 	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM users u WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password
+	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password
 	      FROM users u WHERE ` + where + ` ORDER BY u.first_name, u.last_name
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)
@@ -201,7 +229,7 @@ func (s *UserService) List(ctx context.Context, role, search string, limit, offs
 	var out []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, u)
@@ -229,6 +257,7 @@ type UpdateUserInput struct {
 	LastName   *string   `json:"last_name,omitempty"`
 	Phone      *string   `json:"phone,omitempty"`
 	StudyLevel *string   `json:"study_level,omitempty"`
+	StudyYear  *int      `json:"study_year,omitempty"`
 	Roles      *[]string `json:"roles,omitempty"`
 	BankName   *string   `json:"bank_name,omitempty"`
 	BankBranch *string   `json:"bank_branch,omitempty"`
@@ -275,6 +304,19 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 			i++
 		}
 	}
+	if in.StudyYear != nil {
+		// 0 is the "clear" sentinel; any other value is validated to 1..8.
+		if *in.StudyYear == 0 {
+			sets = append(sets, "study_year=NULL")
+		} else {
+			if err := validateStudyYear(in.StudyYear); err != nil {
+				return nil, err
+			}
+			sets = append(sets, "study_year=$"+itoa(i))
+			args = append(args, *in.StudyYear)
+			i++
+		}
+	}
 	if len(sets) > 0 {
 		sets = append(sets, "updated_at=NOW()")
 		q := "UPDATE users SET " + strings.Join(sets, ", ") + " WHERE id=$" + itoa(i)
@@ -285,6 +327,30 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 	}
 
 	if in.Roles != nil {
+		if err := validateRoles(*in.Roles); err != nil {
+			return nil, err
+		}
+		if len(*in.Roles) == 0 {
+			return nil, Invalid("ต้องมีบทบาทอย่างน้อย 1 บทบาท")
+		}
+		actorAdmin, err := hasRole(ctx, s.pool, actor, "admin")
+		if err != nil {
+			return nil, err
+		}
+		// Non-admins may not grant admin, nor alter the roles of an existing
+		// admin account (privilege-escalation guard, C4).
+		if !actorAdmin {
+			if containsRole(*in.Roles, "admin") {
+				return nil, Forbidden("เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่กำหนดบทบาท admin ได้")
+			}
+			targetAdmin, err := hasRole(ctx, s.pool, id, "admin")
+			if err != nil {
+				return nil, err
+			}
+			if targetAdmin {
+				return nil, Forbidden("เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่แก้ไขบทบาทของบัญชี admin ได้")
+			}
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM user_roles WHERE user_id=$1`, id); err != nil {
 			return nil, err
 		}
@@ -322,11 +388,28 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 }
 
 func (s *UserService) Deactivate(ctx context.Context, actor, id uuid.UUID) error {
+	if actor == id {
+		return Invalid("ไม่สามารถปิดใช้งานบัญชีของตนเองได้")
+	}
 	_, err := s.pool.Exec(ctx, `UPDATE users SET is_active = FALSE, updated_at=NOW() WHERE id=$1`, id)
 	if err == nil {
 		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.deactivate", Entity: "user", EntityID: id.String()})
 	}
 	return err
+}
+
+// Activate re-enables a previously deactivated account.
+func (s *UserService) Activate(ctx context.Context, actor, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE users SET is_active = TRUE, updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.activate", Entity: "user", EntityID: id.String()})
+	return nil
 }
 
 // GetEmail returns the current email for a user (used for deactivation confirmation).
@@ -368,6 +451,58 @@ func (s *UserService) ResetPassword(ctx context.Context, actor, id uuid.UUID) (s
 func (s *UserService) MarkProfileComplete(ctx context.Context, id uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `UPDATE users SET profile_completed=TRUE, updated_at=NOW() WHERE id=$1`, id)
 	return err
+}
+
+// validateStudyYear allows nil (not set) or 1..8; 0 is handled by callers as a
+// clear sentinel and should not reach here as a stored value.
+func validateStudyYear(y *int) error {
+	if y == nil || *y == 0 {
+		return nil
+	}
+	if *y < 1 || *y > 8 {
+		return Invalid("ชั้นปีต้องอยู่ระหว่าง 1 ถึง 8")
+	}
+	return nil
+}
+
+var validRoles = map[string]bool{"admin": true, "staff": true, "lecturer": true, "ta": true}
+
+func validateRoles(roles []string) error {
+	for _, r := range roles {
+		if !validRoles[r] {
+			return Invalid("บทบาทไม่ถูกต้อง: " + r)
+		}
+	}
+	return nil
+}
+
+func containsRole(roles []string, want string) bool {
+	for _, r := range roles {
+		if r == want {
+			return true
+		}
+	}
+	return false
+}
+
+// validEmail does a lightweight structural check (local@domain.tld). It is not a
+// full RFC 5322 validator — just enough to reject obvious garbage.
+func validEmail(s string) bool {
+	at := strings.IndexByte(s, '@')
+	if at <= 0 || at == len(s)-1 {
+		return false
+	}
+	if strings.Count(s, "@") != 1 {
+		return false
+	}
+	domain := s[at+1:]
+	if !strings.Contains(domain, ".") || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return false
+	}
+	if strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	return true
 }
 
 func coalesceStr(p *string) any {

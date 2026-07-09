@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"time"
+
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/auth"
@@ -22,13 +25,27 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 
 	// Public
 	authH := &AuthHandler{Svc: svc, Tokens: tokens, RBAC: r, Aud: aud}
-	api.Post("/auth/login", authH.Login)
+	// Rate-limit login attempts per IP to blunt brute-force / credential stuffing.
+	loginLimiter := limiter.New(limiter.Config{
+		Max:        10,
+		Expiration: time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP()
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "พยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่",
+			})
+		},
+	})
+	api.Post("/auth/login", loginLimiter, authH.Login)
 	api.Post("/auth/sso/callback", authH.SSOCallback) // stub
 	api.Get("/auth/sso/url", authH.SSOURL)
 	api.Post("/auth/logout", authH.Logout)
 
-	// Authenticated
-	authed := api.Group("", Authenticated(tokens))
+	// Authenticated. AccountGuard re-checks live account state (active +
+	// must-change-password) on every protected request.
+	authed := api.Group("", Authenticated(tokens), AccountGuard(svc.Pool))
 	authed.Get("/me", authH.Me)
 	authed.Post("/me/password", authH.ChangePassword)
 
@@ -42,6 +59,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Patch("/users/:id", adminOrStaff, uh.Update)
 	authed.Post("/users/:id/reset-password", adminOrStaff, uh.ResetPassword)
 	authed.Post("/users/:id/deactivate", adminOrStaff, uh.Deactivate)
+	authed.Post("/users/:id/activate", adminOrStaff, uh.Activate)
 
 	// Faculty courses & settings (admin, staff)
 	ch := &CourseHandler{Svc: svc}
@@ -157,6 +175,8 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Export
 	eh := &ExportHandler{Svc: svc}
 	authed.Get("/exports/course/:id.zip", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseZip)
+	// Admin-only escape hatch to undo an accidental export lock.
+	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}

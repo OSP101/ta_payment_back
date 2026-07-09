@@ -47,6 +47,22 @@ var acceptedDocMIMEs = map[string]bool{
 	"image/png":       true,
 }
 
+// sniffAllowedDoc reports whether head (the leading bytes of an upload) begins
+// with a PDF, JPEG, or PNG magic-byte signature. We verify the real bytes
+// rather than trusting the client-supplied Content-Type / filename extension,
+// both of which the client fully controls.
+func sniffAllowedDoc(head []byte) bool {
+	switch {
+	case bytes.HasPrefix(head, []byte("%PDF")):
+		return true
+	case bytes.HasPrefix(head, []byte{0xFF, 0xD8, 0xFF}): // JPEG
+		return true
+	case bytes.HasPrefix(head, []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}): // PNG
+		return true
+	}
+	return false
+}
+
 // filenameExt returns the lowercase extension after the last "." (no dot).
 func filenameExt(name string) string {
 	i := strings.LastIndex(name, ".")
@@ -110,6 +126,11 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 	}
 	if strings.TrimSpace(in.SignatureSVG) == "" {
 		return errors.New("signature is required")
+	}
+	// Signature payloads are user-controlled and otherwise unbounded; cap both
+	// the SVG path data and the rasterized PNG so a client can't wedge the row.
+	if len(in.SignatureSVG) > 300000 || len(in.SignaturePNGB64) > 300000 {
+		return Invalid("ลายเซ็นมีขนาดใหญ่เกินไป")
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -234,6 +255,21 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 			return uuid.Nil, errors.New("unsupported file type: only PDF, JPG, or PNG are accepted")
 		}
 	}
+
+	// Content sniffing: the MIME/extension checks above are advisory only since
+	// the client controls both. Read the leading bytes and confirm the file is
+	// genuinely a PDF/JPEG/PNG, then reattach the consumed prefix so the full
+	// file still reaches storage.
+	head := make([]byte, 512)
+	n, err := io.ReadFull(r, head)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return uuid.Nil, err
+	}
+	head = head[:n]
+	if !sniffAllowedDoc(head) {
+		return uuid.Nil, Invalid("ชนิดไฟล์ไม่ถูกต้อง รองรับเฉพาะ PDF, JPG, PNG")
+	}
+	r = io.MultiReader(bytes.NewReader(head), r)
 
 	// Save first so we can abort cleanly on DB failure.
 	key, savedSize, err := s.store.Save("ta_docs", filename, r)
@@ -456,6 +492,25 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 	}
 	if err != nil {
 		return err
+	}
+
+	// RULE C6: staff may not approve a profile until every mandatory supporting
+	// document is present AND has cleared review. Require a current (not
+	// superseded) row of each kind sitting at status='approved'.
+	if approve {
+		var approvedRequired int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(DISTINCT kind) FROM ta_documents
+			WHERE user_id = $1
+			  AND kind IN ('national_id','bank_book','creditor_form')
+			  AND superseded_at IS NULL
+			  AND status = 'approved'`, userID,
+		).Scan(&approvedRequired); err != nil {
+			return err
+		}
+		if approvedRequired < 3 {
+			return Invalid("ไม่สามารถอนุมัติได้: เอกสารบังคับยังไม่ครบหรือยังไม่ผ่านการตรวจ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)")
+		}
 	}
 
 	if _, err := tx.Exec(ctx,

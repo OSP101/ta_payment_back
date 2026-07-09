@@ -2,15 +2,18 @@ package handler
 
 import (
 	"errors"
+	"log"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/auth"
 	"ta-payment-back/internal/rbac"
+	"ta-payment-back/internal/service"
 )
 
 type ctxKey string
@@ -42,6 +45,37 @@ func RequireRole(roles ...string) fiber.Handler {
 		got, _ := c.Locals(string(CtxRoles)).([]string)
 		if !rbac.Has(got, roles...) {
 			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+		return c.Next()
+	}
+}
+
+// AccountGuard runs after Authenticated on every protected route. It re-reads
+// the user's live state from the DB so that (a) a deactivated or deleted account
+// loses access immediately instead of when its 12h token expires, and (b) a user
+// with a pending forced password change cannot use feature endpoints until they
+// change it. The /me and /me/password endpoints stay reachable so the change
+// flow itself can complete.
+func AccountGuard(pool *pgxpool.Pool) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		p := c.Path()
+		var isActive, mustChange bool
+		err := pool.QueryRow(c.Context(),
+			`SELECT is_active, must_change_password FROM users WHERE id=$1 AND deleted_at IS NULL`,
+			UserID(c)).Scan(&isActive, &mustChange)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "บัญชีนี้ไม่สามารถใช้งานได้"})
+		}
+		if err != nil {
+			return err
+		}
+		if !isActive {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "บัญชีนี้ถูกปิดการใช้งาน"})
+		}
+		if mustChange &&
+			!strings.HasSuffix(p, "/me") &&
+			!strings.HasSuffix(p, "/me/password") {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "password_change_required"})
 		}
 		return c.Next()
 	}
@@ -105,10 +139,57 @@ func RequireApprovedTAProfile(pool *pgxpool.Pool) fiber.Handler {
 	}
 }
 
+// ErrorHandler is the single place where errors become HTTP responses. It maps
+// service sentinels and UserError values to their proper status codes, converts
+// database errors into safe generic messages (never leaking SQL/constraint
+// text), and treats any other plain business error as a 400 with its Thai
+// message. Genuine internal failures are logged server-side and returned as a
+// generic 500.
 func ErrorHandler(c *fiber.Ctx, err error) error {
+	// Explicit fiber errors (auth, bad body, etc.).
 	var fe *fiber.Error
 	if errors.As(err, &fe) {
 		return c.Status(fe.Code).JSON(fiber.Map{"error": fe.Message})
 	}
-	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+
+	// User-facing business errors with an explicit status.
+	var ue *service.UserError
+	if errors.As(err, &ue) {
+		return c.Status(ue.Status).JSON(fiber.Map{"error": ue.Msg})
+	}
+
+	// Service sentinels.
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ไม่พบข้อมูลที่ต้องการ"})
+	case errors.Is(err, service.ErrForbidden):
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "คุณไม่มีสิทธิ์ดำเนินการนี้"})
+	case errors.Is(err, service.ErrConflict):
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "ข้อมูลขัดแย้งกับสถานะปัจจุบัน"})
+	case errors.Is(err, service.ErrInvalidInput):
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ข้อมูลไม่ถูกต้อง"})
+	case errors.Is(err, pgx.ErrNoRows):
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ไม่พบข้อมูลที่ต้องการ"})
+	}
+
+	// Database errors — log the real detail, return a safe generic message.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		log.Printf("db error [%s] on %s %s: %s", pgErr.Code, c.Method(), c.Path(), pgErr.Message)
+		switch pgErr.Code {
+		case "23505": // unique_violation
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "ข้อมูลนี้มีอยู่แล้วในระบบ"})
+		case "23503": // foreign_key_violation
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "ไม่สามารถดำเนินการได้เพราะมีข้อมูลอ้างอิงอยู่"})
+		case "23514", "22001", "22003", "22007", "22P02": // check/length/numeric/datetime/text-repr
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ข้อมูลที่กรอกไม่ถูกต้องตามรูปแบบที่กำหนด"})
+		default:
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"})
+		}
+	}
+
+	// Any remaining plain error is treated as a user-facing business message
+	// (services raise these via errors.New/fmt.Errorf with Thai text). These are
+	// never database errors — those are handled above — so it is safe to show.
+	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 }

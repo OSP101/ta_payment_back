@@ -350,6 +350,9 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 // SetNumStudents updates aggregate + per-track counts. Callers may pass -1 for
 // a field they don't want to change (current value is kept).
 func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUID, total, regular, special int) error {
+	if err := assertCourseManager(ctx, s.pool, actor, id); err != nil {
+		return err
+	}
 	// Fetch current values so we can preserve untouched fields.
 	var curTotal, curRegular, curSpecial int
 	if err := s.pool.QueryRow(ctx,
@@ -395,6 +398,9 @@ type UpdateSettingsInput struct {
 }
 
 func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUID, in UpdateSettingsInput) error {
+	if err := assertCourseManager(ctx, s.pool, actor, id); err != nil {
+		return err
+	}
 	sets := []string{}
 	args := []any{}
 	i := 1
@@ -482,8 +488,14 @@ type AddSectionInput struct {
 // AddSection adds a new section to a course. Returns ErrCourseLocked if the
 // course has already been exported. Aggregate counts are recomputed on success.
 func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID, in AddSectionInput) (uuid.UUID, error) {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return uuid.Nil, err
+	}
 	if in.SecNo == "" || (in.Track != "regular" && in.Track != "special") {
 		return uuid.Nil, ErrInvalidInput
+	}
+	if in.NumStudents < 0 {
+		return uuid.Nil, Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
 	}
 	if err := validateSectionSchedules(in.Schedules); err != nil {
 		return uuid.Nil, err
@@ -527,6 +539,9 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 // out-of-range days, malformed times, and any pair of blocks that overlap
 // within the same day.
 func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tcID, sectionID uuid.UUID, schedules []SectionSchedule) error {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
 	if err := validateSectionSchedules(schedules); err != nil {
 		return err
 	}
@@ -644,6 +659,12 @@ type UpdateSectionInput struct {
 // Track is intentionally not editable — switching regular↔special would
 // invalidate any budget/request math already based on the old track.
 func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectionID uuid.UUID, in UpdateSectionInput) error {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
+	if in.NumStudents != nil && *in.NumStudents < 0 {
+		return Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -699,6 +720,9 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 // recomputed. FK violations (e.g. sections still referenced by TA request
 // assignments) surface as-is to the caller.
 func (s *TeachingService) DeleteSection(ctx context.Context, actor, tcID, sectionID uuid.UUID) error {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -730,8 +754,55 @@ func (s *TeachingService) MarkExported(ctx context.Context, tcID uuid.UUID) erro
 	return err
 }
 
+// Unexport clears the export lock so an accidentally-exported course can be
+// edited again. Admin-only (enforced at the route).
+func (s *TeachingService) Unexport(ctx context.Context, actor, tcID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE teaching_courses SET exported_at = NULL WHERE id = $1 AND exported_at IS NOT NULL`, tcID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return Invalid("รายวิชานี้ยังไม่ได้ส่งออก จึงไม่มีอะไรให้ปลดล็อก")
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "course.unexport", Entity: "teaching_course", EntityID: tcID.String()})
+	return nil
+}
+
 // AddMakeup — makeup schedule
 func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.UUID, m MakeupSchedule) error {
+	// sectionID carries no course id — resolve the parent course so we can
+	// enforce ownership and the export lock the section-CRUD paths already use.
+	var tcID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id FROM sections WHERE id=$1`, sectionID).Scan(&tcID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
+	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
+		return err
+	}
+	if _, err := time.Parse("2006-01-02", m.OriginalDate); err != nil {
+		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	if _, err := time.Parse("2006-01-02", m.MakeupDate); err != nil {
+		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	if m.StartTime != nil && m.EndTime != nil {
+		st, ok1 := parseHM(*m.StartTime)
+		et, ok2 := parseHM(*m.EndTime)
+		if !ok1 || !ok2 {
+			return Invalid("รูปแบบเวลาต้องเป็น HH:MM")
+		}
+		if st >= et {
+			return Invalid("เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม")
+		}
+	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note)
 		 VALUES ($1,$2,$3::date,$4::date,$5,$6,$7)`,
@@ -743,6 +814,38 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 }
 
 func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uuid.UUID, r LectureReview) error {
+	// sectionID carries no course id — resolve the parent course so we can
+	// enforce ownership and the export lock the section-CRUD paths already use.
+	var tcID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id FROM sections WHERE id=$1`, sectionID).Scan(&tcID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
+	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
+		return err
+	}
+	if r.Hours <= 0 || r.Hours > 12 {
+		return Invalid("จำนวนชั่วโมงไม่ถูกต้อง")
+	}
+	if _, err := time.Parse("2006-01-02", r.ReviewDate); err != nil {
+		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	if r.StartTime != nil && r.EndTime != nil {
+		st, ok1 := parseHM(*r.StartTime)
+		et, ok2 := parseHM(*r.EndTime)
+		if !ok1 || !ok2 {
+			return Invalid("รูปแบบเวลาต้องเป็น HH:MM")
+		}
+		if st >= et {
+			return Invalid("เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม")
+		}
+	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO lecture_review_dates (id, section_id, review_date, start_time, end_time, hours, note)
 		 VALUES ($1,$2,$3::date,$4,$5,$6,$7)`,
@@ -764,6 +867,16 @@ type ImportResult struct {
 }
 
 func (s *TeachingService) ImportScheduleExcel(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte) (*ImportResult, error) {
+	// Bulk import creates/updates teaching courses across an entire term, so it
+	// is not scoped to a single course a lecturer could own — restrict to
+	// privileged (admin/staff) actors.
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return nil, err
+	}
+	if !priv {
+		return nil, ErrForbidden
+	}
 	f, err := excelize.OpenReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, err

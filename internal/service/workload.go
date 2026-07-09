@@ -135,12 +135,56 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 		`DELETE FROM ta_class_schedules WHERE user_id=$1 AND term_id=$2`, userID, termID); err != nil {
 		return err
 	}
+	// RULE C5 (WBA / year-4): WBA rows are excluded from conflict checks and
+	// therefore must not be forgeable. Enforce that (a) at most one is_wba row is
+	// submitted, and (b) the acting user is a year-4-or-above undergraduate.
+	// study_year is now authoritative (migration 0013); it must be set by staff.
+	wbaCount := 0
+	for _, b := range blocks {
+		if b.IsWBA {
+			wbaCount++
+		}
+	}
+	if wbaCount > 1 {
+		return Invalid("มีแถว WBA ได้เพียงรายการเดียว")
+	}
+	if wbaCount > 0 {
+		var studyLevel string
+		var studyYear *int
+		if err := tx.QueryRow(ctx,
+			`SELECT study_level::text, study_year FROM users WHERE id=$1`, userID).Scan(&studyLevel, &studyYear); err != nil {
+			return err
+		}
+		if studyLevel != "undergrad" {
+			return Invalid("เฉพาะนักศึกษาระดับปริญญาตรีชั้นปีที่ 4 เท่านั้นที่ใช้โหมด WBA ได้")
+		}
+		if studyYear == nil {
+			return Invalid("ยังไม่ได้บันทึกชั้นปีของคุณในระบบ กรุณาติดต่อเจ้าหน้าที่เพื่อใช้โหมด WBA")
+		}
+		if *studyYear < 4 {
+			return Invalid("เฉพาะนักศึกษาชั้นปีที่ 4 ขึ้นไปเท่านั้นที่ใช้โหมด WBA ได้")
+		}
+	}
 	for _, b := range blocks {
 		if b.DayOfWeek < 0 || b.DayOfWeek > 6 {
 			return errors.New("invalid day_of_week")
 		}
-		if !b.IsWBA && b.StartTime >= b.EndTime {
-			return errors.New("เวลาสิ้นสุดของคาบเรียนต้องมากกว่าเวลาเริ่ม")
+		// BUG B12: times must be compared as minutes-from-midnight, not as raw
+		// strings ("9:00" > "10:00" lexicographically). Validating here also
+		// stops malformed strings from reaching the ::time cast (a 500). WBA
+		// rows use the 00:00–00:00 sentinel and skip time validation entirely.
+		if !b.IsWBA {
+			startMin, okS := parseHM(b.StartTime)
+			endMin, okE := parseHM(b.EndTime)
+			if !okS || !okE {
+				return Invalid("รูปแบบเวลาไม่ถูกต้อง (HH:MM)")
+			}
+			// M2: parseHM already bounds each value to a valid 00:00–23:59
+			// (0..1439 min) range; reject anything where start is not strictly
+			// before end.
+			if startMin >= endMin {
+				return errors.New("เวลาสิ้นสุดของคาบเรียนต้องมากกว่าเวลาเริ่ม")
+			}
 		}
 		if b.Kind != "" && b.Kind != "lecture" && b.Kind != "lab" {
 			return errors.New("invalid kind")

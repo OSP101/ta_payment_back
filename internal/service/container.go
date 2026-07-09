@@ -41,7 +41,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.TARequest = &TARequestService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
 	c.Docs = &DocsService{pool: pool, aud: auditor, store: store}
 	c.Workload = &WorkloadService{pool: pool}
-	c.WorkLog = &WorkLogService{pool: pool, aud: auditor}
+	c.WorkLog = &WorkLogService{pool: pool, aud: auditor, budget: c.Budget}
 	c.Export = &ExportService{pool: pool, store: store}
 	c.Announce = &AnnounceService{pool: pool, aud: auditor, notify: c.Notify}
 	c.Dashboard = &DashboardService{pool: pool}

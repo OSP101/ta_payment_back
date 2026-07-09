@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -49,6 +50,13 @@ func (s *CourseService) List(ctx context.Context, search string) ([]FacultyCours
 }
 
 func (s *CourseService) Upsert(ctx context.Context, actor uuid.UUID, in FacultyCourse) (*FacultyCourse, error) {
+	in.Code = strings.TrimSpace(in.Code)
+	if in.Code == "" {
+		return nil, Invalid("กรุณาระบุรหัสวิชา")
+	}
+	if in.Credits < 0 || in.LectureHrs < 0 || in.LabHrs < 0 || in.SelfHrs < 0 {
+		return nil, Invalid("หน่วยกิตและจำนวนชั่วโมงต้องไม่ติดลบ")
+	}
 	if in.ID == uuid.Nil {
 		in.ID = uuid.New()
 		_, err := s.pool.Exec(ctx,
@@ -61,12 +69,15 @@ func (s *CourseService) Upsert(ctx context.Context, actor uuid.UUID, in FacultyC
 		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "faculty_course.create", Entity: "faculty_course", EntityID: in.ID.String(), After: in})
 		return &in, nil
 	}
-	_, err := s.pool.Exec(ctx,
+	res, err := s.pool.Exec(ctx,
 		`UPDATE faculty_courses SET code=$2, name_th=$3, name_en=$4, credits=$5, lecture_hrs=$6, lab_hrs=$7, self_hrs=$8, department=$9, is_active=$10, updated_at=NOW()
 		 WHERE id=$1`,
 		in.ID, in.Code, in.NameTH, in.NameEN, in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs, in.Department, in.IsActive)
 	if err != nil {
 		return nil, err
+	}
+	if res.RowsAffected() == 0 {
+		return nil, ErrNotFound
 	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "faculty_course.update", Entity: "faculty_course", EntityID: in.ID.String(), After: in})
 	return &in, nil
@@ -131,6 +142,25 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 
 func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in PayRate) (*PayRate, error) {
 	in.ID = uuid.New()
+	// Reject negatives on every numeric field. 0 is allowed only for the fields
+	// below that treat it as "use default"; the defaults block then fills them in.
+	if in.UndergradRegular < 0 || in.UndergradSpecial < 0 ||
+		in.GraduateRegular < 0 || in.GraduateSpecialLumpsum < 0 ||
+		in.UGLectureHoursPerCredit < 0 || in.UGLabHoursPerCredit < 0 ||
+		in.BaselineStudentsLecture < 0 || in.BaselineStudentsLab < 0 ||
+		in.UGWorkloadRateRegular < 0 || in.UGWorkloadRateSpecial < 0 ||
+		in.TermMonths < 0 || in.UGMaxHoursPerDay < 0 || in.MaxCoursesPerStudent < 0 {
+		return nil, Invalid("ค่าตัวเลขต้องไม่ติดลบ")
+	}
+	// Actual payment rates have no default — a 0 rate breaks payroll.
+	if in.UndergradRegular <= 0 || in.UndergradSpecial <= 0 ||
+		in.GraduateRegular <= 0 || in.GraduateSpecialLumpsum <= 0 {
+		return nil, Invalid("อัตราจ่ายต้องเป็นค่ามากกว่า 0")
+	}
+	// Term length must be within a sane academic range (0 = use default).
+	if in.TermMonths > 12 {
+		return nil, Invalid("จำนวนเดือนต่อภาคเรียนต้องอยู่ระหว่าง 1 ถึง 12")
+	}
 	// Fill defaults if the client didn't send the new fields
 	if in.UGLectureHoursPerCredit == 0 { in.UGLectureHoursPerCredit = 3 }
 	if in.UGLabHoursPerCredit == 0     { in.UGLabHoursPerCredit = 4.5 }
@@ -187,6 +217,9 @@ func (s *CourseService) ListHourCaps(ctx context.Context) ([]HourCap, error) {
 }
 
 func (s *CourseService) UpsertHourCap(ctx context.Context, actor uuid.UUID, in HourCap) (*HourCap, error) {
+	if in.Credits <= 0 || in.HoursCap < 0 {
+		return nil, Invalid("จำนวนหน่วยกิตและชั่วโมงต้องไม่ติดลบ")
+	}
 	in.ID = uuid.New()
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO hour_caps (id, credits, hours_cap, note) VALUES ($1,$2,$3,$4)
@@ -231,6 +264,9 @@ func (s *CourseService) LatestBudgetCap(ctx context.Context) (*BudgetCap, error)
 }
 
 func (s *CourseService) UpsertBudgetCap(ctx context.Context, actor uuid.UUID, in BudgetCap) (*BudgetCap, error) {
+	if in.PerCourseMax < 0 {
+		return nil, Invalid("จำนวนเงินต้องไม่ติดลบ")
+	}
 	in.ID = uuid.New()
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO budget_caps (id, effective_from, per_course_max, note) VALUES ($1,$2::date,$3,$4)`,

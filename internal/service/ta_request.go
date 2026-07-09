@@ -79,16 +79,19 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return uuid.Nil, errors.New("ไม่พบรายวิชาที่เลือก")
 	}
 
-	// enforce active window
-	var openWindows int
-	if err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM ta_request_windows w
+	// enforce active window and capture which window admitted this request so
+	// window deletion can honour the "in use" guard (M3).
+	var windowID uuid.UUID
+	err := s.pool.QueryRow(ctx, `
+		SELECT w.id FROM ta_request_windows w
 		WHERE w.term_id = $1 AND w.is_open AND NOW() BETWEEN w.opens_at AND w.closes_at
-	`, termID).Scan(&openWindows); err != nil {
-		return uuid.Nil, err
-	}
-	if openWindows == 0 {
+		ORDER BY w.closes_at DESC LIMIT 1
+	`, termID).Scan(&windowID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, errors.New("ยังไม่เปิดรับคำขอ TA สำหรับภาคการศึกษานี้")
+	}
+	if err != nil {
+		return uuid.Nil, err
 	}
 
 	// A lecturer may file multiple TA requests for the same course (e.g. to add
@@ -173,6 +176,12 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			return uuid.Nil, err
 		}
 
+		// Each workload component must be a sane non-negative number. Without
+		// this, negative values can cancel out to satisfy the total-hours rule
+		// (e.g. 20 + (−9) = 11) and values > 99.99 overflow NUMERIC(4,2) → 500.
+		if err := validateWorkloadFields(a.Workload, name); err != nil {
+			return uuid.Nil, err
+		}
 		if level == "master" || level == "phd" {
 			tot := a.Workload.HelpTeachHrs + a.Workload.PrepHrs + a.Workload.GradeHrs + a.Workload.OtherHrs
 			if tot < 10 || tot > 12 {
@@ -217,9 +226,9 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	defer tx.Rollback(ctx)
 	rid := uuid.New()
 	_, err = tx.Exec(ctx,
-		`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at)
-		 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW())`,
-		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope)
+		`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id)
+		 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5)`,
+		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -252,6 +261,24 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &lecturerID, Action: "ta_request.submit", Entity: "ta_request", EntityID: rid.String(), After: in})
 	return rid, nil
+}
+
+// validateWorkloadFields rejects negative or absurd hour components. Each field
+// is stored as NUMERIC(4,2), so the hard ceiling is < 100.
+func validateWorkloadFields(w WorkloadInput, name string) error {
+	fields := []float64{
+		w.HelpTeachHrs, w.PrepHrs, w.GradeHrs, w.OtherHrs,
+		w.CheckWorkHrs, w.AttendanceHrs, w.UGOtherHrs, w.LabHrs,
+	}
+	for _, v := range fields {
+		if v < 0 {
+			return fmt.Errorf("ภาระงานของ %s มีค่าติดลบ", name)
+		}
+		if v > 99 {
+			return fmt.Errorf("ภาระงานของ %s มีค่าเกินกว่าที่กำหนด (สูงสุด 99 ชม.)", name)
+		}
+	}
+	return nil
 }
 
 // validateTA checks the user is an active TA and returns their display name
@@ -308,6 +335,20 @@ func (s *TARequestService) checkTAEligibility(ctx context.Context, taID, termID 
 	}
 	if profileStatus == nil || *profileStatus != "approved" {
 		return fmt.Errorf("%s ยังไม่ผ่านการอนุมัติเอกสารจากเจ้าหน้าที่", name)
+	}
+	// The three required documents must each exist as a current (not superseded)
+	// row with status='approved'. A profile can be approved independently of the
+	// documents, so this gate must be checked explicitly (rule C6).
+	var approvedDocKinds int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT kind) FROM ta_documents
+		WHERE user_id = $1 AND superseded_at IS NULL AND status = 'approved'
+		  AND kind IN ('national_id','bank_book','creditor_form')`,
+		taID).Scan(&approvedDocKinds); err != nil {
+		return err
+	}
+	if approvedDocKinds < 3 {
+		return fmt.Errorf("%s ยังมีเอกสารบังคับที่ไม่ครบหรือยังไม่ผ่านการอนุมัติ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)", name)
 	}
 	var hasSchedule bool
 	if err := s.pool.QueryRow(ctx,

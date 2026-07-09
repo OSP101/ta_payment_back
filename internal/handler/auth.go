@@ -29,11 +29,14 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	u, hash, err := h.Svc.Users.FindByEmail(c.Context(), in.Email)
-	if err != nil || u == nil {
-		return fiber.NewError(fiber.StatusUnauthorized, "invalid credentials")
+	if err != nil || u == nil || hash == "" {
+		// Spend the same time a real bcrypt check would, so a missing account is
+		// indistinguishable from a wrong password by timing.
+		auth.DummyCompare(in.Password)
+		return fiber.NewError(fiber.StatusUnauthorized, "อีเมลหรือรหัสผ่านไม่ถูกต้อง")
 	}
-	if hash == "" || !auth.CheckPassword(hash, in.Password) {
-		return fiber.NewError(fiber.StatusUnauthorized, "invalid credentials")
+	if !auth.CheckPassword(hash, in.Password) {
+		return fiber.NewError(fiber.StatusUnauthorized, "อีเมลหรือรหัสผ่านไม่ถูกต้อง")
 	}
 	tok, err := h.Tokens.Issue(u.ID, u.Roles, h.Svc.Cfg.JWTLifetime)
 	if err != nil {
@@ -41,7 +44,10 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	}
 	setAuthCookie(c, tok, h.Svc.Cfg.JWTLifetime)
 	h.Aud.Log(c.Context(), audit.Entry{ActorID: &u.ID, Action: "auth.login", Entity: "user", EntityID: u.ID.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")})
-	return c.JSON(fiber.Map{"user": u, "token": tok})
+	// The token lives only in the HttpOnly cookie — it is deliberately NOT
+	// returned in the body so it can't be stashed in localStorage where XSS
+	// could read it.
+	return c.JSON(fiber.Map{"user": u})
 }
 
 // SSOURL returns the SSO redirect URL for the frontend to send the user to.
