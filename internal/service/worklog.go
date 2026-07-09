@@ -440,6 +440,69 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	return nil
 }
 
+// PendingReport is one row on the lecturer's "อนุมัติรายงาน TA" list — an
+// assignment that currently has at least one submitted work-log row awaiting
+// review.
+type PendingReport struct {
+	ID               uuid.UUID `json:"id"`
+	TAName           string    `json:"ta_name"`
+	CourseCode       string    `json:"course_code"`
+	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
+	TotalHours       float64   `json:"total_hours"`
+	PeriodLabel      string    `json:"period_label,omitempty"`
+}
+
+// ListPending returns assignments with submitted (awaiting-review) work-logs.
+// Lecturers see only assignments in courses they teach; privileged users
+// (admin/staff) see all.
+func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privileged bool) ([]PendingReport, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.id,
+		       u.first_name || ' ' || u.last_name,
+		       fc.code,
+		       tc.id,
+		       COALESCE(SUM(wl.hours), 0),
+		       MIN(wl.work_date),
+		       MAX(wl.work_date),
+		       MIN(wl.submitted_at)
+		FROM ta_request_assignments a
+		JOIN sections sec ON sec.id = a.section_id
+		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		JOIN users u ON u.id = a.ta_id
+		JOIN work_logs wl ON wl.assignment_id = a.id AND wl.status = 'submitted'
+		WHERE $1 = TRUE OR EXISTS (
+		    SELECT 1 FROM teaching_lecturers tl
+		    WHERE tl.teaching_course_id = tc.id AND tl.lecturer_id = $2
+		)
+		GROUP BY a.id, u.first_name, u.last_name, fc.code, tc.id
+		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, fc.code`,
+		privileged, actor)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]PendingReport, 0)
+	for rows.Next() {
+		var (
+			p           PendingReport
+			minD, maxD  time.Time
+			submittedAt *time.Time
+		)
+		if err := rows.Scan(&p.ID, &p.TAName, &p.CourseCode, &p.TeachingCourseID,
+			&p.TotalHours, &minD, &maxD, &submittedAt); err != nil {
+			return nil, err
+		}
+		if minD.Equal(maxD) {
+			p.PeriodLabel = minD.Format("2006-01-02")
+		} else {
+			p.PeriodLabel = minD.Format("2006-01-02") + " – " + maxD.Format("2006-01-02")
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UUID, reason string, privileged bool) error {
 	if reason == "" {
 		return errors.New("ต้องระบุเหตุผลการปฏิเสธ")

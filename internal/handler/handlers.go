@@ -1032,6 +1032,15 @@ func (h *WorkLogHandler) Approve(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+func (h *WorkLogHandler) PendingReports(c *fiber.Ctx) error {
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	out, err := h.Svc.WorkLog.ListPending(c.Context(), UserID(c), privileged)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 func (h *WorkLogHandler) Reject(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
