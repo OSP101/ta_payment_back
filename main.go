@@ -98,6 +98,16 @@ func main() {
 	// still lands in inboxes if the office opens at 08:15.
 	go services.Announce.RunScheduler(ctx)
 
+	// Retention sweep: delete on-disk blobs 7 days after approval and mark
+	// file_deleted_at on the row for audit. See docs_review.go.
+	go services.Docs.RunRetention(ctx)
+
+	// One-shot: auto-decide any legacy ta_requests still in 'submitted' state
+	// after 0017 migration (officer manual approval flow is gone).
+	if err := services.TARequest.RunPendingSweep(ctx); err != nil {
+		log.Printf("ta_request sweep warning: %v", err)
+	}
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig

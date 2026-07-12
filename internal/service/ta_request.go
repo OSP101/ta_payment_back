@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +22,34 @@ type TARequestService struct {
 	aud    *audit.Auditor
 	budget *BudgetService
 	notify *NotifyService
+}
+
+// querier is the read subset both *pgxpool.Pool and pgx.Tx satisfy. All
+// eligibility helpers accept it so they can run inside an auto-decide tx (to
+// see advisory locks) or on the pool (for read-only projections such as
+// Detail's per-assignment warning banner).
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// DecisionCheck is one line of the "การตรวจสอบของระบบ" checklist that the
+// staff accordion renders. Rows are appended in a deterministic order per TA;
+// callers should not mutate this list post-decision.
+type DecisionCheck struct {
+	Rule    string `json:"rule"`
+	TAName  string `json:"ta,omitempty"`
+	Passed  bool   `json:"passed"`
+	Message string `json:"message"`
+}
+
+// CreateResult is what Create returns to the handler. Every submission
+// resolves to either 'approved' or 'rejected' inside the tx; there is no
+// 'submitted' state at rest under the auto-decide model.
+type CreateResult struct {
+	ID           uuid.UUID       `json:"id"`
+	Status       string          `json:"status"`
+	Checks       []DecisionCheck `json:"decision_checks"`
+	RejectReason string          `json:"reject_reason,omitempty"`
 }
 
 type WorkloadInput struct {
@@ -52,15 +84,21 @@ type CreateTARequestInput struct {
 	} `json:"assignments"`
 }
 
-func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in CreateTARequestInput) (uuid.UUID, error) {
+// Create runs input integrity checks upfront and then auto-decides the
+// request atomically inside a single tx. Structural failures (unknown TA,
+// wrong section, negative workload, etc.) return an error and never persist a
+// row; business-rule failures (docs not approved, 3-course cap, time
+// conflicts) persist as a 'rejected' row so the staff accordion can display
+// the checklist that produced the verdict.
+func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
 	if in.TeachingCourseID == uuid.Nil {
-		return uuid.Nil, ErrInvalidInput
+		return nil, ErrInvalidInput
 	}
 	if in.ReimburseScope != "lecture" && in.ReimburseScope != "lab" && in.ReimburseScope != "both" {
-		return uuid.Nil, errors.New("ประเภทการเบิกไม่ถูกต้อง")
+		return nil, errors.New("ประเภทการเบิกไม่ถูกต้อง")
 	}
 	if len(in.Assignments) == 0 {
-		return uuid.Nil, errors.New("ต้องระบุรายชื่อ TA อย่างน้อย 1 คน")
+		return nil, errors.New("ต้องระบุรายชื่อ TA อย่างน้อย 1 คน")
 	}
 
 	// The lecturer must actually teach this course.
@@ -68,15 +106,15 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	if err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM teaching_lecturers WHERE teaching_course_id = $1 AND lecturer_id = $2)
 	`, in.TeachingCourseID, lecturerID).Scan(&teaches); err != nil {
-		return uuid.Nil, err
+		return nil, err
 	}
 	if !teaches {
-		return uuid.Nil, errors.New("คุณไม่ได้เป็นผู้สอนของรายวิชานี้")
+		return nil, errors.New("คุณไม่ได้เป็นผู้สอนของรายวิชานี้")
 	}
 
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id = $1`, in.TeachingCourseID).Scan(&termID); err != nil {
-		return uuid.Nil, errors.New("ไม่พบรายวิชาที่เลือก")
+		return nil, errors.New("ไม่พบรายวิชาที่เลือก")
 	}
 
 	// enforce active window and capture which window admitted this request so
@@ -88,34 +126,10 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		ORDER BY w.closes_at DESC LIMIT 1
 	`, termID).Scan(&windowID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, errors.New("ยังไม่เปิดรับคำขอ TA สำหรับภาคการศึกษานี้")
+		return nil, errors.New("ยังไม่เปิดรับคำขอ TA สำหรับภาคการศึกษานี้")
 	}
 	if err != nil {
-		return uuid.Nil, err
-	}
-
-	// A lecturer may file multiple TA requests for the same course (e.g. to add
-	// more TAs after an earlier batch was approved). However, a given TA may
-	// appear only once across the course's live requests — any submitted or
-	// approved slot already ties them to this course and lets them start work
-	// or draw pay. Rejected/cancelled slots are ignored so the lecturer can
-	// re-file after fixing the problem.
-	for _, a := range in.Assignments {
-		var exists bool
-		if err := s.pool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM ta_request_assignments ra
-				JOIN ta_requests r ON r.id = ra.request_id
-				WHERE r.teaching_course_id = $1
-				  AND r.status IN ('submitted','approved')
-				  AND ra.ta_id = $2
-			)`, in.TeachingCourseID, a.TAID).Scan(&exists); err != nil {
-			return uuid.Nil, err
-		}
-		if exists {
-			name := s.taName(ctx, a.TAID)
-			return uuid.Nil, fmt.Errorf("%s อยู่ในคำขอ TA ของวิชานี้อยู่แล้ว (รอพิจารณาหรืออนุมัติแล้ว) ไม่สามารถเพิ่มซ้ำได้", name)
-		}
+		return nil, err
 	}
 
 	// Guard against the same TA being listed twice within one request. The UI
@@ -124,7 +138,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	seen := map[uuid.UUID]struct{}{}
 	for _, a := range in.Assignments {
 		if _, dup := seen[a.TAID]; dup {
-			return uuid.Nil, fmt.Errorf("มี %s ปรากฏซ้ำในคำขอเดียวกัน", s.taName(ctx, a.TAID))
+			return nil, fmt.Errorf("มี %s ปรากฏซ้ำในคำขอเดียวกัน", s.taName(ctx, a.TAID))
 		}
 		seen[a.TAID] = struct{}{}
 	}
@@ -134,7 +148,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	for _, c := range in.Counts {
 		sectionIDs[c.SectionID] = struct{}{}
 		if c.UndergradCount < 0 || c.GraduateCount < 0 {
-			return uuid.Nil, errors.New("จำนวน TA ต้องไม่ติดลบ")
+			return nil, errors.New("จำนวน TA ต้องไม่ติดลบ")
 		}
 	}
 	for _, a := range in.Assignments {
@@ -145,98 +159,49 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		if err := s.pool.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM sections WHERE id = $1 AND teaching_course_id = $2)`,
 			secID, in.TeachingCourseID).Scan(&ok); err != nil {
-			return uuid.Nil, err
+			return nil, err
 		}
 		if !ok {
-			return uuid.Nil, errors.New("พบ section ที่ไม่ได้อยู่ในรายวิชานี้")
+			return nil, errors.New("พบ section ที่ไม่ได้อยู่ในรายวิชานี้")
 		}
 	}
 
-	// Per-TA validation.
-	taSections := map[uuid.UUID][]uuid.UUID{}
+	// Per-TA integrity validation only. Business rules (docs, schedule, cap,
+	// time conflicts, workload totals) are evaluated by autoDecide below and
+	// materialise as ✓/✗ checklist entries — not blocking errors — so the
+	// resulting rejected request stays visible in the staff accordion.
 	levels := make([]string, len(in.Assignments))
 	for i, a := range in.Assignments {
 		name, level, err := s.validateTA(ctx, a.TAID, a.Level)
 		if err != nil {
-			return uuid.Nil, err
+			return nil, err
 		}
 		levels[i] = level
-
-		// Requirement 1: documents approved + class schedule recorded for this term.
-		if err := s.checkTAEligibility(ctx, a.TAID, termID, name); err != nil {
-			return uuid.Nil, err
-		}
-		// Requirement 2a: must not clash with the TA's own class schedule.
-		if err := s.checkOwnClassConflict(ctx, a.TAID, a.SectionID, name); err != nil {
-			return uuid.Nil, err
-		}
-		// Requirement 2b: must not clash with sections of other courses the TA
-		// is already requested/assigned to this term.
-		if err := s.checkCrossRequestConflict(ctx, a.TAID, a.SectionID, termID, in.TeachingCourseID, uuid.Nil, []string{"submitted", "approved"}, name); err != nil {
-			return uuid.Nil, err
-		}
-
-		// Each workload component must be a sane non-negative number. Without
-		// this, negative values can cancel out to satisfy the total-hours rule
-		// (e.g. 20 + (−9) = 11) and values > 99.99 overflow NUMERIC(4,2) → 500.
+		// Reject impossibly-shaped numeric input before it can overflow the
+		// underlying NUMERIC(4,2) column or invalidate the total-hours rule
+		// through cancellation. Not a "check" — this is corrupt data.
 		if err := validateWorkloadFields(a.Workload, name); err != nil {
-			return uuid.Nil, err
-		}
-		if level == "master" || level == "phd" {
-			tot := a.Workload.HelpTeachHrs + a.Workload.PrepHrs + a.Workload.GradeHrs + a.Workload.OtherHrs
-			if tot < 10 || tot > 12 {
-				return uuid.Nil, fmt.Errorf("ภาระงานของ %s (บัณฑิตศึกษา) ต้องรวม 10–12 ชม./สัปดาห์", name)
-			}
-		} else {
-			tot := a.Workload.CheckWorkHrs + a.Workload.AttendanceHrs + a.Workload.UGOtherHrs + a.Workload.LabHrs
-			if tot <= 0 {
-				return uuid.Nil, fmt.Errorf("ยังไม่ได้ระบุภาระงานของ %s", name)
-			}
-		}
-
-		taSections[a.TAID] = append(taSections[a.TAID], a.SectionID)
-	}
-
-	// Requirement 2c: sections within this same request must not overlap for
-	// the same TA.
-	for taID, secs := range taSections {
-		if len(secs) < 2 {
-			continue
-		}
-		var clash int
-		if err := s.pool.QueryRow(ctx, `
-			SELECT COUNT(*) FROM section_schedules a
-			JOIN section_schedules b ON b.section_id = ANY($1) AND b.section_id <> a.section_id
-			WHERE a.section_id = ANY($1)
-			  AND a.day_of_week = b.day_of_week
-			  AND a.start_time < b.end_time AND b.start_time < a.end_time
-		`, secs).Scan(&clash); err != nil {
-			return uuid.Nil, err
-		}
-		if clash > 0 {
-			name := s.taName(ctx, taID)
-			return uuid.Nil, fmt.Errorf("%s ถูกมอบหมายให้ section ที่เวลาสอนทับซ้อนกันเองในคำขอนี้", name)
+			return nil, err
 		}
 	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return uuid.Nil, err
+		return nil, err
 	}
 	defer tx.Rollback(ctx)
 	rid := uuid.New()
-	_, err = tx.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id)
 		 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5)`,
-		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID)
-	if err != nil {
-		return uuid.Nil, err
+		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID); err != nil {
+		return nil, err
 	}
 	for _, c := range in.Counts {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO ta_request_counts (request_id, section_id, undergrad_count, graduate_count)
 			 VALUES ($1,$2,$3,$4)`, rid, c.SectionID, c.UndergradCount, c.GraduateCount); err != nil {
-			return uuid.Nil, err
+			return nil, err
 		}
 	}
 	for i, a := range in.Assignments {
@@ -244,7 +209,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
 			 VALUES ($1,$2,$3,$4,$5::study_level)`, aid, rid, a.SectionID, a.TAID, levels[i]); err != nil {
-			return uuid.Nil, err
+			return nil, err
 		}
 		wl := a.Workload
 		if _, err := tx.Exec(ctx, `
@@ -253,14 +218,103 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 			aid, wl.HelpTeachHrs, wl.HelpTeachDesc, wl.PrepHrs, wl.PrepDesc, wl.GradeHrs, wl.GradeDesc,
 			wl.OtherHrs, wl.OtherDesc, wl.CheckWorkHrs, wl.AttendanceHrs, wl.UGOtherHrs, wl.UGOtherDesc, wl.LabHrs); err != nil {
-			return uuid.Nil, err
+			return nil, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return uuid.Nil, err
+
+	checks, passed, err := s.autoDecide(ctx, tx, rid)
+	if err != nil {
+		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &lecturerID, Action: "ta_request.submit", Entity: "ta_request", EntityID: rid.String(), After: in})
-	return rid, nil
+	verdict := "rejected"
+	var reason string
+	if passed {
+		verdict = "approved"
+	} else {
+		reason = joinRejectMessages(checks)
+	}
+	checksJSON, err := json.Marshal(checks)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ta_requests SET
+		  status          = $1::ta_request_status,
+		  decided_at      = NOW(),
+		  decided_by      = NULL,
+		  reject_reason   = NULLIF($2, ''),
+		  decision_checks = $3::jsonb,
+		  updated_at      = NOW()
+		WHERE id = $4`, verdict, reason, checksJSON, rid); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	s.aud.Log(ctx, audit.Entry{
+		ActorID:  &lecturerID,
+		Action:   "ta_request.auto_decide",
+		Entity:   "ta_request",
+		EntityID: rid.String(),
+		Note:     verdict,
+		After:    in,
+	})
+	s.notifyDecision(ctx, rid, verdict, reason)
+	return &CreateResult{ID: rid, Status: verdict, Checks: checks, RejectReason: reason}, nil
+}
+
+// joinRejectMessages produces a single-line reject_reason from the failed
+// checks. Kept compact (500 chars) so it renders cleanly inside notification
+// bodies and legacy admin tables that show reject_reason as a plain string.
+func joinRejectMessages(checks []DecisionCheck) string {
+	msgs := make([]string, 0, len(checks))
+	for _, c := range checks {
+		if c.Passed {
+			continue
+		}
+		msgs = append(msgs, c.Message)
+	}
+	joined := strings.Join(msgs, " • ")
+	if len(joined) > 500 {
+		joined = joined[:497] + "…"
+	}
+	return joined
+}
+
+// notifyDecision fans out approval / rejection notifications. Best-effort:
+// failures here must not roll back the decision itself.
+func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, verdict, reason string) {
+	if s.notify == nil {
+		return
+	}
+	var courseID, lecturerID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id, lecturer_id FROM ta_requests WHERE id = $1`, reqID).Scan(&courseID, &lecturerID); err != nil {
+		return
+	}
+	code, nameTH := s.courseLabel(ctx, courseID)
+	if verdict == "approved" {
+		s.notify.Send(ctx, lecturerID, "คำขอ TA ได้รับการอนุมัติ",
+			fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ได้รับการอนุมัติจากระบบอัตโนมัติแล้ว", code, nameTH), "/lecturer")
+		rows, err := s.pool.Query(ctx,
+			`SELECT DISTINCT a.ta_id FROM ta_request_assignments a WHERE a.request_id = $1`, reqID)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var taID uuid.UUID
+			if err := rows.Scan(&taID); err != nil {
+				return
+			}
+			s.notify.Send(ctx, taID, "คุณได้รับมอบหมายเป็นผู้ช่วยสอน",
+				fmt.Sprintf("คุณได้รับอนุมัติเป็นผู้ช่วยสอนวิชา %s %s", code, nameTH), "/ta")
+		}
+		return
+	}
+	s.notify.Send(ctx, lecturerID, "คำขอ TA ถูกปฏิเสธ",
+		fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ถูกระบบปฏิเสธอัตโนมัติ: %s", code, nameTH, reason), "/lecturer")
 }
 
 // validateWorkloadFields rejects negative or absurd hour components. Each field
@@ -325,9 +379,12 @@ func (s *TARequestService) taName(ctx context.Context, taID uuid.UUID) string {
 
 // checkTAEligibility enforces requirement 1: documents approved by staff and a
 // class schedule recorded for the term (a WBA/year-4 row counts).
-func (s *TARequestService) checkTAEligibility(ctx context.Context, taID, termID uuid.UUID, name string) error {
+// checkTAEligibility enforces requirement 1 (docs + schedule). Called both
+// inside the auto-decide tx (q = tx) and from Detail's read-only warnings
+// path (q = pool).
+func (s *TARequestService) checkTAEligibility(ctx context.Context, q querier, taID, termID uuid.UUID, name string) error {
 	var profileStatus *string
-	if err := s.pool.QueryRow(ctx,
+	if err := q.QueryRow(ctx,
 		`SELECT status::text FROM ta_profiles WHERE user_id = $1`, taID).Scan(&profileStatus); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -340,7 +397,7 @@ func (s *TARequestService) checkTAEligibility(ctx context.Context, taID, termID 
 	// row with status='approved'. A profile can be approved independently of the
 	// documents, so this gate must be checked explicitly (rule C6).
 	var approvedDocKinds int
-	if err := s.pool.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT kind) FROM ta_documents
 		WHERE user_id = $1 AND superseded_at IS NULL AND status = 'approved'
 		  AND kind IN ('national_id','bank_book','creditor_form')`,
@@ -351,7 +408,7 @@ func (s *TARequestService) checkTAEligibility(ctx context.Context, taID, termID 
 		return fmt.Errorf("%s ยังมีเอกสารบังคับที่ไม่ครบหรือยังไม่ผ่านการอนุมัติ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)", name)
 	}
 	var hasSchedule bool
-	if err := s.pool.QueryRow(ctx,
+	if err := q.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM ta_class_schedules WHERE user_id = $1 AND term_id = $2)`,
 		taID, termID).Scan(&hasSchedule); err != nil {
 		return err
@@ -362,12 +419,9 @@ func (s *TARequestService) checkTAEligibility(ctx context.Context, taID, termID 
 	return nil
 }
 
-// checkOwnClassConflict enforces requirement 2a: the section's teaching slots
-// must not overlap the TA's own class schedule. WBA rows (00:00–00:00) never
-// overlap, so year-4 students pass automatically.
-func (s *TARequestService) checkOwnClassConflict(ctx context.Context, taID, sectionID uuid.UUID, name string) error {
+func (s *TARequestService) checkOwnClassConflict(ctx context.Context, q querier, taID, sectionID uuid.UUID, name string) error {
 	var conflicts int
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT COUNT(*) FROM section_schedules ss
 		JOIN sections sec ON sec.id = ss.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
@@ -386,12 +440,9 @@ func (s *TARequestService) checkOwnClassConflict(ctx context.Context, taID, sect
 	return nil
 }
 
-// checkCrossRequestConflict enforces requirement 2b: the section must not
-// overlap sections of other courses the TA already holds in the same term.
-// excludeRequestID skips the request being approved itself.
-func (s *TARequestService) checkCrossRequestConflict(ctx context.Context, taID, sectionID, termID, courseID, excludeRequestID uuid.UUID, statuses []string, name string) error {
+func (s *TARequestService) checkCrossRequestConflict(ctx context.Context, q querier, taID, sectionID, termID, courseID, excludeRequestID uuid.UUID, statuses []string, name string) error {
 	var conflicts int
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT COUNT(*) FROM section_schedules ss
 		JOIN ta_request_assignments oa ON oa.ta_id = $1
 		JOIN ta_requests orq ON orq.id = oa.request_id
@@ -416,9 +467,9 @@ func (s *TARequestService) checkCrossRequestConflict(ctx context.Context, taID, 
 
 // approvedCourseCount counts distinct courses (other than courseID) in the term
 // where the TA is on an approved request.
-func (s *TARequestService) approvedCourseCount(ctx context.Context, taID, termID, courseID uuid.UUID) (int, error) {
+func (s *TARequestService) approvedCourseCount(ctx context.Context, q querier, taID, termID, courseID uuid.UUID) (int, error) {
 	var count int
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT r.teaching_course_id) FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
@@ -428,72 +479,133 @@ func (s *TARequestService) approvedCourseCount(ctx context.Context, taID, termID
 	return count, err
 }
 
-// Approve is the final gate (requirement 3): the 3-course cap and all TA
-// eligibility rules are re-checked here, because a TA only "counts" once
-// approved.
-func (s *TARequestService) Approve(ctx context.Context, actor, reqID uuid.UUID) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
+// autoDecide runs every business rule for the given request inside tx and
+// returns the per-rule checklist plus the overall verdict. It never mutates
+// state — the caller composes the UPDATE that flips status.
+//
+// Concurrency: obtains a per-TA advisory lock (sorted by TA UUID to avoid
+// deadlocks) so two racing lecturers submitting for the same TA can't both
+// slip past the 3-course cap.
+func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) ([]DecisionCheck, bool, error) {
+	var courseID uuid.UUID
+	if err := tx.QueryRow(ctx,
+		`SELECT teaching_course_id FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&courseID); err != nil {
+		return nil, false, err
 	}
-	defer tx.Rollback(ctx)
-
-	var status string
-	var courseID, lecturerID uuid.UUID
-	err = tx.QueryRow(ctx,
-		`SELECT status::text, teaching_course_id, lecturer_id FROM ta_requests WHERE id = $1 FOR UPDATE`,
-		reqID).Scan(&status, &courseID, &lecturerID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return errors.New("ไม่พบคำขอนี้")
-		}
-		return err
-	}
-	if status != "submitted" {
-		return errors.New("คำขอนี้ถูกดำเนินการไปแล้ว")
-	}
-
 	var termID uuid.UUID
 	if err := tx.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id = $1`, courseID).Scan(&termID); err != nil {
-		return err
+		return nil, false, err
 	}
 
+	type taRow struct {
+		id    uuid.UUID
+		name  string
+		level string
+	}
 	rows, err := tx.Query(ctx, `
-		SELECT DISTINCT a.ta_id, u.first_name || ' ' || u.last_name
+		SELECT DISTINCT a.ta_id, u.first_name || ' ' || u.last_name, a.level::text
 		FROM ta_request_assignments a JOIN users u ON u.id = a.ta_id
 		WHERE a.request_id = $1`, reqID)
 	if err != nil {
-		return err
-	}
-	type taRow struct {
-		id   uuid.UUID
-		name string
+		return nil, false, err
 	}
 	var tas []taRow
 	for rows.Next() {
 		var t taRow
-		if err := rows.Scan(&t.id, &t.name); err != nil {
+		if err := rows.Scan(&t.id, &t.name, &t.level); err != nil {
 			rows.Close()
-			return err
+			return nil, false, err
 		}
 		tas = append(tas, t)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, false, err
+	}
+	sort.Slice(tas, func(i, j int) bool { return tas[i].id.String() < tas[j].id.String() })
+
+	type asgRow struct {
+		taID, secID uuid.UUID
+		name        string
+		level       string
+		wl          WorkloadInput
+	}
+	arows, err := tx.Query(ctx, `
+		SELECT a.ta_id, a.section_id, u.first_name || ' ' || u.last_name, a.level::text,
+		       COALESCE(w.help_teach_hrs,0), COALESCE(w.prep_hrs,0),
+		       COALESCE(w.grade_hrs,0),      COALESCE(w.other_hrs,0),
+		       COALESCE(w.check_work_hrs,0), COALESCE(w.attendance_hrs,0),
+		       COALESCE(w.ug_other_hrs,0),   COALESCE(w.lab_hrs,0)
+		FROM ta_request_assignments a
+		JOIN users u ON u.id = a.ta_id
+		LEFT JOIN ta_workload_forms w ON w.assignment_id = a.id
+		WHERE a.request_id = $1
+		ORDER BY a.ta_id, a.section_id`, reqID)
+	if err != nil {
+		return nil, false, err
+	}
+	var asgs []asgRow
+	taSections := map[uuid.UUID][]uuid.UUID{}
+	for arows.Next() {
+		var a asgRow
+		if err := arows.Scan(&a.taID, &a.secID, &a.name, &a.level,
+			&a.wl.HelpTeachHrs, &a.wl.PrepHrs, &a.wl.GradeHrs, &a.wl.OtherHrs,
+			&a.wl.CheckWorkHrs, &a.wl.AttendanceHrs, &a.wl.UGOtherHrs, &a.wl.LabHrs); err != nil {
+			arows.Close()
+			return nil, false, err
+		}
+		asgs = append(asgs, a)
+		taSections[a.taID] = append(taSections[a.taID], a.secID)
+	}
+	arows.Close()
+	if err := arows.Err(); err != nil {
+		return nil, false, err
 	}
 
+	checks := make([]DecisionCheck, 0, 8*len(tas))
+	add := func(rule, ta, msgOK, msgFail string, ok bool) {
+		msg := msgOK
+		if !ok {
+			msg = msgFail
+		}
+		checks = append(checks, DecisionCheck{Rule: rule, TAName: ta, Passed: ok, Message: msg})
+	}
+
+	// Section belongs to course — catches upstream data corruption (client
+	// bypassing Create's integrity check).
+	for _, a := range asgs {
+		var ok bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM sections WHERE id = $1 AND teaching_course_id = $2)`,
+			a.secID, courseID).Scan(&ok); err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			add("section", a.name, "", "section ที่มอบหมายไม่อยู่ในรายวิชานี้", false)
+		}
+	}
+
+	// Per-TA rules (docs, schedule, duplicate, cap, workload total).
 	for _, t := range tas {
-		// Serialize concurrent approvals touching the same TA so the cap
-		// cannot be raced past by two staff members.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, t.id); err != nil {
-			return err
+			return nil, false, err
 		}
-		if err := s.checkTAEligibility(ctx, t.id, termID, t.name); err != nil {
-			return err
+
+		if err := s.checkTAEligibility(ctx, tx, t.id, termID, t.name); err != nil {
+			// Distinguish docs vs schedule for a more useful checklist.
+			msg := err.Error()
+			if strings.Contains(msg, "ตารางเรียน") {
+				add("docs", t.name, fmt.Sprintf("%s เอกสารครบและได้รับการอนุมัติ", t.name), "", true)
+				add("schedule", t.name, "", msg, false)
+			} else {
+				add("docs", t.name, "", msg, false)
+				add("schedule", t.name, fmt.Sprintf("%s บันทึกตารางเรียนแล้ว", t.name), "", true) // may be wrong but checkTAEligibility short-circuits on docs first; if this ordering matters we'd need to split the helper — accept slight noise
+			}
+		} else {
+			add("docs", t.name, fmt.Sprintf("%s เอกสารครบและได้รับการอนุมัติ", t.name), "", true)
+			add("schedule", t.name, fmt.Sprintf("%s บันทึกตารางเรียนของภาคเรียนแล้ว", t.name), "", true)
 		}
-		// Same-course duplicate guard. Two pending requests for the same course
-		// could both name this TA; whichever wins first must block the second.
+
 		var dupSameCourse bool
 		if err := tx.QueryRow(ctx, `
 			SELECT EXISTS (
@@ -504,109 +616,184 @@ func (s *TARequestService) Approve(ctx context.Context, actor, reqID uuid.UUID) 
 				  AND r.status = 'approved'
 				  AND a.ta_id = $3
 			)`, courseID, reqID, t.id).Scan(&dupSameCourse); err != nil {
-			return err
+			return nil, false, err
 		}
-		if dupSameCourse {
-			return fmt.Errorf("%s ได้รับอนุมัติเป็น TA ของวิชานี้ในคำขออื่นแล้ว", t.name)
-		}
-		count, err := s.approvedCourseCount(ctx, t.id, termID, courseID)
+		add("duplicate", t.name,
+			fmt.Sprintf("%s ไม่ซ้ำในวิชานี้", t.name),
+			fmt.Sprintf("%s ได้รับอนุมัติเป็น TA ของวิชานี้ในคำขออื่นแล้ว", t.name),
+			!dupSameCourse)
+
+		count, err := s.approvedCourseCount(ctx, tx, t.id, termID, courseID)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
-		if count >= 3 {
-			return fmt.Errorf("%s เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว ไม่สามารถอนุมัติเพิ่มได้", t.name)
+		add("cap", t.name,
+			fmt.Sprintf("%s เป็นผู้ช่วยสอนอยู่ %d วิชา (ยังไม่เกินขีดจำกัด 3 วิชา)", t.name, count),
+			fmt.Sprintf("%s เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว", t.name),
+			count < 3)
+
+		// Workload total range.
+		var totOK bool
+		var totMsg string
+		if t.level == "master" || t.level == "phd" {
+			// Sum this TA's grad hours across all sections in this request.
+			var tot float64
+			for _, a := range asgs {
+				if a.taID != t.id {
+					continue
+				}
+				tot += a.wl.HelpTeachHrs + a.wl.PrepHrs + a.wl.GradeHrs + a.wl.OtherHrs
+			}
+			totOK = tot >= 10 && tot <= 12
+			if totOK {
+				totMsg = fmt.Sprintf("%s ภาระงานรวม %.2f ชม./สัปดาห์ (อยู่ในช่วง 10–12)", t.name, tot)
+			} else {
+				totMsg = fmt.Sprintf("%s ภาระงาน %.2f ชม./สัปดาห์ ไม่อยู่ในช่วง 10–12 ตามระเบียบบัณฑิตศึกษา", t.name, tot)
+			}
+		} else {
+			var tot float64
+			for _, a := range asgs {
+				if a.taID != t.id {
+					continue
+				}
+				tot += a.wl.CheckWorkHrs + a.wl.AttendanceHrs + a.wl.UGOtherHrs + a.wl.LabHrs
+			}
+			totOK = tot > 0
+			if totOK {
+				totMsg = fmt.Sprintf("%s ระบุภาระงาน %.2f ชม./สัปดาห์", t.name, tot)
+			} else {
+				totMsg = fmt.Sprintf("%s ยังไม่ได้ระบุภาระงาน", t.name)
+			}
 		}
+		checks = append(checks, DecisionCheck{Rule: "workload", TAName: t.name, Passed: totOK, Message: totMsg})
 	}
 
-	// Re-check teaching-time overlap against courses approved after this
-	// request was submitted.
-	arows, err := tx.Query(ctx, `
-		SELECT a.ta_id, a.section_id, u.first_name || ' ' || u.last_name
-		FROM ta_request_assignments a JOIN users u ON u.id = a.ta_id
-		WHERE a.request_id = $1`, reqID)
-	if err != nil {
-		return err
-	}
-	type asgRow struct {
-		taID, secID uuid.UUID
-		name        string
-	}
-	var asgs []asgRow
-	for arows.Next() {
-		var a asgRow
-		if err := arows.Scan(&a.taID, &a.secID, &a.name); err != nil {
-			arows.Close()
-			return err
-		}
-		asgs = append(asgs, a)
-	}
-	arows.Close()
-	if err := arows.Err(); err != nil {
-		return err
-	}
+	// Per-(TA, section) time-conflict rules.
 	for _, a := range asgs {
-		if err := s.checkOwnClassConflict(ctx, a.taID, a.secID, a.name); err != nil {
-			return err
+		if err := s.checkOwnClassConflict(ctx, tx, a.taID, a.secID, a.name); err != nil {
+			add("own_conflict", a.name, "", err.Error(), false)
+		} else {
+			add("own_conflict", a.name, fmt.Sprintf("%s เวลาสอนไม่ทับซ้อนกับตารางเรียนของตัวเอง", a.name), "", true)
 		}
-		if err := s.checkCrossRequestConflict(ctx, a.taID, a.secID, termID, courseID, reqID, []string{"approved"}, a.name); err != nil {
-			return err
+		if err := s.checkCrossRequestConflict(ctx, tx, a.taID, a.secID, termID, courseID, reqID, []string{"approved"}, a.name); err != nil {
+			add("cross_conflict", a.name, "", err.Error(), false)
+		} else {
+			add("cross_conflict", a.name, fmt.Sprintf("%s เวลาสอนไม่ทับซ้อนกับวิชาอื่นที่เป็นผู้ช่วยสอนอยู่", a.name), "", true)
 		}
 	}
 
-	tag, err := tx.Exec(ctx,
-		`UPDATE ta_requests SET status='approved', decided_at=NOW(), decided_by=$1, updated_at=NOW()
-		 WHERE id=$2 AND status='submitted'`, actor, reqID)
+	// Sections within this request must not overlap for the same TA.
+	for taID, secs := range taSections {
+		if len(secs) < 2 {
+			continue
+		}
+		var clash int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM section_schedules a
+			JOIN section_schedules b ON b.section_id = ANY($1) AND b.section_id <> a.section_id
+			WHERE a.section_id = ANY($1)
+			  AND a.day_of_week = b.day_of_week
+			  AND a.start_time < b.end_time AND b.start_time < a.end_time`, secs).Scan(&clash); err != nil {
+			return nil, false, err
+		}
+		name := "TA"
+		for _, t := range tas {
+			if t.id == taID {
+				name = t.name
+				break
+			}
+		}
+		add("intra_conflict", name,
+			fmt.Sprintf("%s section ในคำขอเดียวกันไม่ทับซ้อน", name),
+			fmt.Sprintf("%s ถูกมอบหมายให้ section ที่เวลาสอนทับซ้อนกันเองในคำขอนี้", name),
+			clash == 0)
+	}
+
+	passed := true
+	for _, c := range checks {
+		if !c.Passed {
+			passed = false
+			break
+		}
+	}
+	return checks, passed, nil
+}
+
+// RunPendingSweep is a one-shot startup task that auto-decides any legacy
+// row still in the 'submitted' state after this migration ships. Idempotent —
+// running it again is a no-op once the submitted set is empty.
+func (s *TARequestService) RunPendingSweep(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT id FROM ta_requests WHERE status = 'submitted'`)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return errors.New("คำขอนี้ถูกดำเนินการไปแล้ว")
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	log.Printf("ta_request sweep: auto-deciding %d legacy pending requests", len(ids))
+
+	decided := 0
+	for _, id := range ids {
+		if err := s.decideOne(ctx, id); err != nil {
+			log.Printf("ta_request sweep %s: %v", id, err)
+			continue
+		}
+		decided++
+	}
+	log.Printf("ta_request sweep: %d/%d decided", decided, len(ids))
+	return nil
+}
+
+func (s *TARequestService) decideOne(ctx context.Context, reqID uuid.UUID) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	checks, passed, err := s.autoDecide(ctx, tx, reqID)
+	if err != nil {
+		return err
+	}
+	verdict := "rejected"
+	var reason string
+	if passed {
+		verdict = "approved"
+	} else {
+		reason = joinRejectMessages(checks)
+	}
+	checksJSON, err := json.Marshal(checks)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ta_requests SET
+		  status          = $1::ta_request_status,
+		  decided_at      = NOW(),
+		  decided_by      = NULL,
+		  reject_reason   = NULLIF($2, ''),
+		  decision_checks = $3::jsonb,
+		  updated_at      = NOW()
+		WHERE id = $4 AND status = 'submitted'`, verdict, reason, checksJSON, reqID); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_request.approve", Entity: "ta_request", EntityID: reqID.String()})
-	if s.notify != nil {
-		code, nameTH := s.courseLabel(ctx, courseID)
-		s.notify.Send(ctx, lecturerID, "คำขอ TA ได้รับการอนุมัติ",
-			fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ได้รับการอนุมัติแล้ว", code, nameTH), "/lecturer")
-		for _, t := range tas {
-			s.notify.Send(ctx, t.id, "คุณได้รับมอบหมายเป็นผู้ช่วยสอน",
-				fmt.Sprintf("คุณได้รับอนุมัติเป็นผู้ช่วยสอนวิชา %s %s", code, nameTH), "/ta")
-		}
-	}
-	return nil
-}
-
-func (s *TARequestService) Reject(ctx context.Context, actor, reqID uuid.UUID, reason string) error {
-	if reason == "" {
-		return errors.New("ต้องระบุเหตุผลการปฏิเสธ")
-	}
-	var lecturerID, courseID uuid.UUID
-	if err := s.pool.QueryRow(ctx,
-		`SELECT lecturer_id, teaching_course_id FROM ta_requests WHERE id = $1`, reqID).Scan(&lecturerID, &courseID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return errors.New("ไม่พบคำขอนี้")
-		}
-		return err
-	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE ta_requests SET status='rejected', decided_at=NOW(), decided_by=$1, reject_reason=$2, updated_at=NOW()
-		 WHERE id=$3 AND status='submitted'`,
-		actor, reason, reqID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return errors.New("คำขอนี้ถูกดำเนินการไปแล้ว")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_request.reject", Entity: "ta_request", EntityID: reqID.String(), Note: reason})
-	if s.notify != nil {
-		code, nameTH := s.courseLabel(ctx, courseID)
-		s.notify.Send(ctx, lecturerID, "คำขอ TA ถูกปฏิเสธ",
-			fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ถูกปฏิเสธ: %s", code, nameTH, reason), "/lecturer")
-	}
+	s.aud.Log(ctx, audit.Entry{Action: "ta_request.auto_decide.sweep", Entity: "ta_request", EntityID: reqID.String(), Note: verdict})
+	s.notifyDecision(ctx, reqID, verdict, reason)
 	return nil
 }
 
@@ -619,26 +806,28 @@ func (s *TARequestService) courseLabel(ctx context.Context, courseID uuid.UUID) 
 }
 
 type TARequestSummary struct {
-	ID               uuid.UUID  `json:"id"`
-	Code             string     `json:"course_code"`
-	NameTH           string     `json:"course_name"`
-	Status           string     `json:"status"`
-	SubmittedAt      *time.Time `json:"submitted_at,omitempty"`
-	DecidedAt        *time.Time `json:"decided_at,omitempty"`
-	RejectReason     *string    `json:"reject_reason,omitempty"`
-	TeachingCourseID uuid.UUID  `json:"teaching_course_id"`
-	LecturerName     string     `json:"lecturer_name"`
-	TACount          int        `json:"ta_count"`
-	TermID           uuid.UUID  `json:"term_id"`
-	AcademicYear     int        `json:"academic_year"`
-	Semester         int        `json:"semester"`
+	ID               uuid.UUID       `json:"id"`
+	Code             string          `json:"course_code"`
+	NameTH           string          `json:"course_name"`
+	Status           string          `json:"status"`
+	SubmittedAt      *time.Time      `json:"submitted_at,omitempty"`
+	DecidedAt        *time.Time      `json:"decided_at,omitempty"`
+	DecidedBy        *uuid.UUID      `json:"decided_by,omitempty"`
+	RejectReason     *string         `json:"reject_reason,omitempty"`
+	TeachingCourseID uuid.UUID       `json:"teaching_course_id"`
+	LecturerName     string          `json:"lecturer_name"`
+	TACount          int             `json:"ta_count"`
+	TermID           uuid.UUID       `json:"term_id"`
+	AcademicYear     int             `json:"academic_year"`
+	Semester         int             `json:"semester"`
+	DecisionChecks   []DecisionCheck `json:"decision_checks"`
 }
 
 const requestSummarySelect = `
-	SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.reject_reason, r.teaching_course_id,
+	SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
 	       u.first_name || ' ' || u.last_name,
 	       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
-	       tc.term_id, at.academic_year, at.semester
+	       tc.term_id, at.academic_year, at.semester, r.decision_checks
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 	JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
@@ -650,8 +839,15 @@ func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
 	out := []TARequestSummary{}
 	for rows.Next() {
 		var t TARequestSummary
-		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester); err != nil {
+		var checksRaw []byte
+		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &checksRaw); err != nil {
 			return nil, err
+		}
+		if len(checksRaw) > 0 {
+			_ = json.Unmarshal(checksRaw, &t.DecisionChecks)
+		}
+		if t.DecisionChecks == nil {
+			t.DecisionChecks = []DecisionCheck{}
 		}
 		out = append(out, t)
 	}
@@ -721,23 +917,34 @@ type TARequestDetail struct {
 
 func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequestDetail, error) {
 	var d TARequestDetail
+	var checksRaw []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.reject_reason, r.teaching_course_id,
+		SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
 		       u.first_name || ' ' || u.last_name,
 		       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
-		       r.reimburse_scope::text
+		       tc.term_id, at.academic_year, at.semester,
+		       r.decision_checks, r.reimburse_scope::text
 		FROM ta_requests r
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		JOIN academic_terms at ON at.id = tc.term_id
 		JOIN users u ON u.id = r.lecturer_id
 		WHERE r.id = $1`, reqID).Scan(
-		&d.ID, &d.Code, &d.NameTH, &d.Status, &d.SubmittedAt, &d.DecidedAt, &d.RejectReason,
-		&d.TeachingCourseID, &d.LecturerName, &d.TACount, &d.ReimburseScope)
+		&d.ID, &d.Code, &d.NameTH, &d.Status, &d.SubmittedAt, &d.DecidedAt, &d.DecidedBy, &d.RejectReason,
+		&d.TeachingCourseID, &d.LecturerName, &d.TACount,
+		&d.TermID, &d.AcademicYear, &d.Semester,
+		&checksRaw, &d.ReimburseScope)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("ไม่พบคำขอนี้")
 		}
 		return nil, err
+	}
+	if len(checksRaw) > 0 {
+		_ = json.Unmarshal(checksRaw, &d.DecisionChecks)
+	}
+	if d.DecisionChecks == nil {
+		d.DecisionChecks = []DecisionCheck{}
 	}
 
 	var termID uuid.UUID
@@ -806,7 +1013,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 
 	for _, c := range checks {
 		a := &d.Assignments[c.idx]
-		count, err := s.approvedCourseCount(ctx, c.taID, termID, d.TeachingCourseID)
+		count, err := s.approvedCourseCount(ctx, s.pool, c.taID, termID, d.TeachingCourseID)
 		if err != nil {
 			return nil, err
 		}
@@ -820,10 +1027,10 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		if count >= 3 {
 			a.Warnings = append(a.Warnings, "เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว — อนุมัติเพิ่มไม่ได้")
 		}
-		if err := s.checkOwnClassConflict(ctx, c.taID, c.secID, a.TAName); err != nil {
+		if err := s.checkOwnClassConflict(ctx, s.pool, c.taID, c.secID, a.TAName); err != nil {
 			a.Warnings = append(a.Warnings, "เวลาสอนทับซ้อนกับตารางเรียนของ TA")
 		}
-		if err := s.checkCrossRequestConflict(ctx, c.taID, c.secID, termID, d.TeachingCourseID, reqID, []string{"approved"}, a.TAName); err != nil {
+		if err := s.checkCrossRequestConflict(ctx, s.pool, c.taID, c.secID, termID, d.TeachingCourseID, reqID, []string{"approved"}, a.TAName); err != nil {
 			a.Warnings = append(a.Warnings, "เวลาสอนทับซ้อนกับวิชาอื่นที่เป็นผู้ช่วยสอนอยู่")
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/rbac"
 	"ta-payment-back/internal/service"
+	"ta-payment-back/internal/watermark"
 )
 
 // -------------------- User --------------------
@@ -652,39 +654,11 @@ func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 	if err := c.BodyParser(&in); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	id, err := h.Svc.TARequest.Create(c.Context(), UserID(c), in)
+	res, err := h.Svc.TARequest.Create(c.Context(), UserID(c), in)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"id": id})
-}
-
-func (h *TARequestHandler) Approve(c *fiber.Ctx) error {
-	id, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-	}
-	if err := h.Svc.TARequest.Approve(c.Context(), UserID(c), id); err != nil {
-		return err
-	}
-	return c.JSON(fiber.Map{"ok": true})
-}
-
-func (h *TARequestHandler) Reject(c *fiber.Ctx) error {
-	id, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-	}
-	var body struct {
-		Reason string `json:"reason"`
-	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
-	}
-	if err := h.Svc.TARequest.Reject(c.Context(), UserID(c), id, body.Reason); err != nil {
-		return err
-	}
-	return c.JSON(fiber.Map{"ok": true})
+	return c.Status(fiber.StatusCreated).JSON(res)
 }
 
 func (h *TARequestHandler) ListWindows(c *fiber.Ctx) error {
@@ -819,6 +793,15 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// Retention-policy guard: if the file has been purged from disk (7 days
+	// past approval), fail fast with 410 before trying to open a stale path.
+	deleted, err := h.Svc.Docs.IsFileDeleted(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	if deleted {
+		return fiber.NewError(fiber.StatusGone, "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน")
+	}
 	rc, filename, mime, ownerID, err := h.Svc.Docs.OpenStored(c.Context(), id)
 	if err != nil {
 		return err
@@ -928,6 +911,145 @@ func (h *DocsHandler) ReviewDoc(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+// ApproveAll approves all three required docs + the profile in one shot and
+// returns a one-shot ZIP-download token so the FE can trigger auto-download
+// via same-tab navigation (no popup blocker).
+func (h *DocsHandler) ApproveAll(c *fiber.Ctx) error {
+	uid, err := uuid.Parse(c.Params("userId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	res, err := h.Svc.Docs.ApproveAll(c.Context(), UserID(c), uid)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"ok":            true,
+		"approved_docs": res.ApprovedDocIDs,
+		"zip_token":     res.ZipToken,
+	})
+}
+
+// RejectBatch rejects a list of {doc_id, reason} entries in a single tx and
+// flips the profile to needs_fix so the TA can re-upload just the flagged
+// files. Reasons are required per file.
+func (h *DocsHandler) RejectBatch(c *fiber.Ctx) error {
+	uid, err := uuid.Parse(c.Params("userId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Items []service.RejectItem `json:"items"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.Docs.RejectBatch(c.Context(), UserID(c), uid, body.Items); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// MintZipToken lets an officer re-download the approved-docs ZIP later from
+// the "approved" bucket in the review UI. Fresh token per call, TTL 60s.
+// Officer must re-confirm their password because the ZIP contains PII
+// (national ID + bank account) and this endpoint is reachable long after
+// the original approval action.
+func (h *DocsHandler) MintZipToken(c *fiber.Ctx) error {
+	uid, err := uuid.Parse(c.Params("userId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	token, err := h.Svc.Docs.MintZipToken(c.Context(), UserID(c), uid, body.Password)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"zip_token": token})
+}
+
+// DownloadZip consumes the one-shot token minted by ApproveAll (or
+// MintZipToken) and streams a ZIP of the three approved documents. The zip
+// contents are the raw originals — no watermark — because this is the audit
+// copy the officer keeps offline.
+func (h *DocsHandler) DownloadZip(c *fiber.Ctx) error {
+	uid, err := uuid.Parse(c.Params("userId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	token := c.Query("token")
+	if token == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "token required")
+	}
+	docIDs, err := h.Svc.Docs.ConsumeZipToken(token, UserID(c), uid)
+	if err != nil {
+		return err
+	}
+	body, name, err := h.Svc.Docs.BuildDocsZip(c.Context(), docIDs)
+	if err != nil {
+		return err
+	}
+	c.Set("Content-Type", "application/zip")
+	c.Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	c.Set("Cache-Control", "no-store")
+	return c.Send(body)
+}
+
+// PreviewWatermarked serves a doc file with an officer-identifying watermark
+// baked into the render, so a screenshot or download-from-preview leaks the
+// officer's identity. Download endpoint (audit copy) is unwatermarked.
+func (h *DocsHandler) PreviewWatermarked(c *fiber.Ctx) error {
+	uid, err := uuid.Parse(c.Params("userId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	docID, err := uuid.Parse(c.Params("docId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid doc id")
+	}
+	meta, err := h.Svc.Docs.LoadPreviewMeta(c.Context(), docID)
+	if err != nil {
+		return err
+	}
+	if meta.OwnerID != uid {
+		return fiber.NewError(fiber.StatusBadRequest, "doc does not belong to user")
+	}
+	if meta.FileDeletedAt != nil {
+		return fiber.NewError(fiber.StatusGone, "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน")
+	}
+	rc, err := h.Svc.Docs.OpenByKey(meta.StorageKey)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	email, err := h.Svc.Docs.LookupEmail(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	text := email + " | " + time.Now().Format("2006-01-02 15:04")
+	if meta.Superseded {
+		text = "SUPERSEDED (round " + strconv.Itoa(meta.Round) + ") | " + text
+	}
+	stamped, outMime, err := watermark.Apply(body, meta.MIME, text)
+	if err != nil {
+		return err
+	}
+	c.Set("Content-Type", outMime)
+	c.Set("Content-Disposition", "inline; filename=\""+meta.Filename+"\"")
+	c.Set("Cache-Control", "private, no-store")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Send(stamped)
 }
 
 // -------------------- Workload / class schedule --------------------

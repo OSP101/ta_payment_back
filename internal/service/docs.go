@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,19 @@ type DocsService struct {
 	pool  *pgxpool.Pool
 	aud   *audit.Auditor
 	store storage.Store
+
+	// zipTokens holds one-shot download tokens minted after approve-all so
+	// the client can pull the ZIP without re-triggering the approve tx.
+	zipTokens sync.Map // token(string) -> *zipTokenEntry
+}
+
+// zipTokenEntry pins a download token to a specific actor + user + doc set
+// so a leaked token can't be repurposed. TTL is short (60s) and single-use.
+type zipTokenEntry struct {
+	Actor   uuid.UUID
+	UserID  uuid.UUID
+	DocIDs  []uuid.UUID
+	Expires time.Time
 }
 
 // DocKinds is the closed set of supporting-document kinds a TA can submit.
@@ -354,18 +368,20 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 }
 
 type Document struct {
-	ID           uuid.UUID  `json:"id"`
-	Kind         string     `json:"kind"`
-	Filename     string     `json:"filename"`
-	MIME         string     `json:"mime"`
-	Size         int64      `json:"size_bytes"`
-	Status       string     `json:"status"`
-	Round        int        `json:"round"`
-	UploadedAt   *time.Time `json:"uploaded_at,omitempty"`
-	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
-	Superseded   bool       `json:"superseded"`
-	RejectReason *string    `json:"reject_reason,omitempty"`
-	StorageKey   string     `json:"-"`
+	ID            uuid.UUID  `json:"id"`
+	Kind          string     `json:"kind"`
+	Filename      string     `json:"filename"`
+	MIME          string     `json:"mime"`
+	Size          int64      `json:"size_bytes"`
+	Status        string     `json:"status"`
+	Round         int        `json:"round"`
+	UploadedAt    *time.Time `json:"uploaded_at,omitempty"`
+	ReviewedAt    *time.Time `json:"reviewed_at,omitempty"`
+	Superseded    bool       `json:"superseded"`
+	RejectReason  *string    `json:"reject_reason,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	FileDeletedAt *time.Time `json:"file_deleted_at,omitempty"`
+	StorageKey    string     `json:"-"`
 }
 
 // ListForUser returns only current (non-superseded) documents for a user.
@@ -373,7 +389,8 @@ type Document struct {
 func (s *DocsService) ListForUser(ctx context.Context, userID uuid.UUID) ([]Document, error) {
 	return s.queryDocs(ctx,
 		`SELECT id, kind, filename, mime, size_bytes, status::text, COALESCE(round,1),
-		        uploaded_at, reviewed_at, superseded_at IS NOT NULL, reject_reason, storage_key
+		        uploaded_at, reviewed_at, superseded_at IS NOT NULL, reject_reason,
+		        expires_at, file_deleted_at, storage_key
 		 FROM ta_documents
 		 WHERE user_id = $1 AND superseded_at IS NULL
 		 ORDER BY uploaded_at DESC`, userID)
@@ -384,7 +401,8 @@ func (s *DocsService) ListForUser(ctx context.Context, userID uuid.UUID) ([]Docu
 func (s *DocsService) ListAllForUser(ctx context.Context, userID uuid.UUID) ([]Document, error) {
 	return s.queryDocs(ctx,
 		`SELECT id, kind, filename, mime, size_bytes, status::text, COALESCE(round,1),
-		        uploaded_at, reviewed_at, superseded_at IS NOT NULL, reject_reason, storage_key
+		        uploaded_at, reviewed_at, superseded_at IS NOT NULL, reject_reason,
+		        expires_at, file_deleted_at, storage_key
 		 FROM ta_documents
 		 WHERE user_id = $1
 		 ORDER BY uploaded_at DESC`, userID)
@@ -399,13 +417,16 @@ func (s *DocsService) queryDocs(ctx context.Context, sql string, args ...any) ([
 	var out []Document
 	for rows.Next() {
 		var d Document
-		var uploadedAt, reviewedAt *time.Time
+		var uploadedAt, reviewedAt, expiresAt, fileDeletedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.Kind, &d.Filename, &d.MIME, &d.Size, &d.Status, &d.Round,
-			&uploadedAt, &reviewedAt, &d.Superseded, &d.RejectReason, &d.StorageKey); err != nil {
+			&uploadedAt, &reviewedAt, &d.Superseded, &d.RejectReason,
+			&expiresAt, &fileDeletedAt, &d.StorageKey); err != nil {
 			return nil, err
 		}
 		d.UploadedAt = uploadedAt
 		d.ReviewedAt = reviewedAt
+		d.ExpiresAt = expiresAt
+		d.FileDeletedAt = fileDeletedAt
 		out = append(out, d)
 	}
 	return out, nil
@@ -541,13 +562,21 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 //   "approved"           → approved, most recently verified first
 //   "rejected"           → rejected, most recently verified first
 type PendingProfile struct {
-	UserID      uuid.UUID `json:"user_id"`
-	FullName    string    `json:"full_name"`
-	Email       string    `json:"email"`
-	Status      string    `json:"status"`
-	Round       int       `json:"round"`
-	SubmittedAt *string   `json:"submitted_at,omitempty"`
-	VerifiedAt  *string   `json:"verified_at,omitempty"`
+	UserID       uuid.UUID `json:"user_id"`
+	FullName     string    `json:"full_name"`
+	Email        string    `json:"email"`
+	Status       string    `json:"status"`
+	Round        int       `json:"round"`
+	SubmittedAt  *string   `json:"submitted_at,omitempty"`
+	VerifiedAt   *string   `json:"verified_at,omitempty"`
+	// EarliestExpiresAt is the soonest expires_at among the TA's current
+	// approved required docs. Only meaningful for the approved bucket —
+	// null in pending/rejected. The FE uses it to show "จะลบใน N วัน".
+	EarliestExpiresAt *string `json:"earliest_expires_at,omitempty"`
+	// AllFilesDeleted is true when the retention job has purged every one
+	// of the current approved docs. FE hides the re-download button and
+	// shows an "ถูกลบแล้ว" hint in that case.
+	AllFilesDeleted bool `json:"all_files_deleted,omitempty"`
 }
 
 func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingProfile, error) {
@@ -563,10 +592,26 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		where = "p.status IN ('submitted','needs_fix')"
 		order = "p.completed_at NULLS LAST"
 	}
+	// LEFT JOIN a subquery on ta_documents so we can surface the retention
+	// clock next to each approved row without an extra roundtrip. The
+	// subquery aggregates min(expires_at) + a boolean for "everything purged"
+	// across just the three required kinds on their current (non-superseded)
+	// rows.
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.user_id, u.first_name || ' ' || u.last_name, u.email, p.status::text,
-		       COALESCE(p.current_round, 1), p.completed_at, p.verified_at
-		FROM ta_profiles p JOIN users u ON u.id = p.user_id
+		       COALESCE(p.current_round, 1), p.completed_at, p.verified_at,
+		       d.earliest_expires_at, COALESCE(d.all_deleted, FALSE)
+		FROM ta_profiles p
+		JOIN users u ON u.id = p.user_id
+		LEFT JOIN LATERAL (
+			SELECT MIN(expires_at) AS earliest_expires_at,
+			       BOOL_AND(file_deleted_at IS NOT NULL) AS all_deleted
+			FROM ta_documents
+			WHERE user_id = p.user_id
+			  AND kind IN ('national_id','bank_book','creditor_form')
+			  AND superseded_at IS NULL
+			  AND status = 'approved'
+		) d ON TRUE
 		WHERE `+where+` ORDER BY `+order)
 	if err != nil {
 		return nil, err
@@ -575,8 +620,9 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 	var out []PendingProfile
 	for rows.Next() {
 		var p PendingProfile
-		var completedAt, verifiedAt *time.Time
-		if err := rows.Scan(&p.UserID, &p.FullName, &p.Email, &p.Status, &p.Round, &completedAt, &verifiedAt); err != nil {
+		var completedAt, verifiedAt, earliestExp *time.Time
+		if err := rows.Scan(&p.UserID, &p.FullName, &p.Email, &p.Status, &p.Round,
+			&completedAt, &verifiedAt, &earliestExp, &p.AllFilesDeleted); err != nil {
 			return nil, err
 		}
 		if completedAt != nil {
@@ -586,6 +632,10 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		if verifiedAt != nil {
 			s := verifiedAt.Format(time.RFC3339)
 			p.VerifiedAt = &s
+		}
+		if earliestExp != nil {
+			s := earliestExp.Format(time.RFC3339)
+			p.EarliestExpiresAt = &s
 		}
 		out = append(out, p)
 	}

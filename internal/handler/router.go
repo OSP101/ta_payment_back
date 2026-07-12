@@ -107,8 +107,6 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/ta-requests", rh.List)
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), rh.Detail)
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer), rh.Create)
-	authed.Post("/ta-requests/:id/approve", adminOrStaff, rh.Approve)
-	authed.Post("/ta-requests/:id/reject", adminOrStaff, rh.Reject)
 
 	// Docs (TA)
 	dh := &DocsHandler{Svc: svc}
@@ -126,6 +124,13 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/ta-review/:userId/history", adminOrStaff, dh.History)
 	authed.Post("/ta-review/:userId/profile", adminOrStaff, dh.ReviewProfile)
 	authed.Post("/ta-review/docs/:id", adminOrStaff, dh.ReviewDoc)
+	// Redesigned officer review: batch approve/reject in the list row +
+	// watermarked preview + one-shot ZIP download after approve.
+	authed.Post("/ta-review/:userId/approve-all", adminOrStaff, dh.ApproveAll)
+	authed.Post("/ta-review/:userId/reject-batch", adminOrStaff, dh.RejectBatch)
+	authed.Post("/ta-review/:userId/zip-token", adminOrStaff, dh.MintZipToken)
+	authed.Get("/ta-review/:userId/download.zip", adminOrStaff, dh.DownloadZip)
+	authed.Get("/ta-review/:userId/docs/:docId/preview", adminOrStaff, dh.PreviewWatermarked)
 
 	// TA: my assigned courses (year+term filter on FE).
 	// Read-only endpoints are ungated so an un-approved TA can still browse
