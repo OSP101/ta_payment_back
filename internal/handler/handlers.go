@@ -580,7 +580,27 @@ func (h *TeachingHandler) ImportExcel(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	res, err := h.Svc.Teaching.ImportScheduleExcel(c.Context(), UserID(c), termID, fh.Filename, body)
+	// Preview path: staff uploads to see per-course preview (new / existing /
+	// missing_catalog / unmatched_officer) without touching the DB.
+	if c.Query("dry_run") == "1" {
+		preview, err := h.Svc.Teaching.PreviewImport(c.Context(), UserID(c), termID, fh.Filename, body)
+		if err != nil {
+			return err
+		}
+		return c.JSON(preview)
+	}
+	// Commit path: skip_codes is a comma-separated list of course codes the
+	// staff has explicitly opted out of (e.g. unmatched-officer courses they
+	// chose to skip rather than proceed unassigned).
+	var skipCodes []string
+	if raw := c.FormValue("skip_codes"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				skipCodes = append(skipCodes, p)
+			}
+		}
+	}
+	res, err := h.Svc.Teaching.CommitImport(c.Context(), UserID(c), termID, fh.Filename, body, skipCodes)
 	if err != nil {
 		return err
 	}

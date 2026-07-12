@@ -856,48 +856,236 @@ func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uu
 	return err
 }
 
-// ImportScheduleExcel parses an xlsx file with columns:
-// Row 1: header. Expected: code, name, sec_no, track, kind, day, start, end, room, lecturer_email
-// Returns count parsed and any per-row errors as summary text.
+// -----------------------------------------------------------------------------
+// Bulk import of "รายวิชาที่เปิดสอน" from the university-supplied Excel.
+//
+// The Normalized sheet is one row per (course × section × schedule) with 16
+// columns: CourseCode, CourseName, Unit, Prerequisite, Section, ReservedFor,
+// TotalSeats, Day, Time, SessionType, Room, MidtermExamDate, MidtermExamTime,
+// FinalExamDate, FinalExamTime, Officer.
+//
+// Flow: staff uploads → PreviewImport reports what would happen per course
+// (new / existing / missing_catalog / unmatched_officer) → staff picks skip
+// codes → CommitImport creates courses in per-course transactions so one
+// failure never blocks the rest of the file.
+// -----------------------------------------------------------------------------
+
 type ImportResult struct {
-	RowCount   int      `json:"row_count"`
-	ErrorCount int      `json:"error_count"`
-	Errors     []string `json:"errors,omitempty"`
+	RowCount   int         `json:"row_count"`
 	CreatedIDs []uuid.UUID `json:"created_ids,omitempty"`
+	// SkippedCodes carries course codes that were deliberately skipped by the
+	// staff decision or because the course already existed / had no matching
+	// faculty catalog row. Not an error.
+	SkippedCodes []string `json:"skipped_codes,omitempty"`
+	ErrorCount   int      `json:"error_count"`
+	Errors       []string `json:"errors,omitempty"`
 }
 
-func (s *TeachingService) ImportScheduleExcel(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte) (*ImportResult, error) {
-	// Bulk import creates/updates teaching courses across an entire term, so it
-	// is not scoped to a single course a lecturer could own — restrict to
-	// privileged (admin/staff) actors.
-	priv, err := isPrivileged(ctx, s.pool, actor)
+type ImportPreviewCourse struct {
+	Code               string      `json:"code"`
+	Name               string      `json:"name"`
+	Status             string      `json:"status"` // "new" | "existing" | "missing_catalog" | "unmatched_officer"
+	SectionCount       int         `json:"section_count"`
+	ScheduleCount      int         `json:"schedule_count"`
+	OfficerRaw         string      `json:"officer_raw"`
+	OfficerNames       []string    `json:"officer_names"`
+	MatchedLecturerIDs []uuid.UUID `json:"matched_lecturer_ids"`
+	UnmatchedNames     []string    `json:"unmatched_names,omitempty"`
+	Note               string      `json:"note,omitempty"`
+}
+
+type ImportPreview struct {
+	Filename            string                `json:"filename"`
+	Courses             []ImportPreviewCourse `json:"courses"`
+	NewCount            int                   `json:"new_count"`
+	ExistingCount       int                   `json:"existing_count"`
+	BlockedCount        int                   `json:"blocked_count"`
+	MissingCatalogCount int                   `json:"missing_catalog_count"`
+}
+
+type parsedSchedule struct {
+	kind      string
+	dow       int
+	startTime string
+	endTime   string
+	room      string
+}
+
+type parsedSection struct {
+	secNo       string
+	track       string
+	room        string
+	numStudents int
+	schedules   []parsedSchedule
+}
+
+type parsedCourse struct {
+	code               string
+	name               string
+	officerRaw         string
+	sectionsInOrder    []string
+	sections           map[string]*parsedSection
+	midtermLectureDate string
+	midtermLabDate     string
+	finalLectureDate   string
+	finalLabDate       string
+}
+
+// Officer tokens that are not real personal names — staff wrote them as
+// placeholders (guest lecturer, "and colleagues", honorific-only). They must
+// not participate in the users lookup, otherwise every course with them would
+// be flagged as unmatched even though the course itself is fine.
+var officerNoiseTokens = map[string]struct{}{
+	"อจ.พิเศษ":  {},
+	"และคณะ":   {},
+	"อจ.":      {},
+	"อาจารย์": {},
+}
+
+// Thai month abbreviations as they appear in the Excel (with the trailing dot).
+var thaiMonthAbbrev = map[string]int{
+	"ม.ค.":  1,
+	"ก.พ.":  2,
+	"มี.ค.": 3,
+	"เม.ย.": 4,
+	"พ.ค.":  5,
+	"มิ.ย.": 6,
+	"ก.ค.":  7,
+	"ส.ค.":  8,
+	"ก.ย.":  9,
+	"ต.ค.":  10,
+	"พ.ย.":  11,
+	"ธ.ค.":  12,
+}
+
+// dowFromAbbrev maps the day tokens the university uses (Sunday=0 convention,
+// same as ScheduleGrid.tsx / TA class schedules).
+func dowFromAbbrev(s string) (int, bool) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "SU":
+		return 0, true
+	case "M":
+		return 1, true
+	case "TU":
+		return 2, true
+	case "W":
+		return 3, true
+	case "TH":
+		return 4, true
+	case "F":
+		return 5, true
+	case "SA":
+		return 6, true
+	}
+	return 0, false
+}
+
+// parseTimeRange accepts "13:00-16:00" (allows internal whitespace) and
+// returns each half as "HH:MM". No parse — Postgres does the type coercion via
+// the ::time cast on insert.
+func parseTimeRange(raw string) (string, string, bool) {
+	s := strings.ReplaceAll(raw, " ", "")
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// parseThaiDate turns "29 ต.ค. 69" (Buddhist Era 2-digit year, Thai month
+// abbrev) into an ISO YYYY-MM-DD string. Returns empty string for WBA/blank
+// values or anything unparseable — callers treat empty as "no exam date".
+func parseThaiDate(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || strings.EqualFold(s, "WBA") {
+		return ""
+	}
+	// Strip a leading "Lec " / "Lab " qualifier if present.
+	if strings.HasPrefix(s, "Lec ") || strings.HasPrefix(s, "Lab ") {
+		s = strings.TrimSpace(s[4:])
+	}
+	fields := strings.Fields(s)
+	if len(fields) < 3 {
+		return ""
+	}
+	day, err := strconv.Atoi(fields[0])
+	if err != nil || day < 1 || day > 31 {
+		return ""
+	}
+	month, ok := thaiMonthAbbrev[fields[1]]
+	if !ok {
+		return ""
+	}
+	yy, err := strconv.Atoi(fields[2])
 	if err != nil {
-		return nil, err
+		return ""
 	}
-	if !priv {
-		return nil, ErrForbidden
-	}
-	f, err := excelize.OpenReader(bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+	// 2-digit Buddhist Era → Gregorian. "69" → 2569 BE → 2026 CE.
+	beYear := 2500 + yy
+	ce := beYear - 543
+	return fmt.Sprintf("%04d-%02d-%02d", ce, month, day)
+}
+
+// isExamForLec tests whether the exam-date cell describes a lecture exam. The
+// university prefixes lecture exam dates with "Lec ". Everything without the
+// prefix (bare "WBA", "Lab 22 ต.ค. 69", …) is treated as non-Lec here.
+func isExamForLec(raw string) bool { return strings.HasPrefix(strings.TrimSpace(raw), "Lec ") }
+func isExamForLab(raw string) bool { return strings.HasPrefix(strings.TrimSpace(raw), "Lab ") }
+
+// pickImportSheet returns the sheet name of the Normalized data. Preference:
+// exact name "Normalized" (as produced by the current template), then any
+// sheet whose header row 1 contains "CourseCode", then the last sheet.
+func pickImportSheet(f *excelize.File) (string, error) {
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
-		return nil, errors.New("no sheets in file")
+		return "", errors.New("ไฟล์ไม่มี sheet")
 	}
-	rows, err := f.GetRows(sheets[0])
+	for _, name := range sheets {
+		if name == "Normalized" {
+			return name, nil
+		}
+	}
+	for _, name := range sheets {
+		rows, err := f.GetRows(name)
+		if err != nil || len(rows) == 0 {
+			continue
+		}
+		for _, cell := range rows[0] {
+			if strings.EqualFold(strings.TrimSpace(cell), "CourseCode") {
+				return name, nil
+			}
+		}
+	}
+	return sheets[len(sheets)-1], nil
+}
+
+// parseNormalizedSheet reads the Excel body and groups its rows into courses.
+// It reports per-row structural warnings via `warnings` — malformed rows are
+// simply skipped so a single bad row cannot lose the entire course.
+func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []string, err error) {
+	f, err := excelize.OpenReader(bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	res := &ImportResult{}
+	defer f.Close()
+	sheet, err := pickImportSheet(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := f.GetRows(sheet)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(rows) < 2 {
-		return res, nil
+		return nil, nil, nil
 	}
-	// Naive mapping: expect header row 0. We map by lowercased header.
+	// Header row → column index. Keys are lower-cased with spaces collapsed.
 	headers := map[string]int{}
 	for i, h := range rows[0] {
-		headers[strings.ToLower(strings.TrimSpace(h))] = i
+		key := strings.ToLower(strings.TrimSpace(h))
+		if key != "" {
+			headers[key] = i
+		}
 	}
 	get := func(row []string, key string) string {
 		i, ok := headers[key]
@@ -906,84 +1094,417 @@ func (s *TeachingService) ImportScheduleExcel(ctx context.Context, actor uuid.UU
 		}
 		return strings.TrimSpace(row[i])
 	}
+
+	byCode := map[string]*parsedCourse{}
+	order := []string{}
+
 	for r := 1; r < len(rows); r++ {
 		row := rows[r]
-		code := get(row, "code")
+		rawCode := get(row, "coursecode")
+		code := strings.ToUpper(strings.TrimSpace(rawCode))
 		if code == "" {
 			continue
 		}
-		res.RowCount++
-		var facultyID uuid.UUID
-		if err := s.pool.QueryRow(ctx, `SELECT id FROM faculty_courses WHERE code=$1`, code).Scan(&facultyID); err != nil {
-			res.ErrorCount++
-			res.Errors = append(res.Errors, fmt.Sprintf("row %d: course code '%s' not found", r+1, code))
+		course, seen := byCode[code]
+		if !seen {
+			course = &parsedCourse{
+				code:            code,
+				name:            get(row, "coursename"),
+				officerRaw:      get(row, "officer"),
+				sections:        map[string]*parsedSection{},
+				sectionsInOrder: []string{},
+			}
+			byCode[code] = course
+			order = append(order, code)
+		}
+		// Take the first non-empty officer we see for the course — often only
+		// row 1 of a course lists the officer; later rows leave it blank.
+		if course.officerRaw == "" {
+			if o := get(row, "officer"); o != "" {
+				course.officerRaw = o
+			}
+		}
+
+		// Exam dates — pick first parseable per Lec/Lab bucket per course.
+		if course.midtermLectureDate == "" || course.finalLectureDate == "" || course.midtermLabDate == "" || course.finalLabDate == "" {
+			mRaw := get(row, "midtermexamdate")
+			fRaw := get(row, "finalexamdate")
+			if isExamForLec(mRaw) && course.midtermLectureDate == "" {
+				course.midtermLectureDate = parseThaiDate(mRaw)
+			}
+			if isExamForLab(mRaw) && course.midtermLabDate == "" {
+				course.midtermLabDate = parseThaiDate(mRaw)
+			}
+			if isExamForLec(fRaw) && course.finalLectureDate == "" {
+				course.finalLectureDate = parseThaiDate(fRaw)
+			}
+			if isExamForLab(fRaw) && course.finalLabDate == "" {
+				course.finalLabDate = parseThaiDate(fRaw)
+			}
+		}
+
+		rawSection := get(row, "section")
+		if rawSection == "" {
 			continue
 		}
-		var tcID uuid.UUID
-		err := s.pool.QueryRow(ctx,
-			`SELECT id FROM teaching_courses WHERE faculty_course_id=$1 AND term_id=$2`, facultyID, termID).Scan(&tcID)
-		if err != nil {
-			tcID = uuid.New()
-			if _, err := s.pool.Exec(ctx,
-				`INSERT INTO teaching_courses (id, faculty_course_id, term_id, created_by)
-				 VALUES ($1,$2,$3,$4)`, tcID, facultyID, termID, actor); err != nil {
-				res.ErrorCount++
-				res.Errors = append(res.Errors, fmt.Sprintf("row %d: %v", r+1, err))
-				continue
-			}
-			res.CreatedIDs = append(res.CreatedIDs, tcID)
-		}
-		secNo := get(row, "sec_no")
+		// "SEC 01" → "1"; also handle "SEC01", "01", etc.
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(rawSection), "SEC"))
+		secNo := strings.TrimLeft(trimmed, "0")
 		if secNo == "" {
+			secNo = "0"
+		}
+
+		sec, ok := course.sections[secNo]
+		if !ok {
+			track := "regular"
+			if strings.Contains(get(row, "reservedfor"), "โครงการพิเศษ") {
+				track = "special"
+			}
+			seats, _ := strconv.Atoi(get(row, "totalseats"))
+			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats}
+			course.sections[secNo] = sec
+			course.sectionsInOrder = append(course.sectionsInOrder, secNo)
+		}
+
+		kindRaw := strings.ToLower(get(row, "sessiontype"))
+		var kind string
+		switch kindRaw {
+		case "lec", "lecture":
+			kind = "lecture"
+		case "lab":
+			kind = "lab"
+		default:
+			warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): ประเภทคาบ '%s' ไม่รู้จัก ข้าม", r+1, code, secNo, kindRaw))
 			continue
 		}
-		track := get(row, "track")
-		if track != "special" {
-			track = "regular"
+
+		dow, dowOK := dowFromAbbrev(get(row, "day"))
+		if !dowOK {
+			warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): วัน '%s' ไม่รู้จัก ข้าม", r+1, code, secNo, get(row, "day")))
+			continue
 		}
-		var secID uuid.UUID
-		if err := s.pool.QueryRow(ctx,
-			`SELECT id FROM sections WHERE teaching_course_id=$1 AND sec_no=$2`, tcID, secNo).Scan(&secID); err != nil {
-			secID = uuid.New()
-			room := get(row, "room")
-			var roomPtr *string
-			if room != "" {
-				roomPtr = &room
+		start, end, tOK := parseTimeRange(get(row, "time"))
+		if !tOK {
+			warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): เวลา '%s' อ่านไม่ได้ ข้าม", r+1, code, secNo, get(row, "time")))
+			continue
+		}
+		room := get(row, "room")
+
+		// The section-level room is the room of the first Lec (or first row if
+		// no Lec appears). schedule-level room stays authoritative per row.
+		if sec.room == "" && kind == "lecture" {
+			sec.room = room
+		}
+		if sec.room == "" {
+			sec.room = room
+		}
+		sec.schedules = append(sec.schedules, parsedSchedule{
+			kind: kind, dow: dow, startTime: start, endTime: end, room: room,
+		})
+	}
+
+	courses = make([]*parsedCourse, 0, len(order))
+	for _, code := range order {
+		courses = append(courses, byCode[code])
+	}
+	return courses, warnings, nil
+}
+
+// officerTokens splits the raw Officer cell on whitespace and drops the
+// placeholder tokens (อจ.พิเศษ, และคณะ, …).
+func officerTokens(raw string) []string {
+	fields := strings.Fields(raw)
+	out := make([]string, 0, len(fields))
+	for _, t := range fields {
+		if _, noise := officerNoiseTokens[t]; noise {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// matchOfficers looks up each name in the users table. A name that matches
+// exactly one active lecturer is auto-assigned; anything else (0 matches or
+// >1 ambiguous match) is returned as unmatched so staff can resolve it.
+func (s *TeachingService) matchOfficers(ctx context.Context, names []string) (matched []uuid.UUID, unmatched []string, err error) {
+	seen := map[uuid.UUID]struct{}{}
+	for _, name := range names {
+		rows, err := s.pool.Query(ctx, `
+			SELECT u.id FROM users u
+			JOIN user_roles r ON r.user_id = u.id AND r.role = 'lecturer'
+			WHERE u.first_name = $1 AND u.is_active AND u.deleted_at IS NULL`, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		var ids []uuid.UUID
+		for rows.Next() {
+			var id uuid.UUID
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, nil, err
 			}
-			if _, err := s.pool.Exec(ctx,
-				`INSERT INTO sections (id, teaching_course_id, sec_no, track, room) VALUES ($1,$2,$3,$4::section_track,$5)`,
-				secID, tcID, secNo, track, roomPtr); err != nil {
-				res.ErrorCount++
-				res.Errors = append(res.Errors, fmt.Sprintf("row %d: %v", r+1, err))
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if len(ids) == 1 {
+			if _, dup := seen[ids[0]]; !dup {
+				matched = append(matched, ids[0])
+				seen[ids[0]] = struct{}{}
+			}
+		} else {
+			// 0 = truly missing, >1 = ambiguous — both surface to staff as
+			// unmatched so they can pick.
+			unmatched = append(unmatched, name)
+		}
+	}
+	return matched, unmatched, nil
+}
+
+// PreviewImport parses the file and reports per-course what CommitImport
+// would do. It performs no writes.
+func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte) (*ImportPreview, error) {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return nil, err
+	}
+	if !priv {
+		return nil, ErrForbidden
+	}
+	courses, _, err := parseNormalizedSheet(body)
+	if err != nil {
+		return nil, err
+	}
+	out := &ImportPreview{Filename: filename, Courses: make([]ImportPreviewCourse, 0, len(courses))}
+	for _, c := range courses {
+		schedCount := 0
+		for _, sec := range c.sections {
+			schedCount += len(sec.schedules)
+		}
+		tokens := officerTokens(c.officerRaw)
+		row := ImportPreviewCourse{
+			Code:          c.code,
+			Name:          c.name,
+			SectionCount:  len(c.sections),
+			ScheduleCount: schedCount,
+			OfficerRaw:    c.officerRaw,
+			OfficerNames:  tokens,
+		}
+		var facultyID uuid.UUID
+		if err := s.pool.QueryRow(ctx, `SELECT id FROM faculty_courses WHERE code = $1`, c.code).Scan(&facultyID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				row.Status = "missing_catalog"
+				row.Note = "ยังไม่ได้เพิ่มรหัสวิชานี้ในบัญชีรายวิชากลาง"
+				out.MissingCatalogCount++
+				out.Courses = append(out.Courses, row)
 				continue
 			}
+			return nil, err
 		}
-		kind := get(row, "kind")
-		if kind != "lecture" && kind != "lab" {
+		var existingID uuid.UUID
+		err := s.pool.QueryRow(ctx,
+			`SELECT id FROM teaching_courses WHERE faculty_course_id = $1 AND term_id = $2`, facultyID, termID).Scan(&existingID)
+		if err == nil {
+			row.Status = "existing"
+			out.ExistingCount++
+			out.Courses = append(out.Courses, row)
 			continue
 		}
-		day, _ := strconv.Atoi(get(row, "day"))
-		start := get(row, "start")
-		end := get(row, "end")
-		if start == "" || end == "" {
-			continue
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
 		}
-		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO section_schedules (id, section_id, kind, day_of_week, start_time, end_time)
-			 VALUES ($1,$2,$3,$4,$5::time,$6::time)`,
-			uuid.New(), secID, kind, day, start, end); err != nil {
-			res.ErrorCount++
-			res.Errors = append(res.Errors, fmt.Sprintf("row %d: %v", r+1, err))
+		matched, unmatched, err := s.matchOfficers(ctx, tokens)
+		if err != nil {
+			return nil, err
+		}
+		row.MatchedLecturerIDs = matched
+		row.UnmatchedNames = unmatched
+		if len(unmatched) > 0 {
+			row.Status = "unmatched_officer"
+			out.BlockedCount++
+		} else {
+			row.Status = "new"
+			out.NewCount++
+		}
+		out.Courses = append(out.Courses, row)
+	}
+	return out, nil
+}
+
+// CommitImport writes the courses that pass PreviewImport's checks. Each
+// course is written in its own tx: one failed course never blocks the rest of
+// the file. Codes listed in skipCodes are ignored, letting staff resolve
+// unmatched-officer rows preview-side.
+func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte, skipCodes []string) (*ImportResult, error) {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return nil, err
+	}
+	if !priv {
+		return nil, ErrForbidden
+	}
+	courses, warnings, err := parseNormalizedSheet(body)
+	if err != nil {
+		return nil, err
+	}
+	res := &ImportResult{Errors: warnings, ErrorCount: len(warnings)}
+	skipSet := map[string]struct{}{}
+	for _, c := range skipCodes {
+		if v := strings.ToUpper(strings.TrimSpace(c)); v != "" {
+			skipSet[v] = struct{}{}
 		}
 	}
 
-	summary := map[string]any{"row_count": res.RowCount, "error_count": res.ErrorCount, "errors": res.Errors}
+	for _, c := range courses {
+		res.RowCount++
+		if _, skip := skipSet[c.code]; skip {
+			res.SkippedCodes = append(res.SkippedCodes, c.code)
+			continue
+		}
+		id, err := s.commitOneCourse(ctx, actor, termID, c)
+		if err != nil {
+			// Skip signals a benign non-creation (existing / missing catalog).
+			// Only real errors bump the error count.
+			if err == errImportSkipped {
+				res.SkippedCodes = append(res.SkippedCodes, c.code)
+				continue
+			}
+			res.ErrorCount++
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", c.code, err))
+			continue
+		}
+		res.CreatedIDs = append(res.CreatedIDs, id)
+	}
+
+	summary := map[string]any{
+		"row_count":     res.RowCount,
+		"created_count": len(res.CreatedIDs),
+		"skipped_count": len(res.SkippedCodes),
+		"error_count":   res.ErrorCount,
+	}
 	_, _ = s.pool.Exec(ctx,
 		`INSERT INTO schedule_imports (id, imported_by, filename, row_count, error_count, summary, at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		uuid.New(), actor, filename, res.RowCount, res.ErrorCount, summary, time.Now())
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "schedule.import", Entity: "term", EntityID: termID.String(), After: summary})
 	return res, nil
+}
+
+// errImportSkipped signals commitOneCourse chose not to create the row
+// because it already exists or its faculty catalog entry is missing. The
+// caller records the code in SkippedCodes without incrementing ErrorCount.
+var errImportSkipped = errors.New("skipped")
+
+func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uuid.UUID, c *parsedCourse) (uuid.UUID, error) {
+	var facultyID uuid.UUID
+	if err := s.pool.QueryRow(ctx, `SELECT id FROM faculty_courses WHERE code = $1`, c.code).Scan(&facultyID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, errImportSkipped
+		}
+		return uuid.Nil, err
+	}
+	var existing uuid.UUID
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM teaching_courses WHERE faculty_course_id = $1 AND term_id = $2`, facultyID, termID).Scan(&existing)
+	if err == nil {
+		return uuid.Nil, errImportSkipped
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, err
+	}
+	matched, _, err := s.matchOfficers(ctx, officerTokens(c.officerRaw))
+	if err != nil {
+		return uuid.Nil, err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	id := uuid.New()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO teaching_courses (
+			id, faculty_course_id, term_id,
+			midterm_lecture_date, midterm_lab_date, final_lecture_date, final_lab_date,
+			created_by
+		) VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8)`,
+		id, facultyID, termID,
+		emptyToNil(c.midtermLectureDate), emptyToNil(c.midtermLabDate),
+		emptyToNil(c.finalLectureDate), emptyToNil(c.finalLabDate),
+		actor); err != nil {
+		return uuid.Nil, err
+	}
+	for i, lid := range matched {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO teaching_lecturers (teaching_course_id, lecturer_id, is_primary) VALUES ($1,$2,$3)
+			 ON CONFLICT DO NOTHING`, id, lid, i == 0); err != nil {
+			return uuid.Nil, err
+		}
+	}
+
+	var sumRegular, sumSpecial int
+	for _, secNo := range c.sectionsInOrder {
+		sec := c.sections[secNo]
+		secID := uuid.New()
+		var roomPtr *string
+		if sec.room != "" {
+			r := sec.room
+			roomPtr = &r
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students)
+			 VALUES ($1,$2,$3,$4::section_track,$5,$6)`,
+			secID, id, sec.secNo, sec.track, roomPtr, sec.numStudents); err != nil {
+			return uuid.Nil, err
+		}
+		if sec.track == "special" {
+			sumSpecial += sec.numStudents
+		} else {
+			sumRegular += sec.numStudents
+		}
+		for _, sch := range sec.schedules {
+			var schRoomPtr *string
+			if sch.room != "" {
+				r := sch.room
+				schRoomPtr = &r
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO section_schedules (id, section_id, kind, day_of_week, start_time, end_time, room)
+				 VALUES ($1,$2,$3,$4,$5::time,$6::time,$7)`,
+				uuid.New(), secID, sch.kind, sch.dow, sch.startTime, sch.endTime, schRoomPtr); err != nil {
+				return uuid.Nil, err
+			}
+		}
+	}
+	if sumRegular+sumSpecial > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE teaching_courses SET num_students=$1, num_students_regular=$2, num_students_special=$3
+			 WHERE id=$4`, sumRegular+sumSpecial, sumRegular, sumSpecial, id); err != nil {
+			return uuid.Nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+// emptyToNil turns a raw string ("" ⇒ nil, else pointer). Used for optional
+// date/text columns in INSERT statements.
+func emptyToNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// ImportScheduleExcel is a thin backward-compatibility wrapper. New callers
+// should use PreviewImport + CommitImport. The wrapper commits without any
+// skip list — equivalent to "import all novel courses, skip everything else".
+func (s *TeachingService) ImportScheduleExcel(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte) (*ImportResult, error) {
+	return s.CommitImport(ctx, actor, termID, filename, body, nil)
 }
 
 // Terms
