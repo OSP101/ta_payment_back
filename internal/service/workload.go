@@ -100,7 +100,7 @@ func (s *WorkloadService) ListClasses(ctx context.Context, userID, termID uuid.U
 		return nil, err
 	}
 	defer rows.Close()
-	var out []ClassBlock
+	out := []ClassBlock{}
 	for rows.Next() {
 		var b ClassBlock
 		var rowID uuid.UUID

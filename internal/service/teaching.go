@@ -24,12 +24,13 @@ type TeachingCourse struct {
 	TermID             uuid.UUID `json:"term_id"`
 	Code               string    `json:"code"`
 	NameTH             string    `json:"name_th"`
+	// Credit hours from faculty_courses — surfaced so the request-form UI can
+	// derive its default reimburse_scope (Q&A rule 3): lecture-only → "lecture",
+	// lab-only → "lab", both → "both" (user can still override).
+	LectureHrs         int       `json:"lecture_hrs"`
+	LabHrs             int       `json:"lab_hrs"`
 	StartsOn           *string   `json:"starts_on,omitempty"`
 	EndsOn             *string   `json:"ends_on,omitempty"`
-	MidtermLectureDate *string   `json:"midterm_lecture_date,omitempty"`
-	MidtermLabDate     *string   `json:"midterm_lab_date,omitempty"`
-	FinalLectureDate   *string   `json:"final_lecture_date,omitempty"`
-	FinalLabDate       *string   `json:"final_lab_date,omitempty"`
 	NumStudents        int       `json:"num_students"`         // aggregate (regular + special)
 	NumStudentsRegular int       `json:"num_students_regular"`
 	NumStudentsSpecial int       `json:"num_students_special"`
@@ -102,16 +103,12 @@ type TeachingService struct {
 
 // Create a teaching course with sections + schedules in one transaction.
 type CreateTeachingCourseInput struct {
-	FacultyCourseID    uuid.UUID `json:"faculty_course_id"`
-	TermID             uuid.UUID `json:"term_id"`
-	StartsOn           *string   `json:"starts_on,omitempty"`
-	EndsOn             *string   `json:"ends_on,omitempty"`
-	MidtermLectureDate *string   `json:"midterm_lecture_date,omitempty"`
-	MidtermLabDate     *string   `json:"midterm_lab_date,omitempty"`
-	FinalLectureDate   *string   `json:"final_lecture_date,omitempty"`
-	FinalLabDate       *string   `json:"final_lab_date,omitempty"`
-	NumStudents        int       `json:"num_students"`
-	LecturerIDs        []uuid.UUID `json:"lecturer_ids"`
+	FacultyCourseID uuid.UUID   `json:"faculty_course_id"`
+	TermID          uuid.UUID   `json:"term_id"`
+	StartsOn        *string     `json:"starts_on,omitempty"`
+	EndsOn          *string     `json:"ends_on,omitempty"`
+	NumStudents     int         `json:"num_students"`
+	LecturerIDs     []uuid.UUID `json:"lecturer_ids"`
 	Sections           []struct {
 		SecNo       string           `json:"sec_no"`
 		Track       string           `json:"track"`
@@ -140,13 +137,10 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	_, err = tx.Exec(ctx,
 		`INSERT INTO teaching_courses (
 			id, faculty_course_id, term_id, starts_on, ends_on,
-			midterm_lecture_date, midterm_lab_date, final_lecture_date, final_lab_date,
 			num_students, created_by
-		 ) VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8::date,$9::date,$10,$11)`,
+		 ) VALUES ($1,$2,$3,$4::date,$5::date,$6,$7)`,
 		id, in.FacultyCourseID, in.TermID,
 		nilStr(in.StartsOn), nilStr(in.EndsOn),
-		nilStr(in.MidtermLectureDate), nilStr(in.MidtermLabDate),
-		nilStr(in.FinalLectureDate), nilStr(in.FinalLabDate),
 		in.NumStudents, actor)
 	if err != nil {
 		return uuid.Nil, err
@@ -217,17 +211,14 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	tc := &TeachingCourse{}
 	err := s.pool.QueryRow(ctx,
 		`SELECT tc.id, tc.faculty_course_id, tc.term_id, fc.code, fc.name_th,
+		        fc.lecture_hrs, fc.lab_hrs,
 		        TO_CHAR(tc.starts_on,'YYYY-MM-DD'), TO_CHAR(tc.ends_on,'YYYY-MM-DD'),
-		        TO_CHAR(tc.midterm_lecture_date,'YYYY-MM-DD'),
-		        TO_CHAR(tc.midterm_lab_date,'YYYY-MM-DD'),
-		        TO_CHAR(tc.final_lecture_date,'YYYY-MM-DD'),
-		        TO_CHAR(tc.final_lab_date,'YYYY-MM-DD'),
 		        tc.num_students, tc.num_students_regular, tc.num_students_special,
 		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZ')
 		 FROM teaching_courses tc JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
+		&tc.LectureHrs, &tc.LabHrs,
 		&tc.StartsOn, &tc.EndsOn,
-		&tc.MidtermLectureDate, &tc.MidtermLabDate, &tc.FinalLectureDate, &tc.FinalLabDate,
 		&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
 		&tc.ExportedAt)
 	if err != nil {
@@ -301,7 +292,10 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 		return nil, err
 	}
 	defer rows.Close()
-	var out []TeachingCourse
+	// Zero-length slice (not nil) so empty result sets marshal as `[]` in JSON
+	// instead of `null` — SWR + downstream `.length` checks treat the two
+	// differently and null crashes the render.
+	out := []TeachingCourse{}
 	for rows.Next() {
 		var tc TeachingCourse
 		if err := rows.Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
@@ -335,7 +329,10 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 		return nil, err
 	}
 	defer rows.Close()
-	var out []TeachingCourse
+	// Zero-length slice (not nil) so empty result sets marshal as `[]` in JSON
+	// instead of `null` — SWR + downstream `.length` checks treat the two
+	// differently and null crashes the render.
+	out := []TeachingCourse{}
 	for rows.Next() {
 		var tc TeachingCourse
 		if err := rows.Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
@@ -389,12 +386,8 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 // faculty_courses and stay read-only. Pointer semantics: nil = leave alone;
 // an empty string clears the DB column (sets to NULL).
 type UpdateSettingsInput struct {
-	StartsOn           *string `json:"starts_on,omitempty"`
-	EndsOn             *string `json:"ends_on,omitempty"`
-	MidtermLectureDate *string `json:"midterm_lecture_date,omitempty"`
-	MidtermLabDate     *string `json:"midterm_lab_date,omitempty"`
-	FinalLectureDate   *string `json:"final_lecture_date,omitempty"`
-	FinalLabDate       *string `json:"final_lab_date,omitempty"`
+	StartsOn *string `json:"starts_on,omitempty"`
+	EndsOn   *string `json:"ends_on,omitempty"`
 }
 
 func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUID, in UpdateSettingsInput) error {
@@ -418,10 +411,6 @@ func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUI
 	}
 	add("starts_on", in.StartsOn)
 	add("ends_on", in.EndsOn)
-	add("midterm_lecture_date", in.MidtermLectureDate)
-	add("midterm_lab_date", in.MidtermLabDate)
-	add("final_lecture_date", in.FinalLectureDate)
-	add("final_lab_date", in.FinalLabDate)
 	if len(sets) == 0 {
 		return nil
 	}
@@ -920,15 +909,11 @@ type parsedSection struct {
 }
 
 type parsedCourse struct {
-	code               string
-	name               string
-	officerRaw         string
-	sectionsInOrder    []string
-	sections           map[string]*parsedSection
-	midtermLectureDate string
-	midtermLabDate     string
-	finalLectureDate   string
-	finalLabDate       string
+	code            string
+	name            string
+	officerRaw      string
+	sectionsInOrder []string
+	sections        map[string]*parsedSection
 }
 
 // Officer tokens that are not real personal names — staff wrote them as
@@ -1026,6 +1011,9 @@ func parseThaiDate(raw string) string {
 	return fmt.Sprintf("%04d-%02d-%02d", ce, month, day)
 }
 
+// isExamForLec / isExamForLab were used by the pre-2026-07-14 Excel importer
+// to route "Lec ..."/"Lab ..." exam-date cells into per-course columns. Kept
+// available in case a future importer needs the same prefix check.
 // isExamForLec tests whether the exam-date cell describes a lecture exam. The
 // university prefixes lecture exam dates with "Lec ". Everything without the
 // prefix (bare "WBA", "Lab 22 ต.ค. 69", …) is treated as non-Lec here.
@@ -1125,23 +1113,8 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 			}
 		}
 
-		// Exam dates — pick first parseable per Lec/Lab bucket per course.
-		if course.midtermLectureDate == "" || course.finalLectureDate == "" || course.midtermLabDate == "" || course.finalLabDate == "" {
-			mRaw := get(row, "midtermexamdate")
-			fRaw := get(row, "finalexamdate")
-			if isExamForLec(mRaw) && course.midtermLectureDate == "" {
-				course.midtermLectureDate = parseThaiDate(mRaw)
-			}
-			if isExamForLab(mRaw) && course.midtermLabDate == "" {
-				course.midtermLabDate = parseThaiDate(mRaw)
-			}
-			if isExamForLec(fRaw) && course.finalLectureDate == "" {
-				course.finalLectureDate = parseThaiDate(fRaw)
-			}
-			if isExamForLab(fRaw) && course.finalLabDate == "" {
-				course.finalLabDate = parseThaiDate(fRaw)
-			}
-		}
+		// Per-course exam dates removed 2026-07-14 — exam ranges now live on
+		// academic_terms. Import silently skips these Excel columns.
 
 		rawSection := get(row, "section")
 		if rawSection == "" {
@@ -1426,14 +1399,9 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 	id := uuid.New()
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO teaching_courses (
-			id, faculty_course_id, term_id,
-			midterm_lecture_date, midterm_lab_date, final_lecture_date, final_lab_date,
-			created_by
-		) VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8)`,
-		id, facultyID, termID,
-		emptyToNil(c.midtermLectureDate), emptyToNil(c.midtermLabDate),
-		emptyToNil(c.finalLectureDate), emptyToNil(c.finalLabDate),
-		actor); err != nil {
+			id, faculty_course_id, term_id, created_by
+		) VALUES ($1,$2,$3,$4)`,
+		id, facultyID, termID, actor); err != nil {
 		return uuid.Nil, err
 	}
 	for i, lid := range matched {
@@ -1514,8 +1482,15 @@ type Term struct {
 	Semester     int       `json:"semester"`
 	StartsOn     *string   `json:"starts_on,omitempty"`
 	EndsOn       *string   `json:"ends_on,omitempty"`
-	Months       int       `json:"months"`
-	IsActive     bool      `json:"is_active"`
+	// Faculty-published exam windows. Worklog entries falling inside either
+	// range are rejected — the university closes the ledger during exams.
+	// Required when creating/updating a term.
+	MidtermStartsOn *string `json:"midterm_starts_on,omitempty"`
+	MidtermEndsOn   *string `json:"midterm_ends_on,omitempty"`
+	FinalStartsOn   *string `json:"final_starts_on,omitempty"`
+	FinalEndsOn     *string `json:"final_ends_on,omitempty"`
+	Months          int     `json:"months"`
+	IsActive        bool    `json:"is_active"`
 }
 
 // TermFilter narrows a ListTerms query. All fields optional; nil means no
@@ -1529,7 +1504,11 @@ type TermFilter struct {
 
 func (s *TeachingService) ListTerms(ctx context.Context, f TermFilter) ([]Term, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, academic_year, semester, TO_CHAR(starts_on,'YYYY-MM-DD'), TO_CHAR(ends_on,'YYYY-MM-DD'), months, is_active
+		`SELECT id, academic_year, semester,
+		        TO_CHAR(starts_on,'YYYY-MM-DD'), TO_CHAR(ends_on,'YYYY-MM-DD'),
+		        TO_CHAR(midterm_starts_on,'YYYY-MM-DD'), TO_CHAR(midterm_ends_on,'YYYY-MM-DD'),
+		        TO_CHAR(final_starts_on,'YYYY-MM-DD'),   TO_CHAR(final_ends_on,'YYYY-MM-DD'),
+		        months, is_active
 		 FROM academic_terms
 		 WHERE ($1::int IS NULL OR academic_year = $1::int)
 		   AND ($2::int IS NULL OR academic_year >= $2::int)
@@ -1540,10 +1519,16 @@ func (s *TeachingService) ListTerms(ctx context.Context, f TermFilter) ([]Term, 
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Term
+	out := []Term{}
 	for rows.Next() {
 		var t Term
-		if err := rows.Scan(&t.ID, &t.AcademicYear, &t.Semester, &t.StartsOn, &t.EndsOn, &t.Months, &t.IsActive); err != nil {
+		if err := rows.Scan(
+			&t.ID, &t.AcademicYear, &t.Semester,
+			&t.StartsOn, &t.EndsOn,
+			&t.MidtermStartsOn, &t.MidtermEndsOn,
+			&t.FinalStartsOn, &t.FinalEndsOn,
+			&t.Months, &t.IsActive,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -1584,6 +1569,15 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 	if in.StartsOn != nil && in.EndsOn != nil && *in.StartsOn != "" && *in.EndsOn != "" && *in.StartsOn >= *in.EndsOn {
 		return nil, ErrInvalidInput
 	}
+	// Exam windows are required and must be closed intervals (start <= end).
+	// Faculty publishes these once per term — no partial saves.
+	if !nonEmpty(in.MidtermStartsOn) || !nonEmpty(in.MidtermEndsOn) ||
+		!nonEmpty(in.FinalStartsOn) || !nonEmpty(in.FinalEndsOn) {
+		return nil, ErrInvalidInput
+	}
+	if *in.MidtermStartsOn > *in.MidtermEndsOn || *in.FinalStartsOn > *in.FinalEndsOn {
+		return nil, ErrInvalidInput
+	}
 
 	if in.ID == uuid.Nil {
 		in.ID = uuid.New()
@@ -1597,9 +1591,16 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 			return nil, ErrConflict
 		}
 		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO academic_terms (id, academic_year, semester, starts_on, ends_on, months, is_active)
-			 VALUES ($1,$2,$3,$4::date,$5::date,$6,$7)`,
-			in.ID, in.AcademicYear, in.Semester, nilStr(in.StartsOn), nilStr(in.EndsOn), in.Months, in.IsActive); err != nil {
+			`INSERT INTO academic_terms
+			   (id, academic_year, semester, starts_on, ends_on,
+			    midterm_starts_on, midterm_ends_on, final_starts_on, final_ends_on,
+			    months, is_active)
+			 VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8::date,$9::date,$10,$11)`,
+			in.ID, in.AcademicYear, in.Semester,
+			nilStr(in.StartsOn), nilStr(in.EndsOn),
+			nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),
+			nilStr(in.FinalStartsOn), nilStr(in.FinalEndsOn),
+			in.Months, in.IsActive); err != nil {
 			return nil, err
 		}
 		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "term.create", Entity: "term", EntityID: in.ID.String(), After: in})
@@ -1619,13 +1620,25 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 		return nil, ErrConflict
 	}
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE academic_terms SET starts_on=$2::date, ends_on=$3::date, months=$4, is_active=$5 WHERE id=$1`,
-		in.ID, nilStr(in.StartsOn), nilStr(in.EndsOn), in.Months, in.IsActive); err != nil {
+		`UPDATE academic_terms SET
+		   starts_on=$2::date, ends_on=$3::date,
+		   midterm_starts_on=$4::date, midterm_ends_on=$5::date,
+		   final_starts_on=$6::date,   final_ends_on=$7::date,
+		   months=$8, is_active=$9
+		 WHERE id=$1`,
+		in.ID,
+		nilStr(in.StartsOn), nilStr(in.EndsOn),
+		nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),
+		nilStr(in.FinalStartsOn), nilStr(in.FinalEndsOn),
+		in.Months, in.IsActive); err != nil {
 		return nil, err
 	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "term.update", Entity: "term", EntityID: in.ID.String(), After: in})
 	return &in, nil
 }
+
+// nonEmpty returns true if the pointer is non-nil and its string is non-empty.
+func nonEmpty(s *string) bool { return s != nil && *s != "" }
 
 // TermUsage summarizes how many rows reference this term. Used to preview
 // the blast radius before a delete or to prevent it.

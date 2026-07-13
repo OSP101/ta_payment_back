@@ -194,40 +194,6 @@ func (h *CourseHandler) CreatePayRate(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-func (h *CourseHandler) HourCaps(c *fiber.Ctx) error {
-	out, err := h.Svc.Courses.ListHourCaps(c.Context())
-	if err != nil {
-		return err
-	}
-	return c.JSON(out)
-}
-
-func (h *CourseHandler) DeleteHourCap(c *fiber.Ctx) error {
-	credits, err := strconv.Atoi(c.Params("credits"))
-	if err != nil || credits <= 0 {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid credits")
-	}
-	if err := h.Svc.Courses.DeleteHourCap(c.Context(), UserID(c), credits); err != nil {
-		if err == service.ErrNotFound {
-			return fiber.NewError(fiber.StatusNotFound, "hour cap not found")
-		}
-		return err
-	}
-	return c.JSON(fiber.Map{"ok": true})
-}
-
-func (h *CourseHandler) UpsertHourCap(c *fiber.Ctx) error {
-	var in service.HourCap
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
-	}
-	out, err := h.Svc.Courses.UpsertHourCap(c.Context(), UserID(c), in)
-	if err != nil {
-		return err
-	}
-	return c.JSON(out)
-}
-
 func (h *CourseHandler) BudgetCap(c *fiber.Ctx) error {
 	b, err := h.Svc.Courses.LatestBudgetCap(c.Context())
 	if err != nil {
@@ -679,6 +645,25 @@ func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	return c.Status(fiber.StatusCreated).JSON(res)
+}
+
+// PreviewConflicts previews the schedule-conflict verdict for a TA against
+// every section of a teaching course. Used by the lecturer's request form to
+// flag conflicts inline at TA-picking time (instead of at submit time).
+func (h *TARequestHandler) PreviewConflicts(c *fiber.Ctx) error {
+	taID, err := uuid.Parse(c.Query("ta_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid ta_id")
+	}
+	tcID, err := uuid.Parse(c.Query("teaching_course_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid teaching_course_id")
+	}
+	out, err := h.Svc.TARequest.PreviewConflicts(c.Context(), taID, tcID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(fiber.Map{"conflicts": out})
 }
 
 func (h *TARequestHandler) ListWindows(c *fiber.Ctx) error {
@@ -1183,6 +1168,44 @@ func (h *WorkLogHandler) PendingReports(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// StaffListByCourse — GET /staff/courses/:tcId/worklogs — every TA's entries.
+func (h *WorkLogHandler) StaffListByCourse(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.WorkLog.StaffListByCourse(c.Context(), tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// StaffUpsert — PUT /staff/worklogs — edit or add a row on any TA's behalf.
+func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
+	var w service.WorkLog
+	if err := c.BodyParser(&w); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	id, err := h.Svc.WorkLog.StaffUpsert(c.Context(), UserID(c), w)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"id": id})
+}
+
+// StaffDelete — DELETE /staff/worklogs/:id — remove a draft/rejected row.
+func (h *WorkLogHandler) StaffDelete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.WorkLog.StaffDelete(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *WorkLogHandler) Reject(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -1509,6 +1532,30 @@ func (h *DashboardHandler) Executive(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// TaOverview — GET /dashboard/ta/me — TA's per-course status + estimated pay.
+func (h *DashboardHandler) TaOverview(c *fiber.Ctx) error {
+	out, err := h.Svc.Dashboard.TaOverview(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// LecturerOverview — GET /dashboard/lecturer/me — per-course TA count, hours, budget.
+func (h *DashboardHandler) LecturerOverview(c *fiber.Ctx) error {
+	var termID *uuid.UUID
+	if v := c.Query("term_id"); v != "" {
+		if id, err := uuid.Parse(v); err == nil {
+			termID = &id
+		}
+	}
+	out, err := h.Svc.Dashboard.LecturerOverview(c.Context(), UserID(c), termID, h.Svc.Budget)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 // -------------------- Export --------------------
 
 type ExportHandler struct{ Svc *service.Container }
@@ -1531,8 +1578,68 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// when (PII access trail, M5).
 	actor := UserID(c)
 	h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.course", Entity: "teaching_course", EntityID: id.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")})
+
+	// Phase 4: persist the batch so the dashboard can list history + budget
+	// snapshot. Best-effort — a DB write failure must NOT hide the zip from
+	// the caller (the file is already computed and useful).
+	if snap, berr := h.Svc.Budget.Compute(c.Context(), id); berr == nil {
+		_, _ = h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
+			TeachingCourseID: id,
+			FilePath:         name, // in-memory zip; we persist just the name for reference
+			FileName:         name,
+			TACount:          0,     // best-effort placeholder; full count needs another query
+			TotalBaht:        snap.UsedBaht,
+		})
+	}
+
 	c.Set("Content-Type", "application/zip")
 	c.Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	return c.Send(body)
+}
+
+// CoursesSummary powers the exports dashboard: budget/usage/pending months per
+// course, filtered by ?term_id=.
+func (h *ExportHandler) CoursesSummary(c *fiber.Ctx) error {
+	var termID uuid.UUID
+	if raw := c.Query("term_id"); raw != "" {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid term_id")
+		}
+		termID = id
+	}
+	out, err := h.Svc.ExportBatches.DashboardSummary(c.Context(), h.Svc.Budget, termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// CourseHistory returns the export batches for a single course, newest first.
+func (h *ExportHandler) CourseHistory(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.ExportBatches.ListByCourse(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AppointmentOrder — POST /exports/appointment-order — returns ZIP with PDF+DOCX.
+func (h *ExportHandler) AppointmentOrder(c *fiber.Ctx) error {
+	var in service.AppointmentOrderInput
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	body, name, err := h.Svc.Appointment.Build(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	c.Set(fiber.HeaderContentType, "application/zip")
+	c.Set(fiber.HeaderContentDisposition, `attachment; filename="`+name+`"`)
 	return c.Send(body)
 }
 

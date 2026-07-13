@@ -56,26 +56,32 @@ func main() {
 		fmt.Printf("Admin %s exists — skipping user seed\n", adminEmail)
 	}
 
-	// Reference data: pay rate + hour caps + budget cap (defaults; edit via UI)
-	// undergrad hourly + graduate flat monthly + workload-formula constants from CC finance sheet.
+	// Reference data: pay rate + budget cap (defaults; edit via UI).
+	// Payment rates track ประกาศ 731/2565 + 1080/2565:
+	//   ป.ตรี ปกติ 40 ฿/hr, พิเศษ 50 ฿/hr
+	//   บัณฑิต ปกติ 50 ฿/hr (hourly per Q&A rule 6c), พิเศษ 4,000 ฿/เดือน (flat)
+	// Migration 0018 adds the hourly grad rate + 300฿/day cap + per-track daily
+	// hour caps + 12,000฿/term grad-special cap.
 	pool.Exec(ctx, `INSERT INTO pay_rates (id, effective_from,
 	                    undergrad_regular, undergrad_special,
 	                    graduate_regular, graduate_special_lumpsum,
 	                    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 	                    baseline_students_lecture, baseline_students_lab,
-	                    ug_workload_rate_regular, ug_workload_rate_special, term_months, note)
+	                    ug_workload_rate_regular, ug_workload_rate_special, term_months,
+	                    graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
+	                    ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
+	                    note)
 	                SELECT gen_random_uuid(), CURRENT_DATE,
 	                       40, 50,
 	                       3000, 4000,
-	                       3, 4.5, 60, 30, 200, 250, 4, 'seed defaults from Excel workbook tab 2_59 ป.ตรี'
+	                       3, 4.5, 60, 30, 200, 250, 4,
+	                       50, 12000, 300,
+	                       7, 6, 6,
+	                       'seed defaults per ประกาศ 731/2565 + 1080/2565 + Q&A 2026'
 	                WHERE NOT EXISTS (SELECT 1 FROM pay_rates)`)
 	pool.Exec(ctx, `INSERT INTO budget_caps (id, effective_from, per_course_max, note)
 	                SELECT gen_random_uuid(), CURRENT_DATE, 20000, 'seed default'
 	                WHERE NOT EXISTS (SELECT 1 FROM budget_caps)`)
-	for credits, hrs := range map[int]int{1: 10, 2: 20, 3: 30, 4: 40} {
-		pool.Exec(ctx, `INSERT INTO hour_caps (id, credits, hours_cap, note) VALUES (gen_random_uuid(),$1,$2,'seed')
-		                ON CONFLICT (credits) DO NOTHING`, credits, hrs)
-	}
 	fmt.Println("Seed complete.")
 }
 

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -36,9 +37,14 @@ type querier interface {
 // staff accordion renders. Rows are appended in a deterministic order per TA;
 // callers should not mutate this list post-decision.
 type DecisionCheck struct {
-	Rule    string `json:"rule"`
-	TAName  string `json:"ta,omitempty"`
-	Passed  bool   `json:"passed"`
+	Rule   string `json:"rule"`
+	TAName string `json:"ta,omitempty"`
+	Passed bool   `json:"passed"`
+	// Warning marks a failing check as informational-only: staff still sees
+	// it in the checklist, and reject_reason still lists it, but the overall
+	// verdict is not flipped to 'rejected' just because of it. Used for
+	// docs-not-approved so the lecturer can submit and staff can follow up.
+	Warning bool   `json:"warning,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -77,10 +83,14 @@ type CreateTARequestInput struct {
 		GraduateCount  int       `json:"graduate_count"`
 	} `json:"counts"`
 	Assignments []struct {
-		SectionID uuid.UUID     `json:"section_id"`
-		TAID      uuid.UUID     `json:"ta_id"`
-		Level     string        `json:"level"`
-		Workload  WorkloadInput `json:"workload"`
+		// SectionIDs lists every section this TA is assigned to within the
+		// request. One TA now spans N sections so worklog can attribute time
+		// to the specific section taught; the workload declaration itself is
+		// shared across those sections (single row in ta_workload_forms).
+		SectionIDs []uuid.UUID   `json:"section_ids"`
+		TAID       uuid.UUID     `json:"ta_id"`
+		Level      string        `json:"level"`
+		Workload   WorkloadInput `json:"workload"`
 	} `json:"assignments"`
 }
 
@@ -112,8 +122,15 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return nil, errors.New("คุณไม่ได้เป็นผู้สอนของรายวิชานี้")
 	}
 
-	var termID uuid.UUID
-	if err := s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id = $1`, in.TeachingCourseID).Scan(&termID); err != nil {
+	var (
+		termID                uuid.UUID
+		lectureHrs, labHrs    float64
+	)
+	if err := s.pool.QueryRow(ctx, `
+		SELECT tc.term_id, COALESCE(fc.lecture_hrs, 0), COALESCE(fc.lab_hrs, 0)
+		FROM teaching_courses tc JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		WHERE tc.id = $1
+	`, in.TeachingCourseID).Scan(&termID, &lectureHrs, &labHrs); err != nil {
 		return nil, errors.New("ไม่พบรายวิชาที่เลือก")
 	}
 
@@ -152,7 +169,17 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		}
 	}
 	for _, a := range in.Assignments {
-		sectionIDs[a.SectionID] = struct{}{}
+		if len(a.SectionIDs) == 0 {
+			return nil, errors.New("ต้องเลือก section อย่างน้อย 1 กลุ่มให้ TA แต่ละคน")
+		}
+		seenSec := map[uuid.UUID]struct{}{}
+		for _, sid := range a.SectionIDs {
+			if _, dup := seenSec[sid]; dup {
+				return nil, errors.New("มี section ซ้ำกันในรายการของ TA คนเดียว")
+			}
+			seenSec[sid] = struct{}{}
+			sectionIDs[sid] = struct{}{}
+		}
 	}
 	for secID := range sectionIDs {
 		var ok bool
@@ -183,6 +210,15 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		if err := validateWorkloadFields(a.Workload, name); err != nil {
 			return nil, err
 		}
+		// Enforce per-field caps mirroring the client-side rule (see
+		// project_workload_caps memory). Applies to undergrad only; grad
+		// hours follow the 10–12 total rule inside autoDecide.
+		if level == "undergrad" {
+			nSecs := float64(len(a.SectionIDs))
+			if err := validateUndergradWorkloadCaps(a.Workload, name, lectureHrs, labHrs, nSecs); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -204,21 +240,33 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			return nil, err
 		}
 	}
+	// One TA can cover multiple sections. Each section becomes its own
+	// ta_request_assignments row (so worklog can attribute time per section
+	// and the schedule-conflict checks continue to operate per section), but
+	// the workload declaration is shared: only the first assignment carries
+	// the ta_workload_forms row. Downstream reads LEFT JOIN the form and
+	// COALESCE numeric fields to 0, so the aggregate (which sums across all
+	// of a TA's assignments in the request) matches the declared total.
 	for i, a := range in.Assignments {
-		aid := uuid.New()
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
-			 VALUES ($1,$2,$3,$4,$5::study_level)`, aid, rid, a.SectionID, a.TAID, levels[i]); err != nil {
-			return nil, err
-		}
 		wl := a.Workload
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO ta_workload_forms (id, assignment_id, help_teach_hrs, help_teach_desc, prep_hrs, prep_desc,
-				grade_hrs, grade_desc, other_hrs, other_desc, check_work_hrs, attendance_hrs, ug_other_hrs, ug_other_desc, lab_hrs)
-			VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-			aid, wl.HelpTeachHrs, wl.HelpTeachDesc, wl.PrepHrs, wl.PrepDesc, wl.GradeHrs, wl.GradeDesc,
-			wl.OtherHrs, wl.OtherDesc, wl.CheckWorkHrs, wl.AttendanceHrs, wl.UGOtherHrs, wl.UGOtherDesc, wl.LabHrs); err != nil {
-			return nil, err
+		for j, secID := range a.SectionIDs {
+			aid := uuid.New()
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
+				 VALUES ($1,$2,$3,$4,$5::study_level)`, aid, rid, secID, a.TAID, levels[i]); err != nil {
+				return nil, err
+			}
+			if j != 0 {
+				continue
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO ta_workload_forms (id, assignment_id, help_teach_hrs, help_teach_desc, prep_hrs, prep_desc,
+					grade_hrs, grade_desc, other_hrs, other_desc, check_work_hrs, attendance_hrs, ug_other_hrs, ug_other_desc, lab_hrs)
+				VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+				aid, wl.HelpTeachHrs, wl.HelpTeachDesc, wl.PrepHrs, wl.PrepDesc, wl.GradeHrs, wl.GradeDesc,
+				wl.OtherHrs, wl.OtherDesc, wl.CheckWorkHrs, wl.AttendanceHrs, wl.UGOtherHrs, wl.UGOtherDesc, wl.LabHrs); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -273,11 +321,25 @@ func joinRejectMessages(checks []DecisionCheck) string {
 		if c.Passed {
 			continue
 		}
+		// Warnings don't cause rejection, so they don't belong in
+		// reject_reason (which is shown to lecturers as the rejection cause).
+		if c.Warning {
+			continue
+		}
 		msgs = append(msgs, c.Message)
 	}
 	joined := strings.Join(msgs, " • ")
 	if len(joined) > 500 {
-		joined = joined[:497] + "…"
+		// Byte-slicing a UTF-8 string mid-rune produces invalid bytes and
+		// Postgres rejects the INSERT with SQLSTATE 22021 ("invalid byte
+		// sequence for encoding UTF8"). Back up to the nearest rune start
+		// before truncating so the appended "…" isn't preceded by a dangling
+		// continuation byte.
+		end := 497
+		for end > 0 && !utf8.RuneStart(joined[end]) {
+			end--
+		}
+		joined = joined[:end] + "…"
 	}
 	return joined
 }
@@ -335,6 +397,34 @@ func validateWorkloadFields(w WorkloadInput, name string) error {
 	return nil
 }
 
+// validateUndergradWorkloadCaps mirrors the client-side per-field caps:
+//   - in-class activities (check-work, attendance, lab) scale with class
+//     exposure: max = credit_hrs × n_sections
+//   - ug_other ("อื่น ๆ") is fixed at course credit_hrs — stakeholder rule:
+//     prep/admin time can't scale with section count.
+// Only applies to undergrad; grad fields are governed by the 10–12 total
+// rule inside autoDecide.
+func validateUndergradWorkloadCaps(w WorkloadInput, name string, lectureHrs, labHrs, nSecs float64) error {
+	lectureCap := lectureHrs * nSecs
+	labCap := labHrs * nSecs
+	checks := []struct {
+		v     float64
+		cap   float64
+		label string
+	}{
+		{w.CheckWorkHrs, lectureCap, "ช่วยตรวจงาน"},
+		{w.AttendanceHrs, lectureCap, "เช็คชื่อ/เก็บใบงาน"},
+		{w.UGOtherHrs, lectureHrs, "อื่น ๆ (บรรยาย)"},
+		{w.LabHrs, labCap, "ปฏิบัติการ"},
+	}
+	for _, c := range checks {
+		if c.v > c.cap {
+			return fmt.Errorf("ภาระงาน '%s' ของ %s เกินขีดจำกัด %.2f ชม./สัปดาห์", c.label, name, c.cap)
+		}
+	}
+	return nil
+}
+
 // validateTA checks the user is an active TA and returns their display name
 // and authoritative study level (DB wins over client input).
 func (s *TARequestService) validateTA(ctx context.Context, taID uuid.UUID, clientLevel string) (name, level string, err error) {
@@ -375,6 +465,65 @@ func (s *TARequestService) taName(ctx context.Context, taID uuid.UUID) string {
 		return "TA"
 	}
 	return first + " " + last
+}
+
+// SectionConflict is one section's preview verdict for a specific TA.
+type SectionConflict struct {
+	SectionID uuid.UUID `json:"section_id"`
+	Messages  []string  `json:"messages"`
+}
+
+// PreviewConflicts checks the given TA against every section of the given
+// teaching course and returns the sections that conflict (own class schedule
+// or already-approved TA duties elsewhere). Only sections with at least one
+// conflict appear in the result — an empty slice means the TA can safely be
+// assigned to any section of this course.
+//
+// This mirrors the checks that autoDecide performs at submit time, so the
+// lecturer sees the same verdict inline while picking sections instead of
+// discovering it only after clicking Send.
+func (s *TARequestService) PreviewConflicts(ctx context.Context, taID, teachingCourseID uuid.UUID) ([]SectionConflict, error) {
+	name := s.taName(ctx, taID)
+	var termID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT term_id FROM teaching_courses WHERE id = $1`, teachingCourseID).Scan(&termID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id FROM sections WHERE teaching_course_id = $1`, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	var secIDs []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		secIDs = append(secIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]SectionConflict, 0, len(secIDs))
+	for _, sid := range secIDs {
+		var msgs []string
+		if err := s.checkOwnClassConflict(ctx, s.pool, taID, sid, name); err != nil {
+			msgs = append(msgs, err.Error())
+		}
+		// Passing uuid.Nil for excludeRequestID is fine here — we're not
+		// filing a request yet, so no ID to exclude.
+		if err := s.checkCrossRequestConflict(ctx, s.pool, taID, sid, termID, teachingCourseID, uuid.Nil, []string{"approved"}, name); err != nil {
+			msgs = append(msgs, err.Error())
+		}
+		if len(msgs) > 0 {
+			out = append(out, SectionConflict{SectionID: sid, Messages: msgs})
+		}
+	}
+	return out, nil
 }
 
 // checkTAEligibility enforces requirement 1: documents approved by staff and a
@@ -570,6 +719,16 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		}
 		checks = append(checks, DecisionCheck{Rule: rule, TAName: ta, Passed: ok, Message: msg})
 	}
+	// addWarn records a failing check that surfaces to staff but does not
+	// flip the verdict to rejected. Used for docs-not-approved so lecturers
+	// can still submit while staff follows up with the TA.
+	addWarn := func(rule, ta, msgOK, msgFail string, ok bool) {
+		msg := msgOK
+		if !ok {
+			msg = msgFail
+		}
+		checks = append(checks, DecisionCheck{Rule: rule, TAName: ta, Passed: ok, Warning: !ok, Message: msg})
+	}
 
 	// Section belongs to course — catches upstream data corruption (client
 	// bypassing Create's integrity check).
@@ -592,17 +751,19 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		}
 
 		if err := s.checkTAEligibility(ctx, tx, t.id, termID, t.name); err != nil {
-			// Distinguish docs vs schedule for a more useful checklist.
+			// Distinguish docs vs schedule for a more useful checklist. The
+			// docs branch is a warning (staff sees it, but the request is
+			// still auto-approved); schedule stays blocking.
 			msg := err.Error()
 			if strings.Contains(msg, "ตารางเรียน") {
-				add("docs", t.name, fmt.Sprintf("%s เอกสารครบและได้รับการอนุมัติ", t.name), "", true)
+				addWarn("docs", t.name, fmt.Sprintf("%s เอกสารครบและได้รับการอนุมัติ", t.name), "", true)
 				add("schedule", t.name, "", msg, false)
 			} else {
-				add("docs", t.name, "", msg, false)
+				addWarn("docs", t.name, "", msg, false)
 				add("schedule", t.name, fmt.Sprintf("%s บันทึกตารางเรียนแล้ว", t.name), "", true) // may be wrong but checkTAEligibility short-circuits on docs first; if this ordering matters we'd need to split the helper — accept slight noise
 			}
 		} else {
-			add("docs", t.name, fmt.Sprintf("%s เอกสารครบและได้รับการอนุมัติ", t.name), "", true)
+			addWarn("docs", t.name, fmt.Sprintf("%s เอกสารครบและได้รับการอนุมัติ", t.name), "", true)
 			add("schedule", t.name, fmt.Sprintf("%s บันทึกตารางเรียนของภาคเรียนแล้ว", t.name), "", true)
 		}
 
@@ -711,7 +872,7 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 
 	passed := true
 	for _, c := range checks {
-		if !c.Passed {
+		if !c.Passed && !c.Warning {
 			passed = false
 			break
 		}

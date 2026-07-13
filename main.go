@@ -20,6 +20,7 @@ import (
 	"ta-payment-back/internal/handler"
 	"ta-payment-back/internal/mail"
 	"ta-payment-back/internal/rbac"
+	"ta-payment-back/internal/scheduler"
 	"ta-payment-back/internal/service"
 	"ta-payment-back/internal/storage"
 )
@@ -101,6 +102,10 @@ func main() {
 	// Retention sweep: delete on-disk blobs 7 days after approval and mark
 	// file_deleted_at on the row for audit. See docs_review.go.
 	go services.Docs.RunRetention(ctx)
+
+	// Monthly submission-period scheduler: hourly reminders + daily auto-close.
+	// Runs in-process; extract to cmd/scheduler if the reminder volume grows.
+	scheduler.New(services).Start(ctx)
 
 	// One-shot: auto-decide any legacy ta_requests still in 'submitted' state
 	// after 0017 migration (officer manual approval flow is gone).

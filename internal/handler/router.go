@@ -68,9 +68,6 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Delete("/faculty-courses/:id", adminOrStaff, ch.Delete)
 	authed.Get("/settings/pay-rate", ch.PayRate)
 	authed.Post("/settings/pay-rate", adminOrStaff, ch.CreatePayRate)
-	authed.Get("/settings/hour-caps", ch.HourCaps)
-	authed.Post("/settings/hour-caps", adminOrStaff, ch.UpsertHourCap)
-	authed.Delete("/settings/hour-caps/:credits", adminOrStaff, ch.DeleteHourCap)
 	authed.Get("/settings/budget-cap", ch.BudgetCap)
 	authed.Post("/settings/budget-cap", adminOrStaff, ch.UpsertBudgetCap)
 
@@ -105,6 +102,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 
 	// TA requests
 	authed.Get("/ta-requests", rh.List)
+	authed.Get("/ta-requests/preview-conflicts", RequireRole(rbac.RoleLecturer), rh.PreviewConflicts)
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), rh.Detail)
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer), rh.Create)
 
@@ -141,7 +139,10 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Workload / TA class schedule
 	wh := &WorkloadHandler{Svc: svc}
 	authed.Get("/me/schedule", RequireRole(rbac.RoleTA), wh.ListClasses)
-	authed.Put("/me/schedule", RequireRole(rbac.RoleTA), taApproved, wh.ReplaceClasses)
+	// PUT /me/schedule intentionally does NOT require an approved profile —
+	// TAs can build their weekly class timetable while their documents are
+	// still under review. Worklog submission stays gated below.
+	authed.Put("/me/schedule", RequireRole(rbac.RoleTA), wh.ReplaceClasses)
 
 	// Work logs — writes are gated, GET stays open so the TA can preview.
 	wl := &WorkLogHandler{Svc: svc}
@@ -153,6 +154,12 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/assignments/:id/worklog/reject", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.Reject)
 	// Lecturer's list of submitted work-logs awaiting review across their courses.
 	authed.Get("/reports/pending", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.PendingReports)
+
+	// Staff worklog editor (Phase 5): read all TAs' entries per course, edit
+	// or remove a row before export. Enforces same business rules as TA path.
+	authed.Get("/staff/courses/:tcId/worklogs", adminOrStaff, wl.StaffListByCourse)
+	authed.Put("/staff/worklogs", adminOrStaff, wl.StaffUpsert)
+	authed.Delete("/staff/worklogs/:id", adminOrStaff, wl.StaffDelete)
 
 	// Notifications
 	nh := &NotifyHandler{Svc: svc}
@@ -178,12 +185,19 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Dashboard
 	dashH := &DashboardHandler{Svc: svc}
 	authed.Get("/dashboard/executive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), dashH.Executive)
+	authed.Get("/dashboard/ta/me", RequireRole(rbac.RoleTA), dashH.TaOverview)
+	authed.Get("/dashboard/lecturer/me", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), dashH.LecturerOverview)
 
 	// Export
 	eh := &ExportHandler{Svc: svc}
 	authed.Get("/exports/course/:id.zip", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseZip)
 	// Admin-only escape hatch to undo an accidental export lock.
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
+	// Phase 4 exports dashboard.
+	authed.Get("/exports/summary", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursesSummary)
+	authed.Get("/exports/course/:id/history", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseHistory)
+	// Appointment order (คำสั่งแต่งตั้ง) — PDF + DOCX in one ZIP.
+	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentOrder)
 
 	// Admin officers (executive roster used on generated official docs).
 	// GET is open to any authenticated user so document templates can render
@@ -192,6 +206,17 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/settings/admin-officers", aoH.List)
 	authed.Post("/settings/admin-officers", adminOrStaff, aoH.Upsert)
 	authed.Delete("/settings/admin-officers/:id", adminOrStaff, aoH.Delete)
+
+	// Monthly submission periods (Phase 3): staff CRUD + TA-facing reminders.
+	spH := &SubmissionPeriodHandler{Svc: svc}
+	authed.Get("/submission-periods", spH.List)
+	authed.Post("/submission-periods", adminOrStaff, spH.Upsert)
+	authed.Post("/submission-periods/bulk-for-term/:termId", adminOrStaff, spH.BulkForTerm)
+	authed.Delete("/submission-periods/:id", adminOrStaff, spH.Delete)
+	authed.Get("/me/submission-periods", spH.MePending)
+	authed.Post("/submission-periods/:id/courses/:tcId/ta-sign", RequireRole(rbac.RoleTA), spH.TaSign)
+	authed.Post("/submission-periods/:id/courses/:tcId/tas/:taId/lecturer-sign",
+		RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), spH.LecturerSign)
 
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}

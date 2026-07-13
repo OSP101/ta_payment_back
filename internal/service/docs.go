@@ -414,7 +414,7 @@ func (s *DocsService) queryDocs(ctx context.Context, sql string, args ...any) ([
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Document
+	out := []Document{}
 	for rows.Next() {
 		var d Document
 		var uploadedAt, reviewedAt, expiresAt, fileDeletedAt *time.Time
@@ -617,7 +617,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		return nil, err
 	}
 	defer rows.Close()
-	var out []PendingProfile
+	out := []PendingProfile{}
 	for rows.Next() {
 		var p PendingProfile
 		var completedAt, verifiedAt, earliestExp *time.Time

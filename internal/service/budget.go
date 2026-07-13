@@ -32,7 +32,6 @@ type BudgetSnapshot struct {
 	Credits             int       `json:"credits"`
 	LectureCredits      int       `json:"lecture_credits"`
 	LabCredits          int       `json:"lab_credits"`
-	HoursCap            int       `json:"hours_cap"`      // from hour_caps
 	PerCourseMaxBaht    float64   `json:"per_course_max"` // from budget_caps
 	// Aggregate (regular + special)
 	WeeklyWorkload      float64   `json:"weekly_workload_hours"`
@@ -85,8 +84,6 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	if snap.NumStudentsRegular == 0 && snap.NumStudentsSpecial == 0 && snap.NumStudents > 0 {
 		snap.NumStudentsRegular = snap.NumStudents
 	}
-	_ = s.pool.QueryRow(ctx,
-		`SELECT hours_cap FROM hour_caps WHERE credits = $1`, snap.Credits).Scan(&snap.HoursCap)
 	// per_course_max is derived from the formula (weekly workload × rate × months)
 	// — set below after workload is computed. No more manual budget_caps.
 
@@ -155,7 +152,11 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	snap.SuggestedTAs.Undergrad = min(3, (totalStudents+24)/25)
 	snap.SuggestedTAs.Graduate = min(2, totalStudents/60)
 
-	// Used baht: undergrad uses recorded hours × hourly rate; grad uses lump-sum × months.
+	// Used baht — reflects post-2026 payment model (ประกาศ 731/2565 + 1080/2565):
+	//   Undergrad: SUM(hours × per-track hourly rate) from approved work_logs.
+	//   Grad regular: SUM(hours × graduate_regular_hourly) — now hourly (was lump-sum).
+	//   Grad special: flat 4,000฿/month × term months, capped at grad_special_term_cap
+	//                 (12,000฿/TA/course/term). Counted per assignment.
 	// Months come from academic_terms (per-term); fall back to pay_rates.term_months.
 	_ = s.pool.QueryRow(ctx, `
         WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
@@ -178,17 +179,27 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
              CROSS JOIN latest pr
              WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND u.study_level = 'undergrad')
           +
+            (SELECT COALESCE(SUM(wl.hours * pr.graduate_regular_hourly), 0)
+             FROM work_logs wl
+             JOIN ta_request_assignments a ON a.id = wl.assignment_id
+             JOIN ta_requests r  ON r.id = a.request_id
+             JOIN sections sec   ON sec.id = a.section_id
+             JOIN users u        ON u.id = a.ta_id
+             CROSS JOIN latest pr
+             WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
+               AND u.study_level IN ('master','phd') AND sec.track = 'regular')
+          +
             (SELECT COALESCE(SUM(
-                CASE WHEN sec.track = 'regular' THEN pr.graduate_regular
-                     ELSE pr.graduate_special_lumpsum END
-                * (SELECT months FROM tm)
+                LEAST(pr.graduate_special_lumpsum * (SELECT months FROM tm),
+                      pr.grad_special_term_cap)
              ), 0)
              FROM ta_request_assignments a
              JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
              JOIN sections sec   ON sec.id = a.section_id
              JOIN users u        ON u.id = a.ta_id
              CROSS JOIN latest pr
-             WHERE r.teaching_course_id = $1 AND u.study_level IN ('master','phd'))
+             WHERE r.teaching_course_id = $1 AND u.study_level IN ('master','phd')
+               AND sec.track = 'special')
         , 0)`, tcID).Scan(&snap.UsedBaht)
 
 	snap.RemainingBaht = snap.PerCourseMaxBaht - snap.UsedBaht

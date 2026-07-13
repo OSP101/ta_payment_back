@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
@@ -38,7 +37,7 @@ func (s *CourseService) List(ctx context.Context, search string) ([]FacultyCours
 		return nil, err
 	}
 	defer rows.Close()
-	var out []FacultyCourse
+	out := []FacultyCourse{}
 	for rows.Next() {
 		var c FacultyCourse
 		if err := rows.Scan(&c.ID, &c.Code, &c.NameTH, &c.NameEN, &c.Credits, &c.LectureHrs, &c.LabHrs, &c.SelfHrs, &c.Department, &c.IsActive); err != nil {
@@ -96,10 +95,11 @@ func (s *CourseService) Delete(ctx context.Context, actor, id uuid.UUID) error {
 type PayRate struct {
 	ID                      uuid.UUID `json:"id"`
 	EffectiveFrom           string    `json:"effective_from"`
-	UndergradRegular        float64   `json:"undergrad_regular"`         // hourly, for actual payment
-	UndergradSpecial        float64   `json:"undergrad_special"`         // hourly, for actual payment
-	GraduateRegular         float64   `json:"graduate_regular"`          // monthly lump-sum (grad regular)
-	GraduateSpecialLumpsum  float64   `json:"graduate_special_lumpsum"`  // monthly lump-sum (grad special)
+	UndergradRegular        float64   `json:"undergrad_regular"`         // hourly, ประกาศ 731/2565 = 40 ฿/hr
+	UndergradSpecial        float64   `json:"undergrad_special"`         // hourly, ประกาศ 1080/2565 = 50 ฿/hr
+	// Deprecated: kept for rollback safety. Payment/budget now read GraduateRegularHourly.
+	GraduateRegular         float64   `json:"graduate_regular"`
+	GraduateSpecialLumpsum  float64   `json:"graduate_special_lumpsum"`  // monthly lump-sum, ประกาศ = 4,000 ฿/เดือน
 	// Undergrad budget formula constants (from historical Excel workbook):
 	UGLectureHoursPerCredit float64   `json:"ug_lecture_hours_per_credit"`
 	UGLabHoursPerCredit     float64   `json:"ug_lab_hours_per_credit"`
@@ -115,6 +115,13 @@ type PayRate struct {
 	// Policy limits (advisory) — from the official regulation notes.
 	UGMaxHoursPerDay        int       `json:"ug_max_hours_per_day"`      // undergrad regular: max hrs/day (7)
 	MaxCoursesPerStudent    int       `json:"max_courses_per_student"`   // any student: max concurrent TA courses (3)
+	// New (migration 0018) — per-track daily caps + graduate hourly rate + term/day money caps.
+	GraduateRegularHourly    float64  `json:"graduate_regular_hourly"`   // hourly rate for บัณฑิต regular (50 ฿/hr per ประกาศ)
+	GradSpecialTermCap       float64  `json:"grad_special_term_cap"`     // per TA × course × term cap for บัณฑิต special (12,000 ฿)
+	DailyPayCapBaht          float64  `json:"daily_pay_cap_baht"`        // อัตราค่าตอบแทน hourly ≤ 300 ฿/วัน
+	UGRegularDailyHourCap    float64  `json:"ug_regular_daily_hour_cap"` // ป.ตรี ปกติ ≤ 7 hrs/วัน
+	UGSpecialDailyHourCap    float64  `json:"ug_special_daily_hour_cap"` // ป.ตรี พิเศษ ≤ 6 hrs/วัน
+	GradRegularDailyHourCap  float64  `json:"grad_regular_daily_hour_cap"` // บัณฑิต ปกติ ≤ 6 hrs/วัน
 	Note                    *string   `json:"note,omitempty"`
 }
 
@@ -126,14 +133,20 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		       ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 		       baseline_students_lecture, baseline_students_lab,
 		       ug_workload_rate_regular, ug_workload_rate_special, term_months,
-		       ug_max_hours_per_day, max_courses_per_student, note
+		       ug_max_hours_per_day, max_courses_per_student,
+		       graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
+		       ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
+		       note
 		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
 		&pr.ID, &pr.EffectiveFrom, &pr.UndergradRegular, &pr.UndergradSpecial,
 		&pr.GraduateRegular, &pr.GraduateSpecialLumpsum,
 		&pr.UGLectureHoursPerCredit, &pr.UGLabHoursPerCredit,
 		&pr.BaselineStudentsLecture, &pr.BaselineStudentsLab,
 		&pr.UGWorkloadRateRegular, &pr.UGWorkloadRateSpecial, &pr.TermMonths,
-		&pr.UGMaxHoursPerDay, &pr.MaxCoursesPerStudent, &pr.Note)
+		&pr.UGMaxHoursPerDay, &pr.MaxCoursesPerStudent,
+		&pr.GraduateRegularHourly, &pr.GradSpecialTermCap, &pr.DailyPayCapBaht,
+		&pr.UGRegularDailyHourCap, &pr.UGSpecialDailyHourCap, &pr.GradRegularDailyHourCap,
+		&pr.Note)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +162,9 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		in.UGLectureHoursPerCredit < 0 || in.UGLabHoursPerCredit < 0 ||
 		in.BaselineStudentsLecture < 0 || in.BaselineStudentsLab < 0 ||
 		in.UGWorkloadRateRegular < 0 || in.UGWorkloadRateSpecial < 0 ||
-		in.TermMonths < 0 || in.UGMaxHoursPerDay < 0 || in.MaxCoursesPerStudent < 0 {
+		in.TermMonths < 0 || in.UGMaxHoursPerDay < 0 || in.MaxCoursesPerStudent < 0 ||
+		in.GraduateRegularHourly < 0 || in.GradSpecialTermCap < 0 || in.DailyPayCapBaht < 0 ||
+		in.UGRegularDailyHourCap < 0 || in.UGSpecialDailyHourCap < 0 || in.GradRegularDailyHourCap < 0 {
 		return nil, Invalid("ค่าตัวเลขต้องไม่ติดลบ")
 	}
 	// Actual payment rates have no default — a 0 rate breaks payroll.
@@ -171,78 +186,38 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 	if in.TermMonths == 0              { in.TermMonths = 4 }
 	if in.UGMaxHoursPerDay == 0        { in.UGMaxHoursPerDay = 7 }
 	if in.MaxCoursesPerStudent == 0    { in.MaxCoursesPerStudent = 3 }
+	// ประกาศ 731/2565 + 1080/2565 defaults for the new caps.
+	if in.GraduateRegularHourly == 0    { in.GraduateRegularHourly = 50 }
+	if in.GradSpecialTermCap == 0       { in.GradSpecialTermCap = 12000 }
+	if in.DailyPayCapBaht == 0          { in.DailyPayCapBaht = 300 }
+	if in.UGRegularDailyHourCap == 0    { in.UGRegularDailyHourCap = 7 }
+	if in.UGSpecialDailyHourCap == 0    { in.UGSpecialDailyHourCap = 6 }
+	if in.GradRegularDailyHourCap == 0  { in.GradRegularDailyHourCap = 6 }
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO pay_rates (id, effective_from, undergrad_regular, undergrad_special,
 		    graduate_regular, graduate_special_lumpsum,
 		    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 		    baseline_students_lecture, baseline_students_lab,
 		    ug_workload_rate_regular, ug_workload_rate_special, term_months,
-		    ug_max_hours_per_day, max_courses_per_student, note)
-		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+		    ug_max_hours_per_day, max_courses_per_student,
+		    graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
+		    ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
+		    note)
+		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
 		in.ID, in.EffectiveFrom, in.UndergradRegular, in.UndergradSpecial,
 		in.GraduateRegular, in.GraduateSpecialLumpsum,
 		in.UGLectureHoursPerCredit, in.UGLabHoursPerCredit,
 		in.BaselineStudentsLecture, in.BaselineStudentsLab,
 		in.UGWorkloadRateRegular, in.UGWorkloadRateSpecial, in.TermMonths,
-		in.UGMaxHoursPerDay, in.MaxCoursesPerStudent, in.Note)
+		in.UGMaxHoursPerDay, in.MaxCoursesPerStudent,
+		in.GraduateRegularHourly, in.GradSpecialTermCap, in.DailyPayCapBaht,
+		in.UGRegularDailyHourCap, in.UGSpecialDailyHourCap, in.GradRegularDailyHourCap,
+		in.Note)
 	if err != nil {
 		return nil, err
 	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "pay_rate.create", Entity: "pay_rate", EntityID: in.ID.String(), After: in})
 	return &in, nil
-}
-
-type HourCap struct {
-	ID       uuid.UUID `json:"id"`
-	Credits  int       `json:"credits"`
-	HoursCap int       `json:"hours_cap"`
-	Note     *string   `json:"note,omitempty"`
-}
-
-func (s *CourseService) ListHourCaps(ctx context.Context) ([]HourCap, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, credits, hours_cap, note FROM hour_caps ORDER BY credits`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []HourCap
-	for rows.Next() {
-		var h HourCap
-		if err := rows.Scan(&h.ID, &h.Credits, &h.HoursCap, &h.Note); err != nil {
-			return nil, err
-		}
-		out = append(out, h)
-	}
-	return out, nil
-}
-
-func (s *CourseService) UpsertHourCap(ctx context.Context, actor uuid.UUID, in HourCap) (*HourCap, error) {
-	if in.Credits <= 0 || in.HoursCap < 0 {
-		return nil, Invalid("จำนวนหน่วยกิตและชั่วโมงต้องไม่ติดลบ")
-	}
-	in.ID = uuid.New()
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO hour_caps (id, credits, hours_cap, note) VALUES ($1,$2,$3,$4)
-		 ON CONFLICT (credits) DO UPDATE SET hours_cap=EXCLUDED.hours_cap, note=EXCLUDED.note`,
-		in.ID, in.Credits, in.HoursCap, in.Note)
-	if err != nil {
-		return nil, err
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "hour_cap.upsert", Entity: "hour_cap", EntityID: in.ID.String(), After: in})
-	return &in, nil
-}
-
-func (s *CourseService) DeleteHourCap(ctx context.Context, actor uuid.UUID, credits int) error {
-	res, err := s.pool.Exec(ctx, `DELETE FROM hour_caps WHERE credits = $1`, credits)
-	if err != nil {
-		return err
-	}
-	if res.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "hour_cap.delete", Entity: "hour_cap",
-		EntityID: fmt.Sprintf("credits=%d", credits)})
-	return nil
 }
 
 type BudgetCap struct {

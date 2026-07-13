@@ -17,7 +17,8 @@ type Container struct {
 	Auditor  *audit.Auditor
 	Cfg      config.Config
 
-	Users      *UserService
+	Appointment *AppointmentOrderService
+	Users       *UserService
 	Courses    *CourseService
 	Teaching   *TeachingService
 	TARequest  *TARequestService
@@ -30,6 +31,8 @@ type Container struct {
 	Notify     *NotifyService
 	Dashboard  *DashboardService
 	AdminOfficers *AdminOfficerService
+	SubmissionPeriods *SubmissionPeriodService
+	ExportBatches *ExportBatchService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config) *Container {
@@ -42,10 +45,13 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.TARequest = &TARequestService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
 	c.Docs = &DocsService{pool: pool, aud: auditor, store: store}
 	c.Workload = &WorkloadService{pool: pool}
-	c.WorkLog = &WorkLogService{pool: pool, aud: auditor, budget: c.Budget}
-	c.Export = &ExportService{pool: pool, store: store}
+	c.WorkLog = &WorkLogService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
+	c.Export = &ExportService{pool: pool, store: store, budget: c.Budget, fontDir: cfg.FontDir}
 	c.Announce = &AnnounceService{pool: pool, aud: auditor, notify: c.Notify}
 	c.Dashboard = &DashboardService{pool: pool}
 	c.AdminOfficers = &AdminOfficerService{pool: pool, aud: auditor}
+	c.SubmissionPeriods = &SubmissionPeriodService{pool: pool, aud: auditor, notify: c.Notify}
+	c.ExportBatches = &ExportBatchService{pool: pool, aud: auditor}
+	c.Appointment = &AppointmentOrderService{pool: pool, aud: auditor, fontDir: cfg.FontDir}
 	return c
 }
