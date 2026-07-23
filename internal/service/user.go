@@ -45,6 +45,7 @@ type CreateUserInput struct {
 	Title      *string  `json:"title,omitempty"`
 	FirstName  string   `json:"first_name"`
 	LastName   string   `json:"last_name"`
+	Phone      *string  `json:"phone,omitempty"`
 	Roles      []string `json:"roles"`
 	StudyLevel *string  `json:"study_level,omitempty"`
 	StudyYear  *int     `json:"study_year,omitempty"`
@@ -113,9 +114,9 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 	}
 	id := uuid.New()
 	_, err = tx.Exec(ctx,
-		`INSERT INTO users (id, email, title, first_name, last_name, study_level, study_year, password_hash, must_change_password)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE)`,
-		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.StudyLevel, in.StudyYear, pwHash)
+		`INSERT INTO users (id, email, title, first_name, last_name, phone, study_level, study_year, password_hash, must_change_password)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE)`,
+		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.Phone, in.StudyLevel, in.StudyYear, pwHash)
 	if err != nil {
 		return nil, err
 	}

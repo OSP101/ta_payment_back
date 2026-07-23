@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -59,96 +60,129 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		return nil, "", Invalid("ไม่พบข้อมูลผู้ลงนามในระบบ")
 	}
 
-	// Roster: every distinct (TA × course × track × level) with an approved
-	// assignment in this term. Ordered by course code so the printed table
-	// naturally groups by course.
+	// Roster: one line per distinct (TA × course), scoped to approved
+	// assignments in this term. A TA teaching several sections of the same
+	// course (or both regular + special) is collapsed to a single roster line
+	// via GROUP BY. Ordered so undergraduate-level appointments print first,
+	// then graduate; within a level, science-faculty courses (SC*, the older
+	// programme) print before computing courses (CP*), then any other prefix,
+	// then by course code and TA name — matching the registrar's บัญชีแนบท้าย
+	// layout.
 	rows, err := s.pool.Query(ctx, `
-		SELECT a.ta_id, MIN(u.first_name || ' ' || u.last_name),
-		       fc.code, sec.track::text, a.level::text
+		SELECT CASE WHEN fc.level = 'undergrad' THEN 0 ELSE 1 END AS level_bucket,
+		       fc.code,
+		       COALESCE(NULLIF(fc.name_en, ''), fc.name_th) AS course_name,
+		       fc.credits, fc.lecture_hrs, fc.lab_hrs, fc.self_hrs,
+		       COALESCE(u.student_id, '') AS student_id,
+		       COALESCE(NULLIF(tp.prefix, ''), NULLIF(u.title, ''), '') AS prefix,
+		       u.first_name, u.last_name
 		FROM ta_request_assignments a
-		JOIN ta_requests r      ON r.id = a.request_id AND r.status = 'approved'
-		JOIN users u            ON u.id = a.ta_id
-		JOIN sections sec       ON sec.id = a.section_id
+		JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
+		JOIN users u             ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
+		JOIN sections sec        ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		JOIN faculty_courses fc  ON fc.id = tc.faculty_course_id
 		WHERE tc.term_id = $1
-		GROUP BY a.ta_id, fc.code, sec.track, a.level
-		ORDER BY fc.code, MIN(u.first_name)`, in.TermID)
+		GROUP BY level_bucket, fc.code, course_name,
+		         fc.credits, fc.lecture_hrs, fc.lab_hrs, fc.self_hrs,
+		         u.student_id, tp.prefix, u.title, u.first_name, u.last_name
+		ORDER BY level_bucket,
+		         CASE WHEN fc.code LIKE 'SC%' THEN 0
+		              WHEN fc.code LIKE 'CP%' THEN 1
+		              ELSE 2 END,
+		         fc.code, u.first_name, u.last_name`, in.TermID)
 	if err != nil {
 		return nil, "", err
 	}
 	defer rows.Close()
 
-	type roster struct {
-		taID       uuid.UUID
-		fullName   string
-		courseCode string
-		track      string
-		level      string
+	type rosterRow struct {
+		levelBucket int
+		code        string
+		courseName  string
+		creditText  string
+		studentID   string
+		firstName   string
+		lastName    string
 	}
-	var list []roster
+	var list []rosterRow
 	for rows.Next() {
-		var r roster
-		if err := rows.Scan(&r.taID, &r.fullName, &r.courseCode, &r.track, &r.level); err != nil {
+		var r rosterRow
+		var credits, lec, lab, self int
+		var prefix string
+		if err := rows.Scan(&r.levelBucket, &r.code, &r.courseName,
+			&credits, &lec, &lab, &self, &r.studentID, &prefix, &r.firstName, &r.lastName); err != nil {
 			return nil, "", err
 		}
+		r.creditText = fmt.Sprintf("%d (%d-%d-%d)", credits, lec, lab, self)
+		// The template prints the honorific joined to the given name in the
+		// name column ("นายชาคริต"). Prefix comes from the TA's own profile
+		// (นาย/นาง/นางสาว), falling back to users.title.
+		r.firstName = prefix + r.firstName
 		list = append(list, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
 	}
 	if len(list) == 0 {
 		return nil, "", Invalid("ยังไม่มีทีเอที่ได้รับอนุมัติในภาคเรียนนี้")
 	}
 
-	// Old/new lookup — reuse export.isReturningTA logic inline (single-purpose here).
-	returningCache := map[uuid.UUID]bool{}
-	for _, r := range list {
-		if _, ok := returningCache[r.taID]; ok {
-			continue
+	// Fold the flat, pre-ordered rows into level → course → appointee groups.
+	// The query ordering guarantees rows arrive grouped, so we start a new
+	// group only when the level bucket or course code changes.
+	levelHeading := func(bucket int) string {
+		if bucket == 0 {
+			return "รายวิชาระดับปริญญาตรี"
 		}
-		var yes bool
-		_ = s.pool.QueryRow(ctx, `
-			SELECT EXISTS(
-				SELECT 1 FROM ta_request_assignments a
-				JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
-				JOIN sections sec   ON sec.id = a.section_id
-				JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-				JOIN academic_terms t   ON t.id = tc.term_id
-				JOIN academic_terms cur ON cur.id = $2
-				WHERE a.ta_id = $1
-				  AND (t.academic_year < cur.academic_year
-				       OR (t.academic_year = cur.academic_year AND t.semester < cur.semester))
-			)`, r.taID, in.TermID).Scan(&yes)
-		returningCache[r.taID] = yes
+		return "รายวิชาระดับบัณฑิตศึกษา"
 	}
 
-	// Build shared appointee slices for both renderers.
-	pdfAppointees := make([]pdfgen.AppointmentAppointee, 0, len(list))
-	docxAppointees := make([]docxgen.Appointee, 0, len(list))
+	var docxLevels []docxgen.LevelGroup
+	curBucket := -1
+	curCode := ""
 	for _, r := range list {
-		levelTH := r.level
-		switch r.level {
-		case "undergrad":
-			levelTH = "ปริญญาตรี"
-		case "master":
-			levelTH = "ปริญญาโท"
-		case "phd":
-			levelTH = "ปริญญาเอก"
+		if r.levelBucket != curBucket {
+			docxLevels = append(docxLevels, docxgen.LevelGroup{Heading: levelHeading(r.levelBucket)})
+			curBucket = r.levelBucket
+			curCode = ""
 		}
-		trackTH := r.track
-		switch r.track {
-		case "regular":
-			trackTH = "ภาคปกติ"
-		case "special":
-			trackTH = "ภาคพิเศษ"
+		lv := &docxLevels[len(docxLevels)-1]
+		if r.code != curCode {
+			lv.Courses = append(lv.Courses, docxgen.CourseGroup{
+				Code: r.code, Name: r.courseName, CreditText: r.creditText,
+			})
+			curCode = r.code
 		}
-		pdfAppointees = append(pdfAppointees, pdfgen.AppointmentAppointee{
-			FullName: r.fullName, Level: levelTH, Track: trackTH,
-			CourseCode: r.courseCode, IsReturning: returningCache[r.taID],
-		})
-		docxAppointees = append(docxAppointees, docxgen.Appointee{
-			FullName: r.fullName, Level: levelTH, Track: trackTH,
-			CourseCode: r.courseCode, Returning: returningCache[r.taID],
+		c := &lv.Courses[len(lv.Courses)-1]
+		c.Appointees = append(c.Appointees, docxgen.Appointee{
+			StudentID: r.studentID, FirstName: r.firstName, LastName: r.lastName,
 		})
 	}
+
+	// Mirror the same hierarchy for the PDF renderer.
+	pdfLevels := make([]pdfgen.AppointmentLevel, 0, len(docxLevels))
+	for _, lv := range docxLevels {
+		pl := pdfgen.AppointmentLevel{Heading: lv.Heading}
+		for _, c := range lv.Courses {
+			pc := pdfgen.AppointmentCourse{Code: c.Code, Name: c.Name, CreditText: c.CreditText}
+			for _, ap := range c.Appointees {
+				pc.Appointees = append(pc.Appointees, pdfgen.AppointmentAppointee{
+					StudentID: ap.StudentID, FirstName: ap.FirstName, LastName: ap.LastName,
+				})
+			}
+			pl.Courses = append(pl.Courses, pc)
+		}
+		pdfLevels = append(pdfLevels, pl)
+	}
+
+	// Dates arrive from the form as ISO (YYYY-MM-DD) and are formatted here into
+	// the Thai government style: order date with the era marker
+	// ("14 มกราคม พ.ศ. 2569"), effective date without ("24 พฤศจิกายน 2568"),
+	// matching the registrar template.
+	orderDate := thaiGovDate(in.OrderDate, true)
+	effectiveDate := thaiGovDate(in.EffectiveDate, false)
 
 	// Render both formats.
 	pdfBytes, err := pdfgen.BuildAppointmentOrderPDF(pdfgen.AppointmentOrderInput{
@@ -157,11 +191,11 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 			OrderNo:       in.OrderNo,
 			AcademicYear:  academicYear,
 			SemesterLabel: semLabel,
-			OrderDate:     in.OrderDate,
-			EffectiveDate: in.EffectiveDate,
+			OrderDate:     orderDate,
+			EffectiveDate: effectiveDate,
 			SignerName:    signerName,
 			SignerTitle:   signerTitle,
-			Appointees:    pdfAppointees,
+			Levels:        pdfLevels,
 		},
 	})
 	if err != nil {
@@ -173,11 +207,11 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		OrderNo:       in.OrderNo,
 		AcademicYear:  academicYear,
 		SemesterLabel: semLabel,
-		OrderDate:     in.OrderDate,
-		EffectiveDate: in.EffectiveDate,
+		OrderDate:     orderDate,
+		EffectiveDate: effectiveDate,
 		SignerName:    signerName,
 		SignerTitle:   signerTitle,
-		Appointees:    docxAppointees,
+		Levels:        docxLevels,
 	})
 	if err != nil {
 		return nil, "", err
@@ -205,4 +239,57 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		After: map[string]any{"order_no": in.OrderNo, "count": len(list)},
 	})
 	return buf.Bytes(), base + ".zip", nil
+}
+
+// ensureBuddhistEra inserts "พ.ศ." before a trailing 4-digit year when staff
+// typed a Thai date without the era marker — "14 มกราคม 2569" becomes
+// "14 มกราคม พ.ศ. 2569", matching the registrar template. Dates that already
+// carry พ.ศ. (or don't end in a year) pass through untouched.
+func ensureBuddhistEra(date string) string {
+	if strings.Contains(date, "พ.ศ.") {
+		return date
+	}
+	fields := strings.Fields(date)
+	if len(fields) < 2 {
+		return date
+	}
+	year := fields[len(fields)-1]
+	if len(year) != 4 {
+		return date
+	}
+	for _, r := range year {
+		if r < '0' || r > '9' {
+			return date
+		}
+	}
+	fields[len(fields)-1] = "พ.ศ. " + year
+	return strings.Join(fields, " ")
+}
+
+var thaiMonths = [...]string{
+	"มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+	"กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
+}
+
+// thaiGovDate formats an ISO date ("2026-01-14", Gregorian) into the Thai
+// government style: day + full Thai month + Buddhist-era year (+543), e.g.
+// "14 มกราคม พ.ศ. 2569" (withEra) or "14 มกราคม 2569" (without). If the input
+// isn't ISO it's assumed to be a pre-formatted Thai string and passed through
+// (ensureBuddhistEra still fixes a missing พ.ศ. on the order date).
+func thaiGovDate(s string, withEra bool) string {
+	s = strings.TrimSpace(s)
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		if withEra {
+			return ensureBuddhistEra(s)
+		}
+		return s
+	}
+	day := t.Day()
+	month := thaiMonths[int(t.Month())-1]
+	yearBE := t.Year() + 543
+	if withEra {
+		return fmt.Sprintf("%d %s พ.ศ. %d", day, month, yearBE)
+	}
+	return fmt.Sprintf("%d %s %d", day, month, yearBE)
 }

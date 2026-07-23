@@ -65,6 +65,11 @@ type Config struct {
 	// TADocsEncKey is a 32-byte AES-256 key (base64) used to encrypt TA
 	// documents at rest. Optional — when empty, files are stored unencrypted.
 	TADocsEncKey string
+	// BOT (Bank of Thailand) Open API — Financial Institutions' Holidays.
+	// Used by the "ซิงก์จาก BOT" button on /staff/holidays to seed national
+	// holidays. Empty ClientID → sync endpoint returns 503.
+	BotAPIBaseURL  string
+	BotAPIClientID string
 }
 
 func Load() (Config, error) {
@@ -95,6 +100,8 @@ func Load() (Config, error) {
 		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.pdf"),
 		FontDir:              env("FONT_DIR", "./assets/fonts"),
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
+		BotAPIBaseURL:        env("BOT_API_BASE_URL", "https://gateway.api.bot.or.th/financial-institutions-holidays"),
+		BotAPIClientID:       env("BOT_API_CLIENT_ID", ""),
 	}
 	c.SSOEnabled = c.SSOAuthURL != "" && c.SSOClientID != ""
 	c.JWTLifetime = envDuration("JWT_LIFETIME", 12*time.Hour)

@@ -109,3 +109,56 @@ func TestProrata_SingleRow(t *testing.T) {
 		t.Errorf("got %.2f want 8000", rs[0].actualPaid)
 	}
 }
+
+// --- Two-pool (track) prorata: regular vs special budget pools ---------------
+
+func trackRows(pairs ...[2]float64) []exportRow {
+	rs := make([]exportRow, len(pairs))
+	for i, p := range pairs {
+		rs[i] = exportRow{payRegular: p[0], paySpecial: p[1], payBaht: p[0] + p[1], actualPaid: p[0] + p[1]}
+	}
+	return rs
+}
+
+func TestTrackProrata_UnderBothPools(t *testing.T) {
+	rs := trackRows([2]float64{5000, 3000}, [2]float64{4000, 2000})
+	if applyTrackProrataCap(rs, 20000, 20000) {
+		t.Fatalf("expected no scaling when both pools have room")
+	}
+	if math.Abs(rs[0].actualPaid-8000) > 0.01 || math.Abs(rs[1].actualPaid-6000) > 0.01 {
+		t.Errorf("actualPaid must equal reg+spec: %.2f %.2f", rs[0].actualPaid, rs[1].actualPaid)
+	}
+}
+
+func TestTrackProrata_RegularOverPool_SpecialUntouched(t *testing.T) {
+	// Σreg=15000 pool=9000 → k=0.6; Σspec=4000 pool=10000 → untouched.
+	rs := trackRows([2]float64{10000, 3000}, [2]float64{5000, 1000})
+	if !applyTrackProrataCap(rs, 9000, 10000) {
+		t.Fatalf("expected scaling when regular pool exceeded")
+	}
+	if math.Abs(rs[0].actualPaid-9000) > 0.01 || math.Abs(rs[1].actualPaid-4000) > 0.01 {
+		t.Errorf("got %.2f %.2f, want 9000 4000", rs[0].actualPaid, rs[1].actualPaid)
+	}
+}
+
+func TestTrackProrata_SpecialOverPool_RegularUntouched(t *testing.T) {
+	// Σreg=3000 pool=10000 → untouched; Σspec=12000 pool=6000 → k=0.5.
+	rs := trackRows([2]float64{2000, 8000}, [2]float64{1000, 4000})
+	if !applyTrackProrataCap(rs, 10000, 6000) {
+		t.Fatalf("expected scaling when special pool exceeded")
+	}
+	if math.Abs(rs[0].actualPaid-6000) > 0.01 || math.Abs(rs[1].actualPaid-3000) > 0.01 {
+		t.Errorf("got %.2f %.2f, want 6000 3000", rs[0].actualPaid, rs[1].actualPaid)
+	}
+}
+
+func TestTrackProrata_ZeroPoolIsUnlimited(t *testing.T) {
+	// specialPool=0 must NOT zero out special pay (missing data ≠ zero budget).
+	rs := trackRows([2]float64{1000, 5000})
+	if applyTrackProrataCap(rs, 10000, 0) {
+		t.Errorf("pool<=0 must be treated as unlimited")
+	}
+	if math.Abs(rs[0].actualPaid-6000) > 0.01 {
+		t.Errorf("actualPaid must stay full when pool unlimited, got %.2f", rs[0].actualPaid)
+	}
+}

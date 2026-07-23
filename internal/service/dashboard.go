@@ -104,6 +104,7 @@ type LecturerCourseStatus struct {
 	CourseNameTH     string    `json:"course_name_th"`
 	TermLabel        string    `json:"term_label"`
 	TACount          int       `json:"ta_count"`
+	TAsPending       int       `json:"ta_pending_count"`
 	HoursPending     float64   `json:"hours_pending_approval"`
 	HoursApproved    float64   `json:"hours_approved"`
 	EstimatedBaht    float64   `json:"estimated_baht"`
@@ -125,6 +126,7 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		SELECT tc.id, fc.code, fc.name_th,
 		       t.academic_year || '/' || t.semester,
 		       COUNT(DISTINCT a.ta_id) FILTER (WHERE a.ta_id IS NOT NULL),
+		       COUNT(DISTINCT a.ta_id) FILTER (WHERE wl.status='submitted'),
 		       COALESCE(SUM(CASE WHEN wl.status='submitted' THEN wl.hours END),0),
 		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN wl.hours END),0),
 		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN
@@ -155,7 +157,7 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 	for rows.Next() {
 		var r LecturerCourseStatus
 		if err := rows.Scan(&r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
-			&r.TermLabel, &r.TACount,
+			&r.TermLabel, &r.TACount, &r.TAsPending,
 			&r.HoursPending, &r.HoursApproved, &r.EstimatedBaht); err != nil {
 			return nil, err
 		}

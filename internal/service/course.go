@@ -11,16 +11,19 @@ import (
 )
 
 type FacultyCourse struct {
-	ID         uuid.UUID `json:"id"`
-	Code       string    `json:"code"`
-	NameTH     string    `json:"name_th"`
-	NameEN     *string   `json:"name_en,omitempty"`
-	Credits    int       `json:"credits"`
-	LectureHrs int       `json:"lecture_hrs"`
-	LabHrs     int       `json:"lab_hrs"`
-	SelfHrs    int       `json:"self_hrs"`
-	Department *string   `json:"department,omitempty"`
-	IsActive   bool      `json:"is_active"`
+	ID   uuid.UUID `json:"id"`
+	Code string    `json:"code"`
+	// Level is the course's teaching level: "undergrad" (ปริญญาตรี) or
+	// "graduate" (บัณฑิตศึกษา). Drives how the appointment order groups courses.
+	Level      string  `json:"level"`
+	NameTH     string  `json:"name_th"`
+	NameEN     *string `json:"name_en,omitempty"`
+	Credits    int     `json:"credits"`
+	LectureHrs int     `json:"lecture_hrs"`
+	LabHrs     int     `json:"lab_hrs"`
+	SelfHrs    int     `json:"self_hrs"`
+	Department *string `json:"department,omitempty"`
+	IsActive   bool    `json:"is_active"`
 }
 
 type CourseService struct {
@@ -29,8 +32,8 @@ type CourseService struct {
 }
 
 func (s *CourseService) List(ctx context.Context, search string) ([]FacultyCourse, error) {
-	q := `SELECT id, code, name_th, name_en, credits, lecture_hrs, lab_hrs, self_hrs, department, is_active
-	      FROM faculty_courses WHERE ($1 = '' OR code ILIKE '%'||$1||'%' OR name_th ILIKE '%'||$1||'%')
+	q := `SELECT id, code, level, name_th, name_en, credits, lecture_hrs, lab_hrs, self_hrs, department, is_active
+	      FROM faculty_courses WHERE ($1 = '' OR code ILIKE '%'||$1||'%' OR name_th ILIKE '%'||$1||'%' OR name_en ILIKE '%'||$1||'%')
 		  ORDER BY code`
 	rows, err := s.pool.Query(ctx, q, search)
 	if err != nil {
@@ -40,7 +43,7 @@ func (s *CourseService) List(ctx context.Context, search string) ([]FacultyCours
 	out := []FacultyCourse{}
 	for rows.Next() {
 		var c FacultyCourse
-		if err := rows.Scan(&c.ID, &c.Code, &c.NameTH, &c.NameEN, &c.Credits, &c.LectureHrs, &c.LabHrs, &c.SelfHrs, &c.Department, &c.IsActive); err != nil {
+		if err := rows.Scan(&c.ID, &c.Code, &c.Level, &c.NameTH, &c.NameEN, &c.Credits, &c.LectureHrs, &c.LabHrs, &c.SelfHrs, &c.Department, &c.IsActive); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -56,12 +59,19 @@ func (s *CourseService) Upsert(ctx context.Context, actor uuid.UUID, in FacultyC
 	if in.Credits < 0 || in.LectureHrs < 0 || in.LabHrs < 0 || in.SelfHrs < 0 {
 		return nil, Invalid("หน่วยกิตและจำนวนชั่วโมงต้องไม่ติดลบ")
 	}
+	// Level defaults to undergrad; only the two known values are accepted.
+	if in.Level == "" {
+		in.Level = "undergrad"
+	}
+	if in.Level != "undergrad" && in.Level != "graduate" {
+		return nil, Invalid("ระดับวิชาต้องเป็นปริญญาตรีหรือบัณฑิตศึกษา")
+	}
 	if in.ID == uuid.Nil {
 		in.ID = uuid.New()
 		_, err := s.pool.Exec(ctx,
-			`INSERT INTO faculty_courses (id, code, name_th, name_en, credits, lecture_hrs, lab_hrs, self_hrs, department, is_active)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			in.ID, in.Code, in.NameTH, in.NameEN, in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs, in.Department, in.IsActive)
+			`INSERT INTO faculty_courses (id, code, level, name_th, name_en, credits, lecture_hrs, lab_hrs, self_hrs, department, is_active)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			in.ID, in.Code, in.Level, in.NameTH, in.NameEN, in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs, in.Department, in.IsActive)
 		if err != nil {
 			return nil, err
 		}
@@ -69,9 +79,9 @@ func (s *CourseService) Upsert(ctx context.Context, actor uuid.UUID, in FacultyC
 		return &in, nil
 	}
 	res, err := s.pool.Exec(ctx,
-		`UPDATE faculty_courses SET code=$2, name_th=$3, name_en=$4, credits=$5, lecture_hrs=$6, lab_hrs=$7, self_hrs=$8, department=$9, is_active=$10, updated_at=NOW()
+		`UPDATE faculty_courses SET code=$2, level=$3, name_th=$4, name_en=$5, credits=$6, lecture_hrs=$7, lab_hrs=$8, self_hrs=$9, department=$10, is_active=$11, updated_at=NOW()
 		 WHERE id=$1`,
-		in.ID, in.Code, in.NameTH, in.NameEN, in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs, in.Department, in.IsActive)
+		in.ID, in.Code, in.Level, in.NameTH, in.NameEN, in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs, in.Department, in.IsActive)
 	if err != nil {
 		return nil, err
 	}

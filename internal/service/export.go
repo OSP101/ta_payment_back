@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,20 +37,84 @@ type exportRow struct {
 	track       string
 	level       string
 	hoursTotal  float64
+	payRegular  float64 // earned from regular-track work (pre-cap)
+	paySpecial  float64 // earned from special-track work incl. grad lump (pre-cap)
 	payBaht     float64
 	actualPaid  float64
 	isReturning bool
 }
 
+// exportComputation is the fully-priced result of a course export, shared by
+// the ZIP builder and the read-only preview so both show identical numbers.
+type exportComputation struct {
+	courseCode string
+	courseName string
+	termMonths int
+	records    []exportRow
+	budgetMax  float64
+	prorated   bool
+}
+
+// ExportPreviewRow is one TA's payout line for the staff preview (read-only).
+// It mirrors exportRow but with display-ready labels + a per-TA readiness flag
+// so staff can spot and fix problems BEFORE the locking download.
+type ExportPreviewRow struct {
+	TAID         string  `json:"ta_id"`
+	FullName     string  `json:"full_name"`
+	Email        string  `json:"email"`
+	Level        string  `json:"level"`        // raw: undergrad/master/phd
+	LevelTH      string  `json:"level_th"`     // ปริญญาตรี/โท/เอก
+	Track        string  `json:"track"`        // raw: regular/special
+	TrackTH      string  `json:"track_th"`     // ภาคปกติ/ภาคพิเศษ
+	HoursTotal   float64 `json:"hours_total"`
+	PayBaht      float64 `json:"pay_baht"`     // earned before budget cap
+	ActualPaid   float64 `json:"actual_paid"`  // after pro-rata cap
+	IsReturning  bool    `json:"is_returning"`
+	// NationalID + BankAcct are the FULL values (staff-only endpoint, same PII
+	// access as the ZIP download). The client masks them by default and reveals
+	// on demand via an eye toggle — server-side masking would make reveal
+	// impossible.
+	NationalID   string  `json:"national_id"`
+	BankAcct     string  `json:"bank_acct"`
+	ProfileReady bool    `json:"profile_ready"`
+	ProfileIssue string  `json:"profile_issue"` // "" when ready
+}
+
+// ExportPreview is the JSON payload for GET /exports/course/:id/preview.
+type ExportPreview struct {
+	TeachingCourseID string             `json:"teaching_course_id"`
+	CourseCode       string             `json:"course_code"`
+	CourseNameTH     string             `json:"course_name_th"`
+	TermMonths       int                `json:"term_months"`
+	BudgetMax        float64            `json:"budget_max"`
+	TotalPay         float64            `json:"total_pay"`     // Σ pay_baht
+	TotalActual      float64            `json:"total_actual"`  // Σ actual_paid
+	OverBudget       bool               `json:"over_budget"`
+	Prorated         bool               `json:"prorated"`
+	AllReady         bool               `json:"all_ready"`     // false blocks the download
+	Rows             []ExportPreviewRow `json:"rows"`
+}
+
+// round2 rounds a baht amount to 2 decimals — every figure that lands on a
+// payroll document goes through this so float64 accumulation noise (e.g.
+// 1234.5600000001) never reaches the spreadsheet.
+func round2(v float64) float64 { return math.Round(v*100) / 100 }
+
+// applyProrataCap is superseded by applyTrackProrataCap (two-pool, per-track
+// budget). Retained for reference/tests; not used by buildExportRows anymore.
+//
 // applyProrataCap scales actualPaid on each row when Σ payBaht > budgetMax
-// so that Σ actualPaid == budgetMax exactly (rounding drift lands on the last
-// row). Returns true if scaling was applied. Pure — no I/O, DB-free.
+// so that Σ actualPaid lands on budgetMax (rounding drift is settled on the
+// trailing rows). Returns true if scaling was applied. Pure — no I/O, DB-free.
 //
 // Semantics:
 //   - budgetMax ≤ 0 → no-op (unlimited).
 //   - Σ payBaht ≤ budgetMax → no-op (each actualPaid stays at payBaht).
 //   - Σ payBaht > budgetMax → each actualPaid = round2(payBaht × k) with
-//     k = budgetMax / Σ payBaht; residual off the last row so it sums exactly.
+//     k = budgetMax / Σ payBaht; residual is folded into the trailing rows,
+//     clamped to [0, payBaht] per row so no TA is paid a negative amount or
+//     more than they earned. Σ actualPaid never exceeds budgetMax (it may
+//     fall marginally short when clamping eats the residual).
 func applyProrataCap(records []exportRow, budgetMax float64) bool {
 	if budgetMax <= 0 || len(records) == 0 {
 		return false
@@ -64,13 +129,53 @@ func applyProrataCap(records []exportRow, budgetMax float64) bool {
 	k := budgetMax / totalRaw
 	var scaledSum float64
 	for i := range records {
-		records[i].actualPaid = math.Round(records[i].payBaht*k*100) / 100
+		records[i].actualPaid = round2(records[i].payBaht * k)
 		scaledSum += records[i].actualPaid
 	}
-	// Unconditionally place any residual (positive or negative) on the last row
-	// so Σ actualPaid == budgetMax to the cent. Adding zero is a no-op.
-	records[len(records)-1].actualPaid = math.Round((records[len(records)-1].actualPaid+(budgetMax-scaledSum))*100) / 100
+	// Fold the residual (positive or negative) into the trailing rows, clamping
+	// each row to [0, payBaht]. Walk backwards so the adjustment stays
+	// deterministic; k < 1 keeps every row strictly below payBaht, so a small
+	// positive residual almost always fits on the last row alone.
+	residual := round2(budgetMax - scaledSum)
+	for i := len(records) - 1; i >= 0 && residual != 0; i-- {
+		adjusted := round2(records[i].actualPaid + residual)
+		if adjusted < 0 {
+			adjusted = 0
+		}
+		if adjusted > records[i].payBaht {
+			adjusted = records[i].payBaht
+		}
+		residual = round2(residual - (adjusted - records[i].actualPaid))
+		records[i].actualPaid = adjusted
+	}
 	return true
+}
+
+// applyTrackProrataCap caps each track's pay against its own budget pool:
+// regular-track pay at regularPool (งบภาคปกติ) and special-track pay at
+// specialPool (งบภาคพิเศษ), independently. Within a track, if that track's
+// total earned exceeds its pool, every row's share of that track is scaled by
+// k_track = pool / Σ(track pay). Each row's actualPaid = scaled regular +
+// scaled special. Returns true if either track was scaled. A pool ≤ 0 means
+// "unlimited" for that track (no data → don't zero people out). Pure, DB-free.
+func applyTrackProrataCap(records []exportRow, regularPool, specialPool float64) bool {
+	var sumReg, sumSpec float64
+	for _, r := range records {
+		sumReg += r.payRegular
+		sumSpec += r.paySpecial
+	}
+	regScale, specScale := 1.0, 1.0
+	if regularPool > 0 && sumReg > regularPool+0.01 {
+		regScale = regularPool / sumReg
+	}
+	if specialPool > 0 && sumSpec > specialPool+0.01 {
+		specScale = specialPool / sumSpec
+	}
+	scaled := regScale < 1 || specScale < 1
+	for i := range records {
+		records[i].actualPaid = round2(records[i].payRegular*regScale + records[i].paySpecial*specScale)
+	}
+	return scaled
 }
 
 // isReturningTA reports whether the TA had an approved assignment in any prior
@@ -109,13 +214,17 @@ func (s *ExportService) isReturningTA(ctx context.Context, taID, currentTermID u
 // and a special ป.ตรี section in the same course, consume the regular quota
 // (= scheduled hours/week × weeks_in_term) at the regular rate first; any hours
 // beyond the regular quota "spill" onto the special rate. Grad tiers don't spill.
-func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID) ([]byte, string, error) {
+// buildExportRows performs the full payout computation for a course (pay rates,
+// regular-first spillover, grad tiers, pro-rata budget cap) and returns the
+// priced rows without any side effects or readiness gate. Both the ZIP builder
+// and the read-only preview call this so their numbers can never drift.
+func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uuid.UUID) (*exportComputation, error) {
 	var courseCode, courseName string
 	if err := s.pool.QueryRow(ctx, `
 		SELECT fc.code, fc.name_th FROM teaching_courses tc
 		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		WHERE tc.id=$1`, teachingCourseID).Scan(&courseCode, &courseName); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
 	var pr PayRate
@@ -137,10 +246,9 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	if termMonths == 0 {
 		termMonths = 4
 	}
-	weeksInTerm := float64(termMonths) * 4.0
 
-	// Pull per-assignment rows ordered regular-first per TA so we can consume
-	// the regular quota before spilling onto special.
+	// Pull per-assignment rows; each is billed at its own track's rate into the
+	// regular or special pool (two-pool cap applied after aggregation).
 	assignRows, err := s.pool.Query(ctx, `
 		SELECT a.id, a.ta_id, u.first_name||' '||u.last_name, u.email,
 		       COALESCE(p.national_id,''), COALESCE(p.bank_name,'')||' '||COALESCE(p.account_no,''),
@@ -159,7 +267,7 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		         p.national_id, p.bank_name, p.account_no, sec.track, sec.id, a.level, sec.sec_no
 		ORDER BY u.first_name, a.ta_id, (sec.track='regular') DESC, sec.sec_no`, teachingCourseID)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	defer assignRows.Close()
 
@@ -177,8 +285,13 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		track      string
 		level      string
 		hoursTotal float64
-		payBaht    float64
-		ugRegularQuotaLeft float64 // scheduled regular hours × weeks_in_term
+		// Pay is split by track so the course budget can be consumed as TWO
+		// separate pools (ภาคปกติ then ภาคพิเศษ) — the regular pool funds
+		// regular-track work, the special pool funds special-track work. No
+		// cross-track rate spillover (superseded by the two-pool rule).
+		payRegular     float64
+		paySpecial     float64
+		hasGradSpecial bool // TA holds ≥1 grad-special section in this course
 	}
 	byTA := map[uuid.UUID]*taAgg{}
 	order := []uuid.UUID{}
@@ -195,7 +308,7 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		)
 		if err := assignRows.Scan(&assignID, &taID, &fullName, &email, &nationalID, &bank,
 			&track, &level, &approvedHrs, &schedHrsPerWeek); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		agg, ok := byTA[taID]
 		if !ok {
@@ -206,11 +319,6 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 			}
 			byTA[taID] = agg
 			order = append(order, taID)
-		}
-		// Regular assignments come first (per ORDER BY), so their scheduled hours
-		// seed the regular quota that a later special assignment may spill onto.
-		if track == "regular" && level == "undergrad" {
-			agg.ugRegularQuotaLeft += schedHrsPerWeek * weeksInTerm
 		}
 		// Display-track precedence: "regular" over "special" so the coversheet
 		// shows the more informative label when a TA has both.
@@ -224,38 +332,37 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		}
 		agg.hoursTotal += approvedHrs
 
+		// Bill each assignment at its own track's rate and accumulate into the
+		// matching pool. Regular-track work → payRegular; special-track work →
+		// paySpecial. The two pools are capped independently downstream.
 		switch {
 		case level == "undergrad" && track == "regular":
-			// Bill approved hours at regular rate up to the quota; grad-regular
-			// spillover never applies here (this branch never spills).
-			agg.payBaht += approvedHrs * pr.UndergradRegular
-			agg.ugRegularQuotaLeft -= approvedHrs
-			if agg.ugRegularQuotaLeft < 0 {
-				// TA exceeded scheduled regular hours — treat overflow as
-				// counted-against-regular still (rare; sched hours are advisory).
-				agg.ugRegularQuotaLeft = 0
-			}
+			agg.payRegular += approvedHrs * pr.UndergradRegular
 
 		case level == "undergrad" && track == "special":
-			// Q&A rule 5: consume any leftover regular quota FIRST at the regular
-			// rate, THEN bill the remainder at the special rate.
-			billedAtRegular := math.Min(approvedHrs, agg.ugRegularQuotaLeft)
-			spill := approvedHrs - billedAtRegular
-			agg.payBaht += billedAtRegular*pr.UndergradRegular + spill*pr.UndergradSpecial
-			agg.ugRegularQuotaLeft -= billedAtRegular
+			agg.paySpecial += approvedHrs * pr.UndergradSpecial
 
 		case (level == "master" || level == "phd") && track == "regular":
 			// Q&A rule 6c: บัณฑิต regular is HOURLY (50฿/hr per ประกาศ).
-			agg.payBaht += approvedHrs * pr.GraduateRegularHourly
+			agg.payRegular += approvedHrs * pr.GraduateRegularHourly
 
 		case (level == "master" || level == "phd") && track == "special":
-			// Q&A rule 6b: บัณฑิต special is flat 4,000฿/เดือน capped at 12,000฿/term.
-			raw := pr.GraduateSpecialLumpsum * float64(termMonths)
-			termCap := pr.GradSpecialTermCap
-			if termCap > 0 && raw > termCap {
-				raw = termCap
-			}
-			agg.payBaht += raw
+			// Q&A rule 6b: บัณฑิต special is a flat lump (special-track pool),
+			// added once per TA after the loop (see below).
+			agg.hasGradSpecial = true
+		}
+	}
+
+	// Grad-special lump sum: add once per TA (not per section), and only when the
+	// TA actually has approved work in the course. See the switch above.
+	gradLump := pr.GraduateSpecialLumpsum * float64(termMonths)
+	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
+		gradLump = pr.GradSpecialTermCap
+	}
+	for _, taID := range order {
+		agg := byTA[taID]
+		if agg.hasGradSpecial && agg.hoursTotal > 0 {
+			agg.paySpecial += gradLump
 		}
 	}
 
@@ -267,26 +374,73 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	var records []exportRow
 	for _, taID := range order {
 		agg := byTA[taID]
+		total := agg.payRegular + agg.paySpecial
 		records = append(records, exportRow{
 			taID: agg.taID, fullName: agg.fullName, email: agg.email,
 			nationalID: agg.nationalID, bankAcct: agg.bankAcct,
 			track: agg.track, level: agg.level,
-			hoursTotal:  agg.hoursTotal,
-			payBaht:     agg.payBaht,
-			actualPaid:  agg.payBaht, // will be scaled below if over budget
+			hoursTotal: agg.hoursTotal,
+			payRegular: agg.payRegular,
+			paySpecial: agg.paySpecial,
+			// Round once at the freeze point so both the under-budget path and
+			// the pro-rata path emit clean 2-decimal figures.
+			payBaht:     round2(total),
+			actualPaid:  round2(total), // scaled below if a pool is over budget
 			isReturning: currentTermID != uuid.Nil && s.isReturningTA(ctx, agg.taID, currentTermID),
 		})
 	}
 
-	// Pro-rata cap: if the sum of raw payBaht exceeds the course budget,
-	// scale each TA's actualPaid so the total lands exactly on the budget.
-	var budgetMax float64
+	// Two-pool budget cap: regular-track pay is capped at the regular budget
+	// (TermPayRegular) and special-track pay at the special budget
+	// (TermPaySpecial), independently. This is the "หักงบภาคปกติจนหมดก่อน แล้ว
+	// ค่อยภาคพิเศษ" rule — each track draws only from its own pool. budgetMax
+	// stays the combined figure for display.
+	var budgetMax, regularPool, specialPool float64
 	if s.budget != nil {
 		if snap, err := s.budget.Compute(ctx, teachingCourseID); err == nil {
 			budgetMax = snap.PerCourseMaxBaht
+			regularPool = snap.TermPayRegular
+			specialPool = snap.TermPaySpecial
 		}
 	}
-	prorata := applyProrataCap(records, budgetMax)
+	prorata := applyTrackProrataCap(records, regularPool, specialPool)
+
+	return &exportComputation{
+		courseCode: courseCode, courseName: courseName,
+		termMonths: termMonths, records: records,
+		budgetMax: budgetMax, prorated: prorata,
+	}, nil
+}
+
+// BuildCourseZip builds the per-TA .xlsx (+ best-effort .pdf) ZIP for a course.
+// It gates on payout readiness, then reuses buildExportRows so the file numbers
+// match the preview exactly. Returns (zip bytes, filename, TA count, error).
+func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID) ([]byte, string, int, error) {
+	// Student-count gate: the per-course budget is derived from the enrolled
+	// student count (budget.go). If staff never filled it in, num_students is 0,
+	// the budget cap is 0, and everyone would be pro-rata'd down to ฿0 silently.
+	// Refuse the export with a clear pointer to where to fix it.
+	var numStudents int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT num_students FROM teaching_courses WHERE id=$1`, teachingCourseID).Scan(&numStudents); err != nil {
+		return nil, "", 0, err
+	}
+	if numStudents <= 0 {
+		return nil, "", 0, Invalid("ยังไม่ได้กรอกจำนวนนักศึกษาของวิชานี้ — กรุณากรอกที่หน้า “วิชาที่เปิดสอน” ก่อนส่งออก (งบเบิกจ่ายคำนวณจากจำนวนนักศึกษา)")
+	}
+	// Payout readiness gate: refuse to build reimbursement documents while any
+	// TA in the course has an unapproved or incomplete profile — otherwise the
+	// coversheets ship with blank national-ID/bank fields and nobody notices
+	// until the finance office bounces the batch.
+	if err := s.validatePayoutReadiness(ctx, teachingCourseID); err != nil {
+		return nil, "", 0, err
+	}
+	comp, err := s.buildExportRows(ctx, teachingCourseID)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	courseCode, courseName := comp.courseCode, comp.courseName
+	records, budgetMax, prorata := comp.records, comp.budgetMax, comp.prorated
 
 	buf := &bytes.Buffer{}
 	zw := zip.NewWriter(buf)
@@ -302,14 +456,14 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 
 		xlsx, err := s.buildPerTAWorkbook(ctx, teachingCourseID, courseCode, courseName, r, budgetMax, prorata)
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		w, err := zw.Create(folder + "/" + fileBase + ".xlsx")
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		if _, err := io.Copy(w, bytes.NewReader(xlsx)); err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 
 		// PDF is best-effort: without a fontDir configured we skip it rather
@@ -319,19 +473,200 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 			if perr == nil {
 				pw, err := zw.Create(folder + "/" + fileBase + ".pdf")
 				if err != nil {
-					return nil, "", err
+					return nil, "", 0, err
 				}
 				if _, err := io.Copy(pw, bytes.NewReader(pdfBytes)); err != nil {
-					return nil, "", err
+					return nil, "", 0, err
 				}
 			}
 		}
 	}
 	if err := zw.Close(); err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	name := fmt.Sprintf("%s_%s.zip", courseCode, time.Now().Format("20060102_150405"))
-	return buf.Bytes(), name, nil
+	return buf.Bytes(), name, len(records), nil
+}
+
+// validatePayoutReadiness lists every TA in the course whose profile would
+// produce a defective reimbursement document — missing profile row, profile
+// not yet approved by staff, or blank national-ID/bank fields — and refuses
+// the export with all offenders named in one message.
+func (s *ExportService) validatePayoutReadiness(ctx context.Context, teachingCourseID uuid.UUID) error {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT u.first_name || ' ' || u.last_name,
+		       (p.user_id IS NULL),
+		       COALESCE(p.status::text, ''),
+		       (COALESCE(p.national_id,'') = '' OR COALESCE(p.account_no,'') = '' OR COALESCE(p.bank_name,'') = '')
+		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		JOIN users u ON u.id = a.ta_id
+		LEFT JOIN ta_profiles p ON p.user_id = a.ta_id
+		WHERE r.teaching_course_id = $1
+		  AND (p.user_id IS NULL
+		       OR p.status::text <> 'approved'
+		       OR COALESCE(p.national_id,'') = ''
+		       OR COALESCE(p.account_no,'') = ''
+		       OR COALESCE(p.bank_name,'') = '')
+		ORDER BY 1`, teachingCourseID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var offenders []string
+	for rows.Next() {
+		var name, status string
+		var noProfile, missingFields bool
+		if err := rows.Scan(&name, &noProfile, &status, &missingFields); err != nil {
+			return err
+		}
+		reason := ""
+		switch {
+		case noProfile:
+			reason = "ยังไม่กรอกโปรไฟล์"
+		case status != "approved":
+			reason = "เอกสารยังไม่ผ่านการอนุมัติ"
+		case missingFields:
+			reason = "ข้อมูลบัตร/บัญชีไม่ครบ"
+		}
+		offenders = append(offenders, fmt.Sprintf("%s (%s)", name, reason))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(offenders) > 0 {
+		return Invalid("ส่งออกไม่ได้ — ข้อมูล TA ไม่ครบหรือยังไม่ผ่านการตรวจ: " + strings.Join(offenders, ", "))
+	}
+	return nil
+}
+
+// readinessByTA returns every TA's profile-readiness issue for the course,
+// keyed by ta_id ("" = ready). Same per-row logic as validatePayoutReadiness
+// but for ALL TAs (not just offenders) so the preview can flag individual rows
+// without blocking the whole page.
+func (s *ExportService) readinessByTA(ctx context.Context, teachingCourseID uuid.UUID) (map[uuid.UUID]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT a.ta_id,
+		       (p.user_id IS NULL),
+		       COALESCE(p.status::text, ''),
+		       (COALESCE(p.national_id,'') = '' OR COALESCE(p.account_no,'') = '' OR COALESCE(p.bank_name,'') = '')
+		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		LEFT JOIN ta_profiles p ON p.user_id = a.ta_id
+		WHERE r.teaching_course_id = $1`, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[uuid.UUID]string{}
+	for rows.Next() {
+		var taID uuid.UUID
+		var noProfile, missingFields bool
+		var status string
+		if err := rows.Scan(&taID, &noProfile, &status, &missingFields); err != nil {
+			return nil, err
+		}
+		issue := ""
+		switch {
+		case noProfile:
+			issue = "ยังไม่กรอกโปรไฟล์"
+		case status != "approved":
+			issue = "เอกสารยังไม่ผ่านการอนุมัติ"
+		case missingFields:
+			issue = "ข้อมูลบัตร/บัญชีไม่ครบ"
+		}
+		out[taID] = issue
+	}
+	return out, rows.Err()
+}
+
+// CoursePreview returns the read-only payout preview for a course: the exact
+// per-TA numbers the ZIP export would contain, plus each TA's profile-readiness
+// so staff can review (and fix) before the locking download. No side effects.
+func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid.UUID) (*ExportPreview, error) {
+	comp, err := s.buildExportRows(ctx, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	ready, err := s.readinessByTA(ctx, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	out := &ExportPreview{
+		TeachingCourseID: teachingCourseID.String(),
+		CourseCode:       comp.courseCode,
+		CourseNameTH:     comp.courseName,
+		TermMonths:       comp.termMonths,
+		BudgetMax:        comp.budgetMax,
+		Prorated:         comp.prorated,
+		AllReady:         true,
+		Rows:             []ExportPreviewRow{},
+	}
+	for _, r := range comp.records {
+		issue := ready[r.taID]
+		if issue != "" {
+			out.AllReady = false
+		}
+		out.TotalPay += r.payBaht
+		out.TotalActual += r.actualPaid
+		out.Rows = append(out.Rows, ExportPreviewRow{
+			TAID:         r.taID.String(),
+			FullName:     r.fullName,
+			Email:        r.email,
+			Level:        r.level,
+			LevelTH:      levelLabelTH(r.level),
+			Track:        r.track,
+			TrackTH:      trackLabelTH(r.track),
+			HoursTotal:   r.hoursTotal,
+			PayBaht:      r.payBaht,
+			ActualPaid:   r.actualPaid,
+			IsReturning:  r.isReturning,
+			NationalID:   r.nationalID,
+			BankAcct:     r.bankAcct,
+			ProfileReady: issue == "",
+			ProfileIssue: issue,
+		})
+	}
+	out.TotalPay = round2(out.TotalPay)
+	out.TotalActual = round2(out.TotalActual)
+	out.OverBudget = comp.budgetMax > 0 && out.TotalPay > comp.budgetMax+0.01
+	return out, nil
+}
+
+func levelLabelTH(level string) string {
+	switch level {
+	case "undergrad":
+		return "ปริญญาตรี"
+	case "master":
+		return "ปริญญาโท"
+	case "phd":
+		return "ปริญญาเอก"
+	}
+	return level
+}
+
+func trackLabelTH(track string) string {
+	switch track {
+	case "regular":
+		return "ภาคปกติ"
+	case "special":
+		return "ภาคพิเศษ"
+	}
+	return track
+}
+
+// maskNationalID keeps only the last 4 characters visible (Thai IDs are 13
+// digits). PII stays off-screen on the preview; the full value still ships in
+// the downloaded document that staff hand to finance.
+func maskNationalID(nid string) string {
+	nid = strings.TrimSpace(nid)
+	if nid == "" {
+		return ""
+	}
+	if len(nid) <= 4 {
+		return nid
+	}
+	return strings.Repeat("•", len(nid)-4) + nid[len(nid)-4:]
 }
 
 // buildPerTAPDF assembles the monthly worklog PDF for one TA. The
@@ -505,7 +840,7 @@ func (s *ExportService) buildPerTAWorkbook(ctx context.Context, tcID uuid.UUID, 
 		       wl.activity, COALESCE(wl.room,''), COALESCE(wl.note,'')
 		FROM work_logs wl JOIN ta_request_assignments a ON a.id=wl.assignment_id
 		JOIN ta_requests req ON req.id = a.request_id
-		WHERE req.teaching_course_id=$1 AND a.ta_id=$2 AND wl.status IN ('submitted','approved')
+		WHERE req.teaching_course_id=$1 AND a.ta_id=$2 AND wl.status = 'approved'
 		ORDER BY wl.work_date`, tcID, r.taID)
 	for rows.Next() {
 		var date, start, end, activity, room, note string

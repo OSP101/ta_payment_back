@@ -82,7 +82,8 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 }
 
 type changePwReq struct {
-	NewPassword string `json:"new_password"`
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
 }
 
 func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
@@ -90,7 +91,26 @@ func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 	if err := c.BodyParser(&in); err != nil || len(in.NewPassword) < 8 {
 		return fiber.NewError(fiber.StatusBadRequest, "password must be >= 8 chars")
 	}
-	if err := h.Svc.Users.UpdatePassword(c.Context(), UserID(c), in.NewPassword); err != nil {
+	uid := UserID(c)
+	u, err := h.Svc.Users.Get(c.Context(), uid)
+	if err != nil {
+		return err
+	}
+	// A forced first-login change (must_change_password) has no current password
+	// to confirm — the user just authenticated with the temp password. For a
+	// voluntary change we require the current password so a hijacked live session
+	// on an unattended machine cannot silently take over the account.
+	if !u.MustChangePassword {
+		if in.CurrentPassword == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "กรุณากรอกรหัสผ่านปัจจุบัน")
+		}
+		// Re-fetch the stored hash the same way Login does, then bcrypt-compare.
+		_, hash, err := h.Svc.Users.FindByEmail(c.Context(), u.Email)
+		if err != nil || hash == "" || !auth.CheckPassword(hash, in.CurrentPassword) {
+			return fiber.NewError(fiber.StatusUnauthorized, "รหัสผ่านปัจจุบันไม่ถูกต้อง")
+		}
+	}
+	if err := h.Svc.Users.UpdatePassword(c.Context(), uid, in.NewPassword); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})

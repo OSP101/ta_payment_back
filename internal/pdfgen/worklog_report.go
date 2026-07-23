@@ -225,22 +225,29 @@ func drawWorklogTable(pdf *gopdf.GoPdf, y float64, rows []WorklogRow) float64 {
 // draws cell borders and text, then returns the next row's y.
 func drawTableRow(pdf *gopdf.GoPdf, x, y float64, cells []string, widths []float64, header bool) float64 {
 	rowH := 18.0
+	var fillR, fillG, fillB uint8 = 255, 255, 255
 	if header {
 		setBold(pdf, 10)
-		pdf.SetFillColor(230, 235, 245)
+		fillR, fillG, fillB = 230, 235, 245
 	} else {
 		setReg(pdf, 10)
-		pdf.SetFillColor(255, 255, 255)
 	}
+	// gopdf shares one non-stroking color between shape fill and text fill, so
+	// re-assert the background before every rectangle and black before every
+	// text draw — otherwise SetTextColor bleeds into the next cell's fill (and
+	// vice-versa), producing invisible text or black-filled cells.
 	cx := x
 	for i, w := range widths {
+		pdf.SetFillColor(fillR, fillG, fillB)
 		pdf.Rectangle(cx, y, cx+w, y+rowH, "FD", 0, 0)
 		if i < len(cells) {
+			pdf.SetTextColor(0, 0, 0)
 			textAt(pdf, cx+3, y+3, cells[i])
 		}
 		cx += w
 	}
 	pdf.SetFillColor(0, 0, 0)
+	pdf.SetTextColor(0, 0, 0)
 	return y + rowH
 }
 

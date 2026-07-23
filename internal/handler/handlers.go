@@ -322,6 +322,24 @@ func (h *TeachingHandler) ListMyTACourses(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// ListMyAssignments returns the assignment rows (one per section) held by the
+// current TA. Optional ?teaching_course_id= narrows to a single course — used by
+// the per-course TA view to resolve the assignment_id for /assignments/:id/worklog.
+func (h *TeachingHandler) ListMyAssignments(c *fiber.Ctx) error {
+	taID := UserID(c)
+	var tcID *uuid.UUID
+	if v := c.Query("teaching_course_id"); v != "" {
+		if id, err := uuid.Parse(v); err == nil {
+			tcID = &id
+		}
+	}
+	out, err := h.Svc.Teaching.ListAssignmentsForTA(c.Context(), taID, tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 func (h *TeachingHandler) List(c *fiber.Ctx) error {
 	var termID *uuid.UUID
 	if v := c.Query("term_id"); v != "" {
@@ -367,6 +385,19 @@ func (h *TeachingHandler) Get(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(out)
+}
+
+// Delete removes a mistakenly-opened course (only when it has no downstream
+// records — the service enforces the guard).
+func (h *TeachingHandler) Delete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Teaching.Delete(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 func (h *TeachingHandler) SetNumStudents(c *fiber.Ctx) error {
@@ -507,6 +538,60 @@ func (h *TeachingHandler) AddMakeup(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	if err := h.Svc.Teaching.AddMakeup(c.Context(), UserID(c), sectionID, m); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// DeleteMakeup removes a filed makeup for the section. Service enforces that
+// submitted/approved worklog rows on the vanishing date block the delete.
+func (h *TeachingHandler) DeleteMakeup(c *fiber.Ctx) error {
+	sectionID, err := uuid.Parse(c.Params("sectionId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
+	}
+	makeupID, err := uuid.Parse(c.Params("makeupId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid makeup id")
+	}
+	if err := h.Svc.Teaching.DeleteMakeup(c.Context(), UserID(c), sectionID, makeupID); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// HolidayImpacts is the TA/lecturer per-course join: which holidays hit a
+// scheduled class day, and did the lecturer file a makeup? Open to anyone who
+// can already read the course (TA on the course, lecturer, staff/admin) — the
+// service authz is handled implicitly since the shape of the response mirrors
+// section_schedules that the reader can already fetch.
+func (h *TeachingHandler) HolidayImpacts(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Holiday.ImpactsForCourse(c.Context(), tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// RemindLecturerAboutMakeup — TA nudges the course's lecturer(s) that a
+// holiday still needs a makeup date. Throttled 1/24h per (TA, course, date).
+func (h *TeachingHandler) RemindLecturerAboutMakeup(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	originalDate := c.Params("originalDate")
+	var body struct {
+		Note string `json:"note"`
+	}
+	// Empty body is fine — note is optional. Ignore parse errors that come
+	// from an empty body.
+	_ = c.BodyParser(&body)
+	if err := h.Svc.Holiday.RemindLecturer(c.Context(), UserID(c), tcID, originalDate, body.Note); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -664,6 +749,20 @@ func (h *TARequestHandler) PreviewConflicts(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(fiber.Map{"conflicts": out})
+}
+
+// Candidates lists selectable TAs for a course's request form, each with their
+// approved-course count + at-quota flag so the picker can exclude full TAs.
+func (h *TARequestHandler) Candidates(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Query("teaching_course_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid teaching_course_id")
+	}
+	out, err := h.Svc.TARequest.Candidates(c.Context(), tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": out})
 }
 
 func (h *TARequestHandler) ListWindows(c *fiber.Ctx) error {
@@ -1168,6 +1267,21 @@ func (h *WorkLogHandler) PendingReports(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// ApprovalHistory — GET /teaching-courses/:id/approval-history — the
+// lecturer's own approve/reject actions for a single course, newest first.
+// Backs the "ประวัติการอนุมัติ" panel on the reports page.
+func (h *WorkLogHandler) ApprovalHistory(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.WorkLog.ListApprovalHistory(c.Context(), UserID(c), tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 // StaffListByCourse — GET /staff/courses/:tcId/worklogs — every TA's entries.
 func (h *WorkLogHandler) StaffListByCourse(c *fiber.Ctx) error {
 	tcID, err := uuid.Parse(c.Params("tcId"))
@@ -1175,6 +1289,20 @@ func (h *WorkLogHandler) StaffListByCourse(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	out, err := h.Svc.WorkLog.StaffListByCourse(c.Context(), tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// StaffListAssignments — GET /staff/courses/:tcId/assignments — approved
+// (TA × section) slots for the editor's add-row picker.
+func (h *WorkLogHandler) StaffListAssignments(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.WorkLog.StaffListAssignments(c.Context(), tcID)
 	if err != nil {
 		return err
 	}
@@ -1195,6 +1323,21 @@ func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
 }
 
 // StaffDelete — DELETE /staff/worklogs/:id — remove a draft/rejected row.
+// Delete removes a single work_log row owned by the calling TA. The URL uses
+// the log id under the /assignments prefix so the same collection namespace is
+// reused; the handler ignores the :id param and trusts the log's own owner
+// check in the service layer.
+func (h *WorkLogHandler) Delete(c *fiber.Ctx) error {
+	logID, err := uuid.Parse(c.Params("logId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid log id")
+	}
+	if err := h.Svc.WorkLog.Delete(c.Context(), UserID(c), logID); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *WorkLogHandler) StaffDelete(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -1219,6 +1362,88 @@ func (h *WorkLogHandler) Reject(c *fiber.Ctx) error {
 	}
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
 	if err := h.Svc.WorkLog.Reject(c.Context(), UserID(c), id, body.Reason, privileged); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// -------------------- TA review schedules --------------------
+
+// ListTAReviewSchedules — GET /assignments/:id/review-schedules
+func (h *WorkLogHandler) ListTAReviewSchedules(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.WorkLog.ListTAReviewSchedules(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// ScheduleBusy — GET /assignments/:id/schedule-busy — the TA's occupied weekly
+// slots (class timetable + teaching + review) for the review-editor overlap preview.
+func (h *WorkLogHandler) ScheduleBusy(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.WorkLog.ScheduleBusyBlocks(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AddTAReviewSchedule — POST /assignments/:id/review-schedules
+func (h *WorkLogHandler) AddTAReviewSchedule(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.TAReviewScheduleInput
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	rsID, err := h.Svc.WorkLog.AddTAReviewSchedule(c.Context(), UserID(c), id, in)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"id": rsID})
+}
+
+// UpdateTAReviewSchedule — PATCH /assignments/:id/review-schedules/:rsId
+func (h *WorkLogHandler) UpdateTAReviewSchedule(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	rsID, err := uuid.Parse(c.Params("rsId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid rs id")
+	}
+	var in service.TAReviewScheduleInput
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.WorkLog.UpdateTAReviewSchedule(c.Context(), UserID(c), id, rsID, in); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// DeleteTAReviewSchedule — DELETE /assignments/:id/review-schedules/:rsId
+func (h *WorkLogHandler) DeleteTAReviewSchedule(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	rsID, err := uuid.Parse(c.Params("rsId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid rs id")
+	}
+	if err := h.Svc.WorkLog.DeleteTAReviewSchedule(c.Context(), UserID(c), id, rsID); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -1566,29 +1791,41 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	body, name, err := h.Svc.Export.BuildCourseZip(c.Context(), id)
+	body, name, taCount, err := h.Svc.Export.BuildCourseZip(c.Context(), id)
 	if err != nil {
 		return err
 	}
+	actor := UserID(c)
+	// Lock every fully-approved (TA × month) in the course BEFORE the file leaves
+	// the server: downloading the ZIP IS the freeze point for the payout numbers
+	// (no digital signatures). This MUST NOT be best-effort — if the lock fails
+	// and we still shipped the file, finance would hold a payout document whose
+	// underlying worklogs stayed editable (file silently diverges from the DB).
+	// Fail the request instead so staff retries; months still being worked on
+	// stay editable and lock on a later re-export.
+	if _, err := h.Svc.SubmissionPeriods.MarkCourseExported(c.Context(), actor, id); err != nil {
+		return err
+	}
 	// Freeze section edits — this export is now the source of truth for the
-	// course's section list + student counts. Non-fatal if it fails; the
-	// download still succeeds and staff can mark it manually if needed.
+	// course's section list + student counts. Non-fatal if it fails; the numbers
+	// are already locked above and staff can mark sections manually if needed.
 	_ = h.Svc.Teaching.MarkExported(c.Context(), id)
 	// The export contains national IDs + bank details — audit who pulled it and
 	// when (PII access trail, M5).
-	actor := UserID(c)
 	h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.course", Entity: "teaching_course", EntityID: id.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")})
 
-	// Phase 4: persist the batch so the dashboard can list history + budget
-	// snapshot. Best-effort — a DB write failure must NOT hide the zip from
-	// the caller (the file is already computed and useful).
-	if snap, berr := h.Svc.Budget.Compute(c.Context(), id); berr == nil {
+	// Persist the batch so the dashboard can list history + budget snapshot.
+	// TotalBaht is the ACTUAL paid sum (Σ actual_paid after the pro-rata cap) so
+	// the recorded figure matches the ZIP the staff hands to finance — the old
+	// Budget.UsedBaht used different math and never reconciled with the file.
+	// Best-effort — a DB write failure must NOT hide the (already-locked) zip.
+	if prev, perr := h.Svc.Export.CoursePreview(c.Context(), id); perr == nil {
 		_, _ = h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
 			TeachingCourseID: id,
 			FilePath:         name, // in-memory zip; we persist just the name for reference
 			FileName:         name,
-			TACount:          0,     // best-effort placeholder; full count needs another query
-			TotalBaht:        snap.UsedBaht,
+			TACount:          taCount,
+			TotalBaht:        prev.TotalActual,
 		})
 	}
 
@@ -1609,6 +1846,20 @@ func (h *ExportHandler) CoursesSummary(c *fiber.Ctx) error {
 		termID = id
 	}
 	out, err := h.Svc.ExportBatches.DashboardSummary(c.Context(), h.Svc.Budget, termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// CoursePreview returns the read-only payout preview (per-TA numbers + profile
+// readiness) so staff can review before the locking download. No side effects.
+func (h *ExportHandler) CoursePreview(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Export.CoursePreview(c.Context(), id)
 	if err != nil {
 		return err
 	}
@@ -1735,4 +1986,112 @@ func firstNonEmpty(s ...string) string {
 		}
 	}
 	return ""
+}
+
+// ============================================================================
+// HolidayHandler — staff/admin CRUD for the public_holidays table.
+// ============================================================================
+
+type HolidayHandler struct{ Svc *service.Container }
+
+// List returns holidays, optionally filtered to one calendar year via ?year=.
+// Any authenticated user may read (TA/lecturer UIs surface the list too), but
+// mutations are gated at the router.
+func (h *HolidayHandler) List(c *fiber.Ctx) error {
+	year := 0
+	if v := c.Query("year"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1900 && n <= 3000 {
+			year = n
+		}
+	}
+	out, err := h.Svc.Holiday.List(c.Context(), year)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+func (h *HolidayHandler) Create(c *fiber.Ctx) error {
+	var in service.HolidayInput
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	id, err := h.Svc.Holiday.Create(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"id": id})
+}
+
+func (h *HolidayHandler) BulkCreate(c *fiber.Ctx) error {
+	var in []service.HolidayInput
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	inserted, err := h.Svc.Holiday.BulkCreate(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"inserted": inserted, "total": len(in)})
+}
+
+func (h *HolidayHandler) Patch(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		NameTH string  `json:"name_th"`
+		NameEN *string `json:"name_en,omitempty"`
+		Note   *string `json:"note,omitempty"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.Holiday.Patch(c.Context(), UserID(c), id, body.NameTH, body.NameEN, body.Note); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+func (h *HolidayHandler) Delete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Holiday.Delete(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// SyncFromBOT pulls national holidays from BOT (Bank of Thailand) Open API.
+// Two invocation modes (?start_year+?end_year takes priority):
+//   - ?year=YYYY                              → single-year, returns SyncFromBOTResult
+//   - ?start_year=YYYY&end_year=YYYY          → range, returns SyncFromBOTRangeResult
+//
+// Requires BOT_API_CLIENT_ID in server env.
+func (h *HolidayHandler) SyncFromBOT(c *fiber.Ctx) error {
+	startS, endS := c.Query("start_year"), c.Query("end_year")
+	if startS != "" || endS != "" {
+		startY, err1 := strconv.Atoi(startS)
+		endY, err2 := strconv.Atoi(endS)
+		if err1 != nil || err2 != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid start_year/end_year")
+		}
+		res, err := h.Svc.Holiday.SyncFromBOTRange(c.Context(), UserID(c), startY, endY)
+		if err != nil {
+			return err
+		}
+		return c.JSON(res)
+	}
+	year, err := strconv.Atoi(c.Query("year"))
+	if err != nil || year < 1900 || year > 3000 {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid year")
+	}
+	res, err := h.Svc.Holiday.SyncFromBOT(c.Context(), UserID(c), year)
+	if err != nil {
+		return err
+	}
+	return c.JSON(res)
 }

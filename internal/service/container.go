@@ -33,13 +33,15 @@ type Container struct {
 	AdminOfficers *AdminOfficerService
 	SubmissionPeriods *SubmissionPeriodService
 	ExportBatches *ExportBatchService
+	Holiday       *HolidayService
+	DocProgress   *DocumentProgressService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config) *Container {
 	c := &Container{Pool: pool, Storage: store, Mailer: mailer, Auditor: auditor, Cfg: cfg}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
-	c.Teaching = &TeachingService{pool: pool, aud: auditor}
+	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify}
 	c.Budget = &BudgetService{pool: pool}
 	c.Notify = &NotifyService{pool: pool, mailer: mailer}
 	c.TARequest = &TARequestService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
@@ -52,6 +54,12 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.AdminOfficers = &AdminOfficerService{pool: pool, aud: auditor}
 	c.SubmissionPeriods = &SubmissionPeriodService{pool: pool, aud: auditor, notify: c.Notify}
 	c.ExportBatches = &ExportBatchService{pool: pool, aud: auditor}
+	c.DocProgress = &DocumentProgressService{pool: pool, aud: auditor}
 	c.Appointment = &AppointmentOrderService{pool: pool, aud: auditor, fontDir: cfg.FontDir}
+	c.Holiday = &HolidayService{
+		pool: pool, aud: auditor, notify: c.Notify,
+		botAPIBaseURL:  cfg.BotAPIBaseURL,
+		botAPIClientID: cfg.BotAPIClientID,
+	}
 	return c
 }

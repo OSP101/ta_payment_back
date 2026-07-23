@@ -79,24 +79,15 @@ func (h *SubmissionPeriodHandler) MePending(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-// TaSign flips the (period × tcId) status to ta_signed for the calling TA.
-func (h *SubmissionPeriodHandler) TaSign(c *fiber.Ctx) error {
-	pid, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-	}
-	tcID, err := uuid.Parse(c.Params("tcId"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
-	}
-	if err := h.Svc.SubmissionPeriods.MarkTASigned(c.Context(), UserID(c), pid, tcID); err != nil {
-		return err
-	}
-	return c.JSON(fiber.Map{"ok": true})
+// commentBody is the shared payload for the finance-send endpoint so staff can
+// attach a note that renders next to the signer in the UI.
+type commentBody struct {
+	Comment string `json:"comment"`
 }
 
-// LecturerSign flips the row to lecturer_signed for the given TA.
-func (h *SubmissionPeriodHandler) LecturerSign(c *fiber.Ctx) error {
+// FinanceSend is the last step — staff records the exported batch has been
+// handed to the finance office. Requires the row already in 'exported' state.
+func (h *SubmissionPeriodHandler) FinanceSend(c *fiber.Ctx) error {
 	pid, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
@@ -109,8 +100,114 @@ func (h *SubmissionPeriodHandler) LecturerSign(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
 	}
-	if err := h.Svc.SubmissionPeriods.MarkLecturerSigned(c.Context(), UserID(c), pid, taID, tcID); err != nil {
+	var body commentBody
+	_ = c.BodyParser(&body)
+	if err := h.Svc.SubmissionPeriods.MarkFinanceSent(c.Context(), UserID(c), pid, taID, tcID, body.Comment); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+// SendBack bounces the (period, TA, course) status row back to an earlier
+// step with a mandatory reason. Staff/admin from any pre-finance state;
+// the course's lecturer only from ta_signed/lecturer_signed.
+func (h *SubmissionPeriodHandler) SendBack(c *fiber.Ctx) error {
+	pid, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+	var body struct {
+		ToStatus string `json:"to_status"`
+		Reason   string `json:"reason"`
+	}
+	_ = c.BodyParser(&body)
+	// Sending back after the period closed is allowed on purpose — that's when
+	// corrections surface. The TA can no longer edit a closed month themself,
+	// so the actual fix flows through the staff worklog editor.
+	if err := h.Svc.SubmissionPeriods.MarkSentBack(c.Context(), UserID(c), pid, taID, tcID, body.ToStatus, body.Reason); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// FinanceRevert is the admin-only unlock for a finance_sent row (status
+// reverts to submitted). Requires a reason.
+func (h *SubmissionPeriodHandler) FinanceRevert(c *fiber.Ctx) error {
+	pid, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = c.BodyParser(&body)
+	if err := h.Svc.SubmissionPeriods.RevertFinanceSent(c.Context(), UserID(c), pid, taID, tcID, body.Reason); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// Timeline returns the approval history for one (period, TA, course). The
+// service restricts reads to the TA themself, the course's lecturers, and
+// staff/admin.
+func (h *SubmissionPeriodHandler) Timeline(c *fiber.Ctx) error {
+	pid, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+	out, err := h.Svc.SubmissionPeriods.GetTimeline(c.Context(), UserID(c), pid, taID, tcID)
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		return fiber.NewError(fiber.StatusNotFound, "not found")
+	}
+	return c.JSON(out)
+}
+
+// ListByCourse lists every (TA × period) timeline row for a course, used by
+// the lecturer report page and the staff exports dashboard. Optional
+// ?period_id= filters to one month.
+func (h *SubmissionPeriodHandler) ListByCourse(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	var pid uuid.UUID
+	if raw := c.Query("period_id"); raw != "" {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid period_id")
+		}
+		pid = id
+	}
+	out, err := h.Svc.SubmissionPeriods.ListByCourse(c.Context(), UserID(c), tcID, pid)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
 }

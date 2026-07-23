@@ -34,6 +34,10 @@ type TeachingCourse struct {
 	NumStudents        int       `json:"num_students"`         // aggregate (regular + special)
 	NumStudentsRegular int       `json:"num_students_regular"`
 	NumStudentsSpecial int       `json:"num_students_special"`
+	// HasSpecial is true when the course has at least one special-track section
+	// (i.e. it runs a special program). When false the "นศ. พิเศษ" count is not
+	// applicable — the UI disables that input to prevent stray data entry.
+	HasSpecial         bool      `json:"has_special"`
 	// ExportedAt is set the first time staff builds the export zip for this
 	// course. Once set, section list and per-section student counts are
 	// frozen — the export file is considered the source of truth.
@@ -97,8 +101,9 @@ type LectureReview struct {
 }
 
 type TeachingService struct {
-	pool *pgxpool.Pool
-	aud  *audit.Auditor
+	pool   *pgxpool.Pool
+	aud    *audit.Auditor
+	notify *NotifyService
 }
 
 // Create a teaching course with sections + schedules in one transaction.
@@ -123,8 +128,16 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	if in.FacultyCourseID == uuid.Nil || in.TermID == uuid.Nil {
 		return uuid.Nil, ErrInvalidInput
 	}
+	var lecHrs, labHrs int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT lecture_hrs, lab_hrs FROM faculty_courses WHERE id = $1`, in.FacultyCourseID).Scan(&lecHrs, &labHrs); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, ErrInvalidInput
+		}
+		return uuid.Nil, err
+	}
 	for _, sec := range in.Sections {
-		if err := validateSectionSchedules(sec.Schedules); err != nil {
+		if err := validateSectionSchedules(sec.Schedules, lecHrs, labHrs); err != nil {
 			return uuid.Nil, err
 		}
 	}
@@ -145,11 +158,20 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	if err != nil {
 		return uuid.Nil, err
 	}
-	// Auto-add the actor as primary lecturer if the caller didn't pass an
-	// explicit lecturer list — this is the "lecturer opens their own course"
-	// path. Staff/admin passing LecturerIDs keep full control.
+	// Auto-add the actor as primary lecturer only on the "lecturer opens their
+	// own course" path. When a non-lecturer (staff/admin) opens a course they
+	// MUST name the actual teaching lecturer(s) — otherwise the course would be
+	// wrongly attributed to the staff account and every downstream lecturer
+	// action (approvals, sign-off, notifications) would target the wrong person.
 	lecturerIDs := in.LecturerIDs
 	if len(lecturerIDs) == 0 {
+		isLecturer, lerr := hasRole(ctx, s.pool, actor, "lecturer")
+		if lerr != nil {
+			return uuid.Nil, lerr
+		}
+		if !isLecturer {
+			return uuid.Nil, Invalid("ต้องระบุอาจารย์ผู้สอนอย่างน้อย 1 คน")
+		}
 		lecturerIDs = []uuid.UUID{actor}
 	}
 	for i, lid := range lecturerIDs {
@@ -207,15 +229,84 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	return id, nil
 }
 
+// Delete removes a teaching course ONLY when it carries no downstream records —
+// i.e. it was opened by mistake. It refuses (with a clear reason) once the
+// course has been exported, has any worklog / payout status, has assigned TAs,
+// or has any TA request. This protects the payroll + government-document audit
+// trail. A clean delete cascades sections/schedules/lecturers via FK. Staff/admin.
+func (s *TeachingService) Delete(ctx context.Context, actor, id uuid.UUID) error {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return err
+	}
+	if !priv {
+		return ErrForbidden
+	}
+	var (
+		found                                                          bool
+		exported, hasWL, hasStatus, hasAssign, hasReq, hasCounts, hasHoliday bool
+	)
+	err = s.pool.QueryRow(ctx, `
+		SELECT TRUE,
+		       (tc.exported_at IS NOT NULL),
+		       EXISTS(SELECT 1 FROM work_logs wl
+		                JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		                JOIN sections s ON s.id = a.section_id
+		               WHERE s.teaching_course_id = tc.id),
+		       EXISTS(SELECT 1 FROM submission_period_status st WHERE st.teaching_course_id = tc.id),
+		       EXISTS(SELECT 1 FROM ta_request_assignments a
+		                JOIN sections s ON s.id = a.section_id
+		               WHERE s.teaching_course_id = tc.id),
+		       EXISTS(SELECT 1 FROM ta_requests r WHERE r.teaching_course_id = tc.id),
+		       EXISTS(SELECT 1 FROM ta_request_counts c
+		                JOIN sections s ON s.id = c.section_id
+		               WHERE s.teaching_course_id = tc.id),
+		       EXISTS(SELECT 1 FROM holiday_remind_log h WHERE h.teaching_course_id = tc.id)
+		FROM teaching_courses tc WHERE tc.id = $1`, id).Scan(
+		&found, &exported, &hasWL, &hasStatus, &hasAssign, &hasReq, &hasCounts, &hasHoliday)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Invalid("ไม่พบรายวิชานี้")
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case exported:
+		return Conflict("ลบไม่ได้ — วิชานี้ถูกส่งออกเอกสารแล้ว")
+	case hasWL:
+		return Conflict("ลบไม่ได้ — วิชานี้มีบันทึกเวลาแล้ว")
+	case hasStatus:
+		return Conflict("ลบไม่ได้ — วิชานี้มีสถานะการเบิกจ่ายแล้ว")
+	case hasAssign:
+		return Conflict("ลบไม่ได้ — วิชานี้มี TA ที่ได้รับมอบหมายแล้ว")
+	case hasReq, hasCounts:
+		return Conflict("ลบไม่ได้ — วิชานี้มีคำขอ TA อยู่")
+	case hasHoliday:
+		return Conflict("ลบไม่ได้ — วิชานี้มีข้อมูลที่เกี่ยวข้องอยู่")
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM teaching_courses WHERE id=$1`, id); err != nil {
+		return err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "teaching_course.delete",
+		Entity: "teaching_course", EntityID: id.String()})
+	return nil
+}
+
 func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCourse, error) {
 	tc := &TeachingCourse{}
 	err := s.pool.QueryRow(ctx,
+		// Effective term dates fall back to the parent academic_term when the
+		// course itself doesn't override them — the UI (month grouper,
+		// auto-generator) treats these as the canonical range for the course.
 		`SELECT tc.id, tc.faculty_course_id, tc.term_id, fc.code, fc.name_th,
 		        fc.lecture_hrs, fc.lab_hrs,
-		        TO_CHAR(tc.starts_on,'YYYY-MM-DD'), TO_CHAR(tc.ends_on,'YYYY-MM-DD'),
+		        TO_CHAR(COALESCE(tc.starts_on, at.starts_on), 'YYYY-MM-DD'),
+		        TO_CHAR(COALESCE(tc.ends_on,   at.ends_on),   'YYYY-MM-DD'),
 		        tc.num_students, tc.num_students_regular, tc.num_students_special,
 		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZ')
-		 FROM teaching_courses tc JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		 FROM teaching_courses tc
+		 JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		 JOIN academic_terms  at ON at.id = tc.term_id
 		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
 		&tc.LectureHrs, &tc.LabHrs,
 		&tc.StartsOn, &tc.EndsOn,
@@ -268,7 +359,8 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 
 func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerID *uuid.UUID) ([]TeachingCourse, error) {
 	q := `SELECT tc.id, tc.faculty_course_id, tc.term_id, fc.code, fc.name_th,
-	             tc.num_students, tc.num_students_regular, tc.num_students_special
+	             tc.num_students, tc.num_students_regular, tc.num_students_special,
+	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS has_special
 	      FROM teaching_courses tc JOIN faculty_courses fc ON fc.id=tc.faculty_course_id`
 	where := []string{}
 	args := []any{}
@@ -299,7 +391,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	for rows.Next() {
 		var tc TeachingCourse
 		if err := rows.Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
-			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial); err != nil {
+			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial, &tc.HasSpecial); err != nil {
 			return nil, err
 		}
 		out = append(out, tc)
@@ -340,6 +432,128 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 			return nil, err
 		}
 		out = append(out, tc)
+	}
+	return out, nil
+}
+
+// TAAssignment is one section-level slot the TA holds on an approved TA request.
+// Surfaced so the TA-facing course page can resolve the assignment_id needed by
+// /assignments/:id/worklog without having to peek at the /ta-requests API.
+type TAAssignment struct {
+	ID               uuid.UUID `json:"id"`
+	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
+	CourseCode       string    `json:"course_code"`
+	CourseName       string    `json:"course_name"`
+	SectionID        uuid.UUID `json:"section_id"`
+	SecNo            string    `json:"sec_no"`
+	Track            string    `json:"track"`
+	Level            string    `json:"level"`
+	// ReimburseScope is copied from the parent ta_request so the TA-facing
+	// worklog UI can restrict the activity dropdown to what the lecturer
+	// actually requested — "lecture" | "lab" | "both". Only guides UX; the
+	// server-side hour caps stay authoritative.
+	ReimburseScope string `json:"reimburse_scope"`
+	// HasSchedule tells the UI whether the section has any rows in
+	// section_schedules yet. Auto-generation reads that table to produce class
+	// occurrences, so an empty schedule silently produces zero rows — the UI
+	// blocks the button and tells the TA to ask the lecturer to add class
+	// times instead of letting them wonder why nothing happened.
+	HasSchedule bool `json:"has_schedule"`
+	// Weekly hour caps per activity, derived from ta_workload_forms so the
+	// TA-worklog modal can preflight-limit hour entry and the server can
+	// reject overages before they hit the approver's queue. Mapping:
+	//   undergrad: attendance_hrs → lecture, lab_hrs → lab,
+	//              check_work_hrs → review, ug_other_hrs → other
+	//   grad:      help_teach_hrs → shared cap for lecture+lab combined,
+	//              grade_hrs      → review,
+	//              other_hrs+prep_hrs → other (billable prep collapses in)
+	// WeeklyCapsSet=false means the lecturer hasn't filled the workload form
+	// yet — treat all zeros as "no cap known" and skip enforcement.
+	WeeklyCapLecture       float64 `json:"weekly_cap_lecture"`
+	WeeklyCapLab           float64 `json:"weekly_cap_lab"`
+	WeeklyCapReview        float64 `json:"weekly_cap_review"`
+	WeeklyCapOther         float64 `json:"weekly_cap_other"`
+	WeeklyLectureLabShared bool    `json:"weekly_lecture_lab_shared"`
+	WeeklyCapsSet          bool    `json:"weekly_caps_set"`
+	// TermHourCeiling caps the TOTAL hours loggable for this assignment across
+	// the whole term = (sum of declared weekly workload hours) × weeks-in-term.
+	// Zero when no workload form is filed (no ceiling enforced).
+	TermHourCeiling float64 `json:"term_hour_ceiling"`
+}
+
+// ListAssignmentsForTA returns every approved TA-request assignment belonging to
+// the given TA, optionally narrowed to a single teaching course. One TA can hold
+// multiple assignments on the same course (one per section).
+func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UUID, tcID *uuid.UUID) ([]TAAssignment, error) {
+	q := `SELECT a.id, tc.id, fc.code, fc.name_th,
+	             sec.id, sec.sec_no, sec.track, a.level::text, r.reimburse_scope::text,
+	             EXISTS (SELECT 1 FROM section_schedules ss WHERE ss.section_id = sec.id),
+	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.attendance_hrs, 0)
+	                  ELSE COALESCE(wf.help_teach_hrs, 0) END,
+	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.lab_hrs, 0)
+	                  ELSE COALESCE(wf.help_teach_hrs, 0) END,
+	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.check_work_hrs, 0)
+	                  ELSE COALESCE(wf.grade_hrs, 0) END,
+	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.ug_other_hrs, 0)
+	                  ELSE COALESCE(wf.other_hrs, 0) + COALESCE(wf.prep_hrs, 0) END,
+	             (a.level::text != 'undergrad'),
+	             (wf.id IS NOT NULL)
+	      FROM ta_request_assignments a
+	      JOIN sections sec ON sec.id = a.section_id
+	      JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+	      JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+	      JOIN ta_requests r ON r.id = a.request_id
+	      LEFT JOIN ta_workload_forms wf ON wf.assignment_id = a.id
+	      WHERE a.ta_id = $1 AND r.status = 'approved'`
+	args := []any{taID}
+	if tcID != nil {
+		q += " AND tc.id = $2"
+		args = append(args, *tcID)
+	}
+	q += " ORDER BY fc.code, sec.sec_no"
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TAAssignment{}
+	for rows.Next() {
+		var a TAAssignment
+		if err := rows.Scan(&a.ID, &a.TeachingCourseID, &a.CourseCode, &a.CourseName,
+			&a.SectionID, &a.SecNo, &a.Track, &a.Level, &a.ReimburseScope, &a.HasSchedule,
+			&a.WeeklyCapLecture, &a.WeeklyCapLab, &a.WeeklyCapReview, &a.WeeklyCapOther,
+			&a.WeeklyLectureLabShared, &a.WeeklyCapsSet); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	// Term-hour ceiling per row = weekly workload total × weeks-in-term. For
+	// grad, help_teach is a shared lecture+lab figure so it must not be counted
+	// twice. Term months are cached per course.
+	monthsCache := map[uuid.UUID]int{}
+	for i := range out {
+		a := &out[i]
+		if !a.WeeklyCapsSet {
+			continue
+		}
+		weeklyTotal := a.WeeklyCapReview + a.WeeklyCapOther
+		if a.WeeklyLectureLabShared {
+			weeklyTotal += a.WeeklyCapLecture // help covers lecture+lab once
+		} else {
+			weeklyTotal += a.WeeklyCapLecture + a.WeeklyCapLab
+		}
+		months, ok := monthsCache[a.TeachingCourseID]
+		if !ok {
+			_ = s.pool.QueryRow(ctx,
+				`SELECT COALESCE(NULLIF(at.months,0),4) FROM academic_terms at
+				 JOIN teaching_courses tc ON tc.term_id = at.id WHERE tc.id = $1`,
+				a.TeachingCourseID).Scan(&months)
+			if months <= 0 {
+				months = 4
+			}
+			monthsCache[a.TeachingCourseID] = months
+		}
+		a.TermHourCeiling = weeklyTotal * float64(months) * 4.0
 	}
 	return out, nil
 }
@@ -486,7 +700,11 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 	if in.NumStudents < 0 {
 		return uuid.Nil, Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
 	}
-	if err := validateSectionSchedules(in.Schedules); err != nil {
+	lecHrs, labHrs, err := s.creditHrsForCourse(ctx, tcID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if err := validateSectionSchedules(in.Schedules, lecHrs, labHrs); err != nil {
 		return uuid.Nil, err
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -531,7 +749,11 @@ func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tc
 	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
 		return err
 	}
-	if err := validateSectionSchedules(schedules); err != nil {
+	lecHrs, labHrs, err := s.creditHrsForCourse(ctx, tcID)
+	if err != nil {
+		return err
+	}
+	if err := validateSectionSchedules(schedules, lecHrs, labHrs); err != nil {
 		return err
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -575,7 +797,11 @@ func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tc
 // stray API callers can't skip them. Only intra-section overlap is checked —
 // cross-section conflicts are the lecturer's judgement call and are surfaced
 // later when TAs try to take a request that would collide.
-func validateSectionSchedules(schedules []SectionSchedule) error {
+//
+// lectureHrs/labHrs are the owning course's faculty_courses credit hours; they
+// gate which schedule kinds are allowed (see validateScheduleKinds).
+func validateSectionSchedules(schedules []SectionSchedule, lectureHrs, labHrs int) error {
+	kinds := make([]string, 0, len(schedules))
 	for i, sch := range schedules {
 		if sch.Kind != "lecture" && sch.Kind != "lab" {
 			return errors.New("ประเภทคาบต้องเป็นบรรยาย (lecture) หรือปฏิบัติการ (lab) เท่านั้น")
@@ -598,8 +824,54 @@ func validateSectionSchedules(schedules []SectionSchedule) error {
 				return errors.New("มีช่วงเวลาที่ทับซ้อนกันภายใน section เดียวกัน")
 			}
 		}
+		kinds = append(kinds, sch.Kind)
+	}
+	return validateScheduleKinds(kinds, lectureHrs, labHrs)
+}
+
+// validateScheduleKinds enforces the two credit-gating rules shared by every
+// schedule-writing path (manual section CRUD and the Excel import):
+//
+//  1. A "lecture" block is only allowed when the course carries lecture credit
+//     hours (faculty_courses.lecture_hrs > 0); a "lab" block only when
+//     lab_hrs > 0. Otherwise the schedule would inflate the review-hours
+//     billing cap downstream for hours the course doesn't actually teach.
+//  2. Each kind may appear AT MOST ONCE per section — a section can hold one
+//     lecture block and one lab block, no more.
+//
+// lecture_hrs/lab_hrs are INT NOT NULL DEFAULT 0 in faculty_courses, so a 0
+// reliably means "this course has no such hours" (never "unknown") and it is
+// safe to block that kind on 0.
+func validateScheduleKinds(kinds []string, lectureHrs, labHrs int) error {
+	seen := map[string]bool{}
+	for _, k := range kinds {
+		switch k {
+		case "lecture":
+			if lectureHrs <= 0 {
+				return errors.New("รายวิชานี้ไม่มีหน่วยชั่วโมงบรรยาย — เพิ่มตารางบรรยายไม่ได้")
+			}
+		case "lab":
+			if labHrs <= 0 {
+				return errors.New("รายวิชานี้ไม่มีหน่วยชั่วโมงปฏิบัติการ — เพิ่มตารางปฏิบัติการไม่ได้")
+			}
+		}
+		if seen[k] {
+			return errors.New("มีตารางบรรยาย/ปฏิบัติการซ้ำในกลุ่มเดียวกัน — ระบุได้ประเภทละ 1 รายการต่อกลุ่ม")
+		}
+		seen[k] = true
 	}
 	return nil
+}
+
+// creditHrsForCourse resolves the owning faculty_courses.lecture_hrs / lab_hrs
+// for a teaching course, so schedule mutations can gate which kinds are allowed.
+func (s *TeachingService) creditHrsForCourse(ctx context.Context, tcID uuid.UUID) (lectureHrs, labHrs int, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT fc.lecture_hrs, fc.lab_hrs
+		   FROM teaching_courses tc
+		   JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		  WHERE tc.id = $1`, tcID).Scan(&lectureHrs, &labHrs)
+	return
 }
 
 // isHHMM accepts either "HH:MM" or "HH:MM:SS" so callers may send whichever the
@@ -792,14 +1064,128 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 			return Invalid("เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม")
 		}
 	}
+	// Nested holiday check: a makeup date landing on another public holiday
+	// would just push the problem to a different day. Reject at creation time
+	// so the lecturer picks a workable day up front.
+	var nestedHoliday string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT name_th FROM public_holidays WHERE holiday_date = $1::date LIMIT 1`,
+		m.MakeupDate).Scan(&nestedHoliday); err == nil {
+		return Invalid(fmt.Sprintf("วันชดเชย %s ตรงกับวันหยุด (%s) — กรุณาเลือกวันอื่น", m.MakeupDate, nestedHoliday))
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note)
 		 VALUES ($1,$2,$3::date,$4::date,$5,$6,$7)`,
 		uuid.New(), sectionID, m.OriginalDate, m.MakeupDate, m.StartTime, m.EndTime, m.Note)
-	if err == nil {
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "makeup.add", Entity: "section", EntityID: sectionID.String(), After: m})
+	if err != nil {
+		// UNIQUE (section_id, original_date) violation — the section already
+		// has a filed makeup for this original day. Surface a Thai message
+		// instead of a raw 500 so the frontend can guide the lecturer to the
+		// "edit existing" flow.
+		return Invalid(fmt.Sprintf("มีวันชดเชยของวันที่ %s อยู่แล้ว — กรุณาลบวันเดิมก่อนแล้วเพิ่มใหม่", m.OriginalDate))
 	}
-	return err
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "makeup.add", Entity: "section", EntityID: sectionID.String(), After: m})
+	return nil
+}
+
+// DeleteMakeup removes a filed makeup. Guards against silently invalidating
+// worklog rows that a TA has already submitted or an approver has cleared —
+// those need explicit rejection first. Draft rows on the vanishing makeup date
+// are removed in the same transaction and the owning TA is notified.
+func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, makeupID uuid.UUID) error {
+	// Resolve makeup + parent course; the section id is trusted from the URL,
+	// but we double-check the row belongs to it so a lecturer can't delete a
+	// makeup on another section by URL manipulation.
+	var tcID uuid.UUID
+	var makeupDate time.Time
+	if err := s.pool.QueryRow(ctx, `
+		SELECT sec.teaching_course_id, m.makeup_date
+		FROM makeup_schedules m
+		JOIN sections sec ON sec.id = m.section_id
+		WHERE m.id = $1 AND m.section_id = $2`, makeupID, sectionID).Scan(&tcID, &makeupDate); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
+	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
+		return err
+	}
+	makeupDateStr := makeupDate.Format("2006-01-02")
+
+	// Block if any submitted/approved worklog references the makeup date on
+	// this section — those need to go through Reject first so the audit trail
+	// stays intact.
+	var reviewedCount int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM work_logs wl
+		JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		WHERE a.section_id = $1
+		  AND wl.work_date = $2::date
+		  AND wl.status IN ('submitted','approved')`,
+		sectionID, makeupDateStr).Scan(&reviewedCount); err != nil {
+		return err
+	}
+	if reviewedCount > 0 {
+		return Invalid("ลบไม่ได้: มีบันทึกเวลาในวันชดเชยนี้ถูกส่งอนุมัติแล้ว กรุณาให้อาจารย์/เจ้าหน้าที่ปฏิเสธก่อน")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Collect draft-row TAs so we can notify each one that their day-of-work
+	// row has been removed alongside the makeup.
+	notifyTargets := []uuid.UUID{}
+	nrows, err := tx.Query(ctx, `
+		SELECT DISTINCT a.ta_id
+		FROM work_logs wl
+		JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		WHERE a.section_id = $1 AND wl.work_date = $2::date AND wl.status = 'draft'`,
+		sectionID, makeupDateStr)
+	if err != nil {
+		return err
+	}
+	for nrows.Next() {
+		var taID uuid.UUID
+		if err := nrows.Scan(&taID); err == nil {
+			notifyTargets = append(notifyTargets, taID)
+		}
+	}
+	nrows.Close()
+
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM work_logs
+		USING ta_request_assignments a
+		WHERE work_logs.assignment_id = a.id
+		  AND a.section_id = $1
+		  AND work_logs.work_date = $2::date
+		  AND work_logs.status = 'draft'`,
+		sectionID, makeupDateStr); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM makeup_schedules WHERE id = $1`, makeupID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "makeup.delete", Entity: "section", EntityID: sectionID.String(), Note: makeupDateStr})
+	if s.notify != nil {
+		body := fmt.Sprintf("อาจารย์ยกเลิกวันชดเชย %s — รายการชั่วโมงร่างในวันนั้นถูกลบ", makeupDateStr)
+		for _, taID := range notifyTargets {
+			s.notify.Send(ctx, taID, "อาจารย์ยกเลิกวันชดเชย", body, "/ta")
+		}
+	}
+	return nil
 }
 
 func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uuid.UUID, r LectureReview) error {
@@ -1370,7 +1756,9 @@ var errImportSkipped = errors.New("skipped")
 
 func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uuid.UUID, c *parsedCourse) (uuid.UUID, error) {
 	var facultyID uuid.UUID
-	if err := s.pool.QueryRow(ctx, `SELECT id FROM faculty_courses WHERE code = $1`, c.code).Scan(&facultyID); err != nil {
+	var lecHrs, labHrs int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT id, lecture_hrs, lab_hrs FROM faculty_courses WHERE code = $1`, c.code).Scan(&facultyID, &lecHrs, &labHrs); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return uuid.Nil, errImportSkipped
 		}
@@ -1431,6 +1819,16 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 			sumSpecial += sec.numStudents
 		} else {
 			sumRegular += sec.numStudents
+		}
+		// Same credit-gating + once-per-kind rules the manual section paths
+		// enforce, so an import row can't seed a lecture block on a lab-only
+		// course (or a duplicate kind) and inflate the review-hours cap.
+		kinds := make([]string, 0, len(sec.schedules))
+		for _, sch := range sec.schedules {
+			kinds = append(kinds, sch.kind)
+		}
+		if err := validateScheduleKinds(kinds, lecHrs, labHrs); err != nil {
+			return uuid.Nil, err
 		}
 		for _, sch := range sec.schedules {
 			var schRoomPtr *string

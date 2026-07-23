@@ -10,15 +10,36 @@ import (
 func sampleOrder() AppointmentOrderData {
 	return AppointmentOrderData{
 		OrderNo:       "6/2569",
-		AcademicYear:  "2569",
+		AcademicYear:  "2568",
 		SemesterLabel: "ภาคปลาย",
-		OrderDate:     "24 มกราคม 2569",
-		EffectiveDate: "24 มกราคม 2569",
-		SignerName:    "รศ.ดร.ทดสอบ ระบบ",
-		SignerTitle:   "คณบดี",
-		Appointees: []AppointmentAppointee{
-			{FullName: "สมชาย ใจดี", Level: "ปริญญาตรี", Track: "ภาคปกติ", CourseCode: "CP421024", IsReturning: true},
-			{FullName: "สมหญิง ยิ้มแย้ม", Level: "ปริญญาโท", Track: "ภาคพิเศษ", CourseCode: "CP362104", IsReturning: false},
+		OrderDate:     "14 มกราคม 2569",
+		EffectiveDate: "24 พฤศจิกายน 2568",
+		SignerName:    "รองศาสตราจารย์สิรภัทร เชี่ยวชาญวัฒนา",
+		SignerTitle:   "คณบดีวิทยาลัยการคอมพิวเตอร์",
+		Levels: []AppointmentLevel{
+			{
+				Heading: "รายวิชาระดับปริญญาตรี",
+				Courses: []AppointmentCourse{
+					{
+						Code: "SC310003", Name: "Database System and Design", CreditText: "3 (3-0-6)",
+						Appointees: []AppointmentAppointee{
+							{StudentID: "663380555-8", FirstName: "นายชาคริต", LastName: "อ่วมอ่ำ"},
+							{StudentID: "663380160-1", FirstName: "นางสาวธนาภา", LastName: "เจริญสุข"},
+						},
+					},
+				},
+			},
+			{
+				Heading: "รายวิชาระดับบัณฑิตศึกษา",
+				Courses: []AppointmentCourse{
+					{
+						Code: "CP362104", Name: "Advanced Topics", CreditText: "3 (3-0-6)",
+						Appointees: []AppointmentAppointee{
+							{StudentID: "665380001-2", FirstName: "นางสาวสมหญิง", LastName: "ยิ้มแย้ม"},
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -52,7 +73,7 @@ func TestBuildAppointmentOrderPDF_EmptyRoster(t *testing.T) {
 		t.Skipf("fonts missing")
 	}
 	d := sampleOrder()
-	d.Appointees = nil
+	d.Levels = nil
 	if _, err := BuildAppointmentOrderPDF(AppointmentOrderInput{FontDir: fonts, Data: d}); err != nil {
 		t.Fatalf("empty roster crashed: %v", err)
 	}
