@@ -143,37 +143,6 @@ func (h *UserHandler) Activate(c *fiber.Ctx) error {
 
 type CourseHandler struct{ Svc *service.Container }
 
-func (h *CourseHandler) List(c *fiber.Ctx) error {
-	out, err := h.Svc.Courses.List(c.Context(), c.Query("q"))
-	if err != nil {
-		return err
-	}
-	return c.JSON(out)
-}
-
-func (h *CourseHandler) Upsert(c *fiber.Ctx) error {
-	var in service.FacultyCourse
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
-	}
-	out, err := h.Svc.Courses.Upsert(c.Context(), UserID(c), in)
-	if err != nil {
-		return err
-	}
-	return c.JSON(out)
-}
-
-func (h *CourseHandler) Delete(c *fiber.Ctx) error {
-	id, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-	}
-	if err := h.Svc.Courses.Delete(c.Context(), UserID(c), id); err != nil {
-		return err
-	}
-	return c.JSON(fiber.Map{"ok": true})
-}
-
 func (h *CourseHandler) PayRate(c *fiber.Ctx) error {
 	pr, err := h.Svc.Courses.LatestPayRate(c.Context())
 	if err != nil {
@@ -334,6 +303,21 @@ func (h *TeachingHandler) ListMyAssignments(c *fiber.Ctx) error {
 		}
 	}
 	out, err := h.Svc.Teaching.ListAssignmentsForTA(c.Context(), taID, tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// ClassKinds — GET /class-kinds?term_id=… : the term's timetable with its
+// lecture/lab labels, used by the TA .ics import to fill in ประเภท (the .ics
+// itself has no such field).
+func (h *TeachingHandler) ClassKinds(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "term_id is required")
+	}
+	out, err := h.Svc.Teaching.ClassKinds(c.Context(), termID)
 	if err != nil {
 		return err
 	}
@@ -1251,8 +1235,14 @@ func (h *WorkLogHandler) Approve(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// year_month ("YYYY-MM") scopes the decision to one month; absent = all
+	// submitted rows (legacy behaviour, still used by staff bulk tools).
+	var body struct {
+		YearMonth string `json:"year_month"`
+	}
+	_ = c.BodyParser(&body)
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
-	if err := h.Svc.WorkLog.Approve(c.Context(), UserID(c), id, privileged); err != nil {
+	if err := h.Svc.WorkLog.Approve(c.Context(), UserID(c), id, body.YearMonth, privileged); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -1355,13 +1345,14 @@ func (h *WorkLogHandler) Reject(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		Reason string `json:"reason"`
+		Reason    string `json:"reason"`
+		YearMonth string `json:"year_month"`
 	}
 	if err := c.BodyParser(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
-	if err := h.Svc.WorkLog.Reject(c.Context(), UserID(c), id, body.Reason, privileged); err != nil {
+	if err := h.Svc.WorkLog.Reject(c.Context(), UserID(c), id, body.Reason, body.YearMonth, privileged); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})

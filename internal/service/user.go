@@ -172,6 +172,7 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 		u.BranchCode = bc
 		u.AccountNo = an
 	}
+	applyDerivedStudyYear(u, currentAcademicYearBE(ctx, s.pool))
 	return u, nil
 }
 
@@ -247,7 +248,57 @@ func (s *UserService) List(ctx context.Context, role, search string, limit, offs
 			r.Close()
 		}
 	}
+	// Auto-derive study_year from the student id so it stays current without
+	// manual edits every academic year.
+	cur := currentAcademicYearBE(ctx, s.pool)
+	for k := range out {
+		applyDerivedStudyYear(&out[k], cur)
+	}
 	return out, total, nil
+}
+
+// currentAcademicYearBE returns the active term's academic year (Buddhist era),
+// or 0 if no term is active.
+func currentAcademicYearBE(ctx context.Context, pool *pgxpool.Pool) int {
+	var y int
+	_ = pool.QueryRow(ctx,
+		`SELECT academic_year FROM academic_terms WHERE is_active
+		 ORDER BY academic_year DESC, semester DESC LIMIT 1`).Scan(&y)
+	return y
+}
+
+// deriveStudyYear computes an undergrad's current year from the 2-digit Buddhist
+// admission-year prefix of the KKU student id (e.g. "67…" → admitted 2567,
+// so in academic year 2569 they are in year 3). Returns 0 when it cannot derive
+// a sane 1..8 value, so callers keep the stored value as a fallback for
+// irregular ids / transfer students.
+func deriveStudyYear(studentID string, curYearBE int) int {
+	digits := make([]byte, 0, 2)
+	for i := 0; i < len(studentID) && len(digits) < 2; i++ {
+		if c := studentID[i]; c >= '0' && c <= '9' {
+			digits = append(digits, c)
+		}
+	}
+	if len(digits) < 2 || curYearBE <= 0 {
+		return 0
+	}
+	admitBE := 2500 + int(digits[0]-'0')*10 + int(digits[1]-'0')
+	yr := curYearBE - admitBE + 1
+	if yr < 1 || yr > 8 {
+		return 0
+	}
+	return yr
+}
+
+// applyDerivedStudyYear overrides study_year in place for undergrad users who
+// have a student id, keeping the value current automatically.
+func applyDerivedStudyYear(u *User, curYearBE int) {
+	if u.StudyLevel == nil || *u.StudyLevel != "undergrad" || u.StudentID == nil {
+		return
+	}
+	if yr := deriveStudyYear(*u.StudentID, curYearBE); yr > 0 {
+		u.StudyYear = &yr
+	}
 }
 
 // UpdateInput is a partial patch — only non-nil fields are applied.

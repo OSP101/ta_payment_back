@@ -322,7 +322,7 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		       TO_CHAR(sp.starts_on,'YYYY-MM-DD'),
 		       TO_CHAR(sp.due_date,'YYYY-MM-DD'),
 		       sp.is_closed,
-		       tc.id, fc.code, fc.name_th,
+		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
 		       -- Worklog readiness for the month. MM is taken from the period's
 		       -- year_month and matched against work_date.
@@ -344,9 +344,7 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
 		           AND wl2.status = 'approved'), 0)
 		FROM submission_periods sp
-		JOIN teaching_courses tc ON tc.term_id = sp.term_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
-		JOIN ta_request_assignments a ON a.section_id IN
+		JOIN teaching_courses tc ON tc.term_id = sp.term_id		JOIN ta_request_assignments a ON a.section_id IN
 		    (SELECT id FROM sections WHERE teaching_course_id = tc.id)
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		LEFT JOIN submission_period_status st
@@ -355,8 +353,8 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		   AND st.teaching_course_id = tc.id
 		WHERE a.ta_id = $1
 		GROUP BY sp.id, sp.label, sp.year_month, sp.starts_on, sp.due_date, sp.is_closed,
-		         tc.id, fc.code, fc.name_th, st.status
-		ORDER BY sp.due_date, fc.code`, taID)
+		         tc.id, tc.code, tc.name_th, st.status
+		ORDER BY sp.due_date, tc.code`, taID)
 	if err != nil {
 		return nil, err
 	}
@@ -784,7 +782,7 @@ func (s *SubmissionPeriodService) GetTimeline(ctx context.Context, actor, period
 	rows, err := s.pool.Query(ctx, `
 		SELECT sp.id, sp.label, sp.year_month, TO_CHAR(sp.due_date,'YYYY-MM-DD'), sp.is_closed,
 		       u.id, u.first_name || ' ' || u.last_name,
-		       tc.id, fc.code, fc.name_th,
+		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
 		       (SELECT COUNT(*) FROM work_logs wl
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
@@ -810,9 +808,7 @@ func (s *SubmissionPeriodService) GetTimeline(ctx context.Context, actor, period
 		       st.sent_back_reason
 		FROM submission_periods sp
 		JOIN users u ON u.id = $2
-		JOIN teaching_courses tc ON tc.id = $3
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
-		LEFT JOIN submission_period_status st
+		JOIN teaching_courses tc ON tc.id = $3		LEFT JOIN submission_period_status st
 		    ON st.submission_period_id = sp.id
 		   AND st.ta_id = $2
 		   AND st.teaching_course_id = $3
@@ -856,7 +852,7 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 	rows, err := s.pool.Query(ctx, `
 		SELECT sp.id, sp.label, sp.year_month, TO_CHAR(sp.due_date,'YYYY-MM-DD'), sp.is_closed,
 		       u.id, u.first_name || ' ' || u.last_name,
-		       tc.id, fc.code, fc.name_th,
+		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
 		       (SELECT COUNT(*) FROM work_logs wl
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
@@ -880,9 +876,7 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		       st.sent_back_by::text,
 		       st.sent_back_name,
 		       st.sent_back_reason
-		FROM teaching_courses tc
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
-		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		FROM teaching_courses tc		JOIN submission_periods sp ON sp.term_id = tc.term_id
 		JOIN ta_request_assignments a
 		    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
@@ -894,7 +888,7 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		WHERE tc.id = $1`+filter+`
 		GROUP BY sp.id, sp.label, sp.year_month, sp.due_date, sp.is_closed,
 		         u.id, u.first_name, u.last_name,
-		         tc.id, fc.code, fc.name_th,
+		         tc.id, tc.code, tc.name_th,
 		         st.status, st.exported_at, st.exported_by, st.exported_name,
 		         st.finance_sent_at, st.finance_sent_by, st.finance_sent_name, st.finance_note,
 		         st.sent_back_at, st.sent_back_by, st.sent_back_name, st.sent_back_reason
@@ -934,10 +928,9 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 	rows, err := s.pool.Query(ctx, `
 		WITH pending AS (
 			SELECT DISTINCT sp.id AS period_id, sp.label, sp.due_date,
-			                a.ta_id, tc.id AS tc_id, fc.code, fc.name_th
+			                a.ta_id, tc.id AS tc_id, tc.code, tc.name_th
 			FROM submission_periods sp
 			JOIN teaching_courses tc ON tc.term_id = sp.term_id
-			JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 			JOIN ta_request_assignments a
 			    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
 			JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'

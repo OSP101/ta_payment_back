@@ -394,8 +394,8 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		SELECT COALESCE(prefix,'') || ' ' || first_name || ' ' || last_name
 		FROM users WHERE id = $1`, taID).Scan(&taName)
 	_ = s.pool.QueryRow(ctx, `
-		SELECT fc.code, fc.name_th
-		FROM teaching_courses tc JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		SELECT tc.code, tc.name_th
+		FROM teaching_courses tc
 		WHERE tc.id = $1`, tcID).Scan(&courseCode, &courseNameTH)
 	_ = s.pool.QueryRow(ctx,
 		`SELECT name_th FROM public_holidays WHERE holiday_date = $1::date LIMIT 1`,

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -16,8 +17,9 @@ import (
 // The board only becomes actionable once every course in the term is exported.
 // See migration 0031 for the stage meanings.
 type DocumentProgressService struct {
-	pool *pgxpool.Pool
-	aud  *audit.Auditor
+	pool   *pgxpool.Pool
+	aud    *audit.Auditor
+	notify *NotifyService
 }
 
 // CourseRef names an un-exported course still blocking the term.
@@ -65,11 +67,10 @@ func (s *DocumentProgressService) exportReadiness(ctx context.Context, termID uu
 		return
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT fc.code, fc.name_th
-		FROM teaching_courses tc
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+		SELECT tc.code, tc.name_th
+		FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
 		WHERE tc.term_id = $1 AND x.has_ta AND tc.exported_at IS NULL
-		ORDER BY fc.code`, termID)
+		ORDER BY tc.code`, termID)
 	if err != nil {
 		return
 	}
@@ -196,4 +197,197 @@ func userDisplayName(ctx context.Context, pool *pgxpool.Pool, uid uuid.UUID) str
 		return email
 	}
 	return name
+}
+
+/* -------------------------------------------------------------------------- */
+/* Per-course signature checklist (migration 0037)                            */
+/* -------------------------------------------------------------------------- */
+
+// SignatureItem is one (course × signing-role) checklist row: who is
+// responsible and whether they have signed yet.
+type SignatureItem struct {
+	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
+	Code             string    `json:"code"`
+	NameTH           string    `json:"name_th"`
+	Exported         bool      `json:"exported"`
+	Role             string    `json:"role"`
+	RoleLabel        string    `json:"role_label"`
+	Responsible      string    `json:"responsible"`
+	SignedAt         *string   `json:"signed_at,omitempty"`
+}
+
+var signatureRoles = []struct{ key, label string }{
+	{"ta", "TA เซ็น"},
+	{"lecturer", "อาจารย์เซ็น"},
+	{"certifier", "ผู้รับรองเซ็น"},
+}
+
+// ListChecklist returns three checklist rows (ta/lecturer/certifier) per course
+// that has approved TAs in the term, with the responsible names + signed state.
+// Readable by any authenticated user.
+func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid.UUID) ([]SignatureItem, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT tc.id, tc.code, tc.name_th, (tc.exported_at IS NOT NULL) AS exported,
+		  COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', ')
+		            FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
+		            WHERE tl.teaching_course_id = tc.id), '') AS lecturers,
+		  COALESCE((SELECT string_agg(DISTINCT u.first_name || ' ' || u.last_name, ', ')
+		            FROM ta_request_assignments a
+		            JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		            JOIN sections s ON s.id = a.section_id
+		            JOIN users u ON u.id = a.ta_id
+		            WHERE s.teaching_course_id = tc.id), '') AS tas
+		FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+		WHERE tc.term_id = $1 AND x.has_ta
+		ORDER BY tc.code`, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type courseRow struct {
+		id                          uuid.UUID
+		code, name, lecturers, tas  string
+		exported                    bool
+	}
+	var courses []courseRow
+	for rows.Next() {
+		var c courseRow
+		if err := rows.Scan(&c.id, &c.code, &c.name, &c.exported, &c.lecturers, &c.tas); err != nil {
+			return nil, err
+		}
+		courses = append(courses, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Signed timestamps keyed by "tcID|role".
+	signed := map[string]*string{}
+	srows, err := s.pool.Query(ctx, `
+		SELECT teaching_course_id, role, TO_CHAR(signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZ')
+		FROM signature_checklist WHERE term_id = $1 AND signed_at IS NOT NULL`, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer srows.Close()
+	for srows.Next() {
+		var tcID uuid.UUID
+		var role string
+		var at *string
+		if err := srows.Scan(&tcID, &role, &at); err != nil {
+			return nil, err
+		}
+		signed[tcID.String()+"|"+role] = at
+	}
+	if err := srows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := []SignatureItem{}
+	for _, c := range courses {
+		for _, r := range signatureRoles {
+			resp := "ผู้รับรอง"
+			switch r.key {
+			case "ta":
+				resp = c.tas
+			case "lecturer":
+				resp = c.lecturers
+			}
+			out = append(out, SignatureItem{
+				TeachingCourseID: c.id, Code: c.code, NameTH: c.name, Exported: c.exported,
+				Role: r.key, RoleLabel: r.label, Responsible: resp,
+				SignedAt: signed[c.id.String()+"|"+r.key],
+			})
+		}
+	}
+	return out, nil
+}
+
+// ToggleSignature marks (or clears) a course-role signature. Staff/admin only.
+func (s *DocumentProgressService) ToggleSignature(ctx context.Context, actor, tcID uuid.UUID, role string, signed bool) error {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return err
+	}
+	if !priv {
+		return ErrForbidden
+	}
+	if role != "ta" && role != "lecturer" && role != "certifier" {
+		return Invalid("บทบาทไม่ถูกต้อง")
+	}
+	var termID uuid.UUID
+	if err := s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id = $1`, tcID).Scan(&termID); err != nil {
+		return Invalid("ไม่พบรายวิชา")
+	}
+	name := userDisplayName(ctx, s.pool, actor)
+	signedExpr := "NULL"
+	if signed {
+		signedExpr = "now()"
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO signature_checklist (term_id, teaching_course_id, role, signed_at, updated_by, updated_by_name, updated_at)
+		VALUES ($1, $2, $3, `+signedExpr+`, $4, $5, now())
+		ON CONFLICT (teaching_course_id, role) DO UPDATE SET
+		  signed_at = `+signedExpr+`, updated_by = $4, updated_by_name = $5, updated_at = now()`,
+		termID, tcID, role, actor, name)
+	if err != nil {
+		return err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.toggle",
+		Entity: "teaching_course", EntityID: tcID.String(),
+		After: map[string]any{"role": role, "signed": signed}})
+	return nil
+}
+
+// RemindUnsigned emails+notifies every lecturer whose course still lacks the
+// lecturer signature, one message per lecturer listing their pending courses.
+// Returns how many people were notified. Staff/admin only.
+func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, termID uuid.UUID) (int, error) {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return 0, err
+	}
+	if !priv {
+		return 0, ErrForbidden
+	}
+	if s.notify == nil {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tl.lecturer_id, tc.code
+		FROM teaching_courses tc
+		JOIN teaching_lecturers tl ON tl.teaching_course_id = tc.id, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+		LEFT JOIN signature_checklist sc ON sc.teaching_course_id = tc.id AND sc.role = 'lecturer'
+		WHERE tc.term_id = $1 AND x.has_ta AND sc.signed_at IS NULL
+		ORDER BY tc.code`, termID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	byUser := map[uuid.UUID][]string{}
+	order := []uuid.UUID{}
+	for rows.Next() {
+		var uid uuid.UUID
+		var code string
+		if err := rows.Scan(&uid, &code); err != nil {
+			return 0, err
+		}
+		if _, ok := byUser[uid]; !ok {
+			order = append(order, uid)
+		}
+		byUser[uid] = append(byUser[uid], code)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, uid := range order {
+		body := "มีเอกสารเบิกจ่าย TA ที่รอลายเซ็นของท่านในรายวิชา: " +
+			strings.Join(byUser[uid], ", ") +
+			"\nกรุณาลงนามเพื่อให้เอกสารเดินทางต่อได้"
+		s.notify.Send(ctx, uid, "แจ้งเตือน: เอกสาร TA รอลายเซ็น", body, "/document-progress")
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind",
+		Entity: "academic_term", EntityID: termID.String(),
+		After: map[string]int{"notified": len(order)}})
+	return len(order), nil
 }

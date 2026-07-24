@@ -100,7 +100,7 @@ type CourseSummary struct {
 // filtered by term. Heavy query — used by the staff dashboard page only.
 func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, termID uuid.UUID) ([]CourseSummary, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT tc.id, fc.code, fc.name_th,
+		SELECT tc.id, tc.code, tc.name_th,
 		       t.academic_year || ' ' ||
 		           CASE t.semester WHEN 1 THEN 'ภาคต้น' WHEN 2 THEN 'ภาคปลาย' ELSE 'ภาคฤดูร้อน' END,
 		       (SELECT COUNT(DISTINCT a.ta_id)
@@ -110,10 +110,9 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		       (SELECT TO_CHAR(MAX(generated_at),'YYYY-MM-DD"T"HH24:MI:SSTZ')
 		          FROM export_batches WHERE teaching_course_id = tc.id)
 		FROM teaching_courses tc
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		JOIN academic_terms t ON t.id = tc.term_id
 		WHERE ($1::uuid IS NULL OR tc.term_id = $1)
-		ORDER BY fc.code`, uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
+		ORDER BY tc.code`, uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
 	if err != nil {
 		return nil, err
 	}

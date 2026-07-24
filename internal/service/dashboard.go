@@ -40,7 +40,7 @@ type TACourseStatus struct {
 func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID) ([]TACourseStatus, error) {
 	rows, err := s.pool.Query(ctx, `
 		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT tc.id, fc.code, fc.name_th,
+		SELECT tc.id, tc.code, tc.name_th,
 		       t.academic_year || '/' || t.semester,
 		       a.level, sec.track,
 		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN wl.hours END),0) AS hrs_approved,
@@ -60,13 +60,12 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID) ([]TA
 		JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
 		JOIN sections sec ON sec.id=a.section_id
 		JOIN teaching_courses tc ON tc.id=sec.teaching_course_id
-		JOIN faculty_courses fc ON fc.id=tc.faculty_course_id
 		JOIN academic_terms t ON t.id=tc.term_id
 		LEFT JOIN work_logs wl ON wl.assignment_id=a.id
 		CROSS JOIN latest pr
 		WHERE a.ta_id = $1
-		GROUP BY tc.id, fc.code, fc.name_th, t.academic_year, t.semester, a.level, sec.track, tc.exported_at
-		ORDER BY t.academic_year DESC, t.semester DESC, fc.code`, taID)
+		GROUP BY tc.id, tc.code, tc.name_th, t.academic_year, t.semester, a.level, sec.track, tc.exported_at
+		ORDER BY t.academic_year DESC, t.semester DESC, tc.code`, taID)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +122,7 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 	}
 	rows, err := s.pool.Query(ctx, `
 		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT tc.id, fc.code, fc.name_th,
+		SELECT tc.id, tc.code, tc.name_th,
 		       t.academic_year || '/' || t.semester,
 		       COUNT(DISTINCT a.ta_id) FILTER (WHERE a.ta_id IS NOT NULL),
 		       COUNT(DISTINCT a.ta_id) FILTER (WHERE wl.status='submitted'),
@@ -138,7 +137,6 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		           END
 		       END),0)
 		FROM teaching_courses tc
-		JOIN faculty_courses fc ON fc.id=tc.faculty_course_id
 		JOIN academic_terms t ON t.id=tc.term_id
 		JOIN teaching_lecturers tl ON tl.teaching_course_id=tc.id
 		LEFT JOIN ta_requests r ON r.teaching_course_id=tc.id AND r.status='approved'
@@ -147,8 +145,8 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		LEFT JOIN work_logs wl ON wl.assignment_id=a.id
 		CROSS JOIN latest pr
 		WHERE tl.lecturer_id = $1`+termFilter+`
-		GROUP BY tc.id, fc.code, fc.name_th, t.academic_year, t.semester
-		ORDER BY t.academic_year DESC, t.semester DESC, fc.code`, args...)
+		GROUP BY tc.id, tc.code, tc.name_th, t.academic_year, t.semester
+		ORDER BY t.academic_year DESC, t.semester DESC, tc.code`, args...)
 	if err != nil {
 		return nil, err
 	}

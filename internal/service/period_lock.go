@@ -96,7 +96,7 @@ func assertWorklogWritable(ctx context.Context, pool *pgxpool.Pool, tcID, taID u
 // finance_sent) month that contains at least one of the assignment's work_logs
 // in the given statuses. Used as a batch pre-check by Approve/Reject so a
 // whole-batch transition cannot touch rows already committed to a payout file.
-func financeLockedMonths(ctx context.Context, pool *pgxpool.Pool, assignmentID uuid.UUID, statuses []string) ([]string, error) {
+func financeLockedMonths(ctx context.Context, pool *pgxpool.Pool, assignmentID uuid.UUID, statuses []string, yearMonth string) ([]string, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT DISTINCT sp.label
 		FROM work_logs wl
@@ -112,7 +112,8 @@ func financeLockedMonths(ctx context.Context, pool *pgxpool.Pool, assignmentID u
 		 AND st.teaching_course_id = tc.id
 		 AND st.status IN ('exported','finance_sent')
 		WHERE wl.assignment_id = $1 AND wl.status = ANY($2)
-		ORDER BY sp.label`, assignmentID, statuses)
+		  AND ($3 = '' OR to_char(wl.work_date, 'YYYY-MM') = $3)
+		ORDER BY sp.label`, assignmentID, statuses, yearMonth)
 	if err != nil {
 		return nil, err
 	}
@@ -130,8 +131,9 @@ func financeLockedMonths(ctx context.Context, pool *pgxpool.Pool, assignmentID u
 
 // assertNoFinanceLockedRows is the Conflict-raising form of financeLockedMonths
 // for whole-batch transitions (Approve/Reject).
-func assertNoFinanceLockedRows(ctx context.Context, pool *pgxpool.Pool, assignmentID uuid.UUID, statuses []string) error {
-	months, err := financeLockedMonths(ctx, pool, assignmentID, statuses)
+// yearMonth ("YYYY-MM") narrows the check to a single month; "" = whole batch.
+func assertNoFinanceLockedRows(ctx context.Context, pool *pgxpool.Pool, assignmentID uuid.UUID, statuses []string, yearMonth string) error {
+	months, err := financeLockedMonths(ctx, pool, assignmentID, statuses, yearMonth)
 	if err != nil {
 		return err
 	}

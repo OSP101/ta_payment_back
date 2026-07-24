@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,31 +20,52 @@ import (
 )
 
 type TeachingCourse struct {
-	ID                 uuid.UUID `json:"id"`
-	FacultyCourseID    uuid.UUID `json:"faculty_course_id"`
-	TermID             uuid.UUID `json:"term_id"`
-	Code               string    `json:"code"`
-	NameTH             string    `json:"name_th"`
-	// Credit hours from faculty_courses — surfaced so the request-form UI can
-	// derive its default reimburse_scope (Q&A rule 3): lecture-only → "lecture",
-	// lab-only → "lab", both → "both" (user can still override).
-	LectureHrs         int       `json:"lecture_hrs"`
-	LabHrs             int       `json:"lab_hrs"`
-	StartsOn           *string   `json:"starts_on,omitempty"`
-	EndsOn             *string   `json:"ends_on,omitempty"`
-	NumStudents        int       `json:"num_students"`         // aggregate (regular + special)
-	NumStudentsRegular int       `json:"num_students_regular"`
-	NumStudentsSpecial int       `json:"num_students_special"`
+	ID     uuid.UUID `json:"id"`
+	TermID uuid.UUID `json:"term_id"`
+	// Course identity — denormalized per-term from the imported registrar file
+	// (no central catalog). A course code is unique within a term.
+	Code    string  `json:"code"`
+	NameTH  string  `json:"name_th"`
+	NameEN  *string `json:"name_en,omitempty"`
+	Level   string  `json:"level"` // "undergrad" | "graduate"
+	Credits int     `json:"credits"`
+	// Credit hours — surfaced so the request-form UI can derive its default
+	// reimburse_scope (Q&A rule 3): lecture-only → "lecture", lab-only → "lab",
+	// both → "both" (user can still override).
+	LectureHrs         int     `json:"lecture_hrs"`
+	LabHrs             int     `json:"lab_hrs"`
+	SelfHrs            int     `json:"self_hrs"`
+	Department         *string `json:"department,omitempty"`
+	StartsOn           *string `json:"starts_on,omitempty"`
+	EndsOn             *string `json:"ends_on,omitempty"`
+	NumStudents        int     `json:"num_students"` // aggregate (regular + special)
+	NumStudentsRegular int     `json:"num_students_regular"`
+	NumStudentsSpecial int     `json:"num_students_special"`
 	// HasSpecial is true when the course has at least one special-track section
 	// (i.e. it runs a special program). When false the "นศ. พิเศษ" count is not
 	// applicable — the UI disables that input to prevent stray data entry.
-	HasSpecial         bool      `json:"has_special"`
+	HasSpecial bool `json:"has_special"`
+	// HasMissingSchedule is true when at least one section carries no class
+	// schedule — typical of courses the registrar file marks WBA ("will be
+	// arranged"). Such a course cannot accept a TA request until the lecturer
+	// or staff fills the schedule in; both UIs surface a warning off this flag.
+	HasMissingSchedule bool `json:"has_missing_schedule"`
+	// UnresolvedMakeups counts class occurrences killed by a public holiday that
+	// still have no makeup filed. Each one is a day the TA physically cannot log
+	// (the generator skips it) = money the TA loses, so every lecturer surface
+	// warns off this number. 0 = nothing to do.
+	UnresolvedMakeups int `json:"unresolved_makeups"`
+	// List-only aggregates for the staff course table: section counts per
+	// track and a pre-joined lecturer name string (primary first).
+	NumSectionsRegular int    `json:"num_sections_regular"`
+	NumSectionsSpecial int    `json:"num_sections_special"`
+	LecturerNames      string `json:"lecturer_names,omitempty"`
 	// ExportedAt is set the first time staff builds the export zip for this
 	// course. Once set, section list and per-section student counts are
 	// frozen — the export file is considered the source of truth.
-	ExportedAt         *string   `json:"exported_at,omitempty"`
-	Sections           []Section `json:"sections,omitempty"`
-	Lecturers       []struct {
+	ExportedAt *string   `json:"exported_at,omitempty"`
+	Sections   []Section `json:"sections,omitempty"`
+	Lecturers  []struct {
 		ID        uuid.UUID `json:"id"`
 		FirstName string    `json:"first_name"`
 		LastName  string    `json:"last_name"`
@@ -52,16 +74,16 @@ type TeachingCourse struct {
 }
 
 type Section struct {
-	ID               uuid.UUID          `json:"id"`
-	TeachingCourseID uuid.UUID          `json:"teaching_course_id"`
-	SecNo            string             `json:"sec_no"`
-	Track            string             `json:"track"`
-	Room             *string            `json:"room,omitempty"`
-	NumStudents      int                `json:"num_students"`
-	Schedules        []SectionSchedule  `json:"schedules,omitempty"`
-	Exams            []ExamSchedule     `json:"exams,omitempty"`
-	Makeups          []MakeupSchedule   `json:"makeups,omitempty"`
-	Reviews          []LectureReview    `json:"reviews,omitempty"`
+	ID               uuid.UUID         `json:"id"`
+	TeachingCourseID uuid.UUID         `json:"teaching_course_id"`
+	SecNo            string            `json:"sec_no"`
+	Track            string            `json:"track"`
+	Room             *string           `json:"room,omitempty"`
+	NumStudents      int               `json:"num_students"`
+	Schedules        []SectionSchedule `json:"schedules,omitempty"`
+	Exams            []ExamSchedule    `json:"exams,omitempty"`
+	Makeups          []MakeupSchedule  `json:"makeups,omitempty"`
+	Reviews          []LectureReview   `json:"reviews,omitempty"`
 }
 
 type SectionSchedule struct {
@@ -107,35 +129,66 @@ type TeachingService struct {
 }
 
 // Create a teaching course with sections + schedules in one transaction.
+// Course identity is supplied inline (no central catalog): the manual
+// "add course" form and the Excel import both carry it.
 type CreateTeachingCourseInput struct {
-	FacultyCourseID uuid.UUID   `json:"faculty_course_id"`
-	TermID          uuid.UUID   `json:"term_id"`
-	StartsOn        *string     `json:"starts_on,omitempty"`
-	EndsOn          *string     `json:"ends_on,omitempty"`
-	NumStudents     int         `json:"num_students"`
-	LecturerIDs     []uuid.UUID `json:"lecturer_ids"`
-	Sections           []struct {
-		SecNo       string           `json:"sec_no"`
-		Track       string           `json:"track"`
-		Room        *string          `json:"room,omitempty"`
-		NumStudents int              `json:"num_students"`
+	TermID      uuid.UUID   `json:"term_id"`
+	Code        string      `json:"code"`
+	NameTH      string      `json:"name_th"`
+	NameEN      *string     `json:"name_en,omitempty"`
+	Level       string      `json:"level"`
+	Credits     int         `json:"credits"`
+	LectureHrs  int         `json:"lecture_hrs"`
+	LabHrs      int         `json:"lab_hrs"`
+	SelfHrs     int         `json:"self_hrs"`
+	StartsOn    *string     `json:"starts_on,omitempty"`
+	EndsOn      *string     `json:"ends_on,omitempty"`
+	NumStudents int         `json:"num_students"`
+	LecturerIDs []uuid.UUID `json:"lecturer_ids"`
+	Sections    []struct {
+		SecNo       string            `json:"sec_no"`
+		Track       string            `json:"track"`
+		Room        *string           `json:"room,omitempty"`
+		NumStudents int               `json:"num_students"`
 		Schedules   []SectionSchedule `json:"schedules,omitempty"`
 		Exams       []ExamSchedule    `json:"exams,omitempty"`
 	} `json:"sections"`
 }
 
+// Sanitize + validate the manually-typed course code. Accepted forms follow
+// KKU numbering: legacy = 6 digits ("342233"); current = 2 uppercase letters
+// + 6 digits ("CP353201", "SC363001"). Anything else (odd symbols, Thai
+// characters, wrong length) is rejected outright so junk codes can't seed
+// courses. All whitespace — including internal — is stripped first.
+var courseCodeRe = regexp.MustCompile(`^(?:[A-Z]{2}[0-9]{6}|[0-9]{6})$`)
+
 func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in CreateTeachingCourseInput) (uuid.UUID, error) {
-	if in.FacultyCourseID == uuid.Nil || in.TermID == uuid.Nil {
+	in.Code = strings.ToUpper(strings.Join(strings.Fields(in.Code), ""))
+	in.NameTH = strings.TrimSpace(in.NameTH)
+	if in.Code == "" || in.TermID == uuid.Nil {
 		return uuid.Nil, ErrInvalidInput
 	}
-	var lecHrs, labHrs int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT lecture_hrs, lab_hrs FROM faculty_courses WHERE id = $1`, in.FacultyCourseID).Scan(&lecHrs, &labHrs); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return uuid.Nil, ErrInvalidInput
-		}
-		return uuid.Nil, err
+	if !courseCodeRe.MatchString(in.Code) {
+		return uuid.Nil, Invalid("รูปแบบรหัสวิชาไม่ถูกต้อง — ต้องเป็นตัวเลข 6 หลัก (เช่น 342233) หรือตัวอักษรพิมพ์ใหญ่ 2 ตัวตามด้วยตัวเลข 6 หลัก (เช่น CP353201)")
 	}
+	if in.NameTH == "" {
+		// English-only policy: the display name falls back to the English name,
+		// then the code, so the NOT NULL column is always satisfied.
+		if in.NameEN != nil && strings.TrimSpace(*in.NameEN) != "" {
+			in.NameTH = strings.TrimSpace(*in.NameEN)
+		} else {
+			in.NameTH = in.Code
+		}
+	}
+	if in.Level == "" {
+		in.Level = "undergrad"
+	}
+	if in.Level != "undergrad" && in.Level != "graduate" {
+		return uuid.Nil, Invalid("ระดับวิชาต้องเป็นปริญญาตรีหรือบัณฑิตศึกษา")
+	}
+	// Credit hours come straight from the input now (no catalog lookup); they
+	// gate which schedule kinds a section may carry.
+	lecHrs, labHrs := in.LectureHrs, in.LabHrs
 	for _, sec := range in.Sections {
 		if err := validateSectionSchedules(sec.Schedules, lecHrs, labHrs); err != nil {
 			return uuid.Nil, err
@@ -149,10 +202,12 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	id := uuid.New()
 	_, err = tx.Exec(ctx,
 		`INSERT INTO teaching_courses (
-			id, faculty_course_id, term_id, starts_on, ends_on,
-			num_students, created_by
-		 ) VALUES ($1,$2,$3,$4::date,$5::date,$6,$7)`,
-		id, in.FacultyCourseID, in.TermID,
+			id, term_id, code, name_th, name_en, level,
+			credits, lecture_hrs, lab_hrs, self_hrs,
+			starts_on, ends_on, num_students, created_by
+		 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12::date,$13,$14)`,
+		id, in.TermID, in.Code, in.NameTH, in.NameEN, in.Level,
+		in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs,
 		nilStr(in.StartsOn), nilStr(in.EndsOn),
 		in.NumStudents, actor)
 	if err != nil {
@@ -243,7 +298,7 @@ func (s *TeachingService) Delete(ctx context.Context, actor, id uuid.UUID) error
 		return ErrForbidden
 	}
 	var (
-		found                                                          bool
+		found                                                                bool
 		exported, hasWL, hasStatus, hasAssign, hasReq, hasCounts, hasHoliday bool
 	)
 	err = s.pool.QueryRow(ctx, `
@@ -298,20 +353,30 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		// Effective term dates fall back to the parent academic_term when the
 		// course itself doesn't override them — the UI (month grouper,
 		// auto-generator) treats these as the canonical range for the course.
-		`SELECT tc.id, tc.faculty_course_id, tc.term_id, fc.code, fc.name_th,
-		        fc.lecture_hrs, fc.lab_hrs,
+		`SELECT tc.id, tc.term_id, tc.code, tc.name_th, tc.name_en, tc.level,
+		        tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		        TO_CHAR(COALESCE(tc.starts_on, at.starts_on), 'YYYY-MM-DD'),
 		        TO_CHAR(COALESCE(tc.ends_on,   at.ends_on),   'YYYY-MM-DD'),
 		        tc.num_students, tc.num_students_regular, tc.num_students_special,
-		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZ')
+		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		        -- คาบที่ตรงวันหยุดและยังไม่กำหนดวันชดเชย (เหมือน List/ImpactsForCourse)
+		        (SELECT COUNT(*)
+		           FROM public_holidays h
+		           JOIN sections sx ON sx.teaching_course_id = tc.id
+		           JOIN section_schedules sch ON sch.section_id = sx.id
+		                AND sch.day_of_week = EXTRACT(DOW FROM h.holiday_date)::int
+		           LEFT JOIN makeup_schedules m ON m.section_id = sx.id
+		                AND m.original_date = h.holiday_date
+		          WHERE m.id IS NULL
+		            AND h.holiday_date BETWEEN COALESCE(tc.starts_on, at.starts_on)
+		                                   AND COALESCE(tc.ends_on,   at.ends_on))
 		 FROM teaching_courses tc
-		 JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		 JOIN academic_terms  at ON at.id = tc.term_id
-		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
-		&tc.LectureHrs, &tc.LabHrs,
+		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.NameTH, &tc.NameEN, &tc.Level,
+		&tc.Credits, &tc.LectureHrs, &tc.LabHrs, &tc.SelfHrs,
 		&tc.StartsOn, &tc.EndsOn,
 		&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
-		&tc.ExportedAt)
+		&tc.ExportedAt, &tc.UnresolvedMakeups)
 	if err != nil {
 		return nil, err
 	}
@@ -354,14 +419,92 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		}
 		exRows.Close()
 	}
+	// WBA detection: a section with no schedule rows blocks TA requests until
+	// someone fills the timetable in. Derived here (sections are already
+	// loaded) so Get and List agree on the flag.
+	for i := range tc.Sections {
+		if len(tc.Sections[i].Schedules) == 0 {
+			tc.HasMissingSchedule = true
+			break
+		}
+	}
+	// HasSpecial mirrors List's computed column for single-course readers.
+	for i := range tc.Sections {
+		if tc.Sections[i].Track == "special" {
+			tc.HasSpecial = true
+			break
+		}
+	}
 	return tc, nil
 }
 
+// ClassKindRow is one weekly class slot of a term, flattened to the fields a
+// client needs to tell บรรยาย from ปฏิบัติการ. The KKU REG .ics export carries
+// NO lecture/lab marker (SUMMARY is just "code (credits) sec"), so the TA's
+// schedule import resolves the kind by matching each imported slot against
+// this table — which came from the registrar Excel where Lec/Lab IS labelled.
+type ClassKindRow struct {
+	Code      string `json:"code"`
+	SecNo     string `json:"sec_no"`
+	Kind      string `json:"kind"` // "lecture" | "lab"
+	DayOfWeek int    `json:"day_of_week"`
+	StartTime string `json:"start_time"` // "HH:MM"
+	EndTime   string `json:"end_time"`   // "HH:MM"
+	Room      string `json:"room,omitempty"`
+}
+
+// ClassKinds returns every scheduled class slot of a term. Read-only and not
+// sensitive (it is the published timetable), so any signed-in user may read it.
+func (s *TeachingService) ClassKinds(ctx context.Context, termID uuid.UUID) ([]ClassKindRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT tc.code, sec.sec_no, sch.kind, sch.day_of_week,
+		       TO_CHAR(sch.start_time, 'HH24:MI'), TO_CHAR(sch.end_time, 'HH24:MI'),
+		       COALESCE(sch.room, '')
+		FROM section_schedules sch
+		JOIN sections sec ON sec.id = sch.section_id
+		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+		WHERE tc.term_id = $1
+		ORDER BY tc.code, sec.sec_no, sch.day_of_week, sch.start_time`, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ClassKindRow{}
+	for rows.Next() {
+		var r ClassKindRow
+		if err := rows.Scan(&r.Code, &r.SecNo, &r.Kind, &r.DayOfWeek,
+			&r.StartTime, &r.EndTime, &r.Room); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerID *uuid.UUID) ([]TeachingCourse, error) {
-	q := `SELECT tc.id, tc.faculty_course_id, tc.term_id, fc.code, fc.name_th,
+	q := `SELECT tc.id, tc.term_id, tc.code, tc.name_th, tc.level,
+	             tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 	             tc.num_students, tc.num_students_regular, tc.num_students_special,
-	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS has_special
-	      FROM teaching_courses tc JOIN faculty_courses fc ON fc.id=tc.faculty_course_id`
+	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS has_special,
+	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id
+	                    AND NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id=sx.id)) AS has_missing_schedule,
+	             (SELECT COUNT(*) FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='regular') AS n_sec_regular,
+	             (SELECT COUNT(*) FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS n_sec_special,
+	             COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', ' ORDER BY tl.is_primary DESC, u.first_name)
+	                       FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
+	                       WHERE tl.teaching_course_id = tc.id), '') AS lecturer_names,
+	             -- คาบที่ตรงวันหยุดและยังไม่มีวันชดเชย (สูตรเดียวกับ ImpactsForCourse)
+	             (SELECT COUNT(*)
+	                FROM public_holidays h
+	                JOIN sections sx ON sx.teaching_course_id = tc.id
+	                JOIN section_schedules sch ON sch.section_id = sx.id
+	                     AND sch.day_of_week = EXTRACT(DOW FROM h.holiday_date)::int
+	                LEFT JOIN makeup_schedules m ON m.section_id = sx.id
+	                     AND m.original_date = h.holiday_date
+	               WHERE m.id IS NULL
+	                 AND h.holiday_date BETWEEN COALESCE(tc.starts_on, CURRENT_DATE)
+	                                        AND COALESCE(tc.ends_on, CURRENT_DATE)) AS unresolved_makeups
+	      FROM teaching_courses tc`
 	where := []string{}
 	args := []any{}
 	i := 1
@@ -378,7 +521,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY fc.code"
+	q += " ORDER BY tc.code"
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -390,8 +533,12 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	out := []TeachingCourse{}
 	for rows.Next() {
 		var tc TeachingCourse
-		if err := rows.Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
-			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial, &tc.HasSpecial); err != nil {
+		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.NameTH, &tc.Level,
+			&tc.Credits, &tc.LectureHrs, &tc.LabHrs, &tc.SelfHrs,
+			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
+			&tc.HasSpecial, &tc.HasMissingSchedule,
+			&tc.NumSectionsRegular, &tc.NumSectionsSpecial, &tc.LecturerNames,
+			&tc.UnresolvedMakeups); err != nil {
 			return nil, err
 		}
 		out = append(out, tc)
@@ -402,12 +549,11 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 // ListForTA returns teaching courses where the given TA is assigned via an
 // approved TA request. Optionally filtered by term.
 func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID *uuid.UUID) ([]TeachingCourse, error) {
-	q := `SELECT DISTINCT tc.id, tc.faculty_course_id, tc.term_id, fc.code, fc.name_th,
+	q := `SELECT DISTINCT tc.id, tc.term_id, tc.code, tc.name_th,
 	             tc.num_students, tc.num_students_regular, tc.num_students_special
 	      FROM ta_request_assignments a
 	      JOIN sections s ON s.id = a.section_id
 	      JOIN teaching_courses tc ON tc.id = s.teaching_course_id
-	      JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 	      JOIN ta_requests r ON r.id = a.request_id
 	      WHERE a.ta_id = $1 AND r.status = 'approved'`
 	args := []any{taID}
@@ -415,7 +561,7 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 		q += " AND tc.term_id = $2"
 		args = append(args, *termID)
 	}
-	q += " ORDER BY fc.code"
+	q += " ORDER BY tc.code"
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -427,7 +573,7 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 	out := []TeachingCourse{}
 	for rows.Next() {
 		var tc TeachingCourse
-		if err := rows.Scan(&tc.ID, &tc.FacultyCourseID, &tc.TermID, &tc.Code, &tc.NameTH,
+		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.NameTH,
 			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial); err != nil {
 			return nil, err
 		}
@@ -485,7 +631,7 @@ type TAAssignment struct {
 // the given TA, optionally narrowed to a single teaching course. One TA can hold
 // multiple assignments on the same course (one per section).
 func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UUID, tcID *uuid.UUID) ([]TAAssignment, error) {
-	q := `SELECT a.id, tc.id, fc.code, fc.name_th,
+	q := `SELECT a.id, tc.id, tc.code, tc.name_th,
 	             sec.id, sec.sec_no, sec.track, a.level::text, r.reimburse_scope::text,
 	             EXISTS (SELECT 1 FROM section_schedules ss WHERE ss.section_id = sec.id),
 	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.attendance_hrs, 0)
@@ -501,7 +647,6 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	      FROM ta_request_assignments a
 	      JOIN sections sec ON sec.id = a.section_id
 	      JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-	      JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 	      JOIN ta_requests r ON r.id = a.request_id
 	      LEFT JOIN ta_workload_forms wf ON wf.assignment_id = a.id
 	      WHERE a.ta_id = $1 AND r.status = 'approved'`
@@ -510,7 +655,7 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 		q += " AND tc.id = $2"
 		args = append(args, *tcID)
 	}
-	q += " ORDER BY fc.code, sec.sec_no"
+	q += " ORDER BY tc.code, sec.sec_no"
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -571,8 +716,12 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 		 FROM teaching_courses WHERE id = $1`, id).Scan(&curTotal, &curRegular, &curSpecial); err != nil {
 		return err
 	}
-	if regular < 0 { regular = curRegular }
-	if special < 0 { special = curSpecial }
+	if regular < 0 {
+		regular = curRegular
+	}
+	if special < 0 {
+		special = curSpecial
+	}
 	// Per-track is source of truth for the aggregate; ignore an explicit total
 	// unless neither track was provided.
 	if regular != curRegular || special != curSpecial {
@@ -596,8 +745,8 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 }
 
 // UpdateSettingsInput carries only the fields a lecturer is allowed to edit
-// on the course-settings page. Course code / name / credits come from
-// faculty_courses and stay read-only. Pointer semantics: nil = leave alone;
+// on the course-settings page. Course code / name / credits are set at import
+// (or by staff) and stay read-only here. Pointer semantics: nil = leave alone;
 // an empty string clears the DB column (sets to NULL).
 type UpdateSettingsInput struct {
 	StartsOn *string `json:"starts_on,omitempty"`
@@ -798,8 +947,8 @@ func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tc
 // cross-section conflicts are the lecturer's judgement call and are surfaced
 // later when TAs try to take a request that would collide.
 //
-// lectureHrs/labHrs are the owning course's faculty_courses credit hours; they
-// gate which schedule kinds are allowed (see validateScheduleKinds).
+// lectureHrs/labHrs are the course's per-term credit hours (teaching_courses);
+// they gate which schedule kinds are allowed (see validateScheduleKinds).
 func validateSectionSchedules(schedules []SectionSchedule, lectureHrs, labHrs int) error {
 	kinds := make([]string, 0, len(schedules))
 	for i, sch := range schedules {
@@ -829,19 +978,19 @@ func validateSectionSchedules(schedules []SectionSchedule, lectureHrs, labHrs in
 	return validateScheduleKinds(kinds, lectureHrs, labHrs)
 }
 
-// validateScheduleKinds enforces the two credit-gating rules shared by every
-// schedule-writing path (manual section CRUD and the Excel import):
+// validateScheduleKinds enforces the two credit-gating rules for the manual
+// section-CRUD paths (the Excel import trusts the registrar file and skips it):
 //
 //  1. A "lecture" block is only allowed when the course carries lecture credit
-//     hours (faculty_courses.lecture_hrs > 0); a "lab" block only when
+//     hours (teaching_courses.lecture_hrs > 0); a "lab" block only when
 //     lab_hrs > 0. Otherwise the schedule would inflate the review-hours
 //     billing cap downstream for hours the course doesn't actually teach.
 //  2. Each kind may appear AT MOST ONCE per section — a section can hold one
 //     lecture block and one lab block, no more.
 //
-// lecture_hrs/lab_hrs are INT NOT NULL DEFAULT 0 in faculty_courses, so a 0
-// reliably means "this course has no such hours" (never "unknown") and it is
-// safe to block that kind on 0.
+// lecture_hrs/lab_hrs are INT NOT NULL DEFAULT 0, so a 0 reliably means "this
+// course has no such hours" (never "unknown") and it is safe to block that
+// kind on 0.
 func validateScheduleKinds(kinds []string, lectureHrs, labHrs int) error {
 	seen := map[string]bool{}
 	for _, k := range kinds {
@@ -863,14 +1012,12 @@ func validateScheduleKinds(kinds []string, lectureHrs, labHrs int) error {
 	return nil
 }
 
-// creditHrsForCourse resolves the owning faculty_courses.lecture_hrs / lab_hrs
-// for a teaching course, so schedule mutations can gate which kinds are allowed.
+// creditHrsForCourse resolves the teaching course's lecture_hrs / lab_hrs (now
+// stored per-term on the course itself) so schedule mutations can gate which
+// kinds are allowed.
 func (s *TeachingService) creditHrsForCourse(ctx context.Context, tcID uuid.UUID) (lectureHrs, labHrs int, err error) {
 	err = s.pool.QueryRow(ctx,
-		`SELECT fc.lecture_hrs, fc.lab_hrs
-		   FROM teaching_courses tc
-		   JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
-		  WHERE tc.id = $1`, tcID).Scan(&lectureHrs, &labHrs)
+		`SELECT lecture_hrs, lab_hrs FROM teaching_courses WHERE id = $1`, tcID).Scan(&lectureHrs, &labHrs)
 	return
 }
 
@@ -1240,17 +1387,18 @@ func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uu
 // FinalExamDate, FinalExamTime, Officer.
 //
 // Flow: staff uploads → PreviewImport reports what would happen per course
-// (new / existing / missing_catalog / unmatched_officer) → staff picks skip
-// codes → CommitImport creates courses in per-course transactions so one
-// failure never blocks the rest of the file.
+// (new / existing / unmatched_officer) → staff picks skip codes → CommitImport
+// creates courses in per-course transactions so one failure never blocks the
+// rest of the file. Course identity (code, names, credit hours, level) comes
+// straight from the file — there is no central catalog to pre-populate.
 // -----------------------------------------------------------------------------
 
 type ImportResult struct {
 	RowCount   int         `json:"row_count"`
 	CreatedIDs []uuid.UUID `json:"created_ids,omitempty"`
 	// SkippedCodes carries course codes that were deliberately skipped by the
-	// staff decision or because the course already existed / had no matching
-	// faculty catalog row. Not an error.
+	// staff decision or because the course already exists in this term. Not an
+	// error.
 	SkippedCodes []string `json:"skipped_codes,omitempty"`
 	ErrorCount   int      `json:"error_count"`
 	Errors       []string `json:"errors,omitempty"`
@@ -1259,7 +1407,7 @@ type ImportResult struct {
 type ImportPreviewCourse struct {
 	Code               string      `json:"code"`
 	Name               string      `json:"name"`
-	Status             string      `json:"status"` // "new" | "existing" | "missing_catalog" | "unmatched_officer"
+	Status             string      `json:"status"` // "new" | "existing" | "unmatched_officer"
 	SectionCount       int         `json:"section_count"`
 	ScheduleCount      int         `json:"schedule_count"`
 	OfficerRaw         string      `json:"officer_raw"`
@@ -1270,12 +1418,11 @@ type ImportPreviewCourse struct {
 }
 
 type ImportPreview struct {
-	Filename            string                `json:"filename"`
-	Courses             []ImportPreviewCourse `json:"courses"`
-	NewCount            int                   `json:"new_count"`
-	ExistingCount       int                   `json:"existing_count"`
-	BlockedCount        int                   `json:"blocked_count"`
-	MissingCatalogCount int                   `json:"missing_catalog_count"`
+	Filename      string                `json:"filename"`
+	Courses       []ImportPreviewCourse `json:"courses"`
+	NewCount      int                   `json:"new_count"`
+	ExistingCount int                   `json:"existing_count"`
+	BlockedCount  int                   `json:"blocked_count"`
 }
 
 type parsedSchedule struct {
@@ -1296,7 +1443,13 @@ type parsedSection struct {
 
 type parsedCourse struct {
 	code            string
-	name            string
+	name            string // Thai name (falls back to the English name / code)
+	nameEN          string
+	level           string // "undergrad" | "graduate"
+	credits         int
+	lectureHrs      int
+	labHrs          int
+	selfHrs         int
 	officerRaw      string
 	sectionsInOrder []string
 	sections        map[string]*parsedSection
@@ -1307,10 +1460,10 @@ type parsedCourse struct {
 // not participate in the users lookup, otherwise every course with them would
 // be flagged as unmatched even though the course itself is fine.
 var officerNoiseTokens = map[string]struct{}{
-	"อจ.พิเศษ":  {},
+	"อจ.พิเศษ": {},
 	"และคณะ":   {},
 	"อจ.":      {},
-	"อาจารย์": {},
+	"อาจารย์":  {},
 }
 
 // Thai month abbreviations as they appear in the Excel (with the trailing dot).
@@ -1406,31 +1559,76 @@ func parseThaiDate(raw string) string {
 func isExamForLec(raw string) bool { return strings.HasPrefix(strings.TrimSpace(raw), "Lec ") }
 func isExamForLab(raw string) bool { return strings.HasPrefix(strings.TrimSpace(raw), "Lab ") }
 
-// pickImportSheet returns the sheet name of the Normalized data. Preference:
-// exact name "Normalized" (as produced by the current template), then any
-// sheet whose header row 1 contains "CourseCode", then the last sheet.
-func pickImportSheet(f *excelize.File) (string, error) {
+// pickImportSheet returns the sheet to read and whether it is the raw registrar
+// export (`sysTitle` layout) rather than the flattened `Normalized` table.
+// Preference: the flattened sheet (exact name "Normalized", or a header row
+// containing "CourseCode"); then the raw sheet (name "sysTitle", or a header row
+// containing "COURSECODE1"); then the last sheet, guessed by its header.
+func pickImportSheet(f *excelize.File) (name string, raw bool, err error) {
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
-		return "", errors.New("ไฟล์ไม่มี sheet")
+		return "", false, errors.New("ไฟล์ไม่มี sheet")
 	}
-	for _, name := range sheets {
-		if name == "Normalized" {
-			return name, nil
-		}
-	}
-	for _, name := range sheets {
-		rows, err := f.GetRows(name)
-		if err != nil || len(rows) == 0 {
-			continue
+	headerHas := func(sheet, needle string) bool {
+		rows, e := f.GetRows(sheet)
+		if e != nil || len(rows) == 0 {
+			return false
 		}
 		for _, cell := range rows[0] {
-			if strings.EqualFold(strings.TrimSpace(cell), "CourseCode") {
-				return name, nil
+			if strings.EqualFold(strings.TrimSpace(cell), needle) {
+				return true
 			}
 		}
+		return false
 	}
-	return sheets[len(sheets)-1], nil
+	// 1. Flattened "Normalized" table (preferred — already one row per meeting).
+	for _, s := range sheets {
+		if s == "Normalized" {
+			return s, false, nil
+		}
+	}
+	for _, s := range sheets {
+		if headerHas(s, "CourseCode") {
+			return s, false, nil
+		}
+	}
+	// 2. Raw registrar export (multi-line cells, header rows + section rows).
+	for _, s := range sheets {
+		if s == "sysTitle" || headerHas(s, "COURSECODE1") {
+			return s, true, nil
+		}
+	}
+	// 3. Fall back to the last sheet; guess raw vs flat from its header.
+	last := sheets[len(sheets)-1]
+	return last, headerHas(last, "COURSECODE1"), nil
+}
+
+// parseUnit reads the registrar's credit notation "N (a-b-c)" into
+// credits=N, lectureHrs=a, labHrs=b, selfHrs=c. Unparseable → all zeros.
+var unitRe = regexp.MustCompile(`^\s*(\d+)\s*\(\s*(\d+)\s*-\s*(\d+)\s*-\s*(\d+)\s*\)\s*$`)
+
+func parseUnit(s string) (credits, lectureHrs, labHrs, selfHrs int) {
+	m := unitRe.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, 0, 0, 0
+	}
+	credits, _ = strconv.Atoi(m[1])
+	lectureHrs, _ = strconv.Atoi(m[2])
+	labHrs, _ = strconv.Atoi(m[3])
+	selfHrs, _ = strconv.Atoi(m[4])
+	return
+}
+
+// courseLevelFromReserved maps the "ReservedFor" text to a course level. The
+// registrar writes "ตรี" / "ตรี โครงการพิเศษ" for undergrad and "บัณฑิต" / "โท" /
+// "เอก" for graduate. Defaults to undergrad.
+func courseLevelFromReserved(reserved string) string {
+	for _, kw := range []string{"บัณฑิต", "ปริญญาโท", "ปริญญาเอก", "ป.โท", "ป.เอก", "โท", "เอก"} {
+		if strings.Contains(reserved, kw) {
+			return "graduate"
+		}
+	}
+	return "undergrad"
 }
 
 // parseNormalizedSheet reads the Excel body and groups its rows into courses.
@@ -1442,13 +1640,18 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		return nil, nil, err
 	}
 	defer f.Close()
-	sheet, err := pickImportSheet(f)
+	sheet, raw, err := pickImportSheet(f)
 	if err != nil {
 		return nil, nil, err
 	}
 	rows, err := f.GetRows(sheet)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Raw registrar export (multi-line cells, header + section rows) is flattened
+	// by parseRawRows into the same []*parsedCourse the Normalized branch builds.
+	if raw {
+		return parseRawRows(rows)
 	}
 	if len(rows) < 2 {
 		return nil, nil, nil
@@ -1481,9 +1684,17 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		}
 		course, seen := byCode[code]
 		if !seen {
+			name := get(row, "coursename")
+			credits, lec, lab, self := parseUnit(get(row, "unit"))
 			course = &parsedCourse{
 				code:            code,
-				name:            get(row, "coursename"),
+				name:            name,
+				nameEN:          name,
+				level:           courseLevelFromReserved(get(row, "reservedfor")),
+				credits:         credits,
+				lectureHrs:      lec,
+				labHrs:          lab,
+				selfHrs:         self,
 				officerRaw:      get(row, "officer"),
 				sections:        map[string]*parsedSection{},
 				sectionsInOrder: []string{},
@@ -1497,6 +1708,11 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 			if o := get(row, "officer"); o != "" {
 				course.officerRaw = o
 			}
+		}
+		// A course is graduate if ANY of its sections is reserved for grad
+		// students (regular rows say "ตรี", so only upgrade, never downgrade).
+		if course.level == "undergrad" && courseLevelFromReserved(get(row, "reservedfor")) == "graduate" {
+			course.level = "graduate"
 		}
 
 		// Per-course exam dates removed 2026-07-14 — exam ranges now live on
@@ -1569,6 +1785,143 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 	return courses, warnings, nil
 }
 
+// splitLines splits a multi-line Excel cell (Alt+Enter line breaks) into its
+// lines, normalising CRLF/CR to LF first.
+func splitLines(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.Split(s, "\n")
+}
+
+// parseRawRows flattens the raw registrar export ("sysTitle" layout) into the
+// same []*parsedCourse the Normalized branch produces. Layout by fixed column:
+//
+//	A code | B name | C unit | D prereq | E "SEC NN" | F reservedFor |
+//	G seats | H day(s) | I "time  kind  room"(s) | J..M exam | N officer
+//
+// A course spans one header row (col A set) followed by its section rows
+// (col E set). The Day (H) and Time (I) cells are multi-line — one line per
+// meeting, aligned by index — so a section can hold several Lec/Lab meetings.
+func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, err error) {
+	cell := func(row []string, i int) string {
+		if i >= len(row) {
+			return ""
+		}
+		return strings.TrimSpace(row[i])
+	}
+	byCode := map[string]*parsedCourse{}
+	order := []string{}
+	var cur *parsedCourse
+	for r := 0; r < len(rows); r++ {
+		row := rows[r]
+		codeRaw := cell(row, 0)
+		if strings.EqualFold(codeRaw, "COURSECODE1") {
+			continue // header row
+		}
+		if codeRaw != "" {
+			// Course header row.
+			code := strings.ToUpper(codeRaw)
+			c, ok := byCode[code]
+			if !ok {
+				name := cell(row, 1)
+				credits, lec, lab, self := parseUnit(cell(row, 2))
+				c = &parsedCourse{
+					code: code, name: name, nameEN: name, level: "undergrad",
+					credits: credits, lectureHrs: lec, labHrs: lab, selfHrs: self,
+					sections:        map[string]*parsedSection{},
+					sectionsInOrder: []string{},
+				}
+				byCode[code] = c
+				order = append(order, code)
+			}
+			cur = c
+			continue
+		}
+		// Section row.
+		rawSection := cell(row, 4)
+		if rawSection == "" || cur == nil {
+			continue
+		}
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(rawSection), "SEC"))
+		secNo := strings.TrimLeft(trimmed, "0")
+		if secNo == "" {
+			secNo = "0"
+		}
+		reserved := cell(row, 5)
+		if cur.level == "undergrad" && courseLevelFromReserved(reserved) == "graduate" {
+			cur.level = "graduate"
+		}
+		if cur.officerRaw == "" {
+			if o := cell(row, 13); o != "" {
+				cur.officerRaw = o
+			}
+		}
+		sec, ok := cur.sections[secNo]
+		if !ok {
+			track := "regular"
+			if strings.Contains(reserved, "โครงการพิเศษ") {
+				track = "special"
+			}
+			seats, _ := strconv.Atoi(cell(row, 6))
+			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats}
+			cur.sections[secNo] = sec
+			cur.sectionsInOrder = append(cur.sectionsInOrder, secNo)
+		}
+		// Meetings: Day (col H) and "time kind room" (col I) are multi-line,
+		// aligned line-by-line. Blank/WBA time → section with no schedule.
+		dayLines := splitLines(cell(row, 7))
+		timeLines := splitLines(cell(row, 8))
+		for i, meetingRaw := range timeLines {
+			meeting := strings.TrimSpace(meetingRaw)
+			if meeting == "" {
+				continue
+			}
+			fields := strings.Fields(meeting) // "13:00-16:00" "Lec" "CP9127"
+			if len(fields) < 2 {
+				continue
+			}
+			var kind string
+			switch strings.ToLower(fields[1]) {
+			case "lec", "lecture":
+				kind = "lecture"
+			case "lab":
+				kind = "lab"
+			default:
+				continue
+			}
+			room := ""
+			if len(fields) >= 3 {
+				room = strings.Join(fields[2:], " ")
+			}
+			dayTok := ""
+			if i < len(dayLines) {
+				dayTok = strings.TrimSpace(dayLines[i])
+			} else if len(dayLines) > 0 {
+				dayTok = strings.TrimSpace(dayLines[len(dayLines)-1])
+			}
+			dow, dowOK := dowFromAbbrev(dayTok)
+			if !dowOK {
+				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): วัน '%s' ไม่รู้จัก ข้าม", r+1, cur.code, secNo, dayTok))
+				continue
+			}
+			start, end, tOK := parseTimeRange(fields[0])
+			if !tOK {
+				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): เวลา '%s' อ่านไม่ได้ ข้าม", r+1, cur.code, secNo, fields[0]))
+				continue
+			}
+			if sec.room == "" {
+				sec.room = room
+			}
+			sec.schedules = append(sec.schedules, parsedSchedule{kind: kind, dow: dow, startTime: start, endTime: end, room: room})
+		}
+	}
+	courses = make([]*parsedCourse, 0, len(order))
+	for _, code := range order {
+		courses = append(courses, byCode[code])
+	}
+	return courses, warnings, nil
+}
+
 // officerTokens splits the raw Officer cell on whitespace and drops the
 // placeholder tokens (อจ.พิเศษ, และคณะ, …).
 func officerTokens(raw string) []string {
@@ -1587,6 +1940,10 @@ func officerTokens(raw string) []string {
 // exactly one active lecturer is auto-assigned; anything else (0 matches or
 // >1 ambiguous match) is returned as unmatched so staff can resolve it.
 func (s *TeachingService) matchOfficers(ctx context.Context, names []string) (matched []uuid.UUID, unmatched []string, err error) {
+	// Non-nil so they marshal as [] instead of null — the import preview UI
+	// reads .length on both without a guard.
+	matched = []uuid.UUID{}
+	unmatched = []string{}
 	seen := map[uuid.UUID]struct{}{}
 	for _, name := range names {
 		rows, err := s.pool.Query(ctx, `
@@ -1648,21 +2005,17 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 			ScheduleCount: schedCount,
 			OfficerRaw:    c.officerRaw,
 			OfficerNames:  tokens,
+			// Default to empty slices: an "existing" course returns before
+			// matchOfficers runs, and a nil slice would reach the client as
+			// JSON null and crash the preview table.
+			MatchedLecturerIDs: []uuid.UUID{},
+			UnmatchedNames:     []string{},
 		}
-		var facultyID uuid.UUID
-		if err := s.pool.QueryRow(ctx, `SELECT id FROM faculty_courses WHERE code = $1`, c.code).Scan(&facultyID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				row.Status = "missing_catalog"
-				row.Note = "ยังไม่ได้เพิ่มรหัสวิชานี้ในบัญชีรายวิชากลาง"
-				out.MissingCatalogCount++
-				out.Courses = append(out.Courses, row)
-				continue
-			}
-			return nil, err
-		}
+		// Course identity comes from the file — nothing to pre-populate. A course
+		// is "existing" only when it was already imported into THIS term.
 		var existingID uuid.UUID
 		err := s.pool.QueryRow(ctx,
-			`SELECT id FROM teaching_courses WHERE faculty_course_id = $1 AND term_id = $2`, facultyID, termID).Scan(&existingID)
+			`SELECT id FROM teaching_courses WHERE term_id = $1 AND code = $2`, termID, c.code).Scan(&existingID)
 		if err == nil {
 			row.Status = "existing"
 			out.ExistingCount++
@@ -1722,7 +2075,7 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		}
 		id, err := s.commitOneCourse(ctx, actor, termID, c)
 		if err != nil {
-			// Skip signals a benign non-creation (existing / missing catalog).
+			// Skip signals a benign non-creation (already exists in this term).
 			// Only real errors bump the error count.
 			if err == errImportSkipped {
 				res.SkippedCodes = append(res.SkippedCodes, c.code)
@@ -1749,24 +2102,16 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 	return res, nil
 }
 
-// errImportSkipped signals commitOneCourse chose not to create the row
-// because it already exists or its faculty catalog entry is missing. The
-// caller records the code in SkippedCodes without incrementing ErrorCount.
+// errImportSkipped signals commitOneCourse chose not to create the row because
+// the course was already imported into this term. The caller records the code
+// in SkippedCodes without incrementing ErrorCount.
 var errImportSkipped = errors.New("skipped")
 
 func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uuid.UUID, c *parsedCourse) (uuid.UUID, error) {
-	var facultyID uuid.UUID
-	var lecHrs, labHrs int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT id, lecture_hrs, lab_hrs FROM faculty_courses WHERE code = $1`, c.code).Scan(&facultyID, &lecHrs, &labHrs); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return uuid.Nil, errImportSkipped
-		}
-		return uuid.Nil, err
-	}
+	// Identity comes from the file; a course is unique within a term by code.
 	var existing uuid.UUID
 	err := s.pool.QueryRow(ctx,
-		`SELECT id FROM teaching_courses WHERE faculty_course_id = $1 AND term_id = $2`, facultyID, termID).Scan(&existing)
+		`SELECT id FROM teaching_courses WHERE term_id = $1 AND code = $2`, termID, c.code).Scan(&existing)
 	if err == nil {
 		return uuid.Nil, errImportSkipped
 	}
@@ -1778,6 +2123,19 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 		return uuid.Nil, err
 	}
 
+	nameTH := strings.TrimSpace(c.name)
+	if nameTH == "" {
+		nameTH = c.code
+	}
+	var nameEN *string
+	if v := strings.TrimSpace(c.nameEN); v != "" {
+		nameEN = &v
+	}
+	level := c.level
+	if level != "graduate" {
+		level = "undergrad"
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return uuid.Nil, err
@@ -1787,9 +2145,11 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 	id := uuid.New()
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO teaching_courses (
-			id, faculty_course_id, term_id, created_by
-		) VALUES ($1,$2,$3,$4)`,
-		id, facultyID, termID, actor); err != nil {
+			id, term_id, code, name_th, name_en, level,
+			credits, lecture_hrs, lab_hrs, self_hrs, created_by
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		id, termID, c.code, nameTH, nameEN, level,
+		c.credits, c.lectureHrs, c.labHrs, c.selfHrs, actor); err != nil {
 		return uuid.Nil, err
 	}
 	for i, lid := range matched {
@@ -1820,16 +2180,11 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 		} else {
 			sumRegular += sec.numStudents
 		}
-		// Same credit-gating + once-per-kind rules the manual section paths
-		// enforce, so an import row can't seed a lecture block on a lab-only
-		// course (or a duplicate kind) and inflate the review-hours cap.
-		kinds := make([]string, 0, len(sec.schedules))
-		for _, sch := range sec.schedules {
-			kinds = append(kinds, sch.kind)
-		}
-		if err := validateScheduleKinds(kinds, lecHrs, labHrs); err != nil {
-			return uuid.Nil, err
-		}
+		// The registrar file is the source of truth: a section may legitimately
+		// hold several lab meetings (multiple rooms) and its session labels may
+		// not line up with the course's credit split. We trust the file and
+		// insert every meeting as-is rather than applying the manual-entry
+		// credit-gate (validateScheduleKinds), which would reject those rows.
 		for _, sch := range sec.schedules {
 			var schRoomPtr *string
 			if sch.room != "" {

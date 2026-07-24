@@ -69,10 +69,10 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	// then by course code and TA name — matching the registrar's บัญชีแนบท้าย
 	// layout.
 	rows, err := s.pool.Query(ctx, `
-		SELECT CASE WHEN fc.level = 'undergrad' THEN 0 ELSE 1 END AS level_bucket,
-		       fc.code,
-		       COALESCE(NULLIF(fc.name_en, ''), fc.name_th) AS course_name,
-		       fc.credits, fc.lecture_hrs, fc.lab_hrs, fc.self_hrs,
+		SELECT CASE WHEN tc.level = 'undergrad' THEN 0 ELSE 1 END AS level_bucket,
+		       tc.code,
+		       COALESCE(NULLIF(tc.name_en, ''), tc.name_th) AS course_name,
+		       tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		       COALESCE(u.student_id, '') AS student_id,
 		       COALESCE(NULLIF(tp.prefix, ''), NULLIF(u.title, ''), '') AS prefix,
 		       u.first_name, u.last_name
@@ -82,16 +82,15 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		JOIN sections sec        ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN faculty_courses fc  ON fc.id = tc.faculty_course_id
 		WHERE tc.term_id = $1
-		GROUP BY level_bucket, fc.code, course_name,
-		         fc.credits, fc.lecture_hrs, fc.lab_hrs, fc.self_hrs,
+		GROUP BY level_bucket, tc.code, course_name,
+		         tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		         u.student_id, tp.prefix, u.title, u.first_name, u.last_name
 		ORDER BY level_bucket,
-		         CASE WHEN fc.code LIKE 'SC%' THEN 0
-		              WHEN fc.code LIKE 'CP%' THEN 1
+		         CASE WHEN tc.code LIKE 'SC%' THEN 0
+		              WHEN tc.code LIKE 'CP%' THEN 1
 		              ELSE 2 END,
-		         fc.code, u.first_name, u.last_name`, in.TermID)
+		         tc.code, u.first_name, u.last_name`, in.TermID)
 	if err != nil {
 		return nil, "", err
 	}

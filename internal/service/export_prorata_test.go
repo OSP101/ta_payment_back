@@ -122,7 +122,7 @@ func trackRows(pairs ...[2]float64) []exportRow {
 
 func TestTrackProrata_UnderBothPools(t *testing.T) {
 	rs := trackRows([2]float64{5000, 3000}, [2]float64{4000, 2000})
-	if applyTrackProrataCap(rs, 20000, 20000) {
+	if applyTrackProrataCap(rs, 20000, 20000, 0) {
 		t.Fatalf("expected no scaling when both pools have room")
 	}
 	if math.Abs(rs[0].actualPaid-8000) > 0.01 || math.Abs(rs[1].actualPaid-6000) > 0.01 {
@@ -133,7 +133,7 @@ func TestTrackProrata_UnderBothPools(t *testing.T) {
 func TestTrackProrata_RegularOverPool_SpecialUntouched(t *testing.T) {
 	// Σreg=15000 pool=9000 → k=0.6; Σspec=4000 pool=10000 → untouched.
 	rs := trackRows([2]float64{10000, 3000}, [2]float64{5000, 1000})
-	if !applyTrackProrataCap(rs, 9000, 10000) {
+	if !applyTrackProrataCap(rs, 9000, 10000, 0) {
 		t.Fatalf("expected scaling when regular pool exceeded")
 	}
 	if math.Abs(rs[0].actualPaid-9000) > 0.01 || math.Abs(rs[1].actualPaid-4000) > 0.01 {
@@ -144,7 +144,7 @@ func TestTrackProrata_RegularOverPool_SpecialUntouched(t *testing.T) {
 func TestTrackProrata_SpecialOverPool_RegularUntouched(t *testing.T) {
 	// Σreg=3000 pool=10000 → untouched; Σspec=12000 pool=6000 → k=0.5.
 	rs := trackRows([2]float64{2000, 8000}, [2]float64{1000, 4000})
-	if !applyTrackProrataCap(rs, 10000, 6000) {
+	if !applyTrackProrataCap(rs, 10000, 6000, 0) {
 		t.Fatalf("expected scaling when special pool exceeded")
 	}
 	if math.Abs(rs[0].actualPaid-6000) > 0.01 || math.Abs(rs[1].actualPaid-3000) > 0.01 {
@@ -155,10 +155,38 @@ func TestTrackProrata_SpecialOverPool_RegularUntouched(t *testing.T) {
 func TestTrackProrata_ZeroPoolIsUnlimited(t *testing.T) {
 	// specialPool=0 must NOT zero out special pay (missing data ≠ zero budget).
 	rs := trackRows([2]float64{1000, 5000})
-	if applyTrackProrataCap(rs, 10000, 0) {
+	if applyTrackProrataCap(rs, 10000, 0, 0) {
 		t.Errorf("pool<=0 must be treated as unlimited")
 	}
 	if math.Abs(rs[0].actualPaid-6000) > 0.01 {
 		t.Errorf("actualPaid must stay full when pool unlimited, got %.2f", rs[0].actualPaid)
+	}
+}
+
+// B2 overlap spill: regular pay overflows into the special pool's unused room
+// when the regular pool is exhausted, but only up to spillableReg.
+func TestTrackProrata_OverlapSpillIntoSpecialPool(t *testing.T) {
+	// Σreg=12000 pool=10000 (short 2000); Σspec=3000 pool=8000 (unused 5000).
+	// spillableReg=2000 → spill 2000 → effReg=12000 (no reg scaling), no spec cut.
+	rs := trackRows([2]float64{12000, 3000})
+	if applyTrackProrataCap(rs, 10000, 8000, 2000) {
+		t.Fatalf("spill should absorb the regular shortfall → no scaling")
+	}
+	if math.Abs(rs[0].actualPaid-15000) > 0.01 {
+		t.Errorf("full pay expected after spill, got %.2f want 15000", rs[0].actualPaid)
+	}
+}
+
+// Spill is capped by spillableReg: only overlap pay may borrow from special.
+func TestTrackProrata_SpillCappedBySpillable(t *testing.T) {
+	// Σreg=12000 pool=10000 (short 2000); spillableReg=500 → spill only 500 →
+	// effReg=10500, regScale=10500/12000; special untouched (Σspec=3000<7500).
+	rs := trackRows([2]float64{12000, 3000})
+	if !applyTrackProrataCap(rs, 10000, 8000, 500) {
+		t.Fatalf("expected scaling — spill (500) can't cover the 2000 shortfall")
+	}
+	wantReg := 12000 * (10500.0 / 12000.0)
+	if math.Abs(rs[0].actualPaid-(wantReg+3000)) > 0.5 {
+		t.Errorf("got %.2f want ~%.2f", rs[0].actualPaid, wantReg+3000)
 	}
 }

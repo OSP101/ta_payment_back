@@ -72,8 +72,8 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	snap := &BudgetSnapshot{TeachingCourseID: tcID}
 	err := s.pool.QueryRow(ctx, `
 		SELECT tc.num_students, tc.num_students_regular, tc.num_students_special,
-		       fc.credits, fc.lecture_hrs, fc.lab_hrs
-		FROM teaching_courses tc JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		       tc.credits, tc.lecture_hrs, tc.lab_hrs
+		FROM teaching_courses tc
 		WHERE tc.id = $1`, tcID).Scan(&snap.NumStudents, &snap.NumStudentsRegular, &snap.NumStudentsSpecial,
 		&snap.Credits, &snap.LectureCredits, &snap.LabCredits)
 	if err != nil {
@@ -167,17 +167,30 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
                 WHERE tc.id = $1
              )
         SELECT COALESCE(
-            (SELECT COALESCE(SUM(wl.hours *
-                CASE WHEN sec.track = 'regular' THEN pr.undergrad_regular
-                     ELSE pr.undergrad_special END
-             ), 0)
+            (SELECT COALESCE(SUM(wl.hours * pr.undergrad_regular), 0)
              FROM work_logs wl
              JOIN ta_request_assignments a ON a.id = wl.assignment_id
              JOIN ta_requests r  ON r.id = a.request_id
-             JOIN sections sec   ON sec.id = a.section_id
+             JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'regular'
              JOIN users u        ON u.id = a.ta_id
              CROSS JOIN latest pr
              WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND u.study_level = 'undergrad')
+          +
+            -- ป.ตรี ภาคพิเศษ: รายชั่วโมงแต่ไม่เกิน ug_special_monthly_cap ต่อคน/เดือน
+            -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") — คิดทีละเดือนแล้วรวม
+            (SELECT COALESCE(SUM(LEAST(m.hrs * (SELECT undergrad_special FROM latest),
+                                       (SELECT ug_special_monthly_cap FROM latest))), 0)
+             FROM (
+                SELECT a.ta_id, to_char(wl.work_date,'YYYY-MM') AS ym, SUM(wl.hours) AS hrs
+                FROM work_logs wl
+                JOIN ta_request_assignments a ON a.id = wl.assignment_id
+                JOIN ta_requests r  ON r.id = a.request_id
+                JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'special'
+                JOIN users u        ON u.id = a.ta_id
+                WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
+                  AND u.study_level = 'undergrad'
+                GROUP BY a.ta_id, to_char(wl.work_date,'YYYY-MM')
+             ) m)
           +
             (SELECT COALESCE(SUM(wl.hours * pr.graduate_regular_hourly), 0)
              FROM work_logs wl

@@ -123,35 +123,52 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	}
 
 	var (
-		termID                uuid.UUID
-		lectureHrs, labHrs    float64
+		termID             uuid.UUID
+		lectureHrs, labHrs float64
 	)
 	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.term_id, COALESCE(fc.lecture_hrs, 0), COALESCE(fc.lab_hrs, 0)
-		FROM teaching_courses tc JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
+		SELECT tc.term_id, COALESCE(tc.lecture_hrs, 0), COALESCE(tc.lab_hrs, 0)
+		FROM teaching_courses tc
 		WHERE tc.id = $1
 	`, in.TeachingCourseID).Scan(&termID, &lectureHrs, &labHrs); err != nil {
 		return nil, errors.New("ไม่พบรายวิชาที่เลือก")
 	}
 
+	// WBA gate: a course whose section(s) still have no class schedule (the
+	// registrar file said "will be arranged") cannot accept a TA request —
+	// downstream worklog validation, budget math, and time-clock checks all
+	// read the timetable. The lecturer/staff must fill the schedule first.
+	var missingSchedule bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM sections sx
+			WHERE sx.teaching_course_id = $1
+			  AND NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id = sx.id))
+	`, in.TeachingCourseID).Scan(&missingSchedule); err != nil {
+		return nil, err
+	}
+	if missingSchedule {
+		return nil, Invalid("รายวิชานี้ยังไม่ระบุเวลาเรียน (WBA) — กรุณากรอกตารางเรียนของทุก section ให้ครบก่อน จึงจะส่งคำขอ TA ได้")
+	}
+
 	// Capture which window admitted this request so window deletion can honour
-	// the "in use" guard (M3). We no longer block once the window closes: an
-	// opened window still accepts submissions after closes_at, but the request
-	// is flagged `is_late` so staff can see it arrived past the deadline. A
-	// window that has not opened yet (NOW < opens_at) or was manually switched
-	// off (is_open = false) still blocks.
-	var windowID uuid.UUID
+	// the "in use" guard (M3).
+	//
+	// There is NO "closed" state: a TA request is never blocked by the window
+	// (per the lecturers' request — deadlines inform, they don't gate). The
+	// window only decides ONE thing: on-time vs late. Late requests carry
+	// `is_late` so staff (and the lecturer) know the payout will be delayed.
+	// When the term has no window configured at all, there is no deadline to
+	// miss, so the request is on time and window_id stays NULL.
+	var windowID *uuid.UUID
 	var isLate bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT w.id, (NOW() > w.closes_at) AS is_late
 		FROM ta_request_windows w
-		WHERE w.term_id = $1 AND w.is_open AND NOW() >= w.opens_at
+		WHERE w.term_id = $1
 		ORDER BY w.closes_at DESC LIMIT 1
 	`, termID).Scan(&windowID, &isLate)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, errors.New("ยังไม่เปิดรับคำขอ TA สำหรับภาคการศึกษานี้")
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	}
 
@@ -224,6 +241,14 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			if err := validateUndergradWorkloadCaps(a.Workload, name, lectureHrs, labHrs, nSecs); err != nil {
 				return nil, err
 			}
+		}
+		// ประกาศคุมเป็น "ชม./วัน" แต่ฟอร์มกรอกเป็น "ชม./สัปดาห์" — ตรวจว่าที่กรอก
+		// กระจายลงบันทึกเวลาจริงได้โดยไม่ชนเพดานรายวัน (ไม่งั้น auto-generate
+		// จะข้ามคาบเงียบ ๆ และ TA เสียชั่วโมงที่ควรได้).
+		if err := s.enforceDailyHourFeasibility(
+			ctx, a.SectionIDs, level, name, weeklyWorkloadTotal(a.Workload, level),
+		); err != nil {
+			return nil, err
 		}
 	}
 
@@ -424,6 +449,7 @@ func validateWorkloadFields(w WorkloadInput, name string) error {
 //     exposure: max = credit_hrs × n_sections
 //   - ug_other ("อื่น ๆ") is fixed at course credit_hrs — stakeholder rule:
 //     prep/admin time can't scale with section count.
+//
 // Only applies to undergrad; grad fields are governed by the 10–12 total
 // rule inside autoDecide.
 func validateUndergradWorkloadCaps(w WorkloadInput, name string, lectureHrs, labHrs, nSecs float64) error {
@@ -443,6 +469,96 @@ func validateUndergradWorkloadCaps(w WorkloadInput, name string, lectureHrs, lab
 		if c.v > c.cap {
 			return fmt.Errorf("ภาระงาน '%s' ของ %s เกินขีดจำกัด %.2f ชม./สัปดาห์", c.label, name, c.cap)
 		}
+	}
+	return nil
+}
+
+// weeklyWorkloadTotal sums the fields that actually apply to this TA's level —
+// undergrad and grad use two disjoint sets of columns on the same form.
+func weeklyWorkloadTotal(w WorkloadInput, level string) float64 {
+	if level == "master" || level == "phd" {
+		return w.HelpTeachHrs + w.PrepHrs + w.GradeHrs + w.OtherHrs
+	}
+	return w.CheckWorkHrs + w.AttendanceHrs + w.UGOtherHrs + w.LabHrs
+}
+
+var thaiDayNames = [7]string{"อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"}
+
+// จำนวนวันทำการต่อสัปดาห์ที่ใช้เป็นฐานแปลง "เพดาน ชม./วัน" → "เพดาน ชม./สัปดาห์".
+// งานนอกคาบ (ตรวจงาน/อื่น ๆ) ลงวันไหนก็ได้ จึงไม่ผูกกับวันที่มีคาบเรียน แต่ต้อง
+// มีเพดานไม่งั้นภาระงานที่กรอกจะกระจายลงบันทึกเวลาจริงไม่ได้.
+const workingDaysPerWeek = 5
+
+// enforceDailyHourFeasibility rejects a request whose declared workload could
+// never be recorded as legal work logs under ประกาศ 731/2565 + 1080/2565
+// (ป.ตรี ปกติ ≤7 ชม./วัน, ป.ตรี พิเศษ ≤6, บัณฑิต ปกติ ≤6).
+//
+// Two things must hold, because the auto-generated work logs SILENTLY DROP any
+// occurrence that would breach the daily cap — the TA would just lose payable
+// hours with no error anywhere:
+//  1. per class day: the scheduled hours of every section this TA covers on the
+//     same weekday must fit inside one day's cap;
+//  2. per week: total declared hours ≤ daily cap × working days.
+func (s *TARequestService) enforceDailyHourFeasibility(
+	ctx context.Context, sectionIDs []uuid.UUID, level, name string, declaredWeekly float64,
+) error {
+	if len(sectionIDs) == 0 {
+		return nil
+	}
+	isGrad := level == "master" || level == "phd"
+	rows, err := s.pool.Query(ctx, `
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
+		SELECT ss.day_of_week,
+		       SUM(EXTRACT(EPOCH FROM (ss.end_time - ss.start_time)) / 3600.0) AS hrs,
+		       MIN(CASE
+		           WHEN NOT $2 AND sec.track = 'regular' THEN pr.ug_regular_daily_hour_cap
+		           WHEN NOT $2 AND sec.track = 'special' THEN pr.ug_special_daily_hour_cap
+		           WHEN $2 AND sec.track = 'regular' THEN pr.grad_regular_daily_hour_cap
+		           ELSE 24
+		       END) AS day_cap
+		FROM section_schedules ss
+		JOIN sections sec ON sec.id = ss.section_id
+		CROSS JOIN latest pr
+		WHERE ss.section_id = ANY($1)
+		GROUP BY ss.day_of_week`, sectionIDs, isGrad)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	minCap := 0.0
+	for rows.Next() {
+		var dow int
+		var hrs, dayCap float64
+		if err := rows.Scan(&dow, &hrs, &dayCap); err != nil {
+			return err
+		}
+		if minCap == 0 || dayCap < minCap {
+			minCap = dayCap
+		}
+		if hrs > dayCap+0.01 {
+			day := "—"
+			if dow >= 0 && dow < 7 {
+				day = thaiDayNames[dow]
+			}
+			return Invalid(fmt.Sprintf(
+				"%s รับ section ที่เรียนวัน%sรวม %.1f ชม. เกินเพดาน %.1f ชม./วัน ตามประกาศ — "+
+					"กรุณาลด section ของวันนั้น มิฉะนั้นบันทึกเวลาจะลงได้ไม่ครบ",
+				name, day, hrs, dayCap))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if minCap <= 0 {
+		return nil // ไม่มีตารางเรียน (WBA) — ถูกบล็อกไปแล้วก่อนหน้านี้
+	}
+	weeklyCap := minCap * workingDaysPerWeek
+	if declaredWeekly > weeklyCap+0.01 {
+		return Invalid(fmt.Sprintf(
+			"ภาระงานของ %s รวม %.2f ชม./สัปดาห์ เกินที่จะลงบันทึกเวลาได้จริง — "+
+				"เพดาน %.1f ชม./วัน × %d วันทำการ = %.1f ชม./สัปดาห์",
+			name, declaredWeekly, minCap, workingDaysPerWeek, weeklyCap))
 	}
 	return nil
 }
@@ -669,7 +785,7 @@ type TACandidate struct {
 	StudyLevel          string    `json:"study_level"`
 	ApprovedCourseCount int       `json:"approved_course_count"` // other courses this term (excl. this one)
 	AtQuota             bool      `json:"at_quota"`              // adding THIS course would exceed the cap
-	AlreadyInCourse     bool      `json:"already_in_course"`    // already an approved TA of THIS course
+	AlreadyInCourse     bool      `json:"already_in_course"`     // already an approved TA of THIS course
 }
 
 // Candidates lists every TA with their approved-course count in the given
@@ -1067,8 +1183,8 @@ func (s *TARequestService) decideOne(ctx context.Context, reqID uuid.UUID) error
 
 func (s *TARequestService) courseLabel(ctx context.Context, courseID uuid.UUID) (code, nameTH string) {
 	_ = s.pool.QueryRow(ctx, `
-		SELECT fc.code, fc.name_th FROM teaching_courses tc
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id WHERE tc.id = $1`,
+		SELECT tc.code, tc.name_th FROM teaching_courses tc
+		WHERE tc.id = $1`,
 		courseID).Scan(&code, &nameTH)
 	return code, nameTH
 }
@@ -1093,13 +1209,12 @@ type TARequestSummary struct {
 }
 
 const requestSummarySelect = `
-	SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
+	SELECT r.id, tc.code, tc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
 	       u.first_name || ' ' || u.last_name,
 	       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
 	       tc.term_id, at.academic_year, at.semester, r.is_late, r.decision_checks
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
-	JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 	JOIN academic_terms at ON at.id = tc.term_id
 	JOIN users u ON u.id = r.lecturer_id`
 
@@ -1158,17 +1273,17 @@ func (s *TARequestService) ListAll(ctx context.Context) ([]TARequestSummary, err
 // ---------------------------------------------------------------------------
 
 type TARequestAssignmentDetail struct {
-	SectionNo           string   `json:"section_no"`
+	SectionNo           string    `json:"section_no"`
 	TAID                uuid.UUID `json:"ta_id"`
-	TAName              string   `json:"ta_name"`
-	Email               string   `json:"email"`
-	StudentID           *string  `json:"student_id,omitempty"`
-	Level               string   `json:"level"`
-	TotalHrs            float64  `json:"total_hrs"`
-	ProfileStatus       string   `json:"profile_status"`
-	HasSchedule         bool     `json:"has_schedule"`
-	ApprovedCourseCount int      `json:"approved_course_count"`
-	Warnings            []string `json:"warnings"`
+	TAName              string    `json:"ta_name"`
+	Email               string    `json:"email"`
+	StudentID           *string   `json:"student_id,omitempty"`
+	Level               string    `json:"level"`
+	TotalHrs            float64   `json:"total_hrs"`
+	ProfileStatus       string    `json:"profile_status"`
+	HasSchedule         bool      `json:"has_schedule"`
+	ApprovedCourseCount int       `json:"approved_course_count"`
+	Warnings            []string  `json:"warnings"`
 }
 
 type TARequestCountDetail struct {
@@ -1188,14 +1303,13 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 	var d TARequestDetail
 	var checksRaw []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT r.id, fc.code, fc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
+		SELECT r.id, tc.code, tc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
 		       u.first_name || ' ' || u.last_name,
 		       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
 		       tc.term_id, at.academic_year, at.semester,
 		       r.decision_checks, r.reimburse_scope::text
 		FROM ta_requests r
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		JOIN academic_terms at ON at.id = tc.term_id
 		JOIN users u ON u.id = r.lecturer_id
 		WHERE r.id = $1`, reqID).Scan(

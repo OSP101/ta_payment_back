@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 
@@ -602,11 +603,11 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 
 	// Load schedules
 	type sch struct {
-		kind      string
-		day       int
-		start     string
-		end       string
-		hours     float64
+		kind  string
+		day   int
+		start string
+		end   string
+		hours float64
 	}
 	var schs []sch
 	rows, err := s.pool.Query(ctx,
@@ -903,9 +904,9 @@ func validateReviewInput(in TAReviewScheduleInput) error {
 // Business rule (per user): total review hours per week must not exceed the
 // section's weekly lecture hours (summed from section_schedules kind='lecture').
 type TAReviewScheduleList struct {
-	Items                []TAReviewSchedule `json:"items"`
-	LectureHoursPerWeek  float64            `json:"lecture_hours_per_week"`
-	ReviewHoursPerWeek   float64            `json:"review_hours_per_week"`
+	Items               []TAReviewSchedule `json:"items"`
+	LectureHoursPerWeek float64            `json:"lecture_hours_per_week"`
+	ReviewHoursPerWeek  float64            `json:"review_hours_per_week"`
 }
 
 // weeklyLectureHoursForAssignment sums the section's kind='lecture' hours from
@@ -1049,13 +1050,12 @@ func (s *WorkLogService) ScheduleBusyBlocks(ctx context.Context, actor, assignme
 	rows, err = s.pool.Query(ctx, `
 		SELECT ss.day_of_week,
 		       to_char(ss.start_time,'HH24:MI'), to_char(ss.end_time,'HH24:MI'),
-		       fc.code || ' sec ' || sec2.sec_no
+		       tc2.code || ' sec ' || sec2.sec_no
 		FROM ta_request_assignments a2
 		JOIN ta_requests r2 ON r2.id = a2.request_id AND r2.status = 'approved'
 		JOIN sections sec2 ON sec2.id = a2.section_id
 		JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id AND tc2.term_id = $2
 		JOIN section_schedules ss ON ss.section_id = sec2.id
-		JOIN faculty_courses fc ON fc.id = tc2.faculty_course_id
 		WHERE a2.ta_id = $1`, taID, termID)
 	if err != nil {
 		return nil, err
@@ -1075,12 +1075,11 @@ func (s *WorkLogService) ScheduleBusyBlocks(ctx context.Context, actor, assignme
 	rows, err = s.pool.Query(ctx, `
 		SELECT rs.id::text, rs.day_of_week,
 		       to_char(rs.start_time,'HH24:MI'), to_char(rs.end_time,'HH24:MI'),
-		       fc.code || ' sec ' || sec2.sec_no
+		       tc2.code || ' sec ' || sec2.sec_no
 		FROM ta_review_schedules rs
 		JOIN ta_request_assignments a2 ON a2.id = rs.assignment_id
 		JOIN sections sec2 ON sec2.id = a2.section_id
 		JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id AND tc2.term_id = $2
-		JOIN faculty_courses fc ON fc.id = tc2.faculty_course_id
 		WHERE a2.ta_id = $1`, taID, termID)
 	if err != nil {
 		return nil, err
@@ -1192,14 +1191,13 @@ func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignment
 	{
 		var label, st, en string
 		err := s.pool.QueryRow(ctx, `
-			SELECT fc.code || ' sec ' || sec2.sec_no,
+			SELECT tc2.code || ' sec ' || sec2.sec_no,
 			       to_char(ss.start_time,'HH24:MI'), to_char(ss.end_time,'HH24:MI')
 			FROM ta_request_assignments a2
 			JOIN ta_requests r2 ON r2.id = a2.request_id AND r2.status = 'approved'
 			JOIN sections sec2 ON sec2.id = a2.section_id
 			JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id AND tc2.term_id = $2
 			JOIN section_schedules ss ON ss.section_id = sec2.id
-			JOIN faculty_courses fc ON fc.id = tc2.faculty_course_id
 			WHERE a2.ta_id = $1
 			  AND ss.day_of_week = $3
 			  AND ss.start_time < $5::time AND ss.end_time > $4::time
@@ -1219,13 +1217,12 @@ func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignment
 		}
 		var label, st, en string
 		err := s.pool.QueryRow(ctx, `
-			SELECT fc.code || ' sec ' || sec2.sec_no,
+			SELECT tc2.code || ' sec ' || sec2.sec_no,
 			       to_char(rs.start_time,'HH24:MI'), to_char(rs.end_time,'HH24:MI')
 			FROM ta_review_schedules rs
 			JOIN ta_request_assignments a2 ON a2.id = rs.assignment_id
 			JOIN sections sec2 ON sec2.id = a2.section_id
 			JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id AND tc2.term_id = $2
-			JOIN faculty_courses fc ON fc.id = tc2.faculty_course_id
 			WHERE a2.ta_id = $1 AND rs.id <> $6
 			  AND rs.day_of_week = $3
 			  AND rs.start_time < $5::time AND rs.end_time > $4::time
@@ -1476,12 +1473,11 @@ func (s *WorkLogService) enforceWeeklyActivityCap(ctx context.Context, ac *assig
 func (s *WorkLogService) enforceNoOverlap(ctx context.Context, taID uuid.UUID, w WorkLog) error {
 	var code, st, en string
 	err := s.pool.QueryRow(ctx, `
-		SELECT fc.code, wl.start_time::text, wl.end_time::text
+		SELECT tc.code, wl.start_time::text, wl.end_time::text
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		WHERE a.ta_id = $1 AND wl.work_date = $2::date AND wl.id <> $3
 		  AND wl.status <> 'rejected'
 		  AND wl.start_time < $5::time AND wl.end_time > $4::time
@@ -1596,11 +1592,10 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 func (s *WorkLogService) otherActivityCapHours(ctx context.Context, assignmentID uuid.UUID, parentKind string) (float64, error) {
 	var capHrs float64
 	err := s.pool.QueryRow(ctx, `
-		SELECT CASE WHEN $2='lecture' THEN fc.lecture_hrs ELSE fc.lab_hrs END
+		SELECT CASE WHEN $2='lecture' THEN tc.lecture_hrs ELSE tc.lab_hrs END
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		WHERE a.id = $1`, assignmentID, parentKind).Scan(&capHrs)
 	return capHrs, err
 }
@@ -1891,14 +1886,32 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	return nil
 }
 
-func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.UUID, privileged bool) error {
+var yearMonthRe = regexp.MustCompile(`^[0-9]{4}-(0[1-9]|1[0-2])$`)
+
+// validateYearMonth accepts "" (whole batch) or a strict "YYYY-MM". The value
+// reaches SQL as a to_char() comparison, so a malformed one would silently
+// match nothing and look like "ไม่มีรายการที่รออนุมัติ".
+func validateYearMonth(ym string) error {
+	if ym == "" || yearMonthRe.MatchString(ym) {
+		return nil
+	}
+	return Invalid("รูปแบบเดือนไม่ถูกต้อง (ต้องเป็น YYYY-MM)")
+}
+
+// yearMonth ("YYYY-MM") approves only that month's submitted rows — lecturers
+// asked for per-month decisions because a batch is usually wrong in one month
+// only. "" keeps the legacy whole-batch behaviour.
+func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.UUID, yearMonth string, privileged bool) error {
+	if err := validateYearMonth(yearMonth); err != nil {
+		return err
+	}
 	ac, err := s.assertCanReview(ctx, actor, assignmentID, privileged)
 	if err != nil {
 		return err
 	}
-	// Whole-batch guard: approval flips every submitted row at once, so refuse
-	// outright if any of them falls in a month already handed to finance.
-	if err := assertNoFinanceLockedRows(ctx, s.pool, assignmentID, []string{"submitted"}); err != nil {
+	// Refuse if any row being approved falls in a month already handed to
+	// finance. Scoped to yearMonth so one settled month can't freeze the rest.
+	if err := assertNoFinanceLockedRows(ctx, s.pool, assignmentID, []string{"submitted"}, yearMonth); err != nil {
 		return err
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -1931,7 +1944,8 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
 		CROSS JOIN latest pr
-		WHERE wl.assignment_id = $1 AND wl.status = 'submitted'`, assignmentID).Scan(&addBaht); err != nil {
+		WHERE wl.assignment_id = $1 AND wl.status = 'submitted'
+		  AND ($2 = '' OR to_char(wl.work_date, 'YYYY-MM') = $2)`, assignmentID, yearMonth).Scan(&addBaht); err != nil {
 		return err
 	}
 	if addBaht > 0 {
@@ -1952,7 +1966,8 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE work_logs SET status='approved', approved_at=NOW(), approved_by=$1
-		 WHERE assignment_id=$2 AND status='submitted'`, actor, assignmentID)
+		 WHERE assignment_id=$2 AND status='submitted'
+		   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`, actor, assignmentID, yearMonth)
 	if err != nil {
 		return err
 	}
@@ -1962,12 +1977,13 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.approve", Entity: "assignment", EntityID: assignmentID.String()})
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.approve", Entity: "assignment", EntityID: assignmentID.String(), Note: yearMonth})
 	if s.notify != nil {
-		s.notify.Send(ctx, ac.TAID,
-			"อนุมัติบันทึกเวลา",
-			"บันทึกเวลาปฏิบัติงานของคุณได้รับการอนุมัติแล้ว",
-			"/ta/worklog")
+		scope := "บันทึกเวลาปฏิบัติงานของคุณได้รับการอนุมัติแล้ว"
+		if yearMonth != "" {
+			scope = "บันทึกเวลาเดือน " + yearMonth + " ของคุณได้รับการอนุมัติแล้ว"
+		}
+		s.notify.Send(ctx, ac.TAID, "อนุมัติบันทึกเวลา", scope, "/ta/worklog")
 	}
 	return nil
 }
@@ -1991,7 +2007,7 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.id,
 		       u.first_name || ' ' || u.last_name,
-		       fc.code,
+		       tc.code,
 		       tc.id,
 		       COALESCE(SUM(wl.hours), 0),
 		       MIN(wl.work_date),
@@ -2000,15 +2016,14 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		JOIN users u ON u.id = a.ta_id
 		JOIN work_logs wl ON wl.assignment_id = a.id AND wl.status = 'submitted'
 		WHERE $1 = TRUE OR EXISTS (
 		    SELECT 1 FROM teaching_lecturers tl
 		    WHERE tl.teaching_course_id = tc.id AND tl.lecturer_id = $2
 		)
-		GROUP BY a.id, u.first_name, u.last_name, fc.code, tc.id
-		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, fc.code`,
+		GROUP BY a.id, u.first_name, u.last_name, tc.code, tc.id
+		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, tc.code`,
 		privileged, actor)
 	if err != nil {
 		return nil, err
@@ -2132,7 +2147,7 @@ func (s *WorkLogService) StaffListByCourse(ctx context.Context, tcID uuid.UUID) 
 		       wl.start_time::text, wl.end_time::text, wl.hours, wl.activity,
 		       wl.parent_kind, wl.room, wl.note, wl.status::text,
 		       a.ta_id, u.first_name || ' ' || u.last_name,
-		       fc.code, sec.sec_no, sec.track, a.level,
+		       tc.code, sec.sec_no, sec.track, a.level,
 		       -- Month is frozen for this TA once it reaches exported/finance_sent.
 		       -- Same (ta_id, tc, year_month, status) predicate as financeLockedMonths.
 		       EXISTS (
@@ -2151,7 +2166,6 @@ func (s *WorkLogService) StaffListByCourse(ctx context.Context, tcID uuid.UUID) 
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 		JOIN academic_terms trm ON trm.id = tc.term_id
-		JOIN faculty_courses fc ON fc.id = tc.faculty_course_id
 		WHERE tc.id = $1
 		ORDER BY u.first_name, wl.work_date, wl.start_time`, tcID)
 	if err != nil {
@@ -2425,9 +2439,13 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, staffID, id uuid.UUID)
 	return nil
 }
 
-func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UUID, reason string, privileged bool) error {
+// yearMonth ("YYYY-MM") sends back only that month's rows; "" = whole batch.
+func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UUID, reason, yearMonth string, privileged bool) error {
 	if reason == "" {
 		return Invalid("ต้องระบุเหตุผลการปฏิเสธ")
+	}
+	if err := validateYearMonth(yearMonth); err != nil {
+		return err
 	}
 	ac, err := s.assertCanReview(ctx, actor, assignmentID, privileged)
 	if err != nil {
@@ -2435,12 +2453,14 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 	}
 	// Mirror Approve: a month at finance_sent is settled — bouncing its rows
 	// back would desync the paperwork already at the finance office.
-	if err := assertNoFinanceLockedRows(ctx, s.pool, assignmentID, []string{"submitted"}); err != nil {
+	if err := assertNoFinanceLockedRows(ctx, s.pool, assignmentID, []string{"submitted"}, yearMonth); err != nil {
 		return err
 	}
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE work_logs SET status='rejected', reject_reason=$1 WHERE assignment_id=$2 AND status='submitted'`,
-		reason, assignmentID)
+		`UPDATE work_logs SET status='rejected', reject_reason=$1
+		 WHERE assignment_id=$2 AND status='submitted'
+		   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`,
+		reason, assignmentID, yearMonth)
 	if err != nil {
 		return err
 	}

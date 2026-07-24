@@ -61,11 +61,9 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/users/:id/deactivate", adminOrStaff, uh.Deactivate)
 	authed.Post("/users/:id/activate", adminOrStaff, uh.Activate)
 
-	// Faculty courses & settings (admin, staff)
+	// Pay-rate & budget-cap settings (admin, staff). The faculty course catalog
+	// was removed — course identity now lives per-term on teaching_courses.
 	ch := &CourseHandler{Svc: svc}
-	authed.Get("/faculty-courses", ch.List)
-	authed.Post("/faculty-courses", adminOrStaff, ch.Upsert)
-	authed.Delete("/faculty-courses/:id", adminOrStaff, ch.Delete)
 	authed.Get("/settings/pay-rate", ch.PayRate)
 	authed.Post("/settings/pay-rate", adminOrStaff, ch.CreatePayRate)
 	authed.Get("/settings/budget-cap", ch.BudgetCap)
@@ -81,6 +79,8 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 
 	// Teaching courses
 	authed.Get("/teaching-courses", th.List)
+	// Timetable kinds (บรรยาย/ปฏิบัติการ) for a term — any signed-in user.
+	authed.Get("/class-kinds", th.ClassKinds)
 	authed.Post("/teaching-courses", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.Create)
 	authed.Get("/teaching-courses/:id", th.Get)
 	authed.Delete("/teaching-courses/:id", adminOrStaff, th.Delete)
@@ -227,6 +227,11 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	dpH := &DocProgressHandler{Svc: svc}
 	authed.Get("/document-progress", dpH.Get)
 	authed.Post("/document-progress/:termId", adminOrStaff, dpH.SetStage)
+	// Per-course signature checklist (who hasn't signed). GET readable by anyone;
+	// tick + remind are staff/admin only.
+	authed.Get("/document-progress/checklist", dpH.ListChecklist)
+	authed.Post("/document-progress/checklist/:tcId", adminOrStaff, dpH.ToggleSignature)
+	authed.Post("/document-progress/:termId/remind", adminOrStaff, dpH.RemindUnsigned)
 
 	// Admin officers (executive roster used on generated official docs).
 	// GET is open to any authenticated user so document templates can render

@@ -777,7 +777,17 @@ func (s *DocsService) AttachGeneratedCreditorForm(ctx context.Context, userID uu
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return s.Upload(ctx, userID, "creditor_form", filename, "application/pdf", int64(len(body)), bytes.NewReader(body))
+	docID, err := s.Upload(ctx, userID, "creditor_form", filename, "application/pdf", int64(len(body)), bytes.NewReader(body))
+	if err != nil {
+		return uuid.Nil, err
+	}
+	// PDPA: the national ID is only needed to render the creditor-form PDF.
+	// Now that the PDF exists, scrub the number from the database (the live
+	// profile + the immutable submission snapshots) so it is never retained at
+	// rest. Regenerating the form later requires the TA to re-enter it.
+	_, _ = s.pool.Exec(ctx, `UPDATE ta_profiles SET national_id = NULL WHERE user_id = $1`, userID)
+	_, _ = s.pool.Exec(ctx, `UPDATE ta_profile_submissions SET national_id = NULL WHERE user_id = $1`, userID)
+	return docID, nil
 }
 
 func validateBank(p TAProfile) error {

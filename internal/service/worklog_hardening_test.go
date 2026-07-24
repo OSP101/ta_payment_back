@@ -131,6 +131,39 @@ func TestValidate_ExamBlackoutStillEnforced(t *testing.T) {
 	}
 }
 
+// No back-dating into a month that already passed. todayRef fixes "now".
+func TestValidate_NoBackdatingPastMonth(t *testing.T) {
+	start, end := hardeningBounds() // 2026-06-01 .. 2026-10-31
+	today, _ := time.Parse("2006-01-02", "2026-08-15")
+	mk := func(date string) WorkLog {
+		return WorkLog{
+			WorkDate: date, Activity: "review",
+			StartTime: "09:00", EndTime: "11:00", Hours: 2,
+		}
+	}
+	call := func(date string, ref time.Time) error {
+		return validateWorkLogEntry(mk(date), hardeningGate(), start, end,
+			examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref)
+	}
+
+	// A prior month is rejected.
+	if err := call("2026-07-10", today); err == nil {
+		t.Errorf("a date in a past month must be rejected")
+	}
+	// The current month is allowed even for an earlier day of the month.
+	if err := call("2026-08-05", today); err != nil {
+		t.Errorf("current-month date should pass, got: %v", err)
+	}
+	// A future month (still within the term) is allowed — TAs may fill ahead.
+	if err := call("2026-09-20", today); err != nil {
+		t.Errorf("future-month date within term should pass, got: %v", err)
+	}
+	// Zero todayRef disables the rule (staff override / other callers).
+	if err := call("2026-07-10", time.Time{}); err != nil {
+		t.Errorf("zero todayRef must disable the back-date rule, got: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // statusRank — send-back ordering (monthly staff lifecycle)
 // ---------------------------------------------------------------------------
