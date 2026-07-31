@@ -1,0 +1,25 @@
+# --- Secrets ---------------------------------------------------------------
+# .env holds JWT_SECRET, SMTP_PASS, TA_DOCS_ENC_KEY and the database password.
+# Never commit it; copy .env.example instead.
+.env
+.env.*
+!.env.example
+
+# --- Runtime data (PDPA) ---------------------------------------------------
+# Uploaded TA documents — national ID cards, bank books, creditor forms.
+# Encrypted at rest, but the key lives in .env, so treating these as source is
+# a data-protection problem regardless.
+/data/
+/backup/
+
+# --- Build output ----------------------------------------------------------
+/api
+/seed
+/out/
+*.exe
+*.test
+*.out
+
+# --- Local tooling ---------------------------------------------------------
+.DS_Store
+*.log

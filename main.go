@@ -107,10 +107,15 @@ func main() {
 	// Runs in-process; extract to cmd/scheduler if the reminder volume grows.
 	scheduler.New(services).Start(ctx)
 
-	// One-shot: auto-decide any legacy ta_requests still in 'submitted' state
-	// after 0017 migration (officer manual approval flow is gone).
-	if err := services.TARequest.RunPendingSweep(ctx); err != nil {
+	// Finalise any TA request whose TAs have all filed their timetables while
+	// the server was down. The fast path is the trigger on the TA's own save
+	// (WorkloadService.ReplaceClasses); this catches what that missed. Requests
+	// still waiting on someone are left untouched — 'submitted' is a valid
+	// resting state under the deferred-decision model.
+	if n, err := services.TARequest.SweepPendingRequests(ctx); err != nil {
 		log.Printf("ta_request sweep warning: %v", err)
+	} else if n > 0 {
+		log.Printf("ta_request sweep: finalised %d pending request(s)", n)
 	}
 
 	sig := make(chan os.Signal, 1)

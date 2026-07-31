@@ -11,6 +11,7 @@ require (
 	github.com/signintech/gopdf v0.36.2
 	github.com/xuri/excelize/v2 v2.8.1
 	golang.org/x/crypto v0.52.0
+	golang.org/x/image v0.41.0
 )
 
 require (
@@ -40,7 +41,6 @@ require (
 	github.com/valyala/tcplisten v1.0.0 // indirect
 	github.com/xuri/efp v0.0.0-20231025114914-d1ff6096ae53 // indirect
 	github.com/xuri/nfp v0.0.0-20230919160717-d98342af3f05 // indirect
-	golang.org/x/image v0.41.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect

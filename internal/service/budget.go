@@ -18,7 +18,6 @@ type BudgetRates struct {
 	BaselineStudentsLecture int     `json:"baseline_students_lecture"`
 	BaselineStudentsLab     int     `json:"baseline_students_lab"`
 	UGWorkloadRateRegular   float64 `json:"ug_workload_rate_regular"`
-	UGWorkloadRateSpecial   float64 `json:"ug_workload_rate_special"`
 	GraduateRegularLumpsum  float64 `json:"graduate_regular"`
 	GraduateSpecialLumpsum  float64 `json:"graduate_special_lumpsum"`
 	TermMonths              int     `json:"term_months"`
@@ -91,12 +90,12 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	if err := s.pool.QueryRow(ctx, `
 		SELECT ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 		       baseline_students_lecture, baseline_students_lab,
-		       ug_workload_rate_regular, ug_workload_rate_special,
+		       ug_workload_rate_regular,
 		       graduate_regular, graduate_special_lumpsum, term_months
 		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
 		&rates.UGLectureHoursPerCredit, &rates.UGLabHoursPerCredit,
 		&rates.BaselineStudentsLecture, &rates.BaselineStudentsLab,
-		&rates.UGWorkloadRateRegular, &rates.UGWorkloadRateSpecial,
+		&rates.UGWorkloadRateRegular,
 		&rates.GraduateRegularLumpsum, &rates.GraduateSpecialLumpsum, &rates.TermMonths,
 	); err == nil {
 		snap.Rates = rates

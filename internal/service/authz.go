@@ -16,6 +16,12 @@ import (
 // consistently and IDOR bugs cannot creep back in per-endpoint.
 
 // lecturerOwnsCourse reports whether actor teaches the given teaching course.
+// LecturerOwnsCourse is the exported form for handlers that must gate a read
+// before calling into a service method that has no actor of its own.
+func (s *TeachingService) LecturerOwnsCourse(ctx context.Context, actor, tcID uuid.UUID) (bool, error) {
+	return lecturerOwnsCourse(ctx, s.pool, actor, tcID)
+}
+
 func lecturerOwnsCourse(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID) (bool, error) {
 	var ok bool
 	err := pool.QueryRow(ctx,
@@ -78,21 +84,34 @@ func isPrivileged(ctx context.Context, pool *pgxpool.Pool, actor uuid.UUID) (boo
 // assertCourseManager allows the action when the actor is privileged
 // (admin/staff) or teaches the course. Returns ErrForbidden otherwise.
 func assertCourseManager(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID) error {
+	_, err := courseAccess(ctx, pool, actor, tcID)
+	return err
+}
+
+// courseAccess is assertCourseManager plus the answer to "which kind of
+// manager". Both may act on the course, but not equally: admin/staff have full
+// control, while an owning lecturer is restricted to the narrow set of edits
+// described in teaching.go (they cannot add, rename or delete a section, and
+// may fill in a missing timetable only once). Callers that enforce those limits
+// need the distinction; the rest use assertCourseManager.
+//
+// Returns ErrForbidden for anyone who is neither.
+func courseAccess(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID) (privileged bool, err error) {
 	priv, err := isPrivileged(ctx, pool, actor)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if priv {
-		return nil
+		return true, nil
 	}
 	owns, err := lecturerOwnsCourse(ctx, pool, actor, tcID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !owns {
-		return ErrForbidden
+		return false, ErrForbidden
 	}
-	return nil
+	return false, nil
 }
 
 // assignmentContext resolves the parent teaching course, section, request

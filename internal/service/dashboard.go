@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -11,13 +12,39 @@ type DashboardService struct {
 	pool *pgxpool.Pool
 }
 
+// ExecutiveSummary is the staff/admin landing dashboard. Every figure is scoped
+// to ONE term — the caller's, or the active one. A cross-term total answers no
+// question staff actually have ("how many courses am I running this term?")
+// and silently grows every semester.
 type ExecutiveSummary struct {
-	TotalCourses    int     `json:"total_courses"`
-	CoursesWithTA   int     `json:"courses_with_ta"`
-	TotalTAs        int     `json:"total_tas"`
-	PendingReviews  int     `json:"pending_reviews"`
+	TermID    *uuid.UUID `json:"term_id"`
+	TermLabel string     `json:"term_label"` // "2569/1", empty if no terms exist
+
+	TotalCourses  int `json:"total_courses"`   // วิชาที่เปิดสอนในเทอมนี้
+	CoursesWithTA int `json:"courses_with_ta"` // วิชาที่มีการขอใช้ TA (ส่งคำขอแล้ว/อนุมัติแล้ว)
+	TotalTAs      int `json:"total_tas"`       // TA ที่ทำงานจริงในเทอมนี้
+
+	// One count per step of the staff workflow, in order. These drive both the
+	// sidebar badges and the dashboard's to-do panel: before this, nothing on
+	// screen distinguished "no work waiting" from "nobody has looked", so a
+	// queue could sit untouched for a week without anyone noticing.
+	PendingTARequests    int `json:"pending_ta_requests"`    // ขั้นที่ 1 — คำร้องขอ TA (/staff/approvals)
+	PendingReviews       int `json:"pending_reviews"`        // ขั้นที่ 2 — แบบฟอร์มใบแจ้งหนี้ (/staff/review)
+	PendingPayoutReviews int `json:"pending_payout_reviews"` // ขั้นที่ 3 — เบิกจ่ายค่าตอบแทน (/staff/worklog)
+	ReadyToExport        int `json:"ready_to_export"`        // ขั้นที่ 4 — ตรวจแล้วรอส่งออก (/staff/exports)
+
+	// Budget covers only the courses that actually asked for a TA. Courses
+	// with no request commit no money, so counting all 127 courses in the term
+	// produced a denominator that could never be approached.
 	BudgetAllocated float64 `json:"budget_allocated"`
 	BudgetUsed      float64 `json:"budget_used"`
+	BudgetCourses   int     `json:"budget_courses"` // = CoursesWithTA; makes the card's basis explicit
+
+	// Courses in this term whose enrolled student count is still blank. The
+	// budget formula is driven by that count, so an export is blocked until it
+	// is filled — the dashboard warns up front instead of letting staff find
+	// out at export time.
+	MissingStudentCounts int `json:"missing_student_counts"`
 }
 
 // TACourseStatus is one row on the TA landing dashboard: for a course the TA
@@ -170,43 +197,153 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 	return out, nil
 }
 
-func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID) (*ExecutiveSummary, error) {
+// Executive builds the staff/admin summary for one term. termID may be nil, in
+// which case the active term is used.
+//
+// budget is required: the per-course ceiling is a derived formula living in
+// BudgetService, not a stored number. This used to sum budget_caps.per_course_max
+// across every course in the database — a flat 20,000฿ × every course ever
+// imported. budget_caps stopped being the source of truth when the ceiling
+// became formula-derived (see BudgetService.Compute), so the dashboard was
+// reporting a figure no other page agreed with.
+func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, budget *BudgetService) (*ExecutiveSummary, error) {
 	sum := &ExecutiveSummary{}
-	termFilter := ""
-	args := []any{}
+
+	// Resolve the term once. Fall back to the newest term so a database with no
+	// active term still shows something rather than five zeroes.
+	var (
+		tid  uuid.UUID
+		year int
+		sem  int
+	)
+	resolve := `SELECT id, academic_year, semester FROM academic_terms
+	            ORDER BY is_active DESC, academic_year DESC, semester DESC LIMIT 1`
+	resolveArgs := []any{}
 	if termID != nil {
-		termFilter = " WHERE tc.term_id = $1"
-		args = append(args, *termID)
+		resolve = `SELECT id, academic_year, semester FROM academic_terms WHERE id = $1`
+		resolveArgs = append(resolveArgs, *termID)
 	}
-	_ = s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM teaching_courses tc`+termFilter, args...).Scan(&sum.TotalCourses)
-	_ = s.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT r.teaching_course_id)
+	if err := s.pool.QueryRow(ctx, resolve, resolveArgs...).Scan(&tid, &year, &sem); err != nil {
+		// No terms at all (fresh install) — an empty summary is the honest answer.
+		return sum, nil
+	}
+	sum.TermID = &tid
+	sum.TermLabel = fmt.Sprintf("%d/%d", year, sem)
+
+	_ = s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM teaching_courses WHERE term_id = $1`, tid).Scan(&sum.TotalCourses)
+
+	// Same predicate the dashboard used to evaluate in the browser, which meant
+	// fetching all ~130 course rows (57 KB) on every load and on every SWR
+	// revalidation just to show one integer.
+	_ = s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM teaching_courses tc
+		WHERE tc.term_id = $1
+		  AND (tc.num_students_regular = 0
+		       OR (tc.num_students_special = 0
+		           AND EXISTS (SELECT 1 FROM sections sx
+		                       WHERE sx.teaching_course_id = tc.id AND sx.track = 'special')))`,
+		tid).Scan(&sum.MissingStudentCounts)
+
+	// "มีการขอใช้ TA" counts requests that are still alive: submitted requests
+	// have already reserved a TA's quota (see reservedCourseCount), so a course
+	// waiting on staff approval is as committed as an approved one.
+	courseIDs := []uuid.UUID{}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT r.teaching_course_id
 		FROM ta_requests r
-		JOIN teaching_courses tc ON tc.id = r.teaching_course_id`+termFilter+` AND r.status='approved'`,
-		args...).Scan(&sum.CoursesWithTA)
+		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		WHERE tc.term_id = $1 AND r.status IN ('submitted','approved')`, tid)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		courseIDs = append(courseIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sum.CoursesWithTA = len(courseIDs)
+	sum.BudgetCourses = len(courseIDs)
+
+	// TAs actually working: approved request, assignment not dropped. Counting
+	// every assignment row included TAs whose request was rejected and TAs the
+	// clash rule had already dropped.
 	_ = s.pool.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT a.ta_id)
 		FROM ta_request_assignments a
-		JOIN ta_requests r ON r.id=a.request_id
-		JOIN teaching_courses tc ON tc.id = r.teaching_course_id`+termFilter, args...).Scan(&sum.TotalTAs)
-	_ = s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM ta_profiles WHERE status IN ('submitted','needs_fix')`).Scan(&sum.PendingReviews)
-	_ = s.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM((SELECT per_course_max FROM budget_caps ORDER BY effective_from DESC LIMIT 1)), 0) FROM teaching_courses tc`+termFilter,
-		args...).Scan(&sum.BudgetAllocated)
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		WHERE tc.term_id = $1 AND a.state <> 'dropped'`, tid).Scan(&sum.TotalTAs)
+
+	// ขั้นที่ 1 — คำร้องที่อาจารย์ส่งมาแล้วแต่ยังไม่มีใครตัดสิน. Same predicate as
+	// TARequestService.ListPending.
 	_ = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(wl.hours *
-		 CASE WHEN u.study_level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
-		      WHEN u.study_level='undergrad' AND sec.track='special' THEN pr.undergrad_special
-		      WHEN u.study_level IN ('master','phd') AND sec.track='regular' THEN pr.graduate_regular
-		      ELSE 0 END
-		),0)
-		FROM work_logs wl JOIN ta_request_assignments a ON a.id=wl.assignment_id
-		JOIN ta_requests r ON r.id=a.request_id
-		JOIN teaching_courses tc ON tc.id=r.teaching_course_id
-		JOIN sections sec ON sec.id=a.section_id
-		JOIN users u ON u.id=a.ta_id
-		CROSS JOIN LATERAL (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1) pr
-		WHERE wl.status='approved'`+
-			func() string { if termID != nil { return " AND tc.term_id = $1" }; return "" }(),
-		args...).Scan(&sum.BudgetUsed)
+		SELECT COUNT(*) FROM ta_requests r
+		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		WHERE tc.term_id = $1 AND r.status = 'submitted'`, tid).Scan(&sum.PendingTARequests)
+
+	// ขั้นที่ 2 — same bucket DocsService.ListReview calls "pending", so the card
+	// and the page it links to can never disagree. That includes the "all three
+	// documents are in" test: the page hides TAs who have only saved the profile
+	// form, so a card counting them would send officers to an empty list.
+	_ = s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_profiles p
+		 WHERE p.status IN ('submitted','needs_fix') AND `+ProfileDocsInSQL("p.user_id")+` = 3`).Scan(&sum.PendingReviews)
+
+	// ขั้นที่ 3 — (period, TA, course) months with approved work that staff have
+	// not signed off yet. Mirrors ListReviewQueue's shape; see that query for
+	// why the month match is on RIGHT(year_month, 2).
+	_ = s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM (
+		    SELECT sp.id AS period_id, a.ta_id, tc.id AS tc_id
+		    FROM teaching_courses tc
+		    JOIN submission_periods sp    ON sp.term_id = tc.term_id
+		    JOIN sections sec             ON sec.teaching_course_id = tc.id
+		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
+		    JOIN work_logs wl             ON wl.assignment_id = a.id
+		                                 AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                                 AND wl.status = 'approved'
+		    LEFT JOIN submission_period_status st
+		           ON st.submission_period_id = sp.id
+		          AND st.ta_id = a.ta_id
+		          AND st.teaching_course_id = tc.id
+		    WHERE tc.term_id = $1 AND COALESCE(st.status, 'pending') = 'pending'
+		      -- Same appointment gate as ListReviewQueue. Without it the card
+		      -- counts work the page it links to refuses to show, and the officer
+		      -- clicks a badge saying 12 to land on an empty queue.
+		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		    GROUP BY sp.id, a.ta_id, tc.id
+		) q`, tid).Scan(&sum.PendingPayoutReviews)
+
+	// ขั้นที่ 4 — staff have signed the month off but the payout documents have
+	// not been generated. This is the step that strands money: nothing else on
+	// screen distinguishes "reviewed and waiting for me" from "already sent".
+	_ = s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM submission_period_status st
+		JOIN submission_periods sp ON sp.id = st.submission_period_id
+		WHERE sp.term_id = $1 AND st.status = 'staff_reviewed'`, tid).Scan(&sum.ReadyToExport)
+
+	// Budget over exactly the courses counted above. Delegating to
+	// BudgetService.Compute rather than re-deriving the formula here is what
+	// keeps this card equal to the sum of the per-course pages — the previous
+	// hand-rolled SUM used graduate_regular (a 3,000฿/month lump sum) as if it
+	// were an hourly rate and ignored the ป.ตรี ภาคพิเศษ monthly cap entirely.
+	for _, id := range courseIDs {
+		snap, err := budget.Compute(ctx, id)
+		if err != nil {
+			continue
+		}
+		sum.BudgetAllocated += snap.PerCourseMaxBaht
+		sum.BudgetUsed += snap.UsedBaht
+	}
 	return sum, nil
 }

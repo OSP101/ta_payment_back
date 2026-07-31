@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
+	"ta-payment-back/internal/timeutil"
 )
 
 // isUniqueViolation reports whether err is a Postgres 23505 (unique_violation).
@@ -142,15 +144,17 @@ func (s *WorkLogService) courseExamWindows(ctx context.Context, tcID uuid.UUID) 
 	return
 }
 
-// loadHolidaysInRange loads every public_holidays row in [start, end] into a
-// date→name map. Called on the pay-critical Upsert path with no cache: table
-// is small (<200 rows) and the query is indexed on holiday_date, so freshness
-// matters more than saving microseconds.
+// loadHolidaysInRange loads every public_holidays row in [start, end] into the
+// date→closures index. Called on the pay-critical Upsert path with no cache:
+// table is small (<200 rows) and the query is indexed on holiday_date, so
+// freshness matters more than saving microseconds.
 func (s *WorkLogService) loadHolidaysInRange(ctx context.Context, start, end time.Time) (holidaySet, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT TO_CHAR(holiday_date,'YYYY-MM-DD'), name_th
+		`SELECT TO_CHAR(holiday_date,'YYYY-MM-DD'), name_th,
+		        TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
 		 FROM public_holidays
-		 WHERE holiday_date BETWEEN $1::date AND $2::date`,
+		 WHERE holiday_date BETWEEN $1::date AND $2::date
+		 ORDER BY holiday_date, start_time NULLS FIRST`,
 		start.Format("2006-01-02"), end.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
@@ -159,12 +163,25 @@ func (s *WorkLogService) loadHolidaysInRange(ctx context.Context, start, end tim
 	out := holidaySet{}
 	for rows.Next() {
 		var d, n string
-		if err := rows.Scan(&d, &n); err != nil {
+		var st, et *string
+		if err := rows.Scan(&d, &n, &st, &et); err != nil {
 			return nil, err
 		}
-		if _, exists := out[d]; !exists {
-			out[d] = n
+		w := holidayWindow{name: n, allDay: st == nil || et == nil}
+		if !w.allDay {
+			sm, ok1 := parseHM(*st)
+			em, ok2 := parseHM(*et)
+			if !ok1 || !ok2 {
+				// Unparseable window: fall back to closing the whole day. The
+				// CHECK constraint makes this unreachable, and if it ever is
+				// reached, over-blocking is the side to fail on — a TA who
+				// cannot log asks; a TA who is wrongly paid does not.
+				w.allDay = true
+			} else {
+				w.startMin, w.endMin = sm, em
+			}
 		}
+		out[d] = append(out[d], w)
 	}
 	return out, nil
 }
@@ -175,8 +192,8 @@ func (s *WorkLogService) loadHolidaysInRange(ctx context.Context, start, end tim
 // creation, not on each worklog Upsert.
 func (s *WorkLogService) loadMakeupIndex(ctx context.Context, sectionID uuid.UUID) (makeupIndex, error) {
 	idx := makeupIndex{
-		byOriginal: map[string]time.Time{},
-		byMakeup:   map[string]time.Time{},
+		byOriginal: map[string][]time.Time{},
+		byMakeup:   map[string]bool{},
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT original_date, makeup_date FROM makeup_schedules WHERE section_id = $1`, sectionID)
@@ -189,26 +206,77 @@ func (s *WorkLogService) loadMakeupIndex(ctx context.Context, sectionID uuid.UUI
 		if err := rows.Scan(&orig, &mk); err != nil {
 			return idx, err
 		}
-		idx.byOriginal[orig.Format("2006-01-02")] = mk
-		idx.byMakeup[mk.Format("2006-01-02")] = orig
+		ok := orig.Format("2006-01-02")
+		idx.byOriginal[ok] = append(idx.byOriginal[ok], mk)
+		idx.byMakeup[mk.Format("2006-01-02")] = true
 	}
 	return idx, nil
 }
 
+// holidayWindow is one closure on one date. A faculty holiday may cover only
+// part of the day (migration 0058) — the college holds a ceremony in the
+// morning and teaches in the afternoon — so a closure is a time range, not a
+// flag. allDay is the pre-0058 shape (NULL/NULL in the table) and every
+// national/university holiday; it blocks the date outright.
+type holidayWindow struct {
+	name     string
+	allDay   bool
+	startMin int // minutes from midnight, meaningless when allDay
+	endMin   int
+}
+
+// labelTH names the closure for a refusal message, with its hours when partial.
+// The hours are not decoration: told only "วันกีฬาคณะ", a TA whose lab starts at
+// 13:00 has no way to tell whether the block is a mistake.
+func (w holidayWindow) labelTH() string {
+	if w.allDay {
+		return w.name
+	}
+	return fmt.Sprintf("%s %02d:%02d–%02d:%02d",
+		w.name, w.startMin/60, w.startMin%60, w.endMin/60, w.endMin%60)
+}
+
 // holidaySet is the compact view of the public_holidays table used by the
-// worklog validator: date key "YYYY-MM-DD" -> Thai display name. Populated per
-// Upsert call so a freshly-added holiday takes effect immediately (no caching
-// on the pay-critical path).
-type holidaySet map[string]string
+// worklog validator and generator: date key "YYYY-MM-DD" -> the closures on
+// that date. Populated per Upsert call so a freshly-added holiday takes effect
+// immediately (no caching on the pay-critical path).
+//
+// A date holds a SLICE because closures now compose: a national holiday and a
+// faculty half-day can share a date, as can two faculty windows (a morning
+// ceremony and an evening event, teaching in between).
+type holidaySet map[string][]holidayWindow
+
+// overlapping returns the first closure on `date` that covers any part of
+// [startMin, endMin), the half-open span of the work being logged.
+//
+// Half-open on both sides is what makes back-to-back slots legal: a ceremony
+// ending at 12:00 does not block a lab starting at 12:00. The same comparison
+// is written in SQL in ImpactsForCourse and UnresolvedMakeupsSQL; all three
+// must agree or the page, the badge and the validator start contradicting each
+// other about whether a period survived.
+func (h holidaySet) overlapping(date string, startMin, endMin int) (holidayWindow, bool) {
+	for _, w := range h[date] {
+		if w.allDay || (w.startMin < endMin && w.endMin > startMin) {
+			return w, true
+		}
+	}
+	return holidayWindow{}, false
+}
 
 // makeupIndex is the by-section lookup of makeup_schedules built once per
 // Upsert. Both directions are needed: byOriginal answers "was the class on
 // this day shifted to another day?" (block logging on the original) and
 // byMakeup answers "is this day someone's approved makeup?" (allow logging on
 // a normally-non-class day, e.g. a Saturday).
+//
+// byOriginal holds a SLICE because one cancelled day can have several makeups —
+// one per period (see migration 0055). It used to be a single time.Time, so a
+// section that moved its lecture and its lab to different days kept only whichever
+// row the query happened to read last, and the refusal message named the wrong
+// date. Membership is all byMakeup is ever asked, so it is a plain set.
 type makeupIndex struct {
-	byOriginal map[string]time.Time
-	byMakeup   map[string]time.Time
+	byOriginal map[string][]time.Time
+	byMakeup   map[string]bool
 }
 
 // activityGate is the compact "what's this TA authorized to log" packet the
@@ -216,11 +284,11 @@ type makeupIndex struct {
 // callers pick fields off the assignmentContext they already have and don't
 // have to remember which positional argument means what.
 //
-//   Scope        = ta_requests.reimburse_scope (lecture/lab/both)
-//   AllowLecture = ta_workload_forms declares attendance/help-teach hours > 0
-//   AllowLab     = ta_workload_forms declares lab/help-teach hours > 0
-//   AllowReview  = ta_workload_forms declares check-work/grade hours > 0
-//   AllowOther   = ta_workload_forms declares ug_other/other/prep hours > 0
+//	Scope        = ta_requests.reimburse_scope (lecture/lab/both)
+//	AllowLecture = ta_workload_forms declares attendance/help-teach hours > 0
+//	AllowLab     = ta_workload_forms declares lab/help-teach hours > 0
+//	AllowReview  = ta_workload_forms declares check-work/grade hours > 0
+//	AllowOther   = ta_workload_forms declares ug_other/other/prep hours > 0
 type activityGate struct {
 	Scope        string
 	AllowLecture bool
@@ -370,22 +438,49 @@ func validateWorkLogEntry(
 	//   review        → allowed anytime (grading happens off-site, Q&A rule 7).
 	//   other+lecture → allowed on holidays (prep/admin can be off-site).
 	//   other+lab     → blocked on holidays (lab admin is space-bound).
+	//
+	// "On a holiday" is decided against THIS ENTRY'S HOURS, not its date: a
+	// faculty closure covering 08:00–12:00 leaves the 13:00–16:00 lab running,
+	// and blocking it would deny the TA pay for a class that actually met.
+	// All-day closures (every national/university holiday) overlap everything,
+	// so the rules above are unchanged for them.
 	dkey := w.WorkDate
-	holidayName, isHoliday := holidays[dkey]
-	_, isMakeupDay := mk.byMakeup[dkey]
+	holiday, isHoliday := holidays.overlapping(dkey, sm, em)
+	isMakeupDay := mk.byMakeup[dkey]
 	shiftedTo, isMovedAway := mk.byOriginal[dkey]
 
 	switch w.Activity {
 	case "lecture", "lab":
 		if isMovedAway {
+			// Name every replacement date, not just one: the lecture and the lab
+			// of this day may have moved to different days, and telling the TA
+			// only one of them sends half of them to the wrong date.
+			dates := make([]string, 0, len(shiftedTo))
+			seen := map[string]bool{}
+			for _, d := range shiftedTo {
+				s := d.Format("2006-01-02")
+				if !seen[s] {
+					seen[s] = true
+					dates = append(dates, s)
+				}
+			}
+			sort.Strings(dates)
 			return Invalid(fmt.Sprintf(
 				"วันนี้ (%s) ถูกย้ายไปเป็นวันชดเชย %s แล้ว กรุณาลงในวันชดเชยแทน",
-				dkey, shiftedTo.Format("2006-01-02")))
+				dkey, strings.Join(dates, " / ")))
 		}
 		if isHoliday && !isMakeupDay {
+			if holiday.allDay {
+				return Invalid(fmt.Sprintf(
+					"วันที่ %s ตรงกับวันหยุด (%s) — กรุณาให้อาจารย์กำหนดวันชดเชยก่อน จึงจะลงเวลาได้",
+					dkey, holiday.labelTH()))
+			}
+			// Partial closure: the fix may be as small as moving the entry to the
+			// free part of the same day, so say which hours are closed instead of
+			// sending the TA to wait for a makeup they may not need.
 			return Invalid(fmt.Sprintf(
-				"วันที่ %s ตรงกับวันหยุด (%s) — กรุณาให้อาจารย์กำหนดวันชดเชยก่อน จึงจะลงเวลาได้",
-				dkey, holidayName))
+				"เวลา %s–%s ของวันที่ %s อยู่ในช่วงวันหยุด (%s) — ลงเวลาได้เฉพาะช่วงที่ไม่ตรงกับวันหยุด หรือรอให้อาจารย์กำหนดวันชดเชย",
+				w.StartTime, w.EndTime, dkey, holiday.labelTH()))
 		}
 	case "makeup":
 		if !isMakeupDay {
@@ -398,8 +493,8 @@ func validateWorkLogEntry(
 			// parent_kind is validated non-nil above for activity="other".
 			if w.ParentKind != nil && *w.ParentKind == "lab" {
 				return Invalid(fmt.Sprintf(
-					"วันหยุด (%s) — กิจกรรม 'อื่นๆ' ที่คู่กับปฏิบัติการ ทำได้เฉพาะวันที่มีคาบเรียนจริง",
-					holidayName))
+					"วันหยุด (%s) — กิจกรรม 'อื่นๆ' ที่คู่กับปฏิบัติการ ทำได้เฉพาะช่วงเวลาที่มีคาบเรียนจริง",
+					holiday.labelTH()))
 			}
 			// parent_kind=lecture → admin/prep work is allowed off-campus.
 		}
@@ -434,6 +529,12 @@ type WorkLog struct {
 	// reason so the TA-facing UI can surface the message on entry — otherwise
 	// they only see "rejected" chips with no explanation.
 	RejectReason *string `json:"reject_reason,omitempty"`
+	// Source is 'auto' (generated from the section timetable) or 'manual' (typed
+	// by the TA). The payout-review screen shows the two differently: a generated
+	// row is a copy of times the lecturer entered, so there is nothing in it to
+	// check, while a hand-typed row is a claim with no other source. See
+	// migration 0057.
+	Source string `json:"source"`
 }
 
 // Generate auto-creates a draft set of work logs from a section's schedule between two dates.
@@ -473,9 +574,34 @@ func autoNoteFor(activity string, shifted bool) string {
 	return base
 }
 
-func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.UUID) ([]WorkLog, error) {
+// SkipGroup counts the occurrences auto-generation refused for one reason.
+// Grouped rather than listed per date: a weekly clash produces fifteen-odd
+// identical skips over a term, and fifteen identical lines read as noise.
+type SkipGroup struct {
+	Reason string `json:"reason"`
+	Count  int    `json:"count"`
+}
+
+// GenerateResult carries what auto-generation produced AND what it deliberately
+// left out. The meeting asked for the "why" to be explicit: a TA who presses
+// generate and gets fewer rows than expected must be able to see that their own
+// timetable is the reason, rather than assuming the system is broken.
+type GenerateResult struct {
+	Entries         []WorkLog   `json:"entries"`
+	SkippedOwnClass []SkipGroup `json:"skipped_own_class"`
+	// StoppedAtTermCeiling is set when generation stopped early because the next
+	// class occurrence would exceed the TA's total hours for the term. Without it
+	// the TA just gets fewer rows than their timetable has, with no reason given.
+	StoppedAtTermCeiling bool    `json:"stopped_at_term_ceiling,omitempty"`
+	TermHourCeiling      float64 `json:"term_hour_ceiling,omitempty"`
+}
+
+func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.UUID) (*GenerateResult, error) {
 	ac, err := s.assertTAOwnsAssignment(ctx, actor, assignmentID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
 		return nil, err
 	}
 	if err := s.assertStudentCountFilled(ctx, ac.TeachingCourseID); err != nil {
@@ -544,6 +670,32 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	bahtBlocks := func(dkey string, hrs float64) bool {
 		return genRate > 0 && dailyBahtCap > 0 && dailyBaht[dkey]+hrs*genRate > dailyBahtCap+0.01
 	}
+	// Total hours already committed by this run. Generate enforced every OTHER
+	// limit — daily hours, daily baht, activity scope, holidays, own-class clashes
+	// — but never the term total, which is the one the TA is actually paid
+	// against. Nothing stopped it walking the calendar past the ceiling, and on
+	// the real data every TA of SC362102 ended the term 2 hours over.
+	//
+	// The ceiling itself is separately fixed (see WeeksInTerm): with the real
+	// calendar it now sits above what a full timetable produces, so this is the
+	// net rather than the thing doing the cutting. It stays because a schedule
+	// that changes later must not be able to silently overshoot again.
+	termCeiling := 0.0
+	if ac.HasWorkloadForm && ac.WeeklyTotalHours > 0 {
+		termCeiling = ac.WeeklyTotalHours * s.weeksInTermForCourse(ctx, ac.TeachingCourseID)
+	}
+	termHours := 0.0
+	stoppedAtCeiling := false
+	termBlocks := func(hrs float64) bool {
+		if termCeiling <= 0 {
+			return false
+		}
+		if termHours+hrs > termCeiling+0.01 {
+			stoppedAtCeiling = true
+			return true
+		}
+		return false
+	}
 	// Months whose submission period is closed or locked (exported/finance_sent)
 	// are skipped entirely (silent, mirroring the holiday skip below) — the TA
 	// can no longer write there, so generating rows would only create stuck
@@ -560,6 +712,21 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	for mm, bm := range blockedMonths {
 		if bm.IsClosed || bm.Locked {
 			blockedMM = append(blockedMM, mm)
+		}
+	}
+	// Rows that will SURVIVE the wipe below — submitted/approved ones, plus
+	// drafts parked in blocked months — still count against the term total.
+	// Counting every existing row instead double-counted the drafts this very
+	// run is about to delete and recreate: the first regeneration after a full
+	// term of drafts found the ceiling "already spent" and produced almost
+	// nothing.
+	if termCeiling > 0 {
+		if err := s.pool.QueryRow(ctx,
+			`SELECT COALESCE(SUM(hours),0) FROM work_logs
+			  WHERE assignment_id=$1
+			    AND (status <> 'draft' OR to_char(work_date,'MM') = ANY($2))`,
+			assignmentID, blockedMM).Scan(&termHours); err != nil {
+			return nil, err
 		}
 	}
 	// Holidays that fall in the term — used to skip auto-generation on days
@@ -582,20 +749,38 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		}
 		rows.Close()
 	}
-	makeup := map[string]struct {
-		date  time.Time
-		start *time.Time
-		end   *time.Time
-	}{}
-	if rows, err := s.pool.Query(ctx, `SELECT original_date, makeup_date FROM makeup_schedules WHERE section_id=$1`, sectionID); err == nil {
+	// Keyed by (original date, PERIOD kind): a section that teaches a lecture and
+	// a lab on the same cancelled day files a makeup for each, and they may land on
+	// different days. Keyed by date alone, one row overwrote the other and both
+	// periods were generated on whichever date was read last — the same defect the
+	// holidays page had (see migration 0055).
+	type makeupKey struct{ date, kind string }
+	// A makeup may carry its own time window (a Tuesday class moved to Saturday
+	// evening). Generate used to read only the DATE and keep the original
+	// period's times — so the row landed at an hour when nothing happened, and a
+	// makeup deliberately placed outside a partial closure was re-planted inside
+	// it and skipped. The lecturer's explicit window, when present, IS the duty.
+	type makeupTo struct {
+		date       time.Time
+		start, end string
+		hasTime    bool
+	}
+	makeup := map[makeupKey]makeupTo{}
+	if rows, err := s.pool.Query(ctx,
+		`SELECT original_date, makeup_date, kind,
+		        TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
+		 FROM makeup_schedules WHERE section_id=$1`,
+		sectionID); err == nil {
 		for rows.Next() {
 			var orig, mk time.Time
-			if err := rows.Scan(&orig, &mk); err == nil {
-				makeup[orig.Format("2006-01-02")] = struct {
-					date  time.Time
-					start *time.Time
-					end   *time.Time
-				}{date: mk}
+			var kind string
+			var st, en *string
+			if err := rows.Scan(&orig, &mk, &kind, &st, &en); err == nil {
+				to := makeupTo{date: mk}
+				if st != nil && en != nil {
+					to.start, to.end, to.hasTime = *st, *en, true
+				}
+				makeup[makeupKey{orig.Format("2006-01-02"), kind}] = to
 			}
 		}
 		rows.Close()
@@ -637,47 +822,131 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		return nil, err
 	}
 
+	// The TA's own timetable, loaded once. An empty list means nothing to
+	// check — a TA who has not filed a timetable is handled at request time,
+	// not here.
+	genTermID, err := courseTermID(ctx, s.pool, ac.TeachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	ownClasses, err := loadOwnClassBlocks(ctx, s.pool, ac.TAID, genTermID)
+	if err != nil {
+		return nil, err
+	}
+	// Counted per clashing class rather than per occurrence, so the TA reads
+	// "ข้ามไป 14 คาบ เพราะตรงกับ X" instead of fourteen identical lines.
+	skippedByClass := map[string]int{}
+
 	out := []WorkLog{}
 	dailyHrs := map[string]float64{}
 	for d := startsOn; !d.After(endsOn); d = d.AddDate(0, 0, 1) {
 		key := d.Format("2006-01-02")
-		useDate := d
-		if m, ok := makeup[key]; ok {
-			useDate = m.date
-		}
-		// Holiday gate: if the ORIGINAL scheduled day is a public holiday and
-		// the lecturer hasn't filed a makeup that moves us elsewhere, skip
-		// generation for that day. The TA sees the gap on the holidays page
-		// and can nudge the lecturer to file a makeup, at which point the
-		// next regeneration picks it up on the shifted date.
-		if _, isHoliday := holidays[key]; isHoliday {
-			if _, hasMakeup := makeup[key]; !hasMakeup {
-				continue
-			}
-		}
-		// If the SHIFTED useDate itself lands on a holiday (nested holiday —
-		// lecturer picked a makeup that also happens to be closed), skip too.
-		// AddMakeup rejects this at create time, but defensive-check here in
-		// case a holiday is added AFTER a makeup was filed.
-		if _, isHoliday := holidays[useDate.Format("2006-01-02")]; isHoliday {
-			continue
-		}
-		if examDates[useDate.Format("2006-01-02")] {
-			continue
-		}
-		if inExamWindow(useDate) {
-			continue
-		}
-		if monthBlocked(useDate.Format("01")) {
-			continue
-		}
-		weekday := int(useDate.Weekday())
-		if weekday == 0 || weekday == 6 {
-			// skip weekend (unless make-up moved us out)
+		// Whether the day is "closed" is now a per-period question — a faculty
+		// closure may cover the morning lecture and leave the afternoon lab
+		// running — so it is asked inside the schedule loop, with that period's
+		// hours, rather than once for the whole date here.
+		//
+		// Schedules are matched against the ORIGINAL weekday, and each matched
+		// period is then shifted by ITS OWN makeup below. Previously the day was
+		// shifted first and schedules matched against the shifted weekday, which
+		// only worked when a makeup kept the same weekday: a Tuesday class moved to
+		// a Saturday looked for Saturday schedules, found none, and generated
+		// nothing — while the weekend gate below discarded it anyway.
+		origWeekday := int(d.Weekday())
+		if origWeekday == 0 || origWeekday == 6 {
+			// No class is scheduled on a weekend, so there is nothing to shift.
+			// A makeup that LANDS on a weekend is still generated — it is reached
+			// through its original weekday, and the validator likewise permits
+			// logging on a makeup Saturday.
 			continue
 		}
 		for _, sc := range schs {
-			if sc.day != weekday {
+			if sc.day != origWeekday {
+				continue
+			}
+			// This period's own replacement date, if the lecturer filed one.
+			// rowStart/rowEnd/rowHours are what the generated ROW will carry —
+			// they start as the period itself and may be replaced by the
+			// makeup's explicit window, or narrowed to the attendance window
+			// below. The closure tests keep using the PERIOD's window: whether
+			// the class happened is a question about the class, not the duty.
+			useDate := d
+			rowStart, rowEnd, rowHours := sc.start, sc.end, sc.hours
+			explicitTime := false
+			if mk, ok := makeup[makeupKey{key, sc.kind}]; ok {
+				useDate = mk.date
+				if mk.hasTime {
+					rowStart, rowEnd = mk.start, mk.end
+					if sm, ok1 := parseHM(mk.start); ok1 {
+						if em, ok2 := parseHM(mk.end); ok2 {
+							rowHours = float64(em-sm) / 60.0
+						}
+					}
+					explicitTime = true
+				}
+			}
+			// เช็คชื่อ occupies the LAST attendance_hrs of the lecture, not the
+			// whole period: the faculty's own claim forms bill a 13.00–15.00
+			// lecture as "14.00 - 15.00 เช็คชื่อ" when the declared attendance is
+			// one hour. Generating the full span both contradicted the signed
+			// form and immediately blew the weekly attendance cap it was
+			// declared under. A makeup with an explicit window is exempt — the
+			// lecturer already picked the exact duty hour.
+			if sc.kind == "lecture" && !explicitTime && ac.Level == "undergrad" &&
+				ac.HasWorkloadForm && ac.WeeklyCapLecture > 0 && ac.WeeklyCapLecture < rowHours-0.01 {
+				if em, ok := parseHM(rowEnd); ok {
+					rowStart = hhmm(em - int(ac.WeeklyCapLecture*60+0.5))
+					rowHours = ac.WeeklyCapLecture
+				}
+			}
+			// This period's hours, used by the holiday overlap tests and reused
+			// by the own-class clash check below. An unparseable schedule time
+			// degrades to "the whole day", which blocks rather than pays.
+			scStart, okS := parseHM(sc.start)
+			scEnd, okE := parseHM(sc.end)
+			hStart, hEnd := scStart, scEnd
+			if !okS || !okE {
+				hStart, hEnd = 0, 24*60
+			}
+			// Holiday gate: the original slot is closed and THIS period has no
+			// makeup, so it simply does not happen. The TA sees the gap on the
+			// holidays page and can nudge the lecturer; the next regeneration
+			// picks it up on the shifted date. Checked per period because the
+			// lecture may be rescheduled while the lab is not — and now also
+			// because a partial closure may cover one period of the day and not
+			// the other, in which case the untouched period generates normally.
+			// "Has a makeup" means the date moved OR the time did — a same-day
+			// evening makeup keeps the date, and judging it by date alone
+			// re-cancelled exactly the class the lecturer had rescued.
+			if _, closed := holidays.overlapping(key, hStart, hEnd); closed && useDate.Equal(d) && !explicitTime {
+				continue
+			}
+			// If the SHIFTED slot itself lands on a closure (nested holiday —
+			// lecturer picked a makeup that also happens to be closed), skip too.
+			// AddMakeup rejects this at create time; this is the defensive check
+			// for a holiday added AFTER a makeup was filed. Compared against the
+			// ROW's window, which is the makeup's own when it carries one — a
+			// class moved to the evening of a daytime closure is exactly the
+			// arrangement the explicit window exists to express.
+			shStart, shEnd := hStart, hEnd
+			if explicitTime {
+				if v, ok := parseHM(rowStart); ok {
+					shStart = v
+				}
+				if v, ok := parseHM(rowEnd); ok {
+					shEnd = v
+				}
+			}
+			if _, closed := holidays.overlapping(useDate.Format("2006-01-02"), shStart, shEnd); closed {
+				continue
+			}
+			if examDates[useDate.Format("2006-01-02")] {
+				continue
+			}
+			if inExamWindow(useDate) {
+				continue
+			}
+			if monthBlocked(useDate.Format("01")) {
 				continue
 			}
 			// Scope gate: the lecturer's ta_request authorizes only certain
@@ -701,29 +970,50 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if sc.kind == "lab" && !ac.AllowLab {
 				continue
 			}
-			// enforce per-track daily hour cap (Q&A rule 6d)
-			if dailyHrs[useDate.Format("2006-01-02")]+sc.hours > dailyHourCap {
+			// The TA's own class wins. Evaluated against useDate (the makeup
+			// date when one was filed), not the original slot: a class moved
+			// to Saturday afternoon can clash where the Monday slot did not,
+			// and vice versa. scStart/scEnd were parsed above for the holiday
+			// overlap test.
+			//
+			// Same exemption as the request gate and the manual-entry gate: a
+			// lecture period may overlap the TA's own class. Skipping it here too
+			// would generate a short month for hours the TA is allowed to work.
+			if okS && okE && clashBlockingKind(sc.kind, nil) {
+				if clash := findOwnClassClash(ownClasses, int(useDate.Weekday()), scStart, scEnd); clash != nil {
+					skippedByClass[clash.describe()]++
+					continue
+				}
+			}
+			// enforce per-track daily hour cap (Q&A rule 6d) — on the hours the
+			// row will actually carry, not the full period's.
+			if dailyHrs[useDate.Format("2006-01-02")]+rowHours > dailyHourCap {
 				continue
 			}
-			if bahtBlocks(useDate.Format("2006-01-02"), sc.hours) {
+			if bahtBlocks(useDate.Format("2006-01-02"), rowHours) {
+				continue
+			}
+			if termBlocks(rowHours) {
 				continue
 			}
 			id := uuid.New()
 			// Detect whether this row landed on a makeup date so the note
-			// picks up the "(ชดเชย)" suffix. useDate != d only when the
-			// original class day had a makeup filed above.
-			note := autoNoteFor(sc.kind, !useDate.Equal(d))
+			// picks up the "(ชดเชย)" suffix. A same-day makeup with a new time
+			// (a daytime closure pushing the class to the evening) is still a
+			// makeup, so the explicit window counts too.
+			note := autoNoteFor(sc.kind, !useDate.Equal(d) || explicitTime)
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status)
-				 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,'draft')`,
-				id, assignmentID, useDate.Format("2006-01-02"), sc.start, sc.end, sc.hours, sc.kind, note); err != nil {
+				`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status, source)
+				 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,'draft','auto')`,
+				id, assignmentID, useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours, sc.kind, note); err != nil {
 				return nil, err
 			}
 			out = append(out, WorkLog{ID: id, AssignmentID: assignmentID,
-				WorkDate: useDate.Format("2006-01-02"), StartTime: sc.start, EndTime: sc.end,
-				Hours: sc.hours, Activity: sc.kind, Note: &note, Status: "draft"})
-			dailyHrs[useDate.Format("2006-01-02")] += sc.hours
-			dailyBaht[useDate.Format("2006-01-02")] += sc.hours * genRate
+				WorkDate: useDate.Format("2006-01-02"), StartTime: rowStart, EndTime: rowEnd,
+				Hours: rowHours, Activity: sc.kind, Note: &note, Status: "draft"})
+			dailyHrs[useDate.Format("2006-01-02")] += rowHours
+			dailyBaht[useDate.Format("2006-01-02")] += rowHours * genRate
+			termHours += rowHours
 		}
 	}
 
@@ -756,17 +1046,33 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if len(dstr) >= 7 && monthBlocked(dstr[5:7]) {
 				continue
 			}
+			// Generate INSERTs directly, bypassing Upsert's gates, so it must
+			// apply the class-timetable rule itself — otherwise it would plant
+			// rows the TA can neither edit nor legitimately submit.
+			if rd, err := timeutil.ParseDate(dstr); err == nil {
+				rs, okS := parseHM(start)
+				re, okE := parseHM(end)
+				if okS && okE {
+					if clash := findOwnClassClash(ownClasses, int(rd.Weekday()), rs, re); clash != nil {
+						skippedByClass[clash.describe()]++
+						continue
+					}
+				}
+			}
 			if dailyHrs[dstr]+hrs > dailyHourCap {
 				continue
 			}
 			if bahtBlocks(dstr, hrs) {
 				continue
 			}
+			if termBlocks(hrs) {
+				continue
+			}
 			id := uuid.New()
 			note := autoNoteFor("review", false)
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status)
-				 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,'review',$7,'draft')`,
+				`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status, source)
+				 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,'review',$7,'draft','auto')`,
 				id, assignmentID, dstr, start, end, hrs, note); err != nil {
 				reviewRows.Close()
 				return nil, err
@@ -776,6 +1082,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				Hours: hrs, Activity: "review", Note: &note, Status: "draft"})
 			dailyHrs[dstr] += hrs
 			dailyBaht[dstr] += hrs * genRate
+			termHours += hrs
 		}
 		reviewRows.Close()
 
@@ -825,17 +1132,32 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 					if r.day != weekday {
 						continue
 					}
+					// Same reason as the lecture_review_dates loop above.
+					// AddTAReviewSchedule already refuses a clashing slot, but
+					// a timetable edited AFTER the slot was created can make an
+					// existing one clash.
+					if rs, okS := parseHM(r.start); okS {
+						if re, okE := parseHM(r.end); okE {
+							if clash := findOwnClassClash(ownClasses, weekday, rs, re); clash != nil {
+								skippedByClass[clash.describe()]++
+								continue
+							}
+						}
+					}
 					if dailyHrs[dkey]+r.hours > dailyHourCap {
 						continue
 					}
 					if bahtBlocks(dkey, r.hours) {
 						continue
 					}
+					if termBlocks(r.hours) {
+						continue
+					}
 					id := uuid.New()
 					note := autoNoteFor("review", false)
 					if _, err := tx.Exec(ctx,
-						`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status)
-						 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,'review',$7,'draft')`,
+						`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status, source)
+						 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,'review',$7,'draft','auto')`,
 						id, assignmentID, dkey, r.start, r.end, r.hours, note); err != nil {
 						return nil, err
 					}
@@ -844,6 +1166,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 						Hours: r.hours, Activity: "review", Note: &note, Status: "draft"})
 					dailyHrs[dkey] += r.hours
 					dailyBaht[dkey] += r.hours * genRate
+					termHours += r.hours
 				}
 			}
 		}
@@ -853,7 +1176,24 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		return nil, err
 	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.generate", Entity: "assignment", EntityID: assignmentID.String(), After: map[string]int{"count": len(out)}})
-	return out, nil
+
+	skips := make([]SkipGroup, 0, len(skippedByClass))
+	for reason, n := range skippedByClass {
+		skips = append(skips, SkipGroup{Reason: reason, Count: n})
+	}
+	// Deterministic order so the same generation reads the same way twice.
+	sort.Slice(skips, func(i, j int) bool {
+		if skips[i].Count != skips[j].Count {
+			return skips[i].Count > skips[j].Count
+		}
+		return skips[i].Reason < skips[j].Reason
+	})
+	return &GenerateResult{
+		Entries:              out,
+		SkippedOwnClass:      skips,
+		StoppedAtTermCeiling: stoppedAtCeiling,
+		TermHourCeiling:      termCeiling,
+	}, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -1135,23 +1475,30 @@ var reviewDayNames = []string{"อาทิตย์", "จันทร์", "�
 
 // enforceReviewNoConflict rejects a review slot that overlaps anything already
 // on the TA's weekly schedule for the term:
-//   (a) their own study timetable  (ta_class_schedules, WBA rows excluded),
-//   (b) the classes they help-teach across ALL their approved assignments
-//       (section_schedules of every section the TA holds this term), and
-//   (c) their other review slots  (ta_review_schedules across assignments).
+//
+//	(a) their own study timetable  (ta_class_schedules, WBA rows excluded),
+//	(b) the classes they help-teach across ALL their approved assignments
+//	    (section_schedules of every section the TA holds this term), and
+//	(c) their other review slots  (ta_review_schedules across assignments).
+//
 // Overlap uses the half-open predicate start1 < end2 AND end1 > start2, gated
 // on equal day_of_week — the same pattern ta_request.go uses for section
 // conflicts. excludeID skips the row being edited so it doesn't clash with
 // itself. A conflict returns a Thai message naming the day + clashing slot.
 func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignmentID uuid.UUID, in TAReviewScheduleInput, excludeID *uuid.UUID) error {
-	// Resolve the owning TA + term for this assignment.
-	var taID, termID uuid.UUID
+	// Resolve the owning TA + term for this assignment, plus its co-taught
+	// group: two sections graded in the same sitting (sec 2 ภาคปกติ + sec 3
+	// โครงการพิเศษ) legitimately share one weekly grading hour, and check (c)
+	// below must not treat that as a double booking. Same exemption, same
+	// marker, as enforceNoOverlap.
+	var taID, termID, reqID uuid.UUID
+	var coGroup *int
 	if err := s.pool.QueryRow(ctx, `
-		SELECT a.ta_id, tc.term_id
+		SELECT a.ta_id, tc.term_id, a.request_id, a.cotaught_group
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		WHERE a.id = $1`, assignmentID).Scan(&taID, &termID); err != nil {
+		WHERE a.id = $1`, assignmentID).Scan(&taID, &termID, &reqID, &coGroup); err != nil {
 		return err
 	}
 
@@ -1226,7 +1573,15 @@ func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignment
 			WHERE a2.ta_id = $1 AND rs.id <> $6
 			  AND rs.day_of_week = $3
 			  AND rs.start_time < $5::time AND rs.end_time > $4::time
-			LIMIT 1`, taID, termID, in.DayOfWeek, in.StartTime, in.EndTime, exclude).Scan(&label, &st, &en)
+			  -- Co-taught sections of the same request share the grading
+			  -- sitting; their slots may (and on the faculty's forms, do)
+			  -- coincide. NULL group = not co-taught, keeps the old rule.
+			  AND NOT (a2.id <> $7
+			           AND a2.request_id = $8
+			           AND a2.cotaught_group IS NOT NULL
+			           AND a2.cotaught_group = $9::int)
+			LIMIT 1`, taID, termID, in.DayOfWeek, in.StartTime, in.EndTime, exclude,
+			assignmentID, reqID, coGroup).Scan(&label, &st, &en)
 		if err == nil {
 			return conflict("ตารางตรวจการบ้านอื่นของคุณ", label, st, en)
 		} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1313,10 +1668,11 @@ func (s *WorkLogService) DeleteTAReviewSchedule(ctx context.Context, actor, assi
 
 // dailyHourCapFor resolves the daily hour cap that applies to an assignment
 // based on (level, track). Falls back to 7 if pay_rates is missing.
-//   ป.ตรี ปกติ  → ug_regular_daily_hour_cap    (default 7)
-//   ป.ตรี พิเศษ → ug_special_daily_hour_cap    (default 6)
-//   บัณฑิต ปกติ → grad_regular_daily_hour_cap  (default 6)
-//   บัณฑิต พิเศษ → 24 (flat monthly, hours not billed)
+//
+//	ป.ตรี ปกติ  → ug_regular_daily_hour_cap    (default 7)
+//	ป.ตรี พิเศษ → ug_special_daily_hour_cap    (default 6)
+//	บัณฑิต ปกติ → grad_regular_daily_hour_cap  (default 6)
+//	บัณฑิต พิเศษ → 24 (flat monthly, hours not billed)
 func (s *WorkLogService) dailyHourCapFor(ctx context.Context, assignmentID uuid.UUID) float64 {
 	var cap float64
 	err := s.pool.QueryRow(ctx, `
@@ -1449,12 +1805,18 @@ func (s *WorkLogService) enforceWeeklyActivityCap(ctx context.Context, ac *assig
 		return nil
 	}
 	var weekTotal float64
+	// System-generated makeup rows are exempt from the DESTINATION week's cap:
+	// the hour belongs to the origin week whose class was cancelled, and the
+	// college's own claim forms show both the regular and the relocated hour in
+	// one week. Scoped to source='auto' so a TA typing "ชดเชย" into a manual
+	// note cannot dodge the cap.
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COALESCE(SUM(hours), 0) FROM work_logs
 		 WHERE assignment_id = $1
 		   AND date_trunc('week', work_date) = date_trunc('week', $2::date)
 		   AND activity = ANY($3)
-		   AND id <> $4`,
+		   AND id <> $4
+		   AND NOT (source = 'auto' AND COALESCE(note,'') LIKE '%ชดเชย%')`,
 		w.AssignmentID, w.WorkDate, activities, w.ID).Scan(&weekTotal); err != nil {
 		return err
 	}
@@ -1470,6 +1832,26 @@ func (s *WorkLogService) enforceWeeklyActivityCap(ctx context.Context, ac *assig
 // TA's rows on the same date — across every assignment the TA holds, so two
 // courses can't both bill the same clock hours. Back-to-back rows
 // (end == start) are allowed; rejected rows don't count.
+//
+// CO-TAUGHT SECTIONS ARE EXEMPT (31/07/2026). One lab serving sec 1 (ภาคปกติ)
+// and sec 2 (โครงการพิเศษ) in the same room at the same hour is one sitting that
+// must be recorded against both sections, because the two tracks are paid from
+// separate budgets. The faculty's own signed form does exactly this, and so does
+// the rest of this system:
+//
+//   - Generate never called this function, so it has been writing those
+//     overlapping rows all along — 12 of them sit approved in the live database;
+//   - export.go rule B2 then counts the shared hours ONCE at the regular rate
+//     ("เบิกภาคปกติก่อน") and removes the duplicate from the special side.
+//
+// So the hours were never double-paid, and this gate was the only thing that
+// disagreed: a TA could not hand-correct a row the generator had written for
+// them. It blocked exactly the case the design depends on.
+//
+// The exemption keys on `cotaught_group`, the marker Create already computes and
+// stores for this purpose (detectCotaughtGroups). Deliberately NOT re-derived
+// from matching schedules here: a second definition of "same sitting" is how the
+// clash rule ended up with three spellings that disagreed.
 func (s *WorkLogService) enforceNoOverlap(ctx context.Context, taID uuid.UUID, w WorkLog) error {
 	var code, st, en string
 	err := s.pool.QueryRow(ctx, `
@@ -1478,10 +1860,24 @@ func (s *WorkLogService) enforceNoOverlap(ctx context.Context, taID uuid.UUID, w
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+		-- The assignment the row being written belongs to.
+		JOIN ta_request_assignments self ON self.id = $6
 		WHERE a.ta_id = $1 AND wl.work_date = $2::date AND wl.id <> $3
 		  AND wl.status <> 'rejected'
 		  AND wl.start_time < $5::time AND wl.end_time > $4::time
-		LIMIT 1`, taID, w.WorkDate, w.ID, w.StartTime, w.EndTime).Scan(&code, &st, &en)
+		  -- ...unless both rows are the same sitting taught to co-scheduled
+		  -- sections of the same request. NULL group = not co-taught, and NULL
+		  -- never equals NULL here, so singletons keep the old behaviour.
+		  --
+		  -- a.id <> self.id is load-bearing: without it an assignment matches
+		  -- ITSELF (same request, same group) and the exemption swallows the
+		  -- plain same-assignment overlap rule entirely. The exemption is about
+		  -- a second SECTION, never a second row on the same one.
+		  AND NOT (a.id <> self.id
+		           AND a.request_id = self.request_id
+		           AND a.cotaught_group IS NOT NULL
+		           AND a.cotaught_group = self.cotaught_group)
+		LIMIT 1`, taID, w.WorkDate, w.ID, w.StartTime, w.EndTime, w.AssignmentID).Scan(&code, &st, &en)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -1555,10 +1951,13 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 		if b.cap <= 0 {
 			continue
 		}
+		// Same makeup exemption as enforceWeeklyActivityCap: a relocated class
+		// hour counts against its origin week, not the week it landed in.
 		wrows, err := tx.Query(ctx, `
 			SELECT TO_CHAR(date_trunc('week', work_date),'YYYY-MM-DD')
 			FROM work_logs
 			WHERE assignment_id=$1 AND status IN ('submitted','approved') AND activity = ANY($2)
+			  AND NOT (source = 'auto' AND COALESCE(note,'') LIKE '%ชดเชย%')
 			GROUP BY date_trunc('week', work_date)
 			HAVING SUM(hours) > $3 + 0.01
 			ORDER BY 1`, assignmentID, b.acts, b.cap)
@@ -1605,7 +2004,7 @@ func (s *WorkLogService) List(ctx context.Context, actor, assignmentID uuid.UUID
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, assignment_id, TO_CHAR(work_date,'YYYY-MM-DD'), start_time::text, end_time::text, hours, activity, parent_kind, room, note, status::text, reject_reason
+		`SELECT id, assignment_id, TO_CHAR(work_date,'YYYY-MM-DD'), start_time::text, end_time::text, hours, activity, parent_kind, room, note, status::text, reject_reason, source
 		 FROM work_logs WHERE assignment_id=$1 ORDER BY work_date, start_time`, assignmentID)
 	if err != nil {
 		return nil, err
@@ -1614,12 +2013,50 @@ func (s *WorkLogService) List(ctx context.Context, actor, assignmentID uuid.UUID
 	out := []WorkLog{}
 	for rows.Next() {
 		var w WorkLog
-		if err := rows.Scan(&w.ID, &w.AssignmentID, &w.WorkDate, &w.StartTime, &w.EndTime, &w.Hours, &w.Activity, &w.ParentKind, &w.Room, &w.Note, &w.Status, &w.RejectReason); err != nil {
+		if err := rows.Scan(&w.ID, &w.AssignmentID, &w.WorkDate, &w.StartTime, &w.EndTime, &w.Hours, &w.Activity, &w.ParentKind, &w.Room, &w.Note, &w.Status, &w.RejectReason, &w.Source); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
 	}
 	return out, nil
+}
+
+// assertOwnClassScheduleFilled blocks worklog writes until the TA has entered
+// their OWN class timetable for the term.
+//
+// The faculty's signed form ("ตารางเรียนและตารางปฏิบัติงาน TA") puts the TA's
+// classes and their TA duties in one weekly grid, and the whole point of that
+// layout is that a duty scheduled on top of a lecture the TA has to attend is
+// visible at a glance. With the class half empty the form is not just less
+// useful — it is not the document the faculty signs, and the clash it exists to
+// catch cannot be seen by anyone.
+//
+// Gating the write rather than warning afterwards is deliberate: hours logged
+// against an unknown timetable would have to be re-checked later by hand, which
+// is the work this is meant to remove.
+func (s *WorkLogService) assertOwnClassScheduleFilled(ctx context.Context, taID, termID uuid.UUID) error {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_class_schedules WHERE user_id = $1 AND term_id = $2`,
+		taID, termID).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		return Invalid("กรุณากรอกตารางเรียนของคุณในเทอมนี้ก่อน จึงจะลงเวลาปฏิบัติงานได้ — " +
+			"ระบบใช้ตารางเรียนเพื่อออกแบบฟอร์มตารางปฏิบัติงาน และตรวจว่างาน TA ไม่ชนกับคาบเรียนของคุณ (เมนู “ตารางเรียนของฉัน”)")
+	}
+	return nil
+}
+
+// assertOwnScheduleForCourse resolves the course's term and applies the
+// own-class-schedule gate. Wrapped so the three write paths take the same one
+// line and cannot drift on how the term is derived.
+func (s *WorkLogService) assertOwnScheduleForCourse(ctx context.Context, ac *assignmentContext) error {
+	termID, err := courseTermID(ctx, s.pool, ac.TeachingCourseID)
+	if err != nil {
+		return err
+	}
+	return s.assertOwnClassScheduleFilled(ctx, ac.TAID, termID)
 }
 
 // assertStudentCountFilled blocks worklog writes until staff record the
@@ -1642,15 +2079,7 @@ func (s *WorkLogService) assertStudentCountFilled(ctx context.Context, teachingC
 // the export payout basis (export.go). Defaults to 16 weeks (4 months) when the
 // term's month count is unset.
 func (s *WorkLogService) weeksInTermForCourse(ctx context.Context, teachingCourseID uuid.UUID) float64 {
-	var months int
-	_ = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(NULLIF(t.months, 0), 4)
-		FROM academic_terms t JOIN teaching_courses tc ON tc.term_id = t.id
-		WHERE tc.id = $1`, teachingCourseID).Scan(&months)
-	if months <= 0 {
-		months = 4
-	}
-	return float64(months) * 4.0
+	return WeeksInTerm(ctx, s.pool, teachingCourseID)
 }
 
 // enforceTermHourCeiling caps the TOTAL hours a TA may log for one assignment
@@ -1686,6 +2115,9 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	if err != nil {
 		return uuid.Nil, err
 	}
+	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
+		return uuid.Nil, err
+	}
 	if err := s.assertStudentCountFilled(ctx, ac.TeachingCourseID); err != nil {
 		return uuid.Nil, err
 	}
@@ -1711,7 +2143,10 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		AllowLab:     ac.AllowLab,
 		AllowReview:  ac.AllowReview,
 		AllowOther:   ac.AllowOther,
-	}, termStart, termEnd, midterm, final, holidays, mk, time.Now()); err != nil {
+		// "today" must be Thailand's calendar day, not the host's. On a UTC
+		// server time.Now() still reports yesterday until 07:00 local, which
+		// would reopen a month the back-date rule should already have closed.
+	}, termStart, termEnd, midterm, final, holidays, mk, timeutil.Now()); err != nil {
 		return uuid.Nil, err
 	}
 	// Month lock: a finance_sent month is frozen for everyone; a closed period
@@ -1781,6 +2216,13 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 
 	// The same clock hours must not be billed twice across the TA's courses.
 	if err := s.enforceNoOverlap(ctx, ac.TAID, w); err != nil {
+		return uuid.Nil, err
+	}
+
+	// The TA's own class wins over any teaching duty (24/07/2026 meeting).
+	// Checked here rather than only at request time because a makeup class
+	// lands on a different date and time than the slot the request approved.
+	if err := s.enforceNoOwnClassConflict(ctx, ac, w); err != nil {
 		return uuid.Nil, err
 	}
 
@@ -2231,7 +2673,26 @@ func (s *WorkLogService) StaffListAssignments(ctx context.Context, tcID uuid.UUI
 // baht cap / other-cap-per-session / parent_kind). Preserves the current
 // status (so an approved row stays approved) — the intent is "fix a typo
 // before export" not "undo review". Audits before/after and notifies the TA.
-func (s *WorkLogService) StaffUpsert(ctx context.Context, staffID uuid.UUID, w WorkLog) (uuid.UUID, error) {
+// auditEditAction / auditDeleteAction keep the audit trail honest now that two
+// different roles reach the same code path. "worklog.staff_edit" on a row a
+// lecturer changed would send an investigator to the wrong desk.
+func auditEditAction(privileged bool) string {
+	if privileged {
+		return "worklog.staff_edit"
+	}
+	return "worklog.lecturer_edit"
+}
+
+func auditDeleteAction(privileged bool) string {
+	if privileged {
+		return "worklog.staff_delete"
+	}
+	return "worklog.lecturer_delete"
+}
+
+// StaffUpsert edits a TA's work log on their behalf. Reachable by staff/admin
+// (privileged) and, since the 24/07/2026 meeting, by the course's own lecturer.
+func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privileged bool, w WorkLog) (uuid.UUID, error) {
 	// For an existing row the assignment is authoritative from the DB, never the
 	// request body. Otherwise a caller could send a locked row's id together with
 	// some OTHER (unlocked) assignment_id: every lock/cap check below would run
@@ -2247,6 +2708,23 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, staffID uuid.UUID, w W
 	}
 	ac, err := loadAssignmentContext(ctx, s.pool, w.AssignmentID)
 	if err != nil {
+		return uuid.Nil, err
+	}
+	// Lecturers may now correct their own course's rows (24/07/2026 meeting:
+	// "อาจารย์ตรวจสอบ ตีกลับ อนุมัติ หรือ แก้ไขได้"). Previously the only
+	// caller was staff and the route guard was the whole authorisation story;
+	// with a second caller the service has to own the rule, or any lecturer
+	// could edit any course's hours.
+	if !privileged {
+		owns, err := lecturerOwnsCourse(ctx, s.pool, actor, ac.TeachingCourseID)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		if !owns {
+			return uuid.Nil, ErrForbidden
+		}
+	}
+	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
 		return uuid.Nil, err
 	}
 	if err := s.assertStudentCountFilled(ctx, ac.TeachingCourseID); err != nil {
@@ -2330,6 +2808,13 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, staffID uuid.UUID, w W
 	if err := s.enforceNoOverlap(ctx, ac.TAID, w); err != nil {
 		return uuid.Nil, err
 	}
+	// Staff edit on the TA's behalf. The class-timetable rule still applies —
+	// the TA physically cannot be in two rooms, so staff must not be able to
+	// enter hours the TA could not have worked. (Staff DO keep the back-dating
+	// override above; that one is a paperwork concession, not a physical one.)
+	if err := s.enforceNoOwnClassConflict(ctx, ac, w); err != nil {
+		return uuid.Nil, err
+	}
 
 	if w.ID == uuid.Nil {
 		w.ID = uuid.New()
@@ -2339,7 +2824,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, staffID uuid.UUID, w W
 			w.ID, w.AssignmentID, w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note); err != nil {
 			return uuid.Nil, err
 		}
-		s.aud.Log(ctx, audit.Entry{ActorID: &staffID, Action: "worklog.staff_edit", Entity: "work_log", EntityID: w.ID.String(), After: w})
+		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(), After: w})
 	} else {
 		// Preserve status so approved rows stay approved; staff cannot silently unlock review state.
 		// The assignment_id predicate is defence-in-depth on top of the pin above.
@@ -2353,7 +2838,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, staffID uuid.UUID, w W
 		if tag.RowsAffected() == 0 {
 			return uuid.Nil, Invalid("ไม่พบรายการที่ต้องการแก้ไข")
 		}
-		s.aud.Log(ctx, audit.Entry{ActorID: &staffID, Action: "worklog.staff_edit", Entity: "work_log", EntityID: w.ID.String(), After: w})
+		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(), After: w})
 	}
 	if s.notify != nil {
 		s.notify.Send(ctx, ac.TAID,
@@ -2403,7 +2888,7 @@ func (s *WorkLogService) Delete(ctx context.Context, actor, logID uuid.UUID) err
 // StaffDelete removes a work_log entry. Only draft/rejected can be removed;
 // submitted/approved rows must be handled through Reject or a manual DB fix
 // so the audit trail stays intact.
-func (s *WorkLogService) StaffDelete(ctx context.Context, staffID, id uuid.UUID) error {
+func (s *WorkLogService) StaffDelete(ctx context.Context, actor uuid.UUID, privileged bool, id uuid.UUID) error {
 	var (
 		taID, tcID         uuid.UUID
 		workDate, timeSpan string
@@ -2418,6 +2903,16 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, staffID, id uuid.UUID)
 		WHERE wl.id = $1`, id).Scan(&taID, &tcID, &workDate, &timeSpan); err != nil {
 		return Invalid("ไม่พบรายการที่ต้องการลบ")
 	}
+	// Same rule as StaffUpsert: a lecturer may only touch their own course.
+	if !privileged {
+		owns, err := lecturerOwnsCourse(ctx, s.pool, actor, tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return ErrForbidden
+		}
+	}
 	if err := assertWorklogWritable(ctx, s.pool, tcID, taID, workDate, false); err != nil {
 		return err
 	}
@@ -2429,7 +2924,7 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, staffID, id uuid.UUID)
 	if tag.RowsAffected() == 0 {
 		return Invalid("ลบไม่ได้: รายการอาจถูกส่งอนุมัติหรืออนุมัติแล้ว")
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &staffID, Action: "worklog.staff_delete", Entity: "work_log", EntityID: id.String()})
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: auditDeleteAction(privileged), Entity: "work_log", EntityID: id.String()})
 	if s.notify != nil {
 		s.notify.Send(ctx, taID,
 			"เจ้าหน้าที่ลบบันทึกเวลา",

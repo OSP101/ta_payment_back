@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,10 +31,10 @@ type User struct {
 	ProfileComplete    bool      `json:"profile_completed"`
 	MustChangePassword bool      `json:"must_change_password"`
 	Roles              []string  `json:"roles"`
-	BankName           *string   `json:"bank_name,omitempty"`
-	BankBranch         *string   `json:"bank_branch,omitempty"`
-	BranchCode         *string   `json:"branch_code,omitempty"`
-	AccountNo          *string   `json:"account_no,omitempty"`
+	// AvatarURL is derived, never stored: the API path that streams the
+	// picture, with the last-changed timestamp as a cache-buster. Nil when the
+	// user has not set one, which is what tells the UI to draw initials.
+	AvatarURL *string `json:"avatar_url,omitempty"`
 }
 
 type UserService struct {
@@ -139,10 +141,12 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 
 func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	u := &User{ID: id}
+	var avatarKey *string
+	var avatarAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password
+		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, avatar_key, avatar_updated_at
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
-		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword,
+		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &avatarKey, &avatarAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -161,19 +165,95 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 			u.Roles = append(u.Roles, r)
 		}
 	}
-	// Best-effort banking info from ta_profiles (optional).
-	var bn, bb, bc, an *string
-	err = s.pool.QueryRow(ctx,
-		`SELECT bank_name, bank_branch, branch_code, account_no FROM ta_profiles WHERE user_id=$1`, id,
-	).Scan(&bn, &bb, &bc, &an)
-	if err == nil {
-		u.BankName = bn
-		u.BankBranch = bb
-		u.BranchCode = bc
-		u.AccountNo = an
-	}
+	// Banking details are deliberately not returned: they are not stored
+	// (PDPA, migration 0047). Staff read them from the creditor-form PDF the
+	// TA submitted, which is the only place they exist.
 	applyDerivedStudyYear(u, currentAcademicYearBE(ctx, s.pool))
+	u.AvatarURL = avatarURL(id, avatarKey, avatarAt)
 	return u, nil
+}
+
+// avatarURL turns a stored key into the API path that serves it. The picture
+// itself is never handed out by key — that would let anyone who saw one URL
+// enumerate the store — so the path is keyed by user id and resolved server-side.
+func avatarURL(id uuid.UUID, key *string, at *time.Time) *string {
+	if key == nil || *key == "" {
+		return nil
+	}
+	v := int64(0)
+	if at != nil {
+		v = at.Unix()
+	}
+	u := "/api/v1/users/" + id.String() + "/avatar?v=" + strconv.FormatInt(v, 10)
+	return &u
+}
+
+// AvatarKey returns the stored key for a user's picture, or "" when unset.
+func (s *UserService) AvatarKey(ctx context.Context, id uuid.UUID) (string, error) {
+	var key *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT avatar_key FROM users WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&key)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	if key == nil {
+		return "", nil
+	}
+	return *key, nil
+}
+
+// SetAvatar points the user at a freshly stored image and returns both the URL
+// to show and the key that was replaced, if any. Deleting the old blob is the
+// caller's job: it must happen only after the row commits, or a failed update
+// would leave the user pointing at a file that no longer exists.
+func (s *UserService) SetAvatar(ctx context.Context, id uuid.UUID, key string) (url string, replaced string, err error) {
+	var old *string
+	var at time.Time
+	err = s.pool.QueryRow(ctx,
+		`WITH prev AS (
+		     SELECT id, avatar_key FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE
+		 )
+		 UPDATE users u SET avatar_key=$2, avatar_updated_at=NOW(), updated_at=NOW()
+		 FROM prev WHERE u.id = prev.id
+		 RETURNING prev.avatar_key, u.avatar_updated_at`,
+		id, key).Scan(&old, &at)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", ErrNotFound
+		}
+		return "", "", err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.set", Entity: "user", EntityID: id.String()})
+	if old != nil && *old != "" && *old != key {
+		replaced = *old
+	}
+	return *avatarURL(id, &key, &at), replaced, nil
+}
+
+// ClearAvatar removes the picture and returns the key to delete from the store.
+func (s *UserService) ClearAvatar(ctx context.Context, id uuid.UUID) (string, error) {
+	var old *string
+	err := s.pool.QueryRow(ctx,
+		`WITH prev AS (
+		     SELECT id, avatar_key FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE
+		 )
+		 UPDATE users u SET avatar_key=NULL, avatar_updated_at=NOW(), updated_at=NOW()
+		 FROM prev WHERE u.id = prev.id
+		 RETURNING prev.avatar_key`, id).Scan(&old)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.clear", Entity: "user", EntityID: id.String()})
+	if old == nil {
+		return "", nil
+	}
+	return *old, nil
 }
 
 func (s *UserService) FindByEmail(ctx context.Context, email string) (*User, string, error) {
@@ -219,7 +299,7 @@ func (s *UserService) List(ctx context.Context, role, search string, limit, offs
 	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM users u WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password
+	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.avatar_key, u.avatar_updated_at
 	      FROM users u WHERE ` + where + ` ORDER BY u.first_name, u.last_name
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)
@@ -231,9 +311,12 @@ func (s *UserService) List(ctx context.Context, role, search string, limit, offs
 	out := []User{}
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword); err != nil {
+		var avatarKey *string
+		var avatarAt *time.Time
+		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &avatarKey, &avatarAt); err != nil {
 			return nil, 0, err
 		}
+		u.AvatarURL = avatarURL(u.ID, avatarKey, avatarAt)
 		out = append(out, u)
 	}
 	// bulk-load roles
@@ -414,23 +497,9 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 		}
 	}
 
-	if in.BankName != nil || in.BankBranch != nil || in.BranchCode != nil || in.AccountNo != nil {
-		bn := coalesceStr(in.BankName)
-		bb := coalesceStr(in.BankBranch)
-		bc := coalesceStr(in.BranchCode)
-		an := coalesceStr(in.AccountNo)
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO ta_profiles (user_id, bank_name, bank_branch, branch_code, account_no)
-			VALUES ($1,$2,$3,$4,$5)
-			ON CONFLICT (user_id) DO UPDATE SET
-			  bank_name=COALESCE(EXCLUDED.bank_name, ta_profiles.bank_name),
-			  bank_branch=COALESCE(EXCLUDED.bank_branch, ta_profiles.bank_branch),
-			  branch_code=COALESCE(EXCLUDED.branch_code, ta_profiles.branch_code),
-			  account_no=COALESCE(EXCLUDED.account_no, ta_profiles.account_no)
-			`, id, bn, bb, bc, an); err != nil {
-			return nil, err
-		}
-	}
+	// Bank fields on the request are accepted and ignored — see migration
+	// 0047. Rejecting them would break older clients for no benefit; silently
+	// dropping them is what "never stored" means here.
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err

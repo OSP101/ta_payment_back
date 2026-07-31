@@ -108,6 +108,50 @@ func (h *SubmissionPeriodHandler) FinanceSend(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// ReviewQueue lists the months waiting on staff review for a term — step 3 of
+// the staff workflow ("ตรวจสอบเบิกจ่ายค่าตอบแทน").
+func (h *SubmissionPeriodHandler) ReviewQueue(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "term_id is required")
+	}
+	out, err := h.Svc.SubmissionPeriods.ListReviewQueue(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	// Reported alongside the queue so an empty screen can say WHY. The queue only
+	// carries TAs whose appointment order has been printed; without this number a
+	// term with work waiting looks identical to a term with none.
+	awaiting, err := h.Svc.SubmissionPeriods.CountAwaitingAppointment(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": out, "awaiting_appointment": awaiting})
+}
+
+// StaffReview records staff sign-off on one TA's month, releasing it for
+// export. The export step refuses anything that has not passed through here.
+func (h *SubmissionPeriodHandler) StaffReview(c *fiber.Ctx) error {
+	pid, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+	var body commentBody
+	_ = c.BodyParser(&body)
+	if err := h.Svc.SubmissionPeriods.MarkStaffReviewed(c.Context(), UserID(c), pid, taID, tcID, body.Comment); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // SendBack bounces the (period, TA, course) status row back to an earlier
 // step with a mandatory reason. Staff/admin from any pre-finance state;
 // the course's lecturer only from ta_signed/lecturer_signed.
@@ -161,6 +205,29 @@ func (h *SubmissionPeriodHandler) FinanceRevert(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+// MonthDetail returns the work-log rows behind one queue cell, plus the
+// section timetable to read them against. This is what "ผ่าน" actually approves —
+// before it existed the screen showed only a total.
+func (h *SubmissionPeriodHandler) MonthDetail(c *fiber.Ctx) error {
+	pid, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+	out, err := h.Svc.SubmissionPeriods.MonthDetailForReview(c.Context(), pid, tcID, taID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
 }
 
 // Timeline returns the approval history for one (period, TA, course). The

@@ -67,14 +67,23 @@ func main() {
 	                    graduate_regular, graduate_special_lumpsum,
 	                    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 	                    baseline_students_lecture, baseline_students_lab,
-	                    ug_workload_rate_regular, ug_workload_rate_special, term_months,
+	                    ug_workload_rate_regular, term_months,
 	                    graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
 	                    ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
 	                    note)
 	                SELECT gen_random_uuid(), CURRENT_DATE,
 	                       40, 50,
 	                       3000, 4000,
-	                       3, 4.5, 60, 30, 200, 250, 4,
+	                       -- ug_workload_rate_regular = 300, NOT 200.
+	                       -- The course budget ceiling follows the faculty's
+	                       -- workbook (ชีต "2_59 ป.ตรี"):
+	                       --   ค่า TA/เดือน = ภาระงาน × (50%×200 ตรี + 50%×400 บัณฑิต)
+	                       --                = ภาระงาน × 300
+	                       -- Migration 0005 corrected the column DEFAULT to 300,
+	                       -- but this INSERT names the column explicitly, so the
+	                       -- default never applied and every seeded database got
+	                       -- a ceiling a third too low.
+	                       3, 4.5, 60, 30, 300, 4,
 	                       50, 12000, 300,
 	                       7, 6, 6,
 	                       'seed defaults per ประกาศ 731/2565 + 1080/2565 + Q&A 2026'

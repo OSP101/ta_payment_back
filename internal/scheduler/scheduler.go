@@ -59,6 +59,20 @@ func (s *Scheduler) loop(ctx context.Context) {
 }
 
 func (s *Scheduler) tick(ctx context.Context) {
+	// Safety net for the deferred TA-request decision. The primary trigger runs
+	// when a TA saves their timetable; this catches anything that trigger
+	// missed (a failed call, a crash mid-save, a timetable written by staff
+	// through another path). Without it a request could rest in 'submitted'
+	// forever, holding the course quota its assignments reserved.
+	//
+	// Runs before the reminder sweep because a request finalised here may
+	// change who is due to submit work logs this month.
+	if n, err := s.svc.TARequest.SweepPendingRequests(ctx); err != nil {
+		log.Printf("scheduler: ta_request_sweep err=%v", err)
+	} else if n > 0 {
+		log.Printf("scheduler: finalised %d pending TA request(s)", n)
+	}
+
 	n, err := s.svc.SubmissionPeriods.SweepReminders(ctx)
 	if err != nil {
 		log.Printf("scheduler: sweep_reminders err=%v", err)

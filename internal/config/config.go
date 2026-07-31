@@ -40,26 +40,30 @@ func loadDotEnv(path string) {
 }
 
 type Config struct {
-	Port         string
-	DatabaseURL  string
-	JWTSecret    string
-	JWTIssuer    string
-	JWTLifetime  time.Duration
-	CORSOrigins  string
-	UploadDir    string
-	MaxUploadMB  int
-	SMTPHost     string
-	SMTPPort     int
-	SMTPUser     string
-	SMTPPass     string
-	MailFrom     string
-	AppBaseURL   string
-	SSOEnabled   bool
-	SSOAuthURL   string
-	SSOTokenURL  string
-	SSOClientID  string
-	SSOSecret    string
-	SSORedirect  string
+	Port        string
+	DatabaseURL string
+	JWTSecret   string
+	JWTIssuer   string
+	JWTLifetime time.Duration
+	CORSOrigins string
+	UploadDir   string
+	MaxUploadMB int
+	// ClamAVAddr is a clamd TCP address ("host:port"). Empty disables scanning
+	// — see internal/service.scanUpload for what that means.
+	ClamAVAddr           string
+	ClamAVTimeout        time.Duration
+	SMTPHost             string
+	SMTPPort             int
+	SMTPUser             string
+	SMTPPass             string
+	MailFrom             string
+	AppBaseURL           string
+	SSOEnabled           bool
+	SSOAuthURL           string
+	SSOTokenURL          string
+	SSOClientID          string
+	SSOSecret            string
+	SSORedirect          string
 	CreditorTemplatePath string
 	FontDir              string
 	// TADocsEncKey is a 32-byte AES-256 key (base64) used to encrypt TA
@@ -81,32 +85,34 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
-		Port:        env("PORT", "8080"),
-		DatabaseURL: resolveDatabaseURL(),
-		JWTSecret:   env("JWT_SECRET", ""),
-		JWTIssuer:   env("JWT_ISSUER", "ta-payment"),
-		CORSOrigins: env("CORS_ORIGINS", "http://localhost:3000"),
-		UploadDir:   env("UPLOAD_DIR", "./data/uploads"),
-		SMTPHost:    env("SMTP_HOST", ""),
-		SMTPUser:    env("SMTP_USER", ""),
-		SMTPPass:    env("SMTP_PASS", ""),
-		MailFrom:    env("MAIL_FROM", "no-reply@coco.kku.ac.th"),
-		AppBaseURL:  env("APP_BASE_URL", "http://localhost:3000"),
-		SSOAuthURL:  env("SSO_AUTH_URL", ""),
-		SSOTokenURL: env("SSO_TOKEN_URL", ""),
-		SSOClientID: env("SSO_CLIENT_ID", ""),
-		SSOSecret:   env("SSO_CLIENT_SECRET", ""),
-		SSORedirect: env("SSO_REDIRECT", ""),
+		Port:                 env("PORT", "8080"),
+		DatabaseURL:          resolveDatabaseURL(),
+		JWTSecret:            env("JWT_SECRET", ""),
+		JWTIssuer:            env("JWT_ISSUER", "ta-payment"),
+		CORSOrigins:          env("CORS_ORIGINS", "http://localhost:3000"),
+		UploadDir:            env("UPLOAD_DIR", "./data/uploads"),
+		SMTPHost:             env("SMTP_HOST", ""),
+		SMTPUser:             env("SMTP_USER", ""),
+		SMTPPass:             env("SMTP_PASS", ""),
+		MailFrom:             env("MAIL_FROM", "no-reply@coco.kku.ac.th"),
+		AppBaseURL:           env("APP_BASE_URL", "http://localhost:3000"),
+		SSOAuthURL:           env("SSO_AUTH_URL", ""),
+		SSOTokenURL:          env("SSO_TOKEN_URL", ""),
+		SSOClientID:          env("SSO_CLIENT_ID", ""),
+		SSOSecret:            env("SSO_CLIENT_SECRET", ""),
+		SSORedirect:          env("SSO_REDIRECT", ""),
 		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.pdf"),
 		FontDir:              env("FONT_DIR", "./assets/fonts"),
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
 		BotAPIBaseURL:        env("BOT_API_BASE_URL", "https://gateway.api.bot.or.th/financial-institutions-holidays"),
 		BotAPIClientID:       env("BOT_API_CLIENT_ID", ""),
+		ClamAVAddr:           env("CLAMAV_ADDR", ""),
 	}
 	c.SSOEnabled = c.SSOAuthURL != "" && c.SSOClientID != ""
 	c.JWTLifetime = envDuration("JWT_LIFETIME", 12*time.Hour)
 	c.SMTPPort = envInt("SMTP_PORT", 587)
 	c.MaxUploadMB = envInt("MAX_UPLOAD_MB", 20)
+	c.ClamAVTimeout = envDuration("CLAMAV_TIMEOUT", 30*time.Second)
 	if c.JWTSecret == "" {
 		return c, fmt.Errorf("JWT_SECRET is required")
 	}

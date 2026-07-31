@@ -53,6 +53,13 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	adminOrStaff := RequireRole(rbac.RoleAdmin, rbac.RoleStaff)
 	uh := &UserHandler{Svc: svc}
 	// Lecturers are additionally allowed here but are restricted to role=ta inside the handler
+	// Profile picture. Writes are self-service only (the path says "me", the
+	// handler reads the id from the session), so no role gate belongs here —
+	// every signed-in user owns their own face. Reading is open to any signed-in
+	// user so rosters and review queues can render.
+	authed.Post("/me/avatar", uh.UploadAvatar)
+	authed.Delete("/me/avatar", uh.DeleteAvatar)
+	authed.Get("/users/:id/avatar", uh.ServeAvatar)
 	authed.Get("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.List)
 	authed.Post("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.Create)
 	authed.Get("/users/:id", authed_forSelfOrStaff(), uh.Get)
@@ -81,14 +88,22 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/teaching-courses", th.List)
 	// Timetable kinds (บรรยาย/ปฏิบัติการ) for a term — any signed-in user.
 	authed.Get("/class-kinds", th.ClassKinds)
-	authed.Post("/teaching-courses", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.Create)
+	// Opening a course is staff's job: courses come from the registrar import,
+	// and a lecturer-opened one would carry a section roster nobody at the
+	// registrar knows about. TeachingService.Create enforces this again.
+	authed.Post("/teaching-courses", adminOrStaff, th.Create)
 	authed.Get("/teaching-courses/:id", th.Get)
 	authed.Delete("/teaching-courses/:id", adminOrStaff, th.Delete)
-	authed.Patch("/teaching-courses/:id/num-students", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.SetNumStudents)
-	authed.Patch("/teaching-courses/:id/settings", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.UpdateSettings)
-	authed.Post("/teaching-courses/:id/sections", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddSection)
-	authed.Patch("/teaching-courses/:id/sections/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.UpdateSection)
-	authed.Delete("/teaching-courses/:id/sections/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.DeleteSection)
+	// Course identity, headcount, date range and the section roster all trace
+	// back to the registrar file, so they are staff's. The one exception is
+	// the schedule PUT: a lecturer may fill in a timetable the file left blank,
+	// exactly once — the rule lives in TeachingService.ReplaceSectionSchedules,
+	// which is why the route still admits them.
+	authed.Patch("/teaching-courses/:id/num-students", adminOrStaff, th.SetNumStudents)
+	authed.Patch("/teaching-courses/:id/settings", adminOrStaff, th.UpdateSettings)
+	authed.Post("/teaching-courses/:id/sections", adminOrStaff, th.AddSection)
+	authed.Patch("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.UpdateSection)
+	authed.Delete("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.DeleteSection)
 	authed.Put("/teaching-courses/:id/sections/:sectionId/schedules", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.ReplaceSectionSchedules)
 	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddMakeup)
 	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.DeleteMakeup)
@@ -121,7 +136,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/me/documents", RequireRole(rbac.RoleTA), dh.ListDocs)
 	authed.Post("/me/documents", RequireRole(rbac.RoleTA), dh.UploadDoc)
 	authed.Get("/me/history", RequireRole(rbac.RoleTA), dh.SelfHistory)
-	authed.Get("/me/creditor-form.pdf", RequireRole(rbac.RoleTA, rbac.RoleAdmin, rbac.RoleStaff), dh.CreditorFormPDF)
+	authed.Post("/me/creditor-form/preview.pdf", RequireRole(rbac.RoleTA, rbac.RoleAdmin, rbac.RoleStaff), dh.CreditorFormPDF)
 	authed.Post("/me/creditor-form/confirm", RequireRole(rbac.RoleTA), dh.ConfirmCreditorForm)
 	authed.Get("/creditor-form/blank.pdf", dh.BlankCreditorForm)
 	authed.Get("/documents/:id/download", dh.Download)
@@ -135,6 +150,11 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/ta-review/:userId/approve-all", adminOrStaff, dh.ApproveAll)
 	authed.Post("/ta-review/:userId/reject-batch", adminOrStaff, dh.RejectBatch)
 	authed.Post("/ta-review/:userId/zip-token", adminOrStaff, dh.MintZipToken)
+	// Bulk: every approved TA's documents merged into one file. Two path
+	// segments, so these never collide with the three-segment ":userId" routes
+	// above — no ordering dependency to get wrong later.
+	authed.Post("/ta-review/download-all-token", adminOrStaff, dh.MintAllApprovedZipToken)
+	authed.Get("/ta-review/download-all.zip", adminOrStaff, dh.DownloadAllZip)
 	authed.Get("/ta-review/:userId/download.zip", adminOrStaff, dh.DownloadZip)
 	authed.Get("/ta-review/:userId/docs/:docId/preview", adminOrStaff, dh.PreviewWatermarked)
 
@@ -143,6 +163,8 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// what their eventual dashboard will look like; the visible warning
 	// banner tells them why nothing can be edited yet.
 	authed.Get("/me/ta-courses", RequireRole(rbac.RoleTA), th.ListMyTACourses)
+	authed.Get("/timetable-form", th.TimetableForm)
+	authed.Get("/timetable-form.pdf", th.TimetableFormPDF)
 	authed.Get("/me/assignments", RequireRole(rbac.RoleTA), th.ListMyAssignments)
 
 	// Workload / TA class schedule
@@ -177,10 +199,14 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 
 	// Staff worklog editor (Phase 5): read all TAs' entries per course, edit
 	// or remove a row before export. Enforces same business rules as TA path.
-	authed.Get("/staff/courses/:tcId/worklogs", adminOrStaff, wl.StaffListByCourse)
-	authed.Get("/staff/courses/:tcId/assignments", adminOrStaff, wl.StaffListAssignments)
-	authed.Put("/staff/worklogs", adminOrStaff, wl.StaffUpsert)
-	authed.Delete("/staff/worklogs/:id", adminOrStaff, wl.StaffDelete)
+	// Lecturers were added here by the 24/07/2026 meeting ("อาจารย์...แก้ไขได้").
+	// The route only widens who may call; the per-course ownership check lives
+	// in the service, so a lecturer still cannot reach another lecturer's rows.
+	staffOrLecturer := RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer)
+	authed.Get("/staff/courses/:tcId/worklogs", staffOrLecturer, wl.StaffListByCourse)
+	authed.Get("/staff/courses/:tcId/assignments", staffOrLecturer, wl.StaffListAssignments)
+	authed.Put("/staff/worklogs", staffOrLecturer, wl.StaffUpsert)
+	authed.Delete("/staff/worklogs/:id", staffOrLecturer, wl.StaffDelete)
 
 	// Notifications
 	nh := &NotifyHandler{Svc: svc}
@@ -220,6 +246,10 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/exports/summary", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursesSummary)
 	authed.Get("/exports/course/:id/history", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseHistory)
 	// Appointment order (คำสั่งแต่งตั้ง) — PDF + DOCX in one ZIP.
+	// Issued in rounds: names already printed are never reprinted, so a late
+	// round carries only the courses that were not ready earlier.
+	authed.Get("/exports/appointment-order/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentPreview)
+	authed.Get("/exports/appointment-order/rounds", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRounds)
 	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentOrder)
 
 	// Physical-document progress board — the off-system signature/routing journey.
@@ -248,6 +278,11 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/submission-periods/bulk-for-term/:termId", adminOrStaff, spH.BulkForTerm)
 	authed.Delete("/submission-periods/:id", adminOrStaff, spH.Delete)
 	authed.Get("/me/submission-periods", spH.MePending)
+	// Staff step 3 — ตรวจสอบเบิกจ่ายค่าตอบแทน. Sits between the lecturer's
+	// daily approval and the export, which now refuses months that skipped it.
+	authed.Get("/submission-periods/review-queue", adminOrStaff, spH.ReviewQueue)
+	authed.Post("/submission-periods/:id/courses/:tcId/tas/:taId/staff-review",
+		adminOrStaff, spH.StaffReview)
 	// No digital signatures: the lecturer's daily worklog approval is the
 	// review; staff export (which locks the month) then mark it sent to finance.
 	authed.Post("/submission-periods/:id/courses/:tcId/tas/:taId/finance-send",
@@ -258,6 +293,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Admin-only unlock for a month already handed to finance.
 	authed.Post("/submission-periods/:id/courses/:tcId/tas/:taId/finance-revert",
 		RequireRole(rbac.RoleAdmin), spH.FinanceRevert)
+	authed.Get("/submission-periods/:id/courses/:tcId/tas/:taId/worklog", adminOrStaff, spH.MonthDetail)
 	authed.Get("/submission-periods/:id/courses/:tcId/tas/:taId/timeline", spH.Timeline)
 	authed.Get("/teaching-courses/:tcId/submission-timeline", spH.ListByCourse)
 

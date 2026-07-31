@@ -75,7 +75,9 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		       tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		       COALESCE(u.student_id, '') AS student_id,
 		       COALESCE(NULLIF(tp.prefix, ''), NULLIF(u.title, ''), '') AS prefix,
-		       u.first_name, u.last_name
+		       u.first_name, u.last_name,
+		       -- Carried for the round ledger, not for the printed page.
+		       tc.id AS tc_id, u.id AS ta_id
 		FROM ta_request_assignments a
 		JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
 		JOIN users u             ON u.id = a.ta_id
@@ -83,9 +85,21 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		JOIN sections sec        ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 		WHERE tc.term_id = $1
-		GROUP BY level_bucket, tc.code, course_name,
+		  -- A section every one of whose sessions clashes with the TA's own
+		  -- timetable is not an appointment to print.
+		  AND a.state <> 'dropped'
+		  -- Rounds: never reprint a name already on an issued order for this
+		  -- term. A late round must carry only the stragglers.
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM appointment_order_items it
+		      JOIN appointment_orders o ON o.id = it.appointment_order_id
+		      WHERE o.term_id = $1
+		        AND it.teaching_course_id = tc.id
+		        AND it.ta_id = a.ta_id)
+		GROUP BY level_bucket, tc.id, tc.code, course_name,
 		         tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
-		         u.student_id, tp.prefix, u.title, u.first_name, u.last_name
+		         u.id, u.student_id, tp.prefix, u.title, u.first_name, u.last_name
 		ORDER BY level_bucket,
 		         CASE WHEN tc.code LIKE 'SC%' THEN 0
 		              WHEN tc.code LIKE 'CP%' THEN 1
@@ -106,14 +120,23 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		lastName    string
 	}
 	var list []rosterRow
+	// pairs mirrors `list` but keeps the ids, so the ledger records exactly the
+	// people who appear on the printed page — no second query that could drift.
+	var pairs []AppointmentCandidate
 	for rows.Next() {
 		var r rosterRow
 		var credits, lec, lab, self int
 		var prefix string
+		var tcID, taID uuid.UUID
 		if err := rows.Scan(&r.levelBucket, &r.code, &r.courseName,
-			&credits, &lec, &lab, &self, &r.studentID, &prefix, &r.firstName, &r.lastName); err != nil {
+			&credits, &lec, &lab, &self, &r.studentID, &prefix, &r.firstName, &r.lastName,
+			&tcID, &taID); err != nil {
 			return nil, "", err
 		}
+		pairs = append(pairs, AppointmentCandidate{
+			TeachingCourseID: tcID, CourseCode: r.code,
+			TAID: taID, TAName: r.firstName + " " + r.lastName,
+		})
 		r.creditText = fmt.Sprintf("%d (%d-%d-%d)", credits, lec, lab, self)
 		// The template prints the honorific joined to the given name in the
 		// name column ("นายชาคริต"). Prefix comes from the TA's own profile
@@ -125,6 +148,17 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		return nil, "", err
 	}
 	if len(list) == 0 {
+		// Distinguish "nothing yet" from "everyone already appointed" — the
+		// second is a success state staff reach at the end of a term, and
+		// reporting it as the first sends them hunting for a problem.
+		var issued int
+		_ = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM appointment_order_items it
+			JOIN appointment_orders o ON o.id = it.appointment_order_id
+			WHERE o.term_id = $1`, in.TermID).Scan(&issued)
+		if issued > 0 {
+			return nil, "", Invalid("ออกคำสั่งครบทุกคนแล้วสำหรับภาคเรียนนี้ — ไม่มีรายชื่อค้างให้ออกรอบใหม่")
+		}
 		return nil, "", Invalid("ยังไม่มีทีเอที่ได้รับอนุมัติในภาคเรียนนี้")
 	}
 
@@ -216,12 +250,23 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		return nil, "", err
 	}
 
+	// Record the round BEFORE returning the bytes. If the ledger write fails
+	// we must not hand over a document, because an unrecorded order gets
+	// reprinted in the next round and the same TA is appointed twice on paper.
+	round, err := s.nextRoundNo(ctx, in.TermID)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := s.recordRound(ctx, actor, in, round, pairs); err != nil {
+		return nil, "", err
+	}
+
 	// Package as ZIP. Sanitize OrderNo so "6/2569" doesn't become a subfolder
 	// inside the archive.
 	buf := &bytes.Buffer{}
 	zw := zip.NewWriter(buf)
 	safeOrderNo := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(in.OrderNo)
-	base := fmt.Sprintf("appointment-order-%s", safeOrderNo)
+	base := fmt.Sprintf("appointment-order-%s%s", safeOrderNo, appointmentRoundSuffix(round))
 	if pdfBytes != nil {
 		w, _ := zw.Create(base + ".pdf")
 		_, _ = w.Write(pdfBytes)

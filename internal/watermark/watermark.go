@@ -8,12 +8,14 @@ package watermark
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"io"
+	"strings"
 
 	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
 	pdfmodel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
@@ -43,12 +45,79 @@ func Apply(src []byte, mime, text string) ([]byte, string, error) {
 	}
 }
 
-// applyPDF stamps every page with a diagonal centered text watermark. Font
-// stays Helvetica because the watermark text is ASCII (email + digits +
-// separators) — no Thai glyphs, no font-registration step required.
+// Watermark geometry.
+//
+// The mark has to blanket the page: a single line, or a tile that only covers
+// part of it, can be cropped away around whatever field was worth stealing.
+//
+// The subtlety that produced two wrong attempts before this one: pdfcpu
+// preserves the watermark's aspect ratio and shrinks it to fit inside
+// `scale × page`, so whichever dimension binds first leaves the other short.
+// A tile wider than it is tall (relative to A4) fits by width and leaves the top
+// and bottom bare — which is exactly the "กองไปอยู่ตรงกลาง" complaint. Rotating
+// it makes this worse, not better: the rotated bounding box is what gets fitted,
+// so the text ends up as a band across the middle with all four corners empty,
+// and pdfcpu rejects any relative scale above 1.0 that would let it overflow.
+//
+// So the tile is built to A4's proportions instead of guessed at, and left
+// unrotated so its box maps straight onto the page. Then `scale:1 rel` fills the
+// page by construction rather than by luck.
+const (
+	wmPoints   = 8
+	wmLeading  = 1.2 * wmPoints // pdfcpu's line spacing for multi-line text
+	wmCharWide = 0.5 * wmPoints // Helvetica's average advance, near enough
+	wmCols     = 3
+	// A4 portrait, matching the creditor form (595.32 × 841.92 pt).
+	wmPageAspect = 841.92 / 595.32
+)
+
+// tiledText repeats the identity string into a block shaped like the page.
+//
+// Row count is derived, not hard-coded, so the block keeps covering the page
+// when the text length changes — an officer with a longer email would otherwise
+// silently shift the aspect ratio and bring the bare bands back.
+func tiledText(text string) string {
+	cell := text + "    "
+	lineWidth := float64(wmCols*len(cell)) * wmCharWide
+	rows := int(lineWidth * wmPageAspect / wmLeading)
+	if rows < 8 {
+		rows = 8
+	}
+
+	var b strings.Builder
+	for r := 0; r < rows; r++ {
+		if r > 0 {
+			b.WriteByte('\n')
+		}
+		// Stagger alternate rows by half a cell: aligned columns leave vertical
+		// gutters wide enough to read a whole field through.
+		if r%2 == 1 {
+			b.WriteString(strings.Repeat(" ", len(cell)/2))
+		}
+		for c := 0; c < wmCols; c++ {
+			b.WriteString(cell)
+		}
+	}
+	return b.String()
+}
+
+// applyPDF stamps every page with a dense tiled text watermark.
+//
+// What this does NOT do — worth stating because it is the obvious thing to
+// assume: it cannot stop a screenshot. Blacking out screen capture (as Netflix
+// does) is DRM enforced by the OS and GPU, unavailable to any web page. What a
+// dense mark buys is different and still useful: every capture carries the
+// identity of the officer who opened it, so a leak is attributable and a forged
+// reuse is obvious.
 func applyPDF(src []byte, text string) ([]byte, error) {
-	desc := "font:Helvetica, points:20, opacity:0.28, rotation:35, mode:2, position:c, scale:1 rel"
-	wm, err := pdfapi.TextWatermark(text, desc, true, false, pdftypes.POINTS)
+	// Faint enough that the form underneath stays readable, repeated often
+	// enough that no crop escapes it — legibility is governed by opacity here,
+	// not by density. mode:2 is fill+stroke, which keeps thin glyphs visible
+	// over dark scan areas.
+	desc := fmt.Sprintf(
+		"font:Helvetica, points:%d, opacity:0.17, rotation:0, mode:2, position:c, scale:1 rel",
+		wmPoints)
+	wm, err := pdfapi.TextWatermark(tiledText(text), desc, true, false, pdftypes.POINTS)
 	if err != nil {
 		return nil, err
 	}
@@ -83,17 +152,27 @@ func applyImage(src []byte, mime, text string) ([]byte, error) {
 	rgba := image.NewRGBA(b)
 	draw.Draw(rgba, b, img, b.Min, draw.Src)
 
-	// Draw the watermark once at each grid intersection. Text is repeated
-	// twice per stamp (offset) so an aggressive crop still catches at least
-	// one instance.
-	col := color.RGBA{R: 0, G: 0, B: 0, A: 90} // ~35% opacity
+	// Dense lattice, matching applyPDF's reasoning: a sparse mark is croppable,
+	// so the grid is tight enough that no readable region is unmarked. Opacity
+	// drops as density rises — the total ink is what decides legibility, not the
+	// number of stamps.
+	col := color.RGBA{R: 0, G: 0, B: 0, A: 46} // ~18%
 	face := basicfont.Face7x13
-	step := 180
+	// Roughly one stamp per text width, so stamps nearly touch horizontally.
+	stepX := 7*len(text) + 24
+	stepY := 26
 	if b.Dx() < 400 || b.Dy() < 400 {
-		step = 90
+		stepY = 18
 	}
-	for y := b.Min.Y + 20; y < b.Max.Y; y += step {
-		for x := b.Min.X + 20; x < b.Max.X; x += step {
+	row := 0
+	for y := b.Min.Y + 14; y < b.Max.Y+stepY; y += stepY {
+		// Stagger alternate rows so the gaps between stamps never line up into
+		// a clear vertical channel.
+		shift := 0
+		if row%2 == 1 {
+			shift = stepX / 2
+		}
+		for x := b.Min.X - shift; x < b.Max.X; x += stepX {
 			drawer := &font.Drawer{
 				Dst:  rgba,
 				Src:  image.NewUniform(col),
@@ -102,6 +181,7 @@ func applyImage(src []byte, mime, text string) ([]byte, error) {
 			}
 			drawer.DrawString(text)
 		}
+		row++
 	}
 
 	var out bytes.Buffer

@@ -36,8 +36,6 @@ type PayRate struct {
 	// Per Excel formula: default 300 = 50% × 200 (ตรี TA) + 50% × 400 (บัณฑิต TA).
 	// Applied to BOTH regular and special sections — tracks differ only in student count.
 	UGWorkloadRateRegular float64 `json:"ug_workload_rate_regular"`
-	// Deprecated: kept for backward compatibility. Budget calc no longer reads this.
-	UGWorkloadRateSpecial float64 `json:"ug_workload_rate_special"`
 	TermMonths            int     `json:"term_months"`
 	// Policy limits (advisory) — from the official regulation notes.
 	UGMaxHoursPerDay     int `json:"ug_max_hours_per_day"`    // undergrad regular: max hrs/day (7)
@@ -62,7 +60,7 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		       undergrad_regular, undergrad_special, graduate_regular, graduate_special_lumpsum,
 		       ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 		       baseline_students_lecture, baseline_students_lab,
-		       ug_workload_rate_regular, ug_workload_rate_special, term_months,
+		       ug_workload_rate_regular, term_months,
 		       ug_max_hours_per_day, max_courses_per_student,
 		       graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
 		       ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
@@ -72,7 +70,7 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		&pr.GraduateRegular, &pr.GraduateSpecialLumpsum,
 		&pr.UGLectureHoursPerCredit, &pr.UGLabHoursPerCredit,
 		&pr.BaselineStudentsLecture, &pr.BaselineStudentsLab,
-		&pr.UGWorkloadRateRegular, &pr.UGWorkloadRateSpecial, &pr.TermMonths,
+		&pr.UGWorkloadRateRegular, &pr.TermMonths,
 		&pr.UGMaxHoursPerDay, &pr.MaxCoursesPerStudent,
 		&pr.GraduateRegularHourly, &pr.GradSpecialTermCap, &pr.DailyPayCapBaht,
 		&pr.UGRegularDailyHourCap, &pr.UGSpecialDailyHourCap, &pr.GradRegularDailyHourCap,
@@ -91,7 +89,7 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		in.GraduateRegular < 0 || in.GraduateSpecialLumpsum < 0 ||
 		in.UGLectureHoursPerCredit < 0 || in.UGLabHoursPerCredit < 0 ||
 		in.BaselineStudentsLecture < 0 || in.BaselineStudentsLab < 0 ||
-		in.UGWorkloadRateRegular < 0 || in.UGWorkloadRateSpecial < 0 ||
+		in.UGWorkloadRateRegular < 0 ||
 		in.TermMonths < 0 || in.UGMaxHoursPerDay < 0 || in.MaxCoursesPerStudent < 0 ||
 		in.GraduateRegularHourly < 0 || in.GradSpecialTermCap < 0 || in.DailyPayCapBaht < 0 ||
 		in.UGRegularDailyHourCap < 0 || in.UGSpecialDailyHourCap < 0 || in.GradRegularDailyHourCap < 0 ||
@@ -121,10 +119,11 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		in.BaselineStudentsLab = 30
 	}
 	if in.UGWorkloadRateRegular == 0 {
-		in.UGWorkloadRateRegular = 200
-	}
-	if in.UGWorkloadRateSpecial == 0 {
-		in.UGWorkloadRateSpecial = 250
+		// 300 = 50%×200 (ตรี) + 50%×400 (บัณฑิต), per ชีต "2_59 ป.ตรี".
+		// This defaulted to 200 and would have quietly re-introduced the
+		// one-third-low course ceiling every time staff saved the rate form
+		// with the field left blank.
+		in.UGWorkloadRateRegular = 300
 	}
 	if in.TermMonths == 0 {
 		in.TermMonths = 4
@@ -162,17 +161,17 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		    graduate_regular, graduate_special_lumpsum,
 		    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 		    baseline_students_lecture, baseline_students_lab,
-		    ug_workload_rate_regular, ug_workload_rate_special, term_months,
+		    ug_workload_rate_regular, term_months,
 		    ug_max_hours_per_day, max_courses_per_student,
 		    graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
 		    ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
 		    ug_special_monthly_cap, note)
-		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
 		in.ID, in.EffectiveFrom, in.UndergradRegular, in.UndergradSpecial,
 		in.GraduateRegular, in.GraduateSpecialLumpsum,
 		in.UGLectureHoursPerCredit, in.UGLabHoursPerCredit,
 		in.BaselineStudentsLecture, in.BaselineStudentsLab,
-		in.UGWorkloadRateRegular, in.UGWorkloadRateSpecial, in.TermMonths,
+		in.UGWorkloadRateRegular, in.TermMonths,
 		in.UGMaxHoursPerDay, in.MaxCoursesPerStudent,
 		in.GraduateRegularHourly, in.GradSpecialTermCap, in.DailyPayCapBaht,
 		in.UGRegularDailyHourCap, in.UGSpecialDailyHourCap, in.GradRegularDailyHourCap,

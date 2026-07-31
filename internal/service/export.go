@@ -12,7 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/xuri/excelize/v2"
 
 	"ta-payment-back/internal/pdfgen"
 	"ta-payment-back/internal/storage"
@@ -23,6 +22,9 @@ type ExportService struct {
 	store   storage.Store
 	budget  *BudgetService
 	fontDir string // path to Sarabun-Regular/Bold TTFs, used by the PDF renderer
+	// teaching renders the weekly timetable form. Held as a dependency rather
+	// than duplicated here so the zip ships the same document the TA prints.
+	teaching *TeachingService
 }
 
 // exportRow is one TA's aggregated numbers used by both the coversheet and
@@ -32,8 +34,6 @@ type exportRow struct {
 	taID        uuid.UUID
 	fullName    string
 	email       string
-	nationalID  string
-	bankAcct    string
 	track       string
 	level       string
 	hoursTotal  float64
@@ -70,12 +70,9 @@ type ExportPreviewRow struct {
 	PayBaht     float64 `json:"pay_baht"`    // earned before budget cap
 	ActualPaid  float64 `json:"actual_paid"` // after pro-rata cap
 	IsReturning bool    `json:"is_returning"`
-	// NationalID + BankAcct are the FULL values (staff-only endpoint, same PII
-	// access as the ZIP download). The client masks them by default and reveals
-	// on demand via an eye toggle — server-side masking would make reveal
-	// impossible.
-	NationalID   string `json:"national_id"`
-	BankAcct     string `json:"bank_acct"`
+	// The national ID and bank account are deliberately absent: they are not
+	// stored (migration 0047) and the finance package carries them inside the
+	// creditor-form PDF instead.
 	ProfileReady bool   `json:"profile_ready"`
 	ProfileIssue string `json:"profile_issue"` // "" when ready
 }
@@ -218,15 +215,17 @@ func (s *ExportService) isReturningTA(ctx context.Context, taID, currentTermID u
 
 // BuildCourseZip builds a zip archive containing per-TA .xlsx files for a course.
 // Each xlsx has three sheets:
-//   Sheet 1: "หน้าปะ" (coversheet) — reimbursement summary
-//   Sheet 2: "บันทึกเวลา" (work log)
-//   Sheet 3: "ตารางสอน+งาน" (schedule)
+//
+//	Sheet 1: "หน้าปะ" (coversheet) — reimbursement summary
+//	Sheet 2: "บันทึกเวลา" (work log)
+//	Sheet 3: "ตารางสอน+งาน" (schedule)
 //
 // Payment model (ประกาศ 731/2565 + 1080/2565 + Q&A 2026):
-//   ป.ตรี ปกติ  → 40 ฿ × approved hours
-//   ป.ตรี พิเศษ → 50 ฿ × approved hours
-//   บัณฑิต ปกติ → 50 ฿ × approved hours (hourly per Q&A rule 6c, was lump-sum)
-//   บัณฑิต พิเศษ → min(4,000 × term_months, 12,000) — flat monthly capped per term
+//
+//	ป.ตรี ปกติ  → 40 ฿ × approved hours
+//	ป.ตรี พิเศษ → 50 ฿ × approved hours
+//	บัณฑิต ปกติ → 50 ฿ × approved hours (hourly per Q&A rule 6c, was lump-sum)
+//	บัณฑิต พิเศษ → min(4,000 × term_months, 12,000) — flat monthly capped per term
 //
 // Billing uses two independent budget pools (ภาคปกติ / ภาคพิเศษ), each capped
 // separately (applyTrackProrataCap). Concurrent-section rule (B2): when an
@@ -270,7 +269,6 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	// regular or special pool (two-pool cap applied after aggregation).
 	assignRows, err := s.pool.Query(ctx, `
 		SELECT a.id, a.ta_id, u.first_name||' '||u.last_name, u.email,
-		       COALESCE(p.national_id,''), COALESCE(p.bank_name,'')||' '||COALESCE(p.account_no,''),
 		       sec.track::text, a.level::text,
 		       COALESCE(SUM(wl.hours) FILTER (WHERE wl.status='approved'), 0) AS approved_hrs,
 		       (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_time-start_time))/3600),0)
@@ -278,12 +276,11 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status='approved'
 		JOIN users u ON u.id = a.ta_id
-		LEFT JOIN ta_profiles p ON p.user_id = a.ta_id
 		JOIN sections sec ON sec.id = a.section_id
 		LEFT JOIN work_logs wl ON wl.assignment_id = a.id
 		WHERE r.teaching_course_id = $1
 		GROUP BY a.id, a.ta_id, u.first_name, u.last_name, u.email,
-		         p.national_id, p.bank_name, p.account_no, sec.track, sec.id, a.level, sec.sec_no
+		         sec.track, sec.id, a.level, sec.sec_no
 		ORDER BY u.first_name, a.ta_id, (sec.track='regular') DESC, sec.sec_no`, teachingCourseID)
 	if err != nil {
 		return nil, err
@@ -294,11 +291,9 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	// undergrad and (b) aggregate all of a TA's assignments into ONE workbook row
 	// (matches the pre-refactor UX where each TA yields a single .xlsx).
 	type taAgg struct {
-		taID       uuid.UUID
-		fullName   string
-		email      string
-		nationalID string
-		bankAcct   string
+		taID     uuid.UUID
+		fullName string
+		email    string
 		// display: "regular" if TA has any regular assignment else "special";
 		// display: "undergrad" if any undergrad assignment else "master"/"phd".
 		track      string
@@ -317,15 +312,14 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 
 	for assignRows.Next() {
 		var (
-			assignID         uuid.UUID
-			taID             uuid.UUID
-			fullName, email  string
-			nationalID, bank string
-			track, level     string
-			approvedHrs      float64
-			schedHrsPerWeek  float64
+			assignID        uuid.UUID
+			taID            uuid.UUID
+			fullName, email string
+			track, level    string
+			approvedHrs     float64
+			schedHrsPerWeek float64
 		)
-		if err := assignRows.Scan(&assignID, &taID, &fullName, &email, &nationalID, &bank,
+		if err := assignRows.Scan(&assignID, &taID, &fullName, &email,
 			&track, &level, &approvedHrs, &schedHrsPerWeek); err != nil {
 			return nil, err
 		}
@@ -333,7 +327,6 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		if !ok {
 			agg = &taAgg{
 				taID: taID, fullName: fullName, email: email,
-				nationalID: nationalID, bankAcct: bank,
 				track: track, level: level,
 			}
 			byTA[taID] = agg
@@ -499,7 +492,6 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		total := agg.payRegular + agg.paySpecial
 		records = append(records, exportRow{
 			taID: agg.taID, fullName: agg.fullName, email: agg.email,
-			nationalID: agg.nationalID, bankAcct: agg.bankAcct,
 			track: agg.track, level: agg.level,
 			hoursTotal: agg.hoursTotal,
 			payRegular: agg.payRegular,
@@ -557,12 +549,18 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	if err := s.validatePayoutReadiness(ctx, teachingCourseID); err != nil {
 		return nil, "", 0, err
 	}
+	// Needed by the timetable form, which is scoped to a TERM rather than a
+	// course. A missing term is not fatal — the form is simply skipped.
+	var termID uuid.UUID
+	_ = s.pool.QueryRow(ctx,
+		`SELECT term_id FROM teaching_courses WHERE id=$1`, teachingCourseID).Scan(&termID)
+
 	comp, err := s.buildExportRows(ctx, teachingCourseID)
 	if err != nil {
 		return nil, "", 0, err
 	}
 	courseCode, courseName := comp.courseCode, comp.courseName
-	records, budgetMax, prorata := comp.records, comp.budgetMax, comp.prorated
+	records := comp.records
 
 	buf := &bytes.Buffer{}
 	zw := zip.NewWriter(buf)
@@ -576,16 +574,35 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		folder := fmt.Sprintf("%s/%s", courseCode, safeName)
 		fileBase := fmt.Sprintf("%s - %s", courseCode, safeName)
 
-		xlsx, err := s.buildPerTAWorkbook(ctx, teachingCourseID, courseCode, courseName, r, budgetMax, prorata)
-		if err != nil {
-			return nil, "", 0, err
-		}
-		w, err := zw.Create(folder + "/" + fileBase + ".xlsx")
-		if err != nil {
-			return nil, "", 0, err
-		}
-		if _, err := io.Copy(w, bytes.NewReader(xlsx)); err != nil {
-			return nil, "", 0, err
+		// The official claim workbook, one per term month with activity —
+		// the exact document the college signs. This replaced the old
+		// system-invented summary .xlsx outright (31/07/2026): shipping both
+		// meant two documents claiming to be "the" reimbursement workbook,
+		// and only the monthly one matches what the faculty actually files.
+		// Months with no logged work produce no file.
+		if termID != uuid.Nil {
+			tstart, tend := time.Time{}, time.Time{}
+			_ = s.pool.QueryRow(ctx, `SELECT starts_on, ends_on FROM academic_terms WHERE id=$1`, termID).Scan(&tstart, &tend)
+			idx := 0
+			for ym := time.Date(tstart.Year(), tstart.Month(), 1, 0, 0, 0, 0, time.UTC); !ym.After(tend); ym = ym.AddDate(0, 1, 0) {
+				idx++
+				logs, lerr := s.claimLogs(ctx, r.taID, teachingCourseID, ym.Year(), int(ym.Month()))
+				if lerr != nil || len(logs) == 0 {
+					continue
+				}
+				book, berr := s.BuildClaimWorkbook(ctx, r.taID, teachingCourseID, ym.Year(), int(ym.Month()))
+				if berr != nil {
+					continue // best-effort, like the PDF below
+				}
+				bn := fmt.Sprintf("%s/%d_%s-%s-%s.xlsx", folder, idx, courseCode, safeName, thaiMonthNames[int(ym.Month())])
+				bw, werr := zw.Create(bn)
+				if werr != nil {
+					return nil, "", 0, werr
+				}
+				if _, werr := io.Copy(bw, bytes.NewReader(book)); werr != nil {
+					return nil, "", 0, werr
+				}
+			}
 		}
 
 		// PDF is best-effort: without a fontDir configured we skip it rather
@@ -598,6 +615,23 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 					return nil, "", 0, err
 				}
 				if _, err := io.Copy(pw, bytes.NewReader(pdfBytes)); err != nil {
+					return nil, "", 0, err
+				}
+			}
+		}
+
+		// ตารางเรียนและตารางปฏิบัติงาน — the weekly form the lecturer signs.
+		// It covers EVERY course the TA assists, not just this one, which is the
+		// point of it: the signature attests that the duties do not collide with
+		// the classes the TA has to attend, and that cannot be judged one course
+		// at a time. Best-effort for the same reason as above.
+		if s.teaching != nil && termID != uuid.Nil {
+			if tf, terr := s.teaching.BuildTimetableFormPDF(ctx, r.taID, termID, ""); terr == nil {
+				tw, err := zw.Create(folder + "/ตารางปฏิบัติงาน - " + safeName + ".pdf")
+				if err != nil {
+					return nil, "", 0, err
+				}
+				if _, err := io.Copy(tw, bytes.NewReader(tf)); err != nil {
 					return nil, "", 0, err
 				}
 			}
@@ -615,14 +649,22 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 // not yet approved by staff, or blank national-ID/bank fields — and refuses
 // the export with all offenders named in one message.
 func (s *ExportService) validatePayoutReadiness(ctx context.Context, teachingCourseID uuid.UUID) error {
-	// national_id is intentionally NOT checked here — it is scrubbed after the
-	// creditor form is generated (PDPA, see B1); the number lives in the creditor
-	// PDF, not the profile. Readiness = approved profile + bank account fields.
+	// Readiness = an approved profile AND an approved creditor-form document.
+	//
+	// This used to test whether the bank columns were non-empty. Those columns
+	// no longer exist (PDPA, migration 0047): the account number lives only in
+	// the creditor-form PDF that ships with the finance package. So the honest
+	// question is "does that PDF exist and has staff approved it?" — which is
+	// also a stronger check, because a filled column never proved the document
+	// had been produced.
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT u.first_name || ' ' || u.last_name,
 		       (p.user_id IS NULL),
 		       COALESCE(p.status::text, ''),
-		       (COALESCE(p.account_no,'') = '' OR COALESCE(p.bank_name,'') = '')
+		       NOT EXISTS (
+		           SELECT 1 FROM ta_documents d
+		           WHERE d.user_id = a.ta_id AND d.kind = 'creditor_form'
+		             AND d.superseded_at IS NULL AND d.status = 'approved')
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN users u ON u.id = a.ta_id
@@ -630,8 +672,10 @@ func (s *ExportService) validatePayoutReadiness(ctx context.Context, teachingCou
 		WHERE r.teaching_course_id = $1
 		  AND (p.user_id IS NULL
 		       OR p.status::text <> 'approved'
-		       OR COALESCE(p.account_no,'') = ''
-		       OR COALESCE(p.bank_name,'') = '')
+		       OR NOT EXISTS (
+		           SELECT 1 FROM ta_documents d
+		           WHERE d.user_id = a.ta_id AND d.kind = 'creditor_form'
+		             AND d.superseded_at IS NULL AND d.status = 'approved'))
 		ORDER BY 1`, teachingCourseID)
 	if err != nil {
 		return err
@@ -651,7 +695,7 @@ func (s *ExportService) validatePayoutReadiness(ctx context.Context, teachingCou
 		case status != "approved":
 			reason = "เอกสารยังไม่ผ่านการอนุมัติ"
 		case missingFields:
-			reason = "ข้อมูลบัตร/บัญชีไม่ครบ"
+			reason = "ยังไม่มีแบบฟอร์มเจ้าหนี้ที่อนุมัติแล้ว"
 		}
 		offenders = append(offenders, fmt.Sprintf("%s (%s)", name, reason))
 	}
@@ -673,7 +717,10 @@ func (s *ExportService) readinessByTA(ctx context.Context, teachingCourseID uuid
 		SELECT DISTINCT a.ta_id,
 		       (p.user_id IS NULL),
 		       COALESCE(p.status::text, ''),
-		       (COALESCE(p.account_no,'') = '' OR COALESCE(p.bank_name,'') = '')
+		       NOT EXISTS (
+		           SELECT 1 FROM ta_documents d
+		           WHERE d.user_id = a.ta_id AND d.kind = 'creditor_form'
+		             AND d.superseded_at IS NULL AND d.status = 'approved')
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		LEFT JOIN ta_profiles p ON p.user_id = a.ta_id
@@ -697,7 +744,7 @@ func (s *ExportService) readinessByTA(ctx context.Context, teachingCourseID uuid
 		case status != "approved":
 			issue = "เอกสารยังไม่ผ่านการอนุมัติ"
 		case missingFields:
-			issue = "ข้อมูลบัตร/บัญชีไม่ครบ"
+			issue = "ยังไม่มีแบบฟอร์มเจ้าหนี้ที่อนุมัติแล้ว"
 		}
 		out[taID] = issue
 	}
@@ -745,8 +792,6 @@ func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid
 			PayBaht:      r.payBaht,
 			ActualPaid:   r.actualPaid,
 			IsReturning:  r.isReturning,
-			NationalID:   r.nationalID,
-			BankAcct:     r.bankAcct,
 			ProfileReady: issue == "",
 			ProfileIssue: issue,
 		})
@@ -777,20 +822,6 @@ func trackLabelTH(track string) string {
 		return "ภาคพิเศษ"
 	}
 	return track
-}
-
-// maskNationalID keeps only the last 4 characters visible (Thai IDs are 13
-// digits). PII stays off-screen on the preview; the full value still ships in
-// the downloaded document that staff hand to finance.
-func maskNationalID(nid string) string {
-	nid = strings.TrimSpace(nid)
-	if nid == "" {
-		return ""
-	}
-	if len(nid) <= 4 {
-		return nid
-	}
-	return strings.Repeat("•", len(nid)-4) + nid[len(nid)-4:]
 }
 
 // buildPerTAPDF assembles the monthly worklog PDF for one TA. The
@@ -885,11 +916,6 @@ func (s *ExportService) buildPerTAPDF(ctx context.Context, tcID uuid.UUID,
 	}
 	entryRows.Close()
 
-	// TA signature (best-effort).
-	var taSig []byte
-	_ = s.pool.QueryRow(ctx,
-		`SELECT COALESCE(decode(signature_png_b64, 'base64'), '') FROM ta_profiles WHERE user_id=$1`, r.taID).Scan(&taSig)
-
 	if yearMonthLabel == "" {
 		yearMonthLabel = "รวมทุกเดือน"
 	}
@@ -900,113 +926,15 @@ func (s *ExportService) buildPerTAPDF(ctx context.Context, tcID uuid.UUID,
 			CourseCode: code, CourseName: name,
 			YearMonthLabel: yearMonthLabel,
 			FullName:       r.fullName,
-			NationalID:     r.nationalID,
 			Email:          r.email,
-			BankAcct:       r.bankAcct,
 			Level:          levelTH,
 			Track:          trackTH,
 			HoursTotal:     r.hoursTotal,
 			PayBaht:        r.payBaht,
 			Schedule:       sched,
 			Entries:        entries,
-			TASignaturePNG: taSig,
 		},
 	})
-}
-
-func (s *ExportService) buildPerTAWorkbook(ctx context.Context, tcID uuid.UUID, code, name string, r exportRow, budgetMax float64, prorata bool) ([]byte, error) {
-	f := excelize.NewFile()
-	defer f.Close()
-
-	// Sheet 1: coversheet
-	cover := "หน้าปะ"
-	f.SetSheetName("Sheet1", cover)
-	f.SetCellValue(cover, "A1", "ใบปะหน้าเบิกจ่ายค่าตอบแทนผู้ช่วยสอน")
-	f.SetCellValue(cover, "A3", "รหัสวิชา")
-	f.SetCellValue(cover, "B3", code)
-	f.SetCellValue(cover, "A4", "ชื่อวิชา")
-	f.SetCellValue(cover, "B4", name)
-	f.SetCellValue(cover, "A6", "ชื่อ-นามสกุล TA")
-	f.SetCellValue(cover, "B6", r.fullName)
-	f.SetCellValue(cover, "A7", "สถานะ TA")
-	if r.isReturning {
-		f.SetCellValue(cover, "B7", "เก่า (เคยเป็น TA ในเทอมก่อน)")
-	} else {
-		f.SetCellValue(cover, "B7", "ใหม่")
-	}
-	// เลขบัตรประชาชนไม่แสดงบนหน้าปะ (PDPA — ไม่จัดเก็บแล้ว; อยู่ในไฟล์แบบฟอร์มเจ้าหนี้)
-	f.SetCellValue(cover, "A9", "ระดับ / ภาค")
-	f.SetCellValue(cover, "B9", r.level+" / "+r.track)
-	f.SetCellValue(cover, "A10", "ธนาคาร / บัญชี")
-	f.SetCellValue(cover, "B10", r.bankAcct)
-	f.SetCellValue(cover, "A12", "รวมชั่วโมง (อนุมัติ)")
-	f.SetCellValue(cover, "B12", r.hoursTotal)
-	f.SetCellValue(cover, "A13", "ยอดที่ควรได้ (บาท)")
-	f.SetCellValue(cover, "B13", r.payBaht)
-	f.SetCellValue(cover, "A14", "ยอดจริงที่จ่าย (บาท)")
-	f.SetCellValue(cover, "B14", r.actualPaid)
-	if budgetMax > 0 {
-		f.SetCellValue(cover, "A16", "งบรายวิชา (บาท)")
-		f.SetCellValue(cover, "B16", budgetMax)
-	}
-	if prorata {
-		f.SetCellValue(cover, "A18", "* ยอดถูกเฉลี่ยตามสัดส่วน (pro-rata) เนื่องจากยอดรวมเกินงบวิชา")
-	}
-
-	// Sheet 2: work log
-	log := "บันทึกเวลา"
-	f.NewSheet(log)
-	f.SetSheetRow(log, "A1", &[]interface{}{"วันที่", "เริ่ม", "สิ้นสุด", "ชั่วโมง", "กิจกรรม", "ห้อง", "หมายเหตุ"})
-	rowNum := 2
-	rows, _ := s.pool.Query(ctx, `
-		SELECT TO_CHAR(wl.work_date,'YYYY-MM-DD'), wl.start_time::text, wl.end_time::text, wl.hours,
-		       wl.activity, COALESCE(wl.room,''), COALESCE(wl.note,'')
-		FROM work_logs wl JOIN ta_request_assignments a ON a.id=wl.assignment_id
-		JOIN ta_requests req ON req.id = a.request_id
-		WHERE req.teaching_course_id=$1 AND a.ta_id=$2 AND wl.status = 'approved'
-		ORDER BY wl.work_date`, tcID, r.taID)
-	for rows.Next() {
-		var date, start, end, activity, room, note string
-		var hours float64
-		if err := rows.Scan(&date, &start, &end, &hours, &activity, &room, &note); err == nil {
-			cell := fmt.Sprintf("A%d", rowNum)
-			f.SetSheetRow(log, cell, &[]interface{}{date, start, end, hours, activity, room, note})
-			rowNum++
-		}
-	}
-	rows.Close()
-
-	// Sheet 3: schedule
-	sched := "ตารางสอน+งาน"
-	f.NewSheet(sched)
-	f.SetSheetRow(sched, "A1", &[]interface{}{"วัน", "เริ่ม", "สิ้นสุด", "ประเภท", "ห้อง"})
-	rowNum = 2
-	rows, _ = s.pool.Query(ctx, `
-		SELECT ss.day_of_week, ss.start_time::text, ss.end_time::text, ss.kind, COALESCE(ss.room, '')
-		FROM section_schedules ss
-		JOIN sections sec ON sec.id = ss.section_id
-		JOIN ta_request_assignments a ON a.section_id = sec.id
-		JOIN ta_requests req ON req.id = a.request_id
-		WHERE req.teaching_course_id = $1 AND a.ta_id = $2
-		ORDER BY ss.day_of_week, ss.start_time`, tcID, r.taID)
-	dayName := []string{"อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัส", "ศุกร์", "เสาร์"}
-	for rows.Next() {
-		var day int
-		var start, end, kind, room string
-		if err := rows.Scan(&day, &start, &end, &kind, &room); err == nil {
-			cell := fmt.Sprintf("A%d", rowNum)
-			f.SetSheetRow(sched, cell, &[]interface{}{dayName[day], start, end, kind, room})
-			rowNum++
-		}
-	}
-	rows.Close()
-
-	f.SetActiveSheet(0)
-	var out bytes.Buffer
-	if err := f.Write(&out); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
 }
 
 func sanitize(s string) string {

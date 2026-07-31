@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"time"
@@ -82,16 +81,34 @@ type CreateTARequestInput struct {
 		UndergradCount int       `json:"undergrad_count"`
 		GraduateCount  int       `json:"graduate_count"`
 	} `json:"counts"`
-	Assignments []struct {
-		// SectionIDs lists every section this TA is assigned to within the
-		// request. One TA now spans N sections so worklog can attribute time
-		// to the specific section taught; the workload declaration itself is
-		// shared across those sections (single row in ta_workload_forms).
-		SectionIDs []uuid.UUID   `json:"section_ids"`
-		TAID       uuid.UUID     `json:"ta_id"`
-		Level      string        `json:"level"`
-		Workload   WorkloadInput `json:"workload"`
-	} `json:"assignments"`
+	Assignments []AssignmentInput `json:"assignments"`
+}
+
+// AssignmentInput is one TA's placement within a request. Named rather than
+// anonymous so callers and tests can build one without restating the whole
+// shape — the previous inline struct had to be copied verbatim everywhere and
+// broke at every field addition.
+type AssignmentInput struct {
+	// SectionIDs lists every section this TA is assigned to within the
+	// request. Each becomes its own ta_request_assignments row so worklog can
+	// attribute time to the specific section taught.
+	SectionIDs []uuid.UUID `json:"section_ids"`
+	TAID       uuid.UUID   `json:"ta_id"`
+	Level      string      `json:"level"`
+	// Workload is the fallback declaration applied to every section that has
+	// no entry in SectionWorkloads. Kept so a client that declares one figure
+	// for the whole assignment keeps working.
+	Workload WorkloadInput `json:"workload"`
+	// SectionWorkloads carries the per-section hours the lecturers asked for:
+	// each group gets its own figure, bounded by the course's weekly contact
+	// hours for that kind — the numbers in the 3(3-0-6) notation.
+	SectionWorkloads []SectionWorkload `json:"section_workloads"`
+}
+
+// SectionWorkload is one section's slice of a TA's declared weekly workload.
+type SectionWorkload struct {
+	SectionID uuid.UUID     `json:"section_id"`
+	Workload  WorkloadInput `json:"workload"`
 }
 
 // Create runs input integrity checks upfront and then auto-decides the
@@ -221,37 +238,65 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	// materialise as ✓/✗ checklist entries — not blocking errors — so the
 	// resulting rejected request stays visible in the staff accordion.
 	levels := make([]string, len(in.Assignments))
+	// perSection[i][sectionID] is the workload row that assignment will carry.
+	perSection := make([]map[uuid.UUID]WorkloadInput, len(in.Assignments))
+	// coGroup[i][sectionID] groups sections this TA covers simultaneously, so
+	// their hours are counted once rather than N times.
+	coGroup := make([]map[uuid.UUID]int, len(in.Assignments))
+
 	for i, a := range in.Assignments {
 		name, level, err := s.validateTA(ctx, a.TAID, a.Level)
 		if err != nil {
 			return nil, err
 		}
 		levels[i] = level
-		// Reject impossibly-shaped numeric input before it can overflow the
-		// underlying NUMERIC(4,2) column or invalidate the total-hours rule
-		// through cancellation. Not a "check" — this is corrupt data.
-		if err := validateWorkloadFields(a.Workload, name); err != nil {
+
+		perSection[i] = resolveSectionWorkloads(a.SectionIDs, a.Workload, a.SectionWorkloads)
+		coGroup[i], err = s.detectCotaughtGroups(ctx, a.SectionIDs)
+		if err != nil {
 			return nil, err
 		}
-		// Enforce per-field caps mirroring the client-side rule (see
-		// project_workload_caps memory). Applies to undergrad only; grad
-		// hours follow the 10–12 total rule inside autoDecide.
-		if level == "undergrad" {
-			nSecs := float64(len(a.SectionIDs))
-			if err := validateUndergradWorkloadCaps(a.Workload, name, lectureHrs, labHrs, nSecs); err != nil {
+
+		for _, secID := range a.SectionIDs {
+			w := perSection[i][secID]
+			secNo := s.sectionLabel(ctx, secID)
+			// Reject impossibly-shaped numeric input before it can overflow the
+			// underlying NUMERIC(4,2) column or invalidate the total-hours rule
+			// through cancellation. Not a "check" — this is corrupt data.
+			if err := validateWorkloadFields(w, name); err != nil {
 				return nil, err
 			}
+			// Each group's hours are bounded by the course's weekly contact
+			// hours for that kind — the 3(3-0-6) figures. Undergrad only; grad
+			// hours follow the 10–12 total rule inside autoDecide.
+			if level == "undergrad" {
+				if err := validateUndergradSectionCaps(w, name, secNo, lectureHrs, labHrs); err != nil {
+					return nil, err
+				}
+			}
 		}
+
 		// ประกาศคุมเป็น "ชม./วัน" แต่ฟอร์มกรอกเป็น "ชม./สัปดาห์" — ตรวจว่าที่กรอก
 		// กระจายลงบันทึกเวลาจริงได้โดยไม่ชนเพดานรายวัน (ไม่งั้น auto-generate
-		// จะข้ามคาบเงียบ ๆ และ TA เสียชั่วโมงที่ควรได้).
+		// จะข้ามคาบเงียบ ๆ และ TA เสียชั่วโมงที่ควรได้). Co-taught sections are
+		// worked in a single sitting, so their hours count once here too.
 		if err := s.enforceDailyHourFeasibility(
-			ctx, a.SectionIDs, level, name, weeklyWorkloadTotal(a.Workload, level),
+			ctx, a.SectionIDs, level, name,
+			billableWeeklyTotal(a.SectionIDs, perSection[i], coGroup[i], level),
 		); err != nil {
 			return nil, err
 		}
 	}
 
+	// Case 2 of the deferred-decision model is NOT handled here. It used to be:
+	// a knowable clash refused the whole submission on the spot. That made the
+	// verdict depend on WHEN the TA filed their timetable — file it first and a
+	// single clashing lab cost you the entire section; file it after the lecturer
+	// submitted and applyClashOutcome trimmed just that session and kept the rest.
+	// Same TA, same timetable, two different answers.
+	//
+	// Create now runs the same applyClashOutcome the deferred path runs (below),
+	// so there is one clash rule in the system instead of two. See 3ก, 31/07/2026.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -278,18 +323,26 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	// the ta_workload_forms row. Downstream reads LEFT JOIN the form and
 	// COALESCE numeric fields to 0, so the aggregate (which sums across all
 	// of a TA's assignments in the request) matches the declared total.
+	// Every section now carries its OWN workload row (0041). Before that only
+	// the first one did, which made the hours mean "all sections combined" and
+	// left worklog unable to tell how much time belonged to which group.
 	for i, a := range in.Assignments {
-		wl := a.Workload
-		for j, secID := range a.SectionIDs {
+		for _, secID := range a.SectionIDs {
 			aid := uuid.New()
+			group := coGroup[i][secID]
+			// A singleton group carries no meaning downstream, so store NULL
+			// and reserve non-null for genuinely co-taught sets.
+			var groupVal any
+			if countInGroup(coGroup[i], group) > 1 {
+				groupVal = group
+			}
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
-				 VALUES ($1,$2,$3,$4,$5::study_level)`, aid, rid, secID, a.TAID, levels[i]); err != nil {
+				`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level, cotaught_group)
+				 VALUES ($1,$2,$3,$4,$5::study_level,$6)`,
+				aid, rid, secID, a.TAID, levels[i], groupVal); err != nil {
 				return nil, err
 			}
-			if j != 0 {
-				continue
-			}
+			wl := perSection[i][secID]
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO ta_workload_forms (id, assignment_id, help_teach_hrs, help_teach_desc, prep_hrs, prep_desc,
 					grade_hrs, grade_desc, other_hrs, other_desc, check_work_hrs, attendance_hrs, ug_other_hrs, ug_other_desc, lab_hrs)
@@ -301,15 +354,88 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		}
 	}
 
+	// Case 1: someone on this request has not filed a timetable, so there is
+	// nothing to judge yet. The row RESTS in 'submitted' — which already means
+	// "handed in, not yet judged" — and ReevaluateForTA finishes it the moment
+	// the last timetable arrives. The quota these assignments reserve is held
+	// throughout, which is the point: submitting books the slot.
+	waiting, err := tasMissingSchedule(ctx, tx, rid, termID)
+	if err != nil {
+		return nil, err
+	}
+	if len(waiting) > 0 {
+		checks := []DecisionCheck{{
+			Rule:    "schedule",
+			Passed:  false,
+			Warning: true,
+			Message: fmt.Sprintf(
+				"รอตารางเรียนของ %s — ระบบจะตัดสินคำขอนี้ให้อัตโนมัติเมื่อครบทุกคน "+
+					"หากคาบใดตรงกับตารางเรียนของเขา คาบนั้นจะถูกตัดออก",
+				strings.Join(waiting, ", ")),
+		}}
+		checksJSON, err := json.Marshal(checks)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE ta_requests SET decision_checks = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+			checksJSON, rid); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		s.aud.Log(ctx, audit.Entry{
+			ActorID: &lecturerID, Action: "ta_request.pending_schedule",
+			Entity: "ta_request", EntityID: rid.String(),
+			Note: strings.Join(waiting, ", "), After: in,
+		})
+		return &CreateResult{ID: rid, Status: "submitted", Checks: checks}, nil
+	}
+
+	// Everyone has a timetable, so the clash verdict is knowable now. Decide it
+	// exactly as tryFinalize does: trim the sessions that collide, drop only the
+	// sections where nothing workable is left, and keep the rest.
+	notices, err := s.applyClashOutcome(ctx, tx, rid)
+	if err != nil {
+		return nil, err
+	}
+
 	checks, passed, err := s.autoDecide(ctx, tx, rid)
 	if err != nil {
 		return nil, err
 	}
+
+	// What was trimmed has to reach the lecturer at the moment they submit —
+	// silently handing back a thinner assignment than they asked for is how they
+	// end up counting on hours nobody will work. Warning, not a failure: the
+	// remaining sessions are still worth approving.
+	for taID, lines := range notices {
+		checks = append(checks, DecisionCheck{
+			Rule:    "clash_trimmed",
+			TAName:  s.taName(ctx, taID),
+			Passed:  false,
+			Warning: true,
+			Message: strings.Join(lines, "\n"),
+		})
+	}
+
+	// A TA whose every section was dropped is off the request; if that empties it,
+	// there is nobody left to teach. Mirrors tryFinalize.
+	var surviving int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_request_assignments WHERE request_id = $1 AND state <> 'dropped'`,
+		rid).Scan(&surviving); err != nil {
+		return nil, err
+	}
 	verdict := "rejected"
 	var reason string
-	if passed {
+	switch {
+	case surviving == 0:
+		reason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
+	case passed:
 		verdict = "approved"
-	} else {
+	default:
 		reason = joinRejectMessages(checks)
 	}
 	checksJSON, err := json.Marshal(checks)
@@ -339,6 +465,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		Note:     verdict,
 		After:    in,
 	})
+	s.notifyClashOutcome(ctx, rid, notices)
 	s.notifyDecision(ctx, rid, verdict, reason)
 	return &CreateResult{ID: rid, Status: verdict, Checks: checks, RejectReason: reason}, nil
 }
@@ -444,33 +571,140 @@ func validateWorkloadFields(w WorkloadInput, name string) error {
 	return nil
 }
 
-// validateUndergradWorkloadCaps mirrors the client-side per-field caps:
-//   - in-class activities (check-work, attendance, lab) scale with class
-//     exposure: max = credit_hrs × n_sections
-//   - ug_other ("อื่น ๆ") is fixed at course credit_hrs — stakeholder rule:
-//     prep/admin time can't scale with section count.
+// validateUndergradSectionCaps bounds ONE section's declared weekly hours by
+// the course's contact hours for that kind — the figures inside the Thai
+// credit notation, e.g. 3(3-0-6) means 3 lecture hours and 0 lab hours per
+// week, per group.
 //
-// Only applies to undergrad; grad fields are governed by the 10–12 total
-// rule inside autoDecide.
-func validateUndergradWorkloadCaps(w WorkloadInput, name string, lectureHrs, labHrs, nSecs float64) error {
-	lectureCap := lectureHrs * nSecs
-	labCap := labHrs * nSecs
+// The bound is per section, not per assignment: the lecturers asked to declare
+// hours "ต่อกลุ่มเรียน (section)", and a TA cannot spend more time on a group
+// than that group actually meets. Before per-section declarations existed this
+// function multiplied the ceiling by the number of sections, because one
+// figure covered them all; that multiplication is now wrong and gone.
+//
+// secLabel names the group in the error so a lecturer filling several knows
+// which one to fix.
+func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, lectureHrs, labHrs float64) error {
 	checks := []struct {
 		v     float64
 		cap   float64
 		label string
 	}{
-		{w.CheckWorkHrs, lectureCap, "ช่วยตรวจงาน"},
-		{w.AttendanceHrs, lectureCap, "เช็คชื่อ/เก็บใบงาน"},
+		{w.CheckWorkHrs, lectureHrs, "ช่วยตรวจงาน"},
+		{w.AttendanceHrs, lectureHrs, "เช็คชื่อ/เก็บใบงาน"},
 		{w.UGOtherHrs, lectureHrs, "อื่น ๆ (บรรยาย)"},
-		{w.LabHrs, labCap, "ปฏิบัติการ"},
+		{w.LabHrs, labHrs, "ปฏิบัติการ"},
 	}
 	for _, c := range checks {
-		if c.v > c.cap {
-			return fmt.Errorf("ภาระงาน '%s' ของ %s เกินขีดจำกัด %.2f ชม./สัปดาห์", c.label, name, c.cap)
+		if c.v > c.cap+0.001 {
+			if c.cap == 0 {
+				return fmt.Errorf(
+					"ภาระงาน '%s' ของ %s (Sec %s) กรอกไม่ได้ — วิชานี้ไม่มีชั่วโมงประเภทนี้ในหน่วยกิต",
+					c.label, name, secLabel)
+			}
+			return fmt.Errorf(
+				"ภาระงาน '%s' ของ %s (Sec %s) เกินชั่วโมงของวิชาต่อสัปดาห์ (%.2f ชม.)",
+				c.label, name, secLabel, c.cap)
 		}
 	}
 	return nil
+}
+
+// resolveSectionWorkloads maps every assigned section to the hours it should
+// carry. A section named in SectionWorkloads uses its own figure; anything left
+// over falls back to the assignment-wide Workload, which is how older clients
+// (and the request tests) declare one figure for the whole assignment.
+func resolveSectionWorkloads(sectionIDs []uuid.UUID, fallback WorkloadInput, per []SectionWorkload) map[uuid.UUID]WorkloadInput {
+	byID := make(map[uuid.UUID]WorkloadInput, len(sectionIDs))
+	for _, sw := range per {
+		byID[sw.SectionID] = sw.Workload
+	}
+	out := make(map[uuid.UUID]WorkloadInput, len(sectionIDs))
+	for _, id := range sectionIDs {
+		if w, ok := byID[id]; ok {
+			out[id] = w
+			continue
+		}
+		out[id] = fallback
+	}
+	return out
+}
+
+// detectCotaughtGroups partitions the sections a TA covers into groups that
+// meet at the same time, so their hours are billed once.
+//
+// The meeting was explicit that co-teaching is the normal case at CP KKU (sec
+// 01–02 ภาคปกติ plus sec 03 โครงการพิเศษ in one room, one TA) and that such a
+// TA "เบิกได้แค่ก้อนเดียว". The system already knows every section's timetable,
+// so it derives the grouping instead of asking the lecturer to declare it —
+// one less thing to get wrong, and it cannot drift from the real schedule.
+//
+// Sections with no timetable rows form their own singleton groups.
+func (s *TARequestService) detectCotaughtGroups(ctx context.Context, sectionIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+	groups := make(map[uuid.UUID]int, len(sectionIDs))
+	next := 0
+	for _, id := range sectionIDs {
+		if _, done := groups[id]; done {
+			continue
+		}
+		next++
+		groups[id] = next
+		// Anything overlapping this section joins its group. Overlap is
+		// transitive enough in practice (co-taught sections share one slot),
+		// and a wrong grouping can only ever under-count, never over-bill.
+		for _, other := range sectionIDs {
+			if other == id {
+				continue
+			}
+			if _, done := groups[other]; done {
+				continue
+			}
+			var overlaps bool
+			if err := s.pool.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM section_schedules a
+					JOIN section_schedules b ON b.section_id = $2
+					WHERE a.section_id = $1
+					  AND a.day_of_week = b.day_of_week
+					  AND a.start_time < b.end_time
+					  AND b.start_time < a.end_time)`, id, other).Scan(&overlaps); err != nil {
+				return nil, err
+			}
+			if overlaps {
+				groups[other] = next
+			}
+		}
+	}
+	return groups, nil
+}
+
+// countInGroup returns how many sections share the given co-taught group.
+func countInGroup(groups map[uuid.UUID]int, group int) int {
+	n := 0
+	for _, g := range groups {
+		if g == group {
+			n++
+		}
+	}
+	return n
+}
+
+// billableWeeklyTotal sums a TA's declared hours across their sections, counting
+// each co-taught group once. Used for the daily-feasibility check and for the
+// graduate 10–12 hour rule, both of which describe time the person actually
+// spends — not time multiplied by how many groups were in the room.
+func billableWeeklyTotal(sectionIDs []uuid.UUID, per map[uuid.UUID]WorkloadInput, groups map[uuid.UUID]int, level string) float64 {
+	seen := map[int]bool{}
+	var total float64
+	for _, id := range sectionIDs {
+		g := groups[id]
+		if g != 0 && seen[g] {
+			continue
+		}
+		seen[g] = true
+		total += weeklyWorkloadTotal(per[id], level)
+	}
+	return total
 }
 
 // weeklyWorkloadTotal sums the fields that actually apply to this TA's level —
@@ -506,21 +740,56 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 		return nil
 	}
 	isGrad := level == "master" || level == "phd"
+	// Hours per weekday must be the UNION of the occupied time, not the sum of
+	// each section's length. Co-taught sections meet in one room at one time —
+	// summing them would report a TA as working 12 hours for a single 6-hour
+	// sitting and refuse a request that is perfectly legal. The CTE chain below
+	// is the standard merge-intervals: order the slots, start a new "island"
+	// whenever a slot begins after every previous one has ended, then measure
+	// each island once.
 	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT ss.day_of_week,
-		       SUM(EXTRACT(EPOCH FROM (ss.end_time - ss.start_time)) / 3600.0) AS hrs,
-		       MIN(CASE
-		           WHEN NOT $2 AND sec.track = 'regular' THEN pr.ug_regular_daily_hour_cap
-		           WHEN NOT $2 AND sec.track = 'special' THEN pr.ug_special_daily_hour_cap
-		           WHEN $2 AND sec.track = 'regular' THEN pr.grad_regular_daily_hour_cap
-		           ELSE 24
-		       END) AS day_cap
-		FROM section_schedules ss
-		JOIN sections sec ON sec.id = ss.section_id
-		CROSS JOIN latest pr
-		WHERE ss.section_id = ANY($1)
-		GROUP BY ss.day_of_week`, sectionIDs, isGrad)
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		slots AS (
+		    SELECT ss.day_of_week AS dow, ss.start_time AS st, ss.end_time AS en
+		    FROM section_schedules ss
+		    WHERE ss.section_id = ANY($1)
+		),
+		ordered AS (
+		    SELECT dow, st, en,
+		           MAX(en) OVER (PARTITION BY dow ORDER BY st, en
+		                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_end
+		    FROM slots
+		),
+		islands AS (
+		    SELECT dow, st, en,
+		           SUM(CASE WHEN prev_end IS NULL OR st > prev_end THEN 1 ELSE 0 END)
+		               OVER (PARTITION BY dow ORDER BY st, en ROWS UNBOUNDED PRECEDING) AS island
+		    FROM ordered
+		),
+		merged AS (
+		    SELECT dow, island, MIN(st) AS st, MAX(en) AS en
+		    FROM islands GROUP BY dow, island
+		),
+		day_hours AS (
+		    SELECT dow, SUM(EXTRACT(EPOCH FROM (en - st)) / 3600.0) AS hrs
+		    FROM merged GROUP BY dow
+		),
+		day_caps AS (
+		    SELECT ss.day_of_week AS dow,
+		           MIN(CASE
+		               WHEN NOT $2 AND sec.track = 'regular' THEN pr.ug_regular_daily_hour_cap
+		               WHEN NOT $2 AND sec.track = 'special' THEN pr.ug_special_daily_hour_cap
+		               WHEN $2 AND sec.track = 'regular' THEN pr.grad_regular_daily_hour_cap
+		               ELSE 24
+		           END) AS day_cap
+		    FROM section_schedules ss
+		    JOIN sections sec ON sec.id = ss.section_id
+		    CROSS JOIN latest pr
+		    WHERE ss.section_id = ANY($1)
+		    GROUP BY ss.day_of_week
+		)
+		SELECT h.dow, h.hrs, c.day_cap
+		FROM day_hours h JOIN day_caps c ON c.dow = h.dow`, sectionIDs, isGrad)
 	if err != nil {
 		return err
 	}
@@ -723,6 +992,18 @@ func (s *TARequestService) checkTASchedule(ctx context.Context, q querier, taID,
 	return nil
 }
 
+// sectionLabel names a section for an error message. Moved here from
+// ta_request_decide.go when assertNoKnownClash was removed — its only remaining
+// caller is the workload-cap validator above.
+func (s *TARequestService) sectionLabel(ctx context.Context, sectionID uuid.UUID) string {
+	var secNo string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT sec_no FROM sections WHERE id = $1`, sectionID).Scan(&secNo); err != nil {
+		return "—"
+	}
+	return secNo
+}
+
 func (s *TARequestService) checkOwnClassConflict(ctx context.Context, q querier, taID, sectionID uuid.UUID, name string) error {
 	var conflicts int
 	err := q.QueryRow(ctx, `
@@ -731,6 +1012,11 @@ func (s *TARequestService) checkOwnClassConflict(ctx context.Context, q querier,
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 		JOIN ta_class_schedules cs ON cs.user_id = $1 AND cs.term_id = tc.term_id AND NOT cs.is_wba
 		WHERE ss.section_id = $2
+		  -- Lab periods only. A lab puts the TA in a room with students at a
+		  -- fixed hour, so it cannot share a slot with their own class; lecture
+		  -- duty does not, and blocking on it ruled out TAs who were perfectly
+		  -- able to do the job (31/07/2026 change).
+		  AND `+BlockingSessionSQL("ss")+`
 		  AND ss.day_of_week = cs.day_of_week
 		  AND ss.start_time < cs.end_time
 		  AND ss.end_time > cs.start_time`,
@@ -739,7 +1025,7 @@ func (s *TARequestService) checkOwnClassConflict(ctx context.Context, q querier,
 		return err
 	}
 	if conflicts > 0 {
-		return fmt.Errorf("เวลาสอนของ section นี้ทับซ้อนกับตารางเรียนของ %s", name)
+		return fmt.Errorf("คาบปฏิบัติการของ section นี้ทับซ้อนกับตารางเรียนของ %s", name)
 	}
 	return nil
 }
@@ -756,6 +1042,12 @@ func (s *TARequestService) checkCrossRequestConflict(ctx context.Context, q quer
 		JOIN teaching_courses otc ON otc.id = orq.teaching_course_id AND otc.term_id = $3
 		JOIN section_schedules oss ON oss.section_id = oa.section_id
 		WHERE ss.section_id = $2
+		  -- Blocking when EITHER side is a lab, not only the requested one. A lab
+		  -- is a fixed commitment whichever course it belongs to, so a lecture
+		  -- duty here that lands on a lab the TA already runs elsewhere is still
+		  -- a double booking — exempting lectures on both sides would have let
+		  -- exactly that through.
+		  AND ('lab' IN (ss.kind, oss.kind))
 		  AND oss.day_of_week = ss.day_of_week
 		  AND oss.start_time < ss.end_time
 		  AND ss.start_time < oss.end_time`,
@@ -786,6 +1078,11 @@ type TACandidate struct {
 	ApprovedCourseCount int       `json:"approved_course_count"` // other courses this term (excl. this one)
 	AtQuota             bool      `json:"at_quota"`              // adding THIS course would exceed the cap
 	AlreadyInCourse     bool      `json:"already_in_course"`     // already an approved TA of THIS course
+	// HasSchedule reports whether this TA has filed a class timetable for the
+	// term. False means the request can still be submitted, but the verdict
+	// waits for the timetable and any clashing session will be dropped — the
+	// form shows that warning before the lecturer commits.
+	HasSchedule bool `json:"has_schedule"`
 }
 
 // Candidates lists every TA with their approved-course count in the given
@@ -805,11 +1102,18 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 		         JOIN ta_requests r ON r.id = a.request_id
 		         JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 		         WHERE a.ta_id = u.id AND tc.term_id = $2
-		           AND r.status = 'approved' AND r.teaching_course_id <> $1), 0),
+		           AND r.status IN ('submitted', 'approved')
+		           AND a.state <> 'dropped'
+		           AND r.teaching_course_id <> $1), 0),
 		       EXISTS (
 		         SELECT 1 FROM ta_request_assignments a
 		         JOIN ta_requests r ON r.id = a.request_id
-		         WHERE a.ta_id = u.id AND r.teaching_course_id = $1 AND r.status = 'approved')
+		         WHERE a.ta_id = u.id AND r.teaching_course_id = $1
+		           AND r.status IN ('submitted', 'approved')
+		           AND a.state <> 'dropped'),
+		       EXISTS (
+		         SELECT 1 FROM ta_class_schedules cs
+		         WHERE cs.user_id = u.id AND cs.term_id = $2)
 		FROM users u
 		WHERE EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role::text = 'ta')
 		ORDER BY u.first_name, u.last_name`, tcID, termID)
@@ -821,7 +1125,7 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 	for rows.Next() {
 		var c TACandidate
 		if err := rows.Scan(&c.ID, &c.FirstName, &c.LastName, &c.Email, &c.StudyLevel,
-			&c.ApprovedCourseCount, &c.AlreadyInCourse); err != nil {
+			&c.ApprovedCourseCount, &c.AlreadyInCourse, &c.HasSchedule); err != nil {
 			return nil, err
 		}
 		c.AtQuota = c.ApprovedCourseCount >= maxApprovedCoursesPerTerm
@@ -830,15 +1134,28 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 	return out, rows.Err()
 }
 
-// approvedCourseCount counts distinct courses (other than courseID) in the term
-// where the TA is on an approved request.
-func (s *TARequestService) approvedCourseCount(ctx context.Context, q querier, taID, termID, courseID uuid.UUID) (int, error) {
+// reservedCourseCount counts distinct courses (other than courseID) in the term
+// that this TA's quota is currently committed to.
+//
+// The meeting changed what "committed" means: putting a name on a request
+// BOOKS the slot, whether or not the request has been judged yet. Otherwise a
+// TA sitting in three pending requests looks free to a fourth lecturer, and
+// all four approve at once.
+//
+// Two exclusions release the booking again:
+//   - a request that ends up 'rejected' or 'cancelled' never counted;
+//   - an assignment dropped because every session clashed with the TA's own
+//     timetable frees that course, exactly as the meeting asked ("กรณีสอนวิชานั้น
+//     ไม่ได้เลย … ก็ให้คืนโควต้า").
+func (s *TARequestService) reservedCourseCount(ctx context.Context, q querier, taID, termID, courseID uuid.UUID) (int, error) {
 	var count int
 	err := q.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT r.teaching_course_id) FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
-		WHERE a.ta_id = $1 AND tc.term_id = $2 AND r.status = 'approved'
+		WHERE a.ta_id = $1 AND tc.term_id = $2
+		  AND r.status IN ('submitted', 'approved')
+		  AND a.state <> 'dropped'
 		  AND r.teaching_course_id <> $3`,
 		taID, termID, courseID).Scan(&count)
 	return count, err
@@ -894,13 +1211,18 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		name        string
 		level       string
 		wl          WorkloadInput
+		// coGroup is non-zero when this section is taught in the same sitting
+		// as others in the request. Their hours are the SAME hours, so the
+		// weekly total must count the group once.
+		coGroup int
 	}
 	arows, err := tx.Query(ctx, `
 		SELECT a.ta_id, a.section_id, u.first_name || ' ' || u.last_name, a.level::text,
 		       COALESCE(w.help_teach_hrs,0), COALESCE(w.prep_hrs,0),
 		       COALESCE(w.grade_hrs,0),      COALESCE(w.other_hrs,0),
 		       COALESCE(w.check_work_hrs,0), COALESCE(w.attendance_hrs,0),
-		       COALESCE(w.ug_other_hrs,0),   COALESCE(w.lab_hrs,0)
+		       COALESCE(w.ug_other_hrs,0),   COALESCE(w.lab_hrs,0),
+		       COALESCE(a.cotaught_group, 0)
 		FROM ta_request_assignments a
 		JOIN users u ON u.id = a.ta_id
 		LEFT JOIN ta_workload_forms w ON w.assignment_id = a.id
@@ -915,7 +1237,8 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		var a asgRow
 		if err := arows.Scan(&a.taID, &a.secID, &a.name, &a.level,
 			&a.wl.HelpTeachHrs, &a.wl.PrepHrs, &a.wl.GradeHrs, &a.wl.OtherHrs,
-			&a.wl.CheckWorkHrs, &a.wl.AttendanceHrs, &a.wl.UGOtherHrs, &a.wl.LabHrs); err != nil {
+			&a.wl.CheckWorkHrs, &a.wl.AttendanceHrs, &a.wl.UGOtherHrs, &a.wl.LabHrs,
+			&a.coGroup); err != nil {
 			arows.Close()
 			return nil, false, err
 		}
@@ -990,17 +1313,18 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 				JOIN ta_requests r ON r.id = a.request_id
 				WHERE r.teaching_course_id = $1
 				  AND r.id <> $2
-				  AND r.status = 'approved'
+				  AND r.status IN ('submitted', 'approved')
+				  AND a.state <> 'dropped'
 				  AND a.ta_id = $3
 			)`, courseID, reqID, t.id).Scan(&dupSameCourse); err != nil {
 			return nil, false, err
 		}
 		add("duplicate", t.name,
 			fmt.Sprintf("%s ไม่ซ้ำในวิชานี้", t.name),
-			fmt.Sprintf("%s ได้รับอนุมัติเป็น TA ของวิชานี้ในคำขออื่นแล้ว", t.name),
+			fmt.Sprintf("%s อยู่ในคำขออื่นของวิชานี้แล้ว", t.name),
 			!dupSameCourse)
 
-		count, err := s.approvedCourseCount(ctx, tx, t.id, termID, courseID)
+		count, err := s.reservedCourseCount(ctx, tx, t.id, termID, courseID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1012,11 +1336,25 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		// Workload total range.
 		var totOK bool
 		var totMsg string
+		// Co-taught sections describe one sitting, so their declared hours are
+		// the same hours seen from several groups. Counting each row would
+		// inflate a graduate TA past the 10–12 rule for doing nothing extra.
+		countedGroups := map[int]bool{}
+		countOnce := func(a asgRow) bool {
+			if a.coGroup == 0 {
+				return true
+			}
+			if countedGroups[a.coGroup] {
+				return false
+			}
+			countedGroups[a.coGroup] = true
+			return true
+		}
 		if t.level == "master" || t.level == "phd" {
 			// Sum this TA's grad hours across all sections in this request.
 			var tot float64
 			for _, a := range asgs {
-				if a.taID != t.id {
+				if a.taID != t.id || !countOnce(a) {
 					continue
 				}
 				tot += a.wl.HelpTeachHrs + a.wl.PrepHrs + a.wl.GradeHrs + a.wl.OtherHrs
@@ -1030,7 +1368,7 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		} else {
 			var tot float64
 			for _, a := range asgs {
-				if a.taID != t.id {
+				if a.taID != t.id || !countOnce(a) {
 					continue
 				}
 				tot += a.wl.CheckWorkHrs + a.wl.AttendanceHrs + a.wl.UGOtherHrs + a.wl.LabHrs
@@ -1047,8 +1385,17 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 
 	// Per-(TA, section) time-conflict rules.
 	for _, a := range asgs {
+		// Informational only since 0041. A clash with the TA's OWN timetable no
+		// longer sinks the request: applyClashOutcome has already marked the
+		// affected assignment 'trimmed' or 'dropped', which is the outcome the
+		// lecturers asked for ("ทับแค่บางคาบก็สอนได้บางคาบ"). Rejecting here as
+		// well would throw away the sections that are still perfectly workable.
+		//
+		// cross_conflict below stays blocking — an overlap with a DIFFERENT
+		// course the TA already assists cannot be resolved by dropping sessions
+		// from this request, because both sides are teaching commitments.
 		if err := s.checkOwnClassConflict(ctx, tx, a.taID, a.secID, a.name); err != nil {
-			add("own_conflict", a.name, "", err.Error(), false)
+			addWarn("own_conflict", a.name, "", err.Error(), false)
 		} else {
 			add("own_conflict", a.name, fmt.Sprintf("%s เวลาสอนไม่ทับซ้อนกับตารางเรียนของตัวเอง", a.name), "", true)
 		}
@@ -1103,83 +1450,12 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 	return checks, passed, nil
 }
 
-// RunPendingSweep is a one-shot startup task that auto-decides any legacy
-// row still in the 'submitted' state after this migration ships. Idempotent —
-// running it again is a no-op once the submitted set is empty.
-func (s *TARequestService) RunPendingSweep(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT id FROM ta_requests WHERE status = 'submitted'`)
-	if err != nil {
-		return err
-	}
-	var ids []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	log.Printf("ta_request sweep: auto-deciding %d legacy pending requests", len(ids))
-
-	decided := 0
-	for _, id := range ids {
-		if err := s.decideOne(ctx, id); err != nil {
-			log.Printf("ta_request sweep %s: %v", id, err)
-			continue
-		}
-		decided++
-	}
-	log.Printf("ta_request sweep: %d/%d decided", decided, len(ids))
-	return nil
-}
-
-func (s *TARequestService) decideOne(ctx context.Context, reqID uuid.UUID) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	checks, passed, err := s.autoDecide(ctx, tx, reqID)
-	if err != nil {
-		return err
-	}
-	verdict := "rejected"
-	var reason string
-	if passed {
-		verdict = "approved"
-	} else {
-		reason = joinRejectMessages(checks)
-	}
-	checksJSON, err := json.Marshal(checks)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE ta_requests SET
-		  status          = $1::ta_request_status,
-		  decided_at      = NOW(),
-		  decided_by      = NULL,
-		  reject_reason   = NULLIF($2, ''),
-		  decision_checks = $3::jsonb,
-		  updated_at      = NOW()
-		WHERE id = $4 AND status = 'submitted'`, verdict, reason, checksJSON, reqID); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	s.aud.Log(ctx, audit.Entry{Action: "ta_request.auto_decide.sweep", Entity: "ta_request", EntityID: reqID.String(), Note: verdict})
-	s.notifyDecision(ctx, reqID, verdict, reason)
-	return nil
-}
+// The startup sweep that used to force-decide every 'submitted' row lived
+// here. Under the deferred-decision model (0041) 'submitted' is a legitimate
+// resting state — the request is waiting for a TA's timetable — so blindly
+// deciding those rows would defeat the whole mechanism. Its replacement,
+// SweepPendingRequests in ta_request_decide.go, only finalises requests whose
+// TAs have all filed timetables.
 
 func (s *TARequestService) courseLabel(ctx context.Context, courseID uuid.UUID) (code, nameTH string) {
 	_ = s.pool.QueryRow(ctx, `
@@ -1206,13 +1482,21 @@ type TARequestSummary struct {
 	Semester         int             `json:"semester"`
 	IsLate           bool            `json:"is_late"`
 	DecisionChecks   []DecisionCheck `json:"decision_checks"`
+	// TrimmedCount / DroppedCount summarise the deferred decision's per-section
+	// outcome. An approved request can still contain sections the TA cannot
+	// fully work, and the summary row is where the lecturer looks first — a
+	// green "อนุมัติแล้ว" with no other signal would hide that entirely.
+	TrimmedCount int `json:"trimmed_count"`
+	DroppedCount int `json:"dropped_count"`
 }
 
 const requestSummarySelect = `
 	SELECT r.id, tc.code, tc.name_th, r.status::text, r.submitted_at, r.decided_at, r.decided_by, r.reject_reason, r.teaching_course_id,
 	       u.first_name || ' ' || u.last_name,
 	       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
-	       tc.term_id, at.academic_year, at.semester, r.is_late, r.decision_checks
+	       tc.term_id, at.academic_year, at.semester, r.is_late, r.decision_checks,
+	       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'trimmed'),
+	       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'dropped')
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 	JOIN academic_terms at ON at.id = tc.term_id
@@ -1224,7 +1508,7 @@ func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
 	for rows.Next() {
 		var t TARequestSummary
 		var checksRaw []byte
-		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw); err != nil {
+		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount); err != nil {
 			return nil, err
 		}
 		if len(checksRaw) > 0 {
@@ -1284,6 +1568,14 @@ type TARequestAssignmentDetail struct {
 	HasSchedule         bool      `json:"has_schedule"`
 	ApprovedCourseCount int       `json:"approved_course_count"`
 	Warnings            []string  `json:"warnings"`
+	// State and StateReason expose the per-section outcome of the deferred
+	// decision: 'active', 'trimmed' (some sessions clash with the TA's own
+	// timetable) or 'dropped' (all of them do). Without surfacing these the
+	// lecturer would see an approved request and never learn that some
+	// sessions are unworkable — the TA would discover it only when the work
+	// log refused the entry.
+	State       string  `json:"state"`
+	StateReason *string `json:"state_reason,omitempty"`
 }
 
 type TARequestCountDetail struct {
@@ -1361,7 +1653,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		       +COALESCE(w.check_work_hrs,0)+COALESCE(w.attendance_hrs,0)+COALESCE(w.ug_other_hrs,0)+COALESCE(w.lab_hrs,0),
 		       COALESCE(p.status::text, 'pending'),
 		       EXISTS (SELECT 1 FROM ta_class_schedules cs WHERE cs.user_id = a.ta_id AND cs.term_id = $2),
-		       a.section_id
+		       a.section_id, a.state::text, a.state_reason
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN users u ON u.id = a.ta_id
@@ -1381,7 +1673,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		var a TARequestAssignmentDetail
 		var secID uuid.UUID
 		if err := arows.Scan(&a.SectionNo, &a.TAID, &a.TAName, &a.Email, &a.StudentID, &a.Level, &a.TotalHrs,
-			&a.ProfileStatus, &a.HasSchedule, &secID); err != nil {
+			&a.ProfileStatus, &a.HasSchedule, &secID, &a.State, &a.StateReason); err != nil {
 			arows.Close()
 			return nil, err
 		}
@@ -1396,7 +1688,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 
 	for _, c := range checks {
 		a := &d.Assignments[c.idx]
-		count, err := s.approvedCourseCount(ctx, s.pool, c.taID, termID, d.TeachingCourseID)
+		count, err := s.reservedCourseCount(ctx, s.pool, c.taID, termID, d.TeachingCourseID)
 		if err != nil {
 			return nil, err
 		}

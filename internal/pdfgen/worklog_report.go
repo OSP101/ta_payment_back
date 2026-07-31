@@ -29,9 +29,7 @@ type WorklogPDFData struct {
 	YearMonthLabel  string // "มิถุนายน 2569"
 	// TA identity
 	FullName    string
-	NationalID  string
 	Email       string
-	BankAcct    string
 	Level       string // "ป.ตรี" / "บัณฑิต"
 	Track       string // "ภาคปกติ" / "ภาคพิเศษ" / "รวม"
 	// Totals
@@ -42,8 +40,6 @@ type WorklogPDFData struct {
 	// Approved work_log rows (Block C)
 	Entries []WorklogRow
 	// Signature blocks — either raw PNG bytes (auto-placed) or blank if unsigned.
-	TASignaturePNG      []byte
-	LecturerSignaturePNG []byte
 	LecturerName        string
 }
 
@@ -119,19 +115,9 @@ func BuildWorklogPDF(in WorklogPDFInput) ([]byte, error) {
 	textAt(&pdf, col2, y, d.FullName)
 	y += rowH
 	setBold(&pdf, 11)
-	textAt(&pdf, col1, y, "เลขบัตร ปชช.:")
-	setReg(&pdf, 11)
-	textAt(&pdf, col2, y, d.NationalID)
-	y += rowH
-	setBold(&pdf, 11)
 	textAt(&pdf, col1, y, "อีเมล:")
 	setReg(&pdf, 11)
 	textAt(&pdf, col2, y, d.Email)
-	y += rowH
-	setBold(&pdf, 11)
-	textAt(&pdf, col1, y, "ธนาคาร/บัญชี:")
-	setReg(&pdf, 11)
-	textAt(&pdf, col2, y, d.BankAcct)
 	y += rowH
 	setBold(&pdf, 11)
 	textAt(&pdf, col1, y, "ระดับ/ภาค:")
@@ -259,19 +245,17 @@ func drawSignatureRow(pdf *gopdf.GoPdf, y float64, d WorklogPDFData) {
 	sigW := 180.0
 	sigH := 40.0
 
+	// No stored signature image is drawn: signatures are not kept in the
+	// database (PDPA, migration 0047) and the 24/07/2026 meeting settled that
+	// approval happens per-day in the app, with the printed sheet signed by
+	// hand. The ruled line below is what gets signed.
 	setReg(pdf, 11)
 	textAt(pdf, taX, y, "ลงชื่อผู้ช่วยสอน")
-	if len(d.TASignaturePNG) > 0 {
-		_ = placePNG(pdf, d.TASignaturePNG, taX+30, y+20, sigW-30, sigH)
-	}
 	pdf.Line(taX, y+sigH+22, taX+sigW, y+sigH+22)
 	textAt(pdf, taX+10, y+sigH+24, "( "+d.FullName+" )")
 	textAt(pdf, taX+10, y+sigH+40, "วันที่ "+thaiToday())
 
 	textAt(pdf, lectX, y, "ลงชื่ออาจารย์ประจำวิชา")
-	if len(d.LecturerSignaturePNG) > 0 {
-		_ = placePNG(pdf, d.LecturerSignaturePNG, lectX+30, y+20, sigW-30, sigH)
-	}
 	pdf.Line(lectX, y+sigH+22, lectX+sigW, y+sigH+22)
 	name := d.LecturerName
 	if name == "" {

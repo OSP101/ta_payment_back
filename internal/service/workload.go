@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"log"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -28,6 +29,9 @@ var (
 
 type WorkloadService struct {
 	pool *pgxpool.Pool
+	// requests lets a timetable save finish any TA request that was waiting on
+	// it. Optional: nil in tests that only exercise timetable validation.
+	requests *TARequestService
 }
 
 // TA class schedule (drag-drop UI).
@@ -124,8 +128,45 @@ func (s *WorkloadService) ListClasses(ctx context.Context, userID, termID uuid.U
 	return out, nil
 }
 
+// ScheduleLockedReason returns a non-empty Thai reason when the TA may no
+// longer edit their class schedule for this term, or "" when editing is open.
+//
+// The schedule is an input to the clash rules that decide which work logs are
+// payable. Once staff have exported a payout document for this TA in this term,
+// those decisions are on paper and in the finance office — letting the TA move
+// a class afterwards would silently contradict a document that has already been
+// sent. Past terms therefore stay readable but frozen.
+//
+// 'exported' and 'finance_sent' are the same two states submission_period.go
+// already treats as locked for work logs; the schedule now follows the same
+// line rather than inventing a second notion of "too late".
+func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, termID uuid.UUID) (string, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM submission_period_status st
+		JOIN submission_periods sp ON sp.id = st.submission_period_id
+		WHERE st.ta_id = $1 AND sp.term_id = $2
+		  AND st.status IN ('exported','finance_sent')`, userID, termID).Scan(&n); err != nil {
+		return "", err
+	}
+	if n > 0 {
+		return "เจ้าหน้าที่ส่งออกเอกสารเบิกจ่ายของภาคเรียนนี้แล้ว — ดูได้แต่แก้ไขไม่ได้", nil
+	}
+	return "", nil
+}
+
 // ReplaceClasses swaps the whole schedule for a term.
 func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uuid.UUID, blocks []ClassBlock) error {
+	// Checked server-side, not just hidden in the UI: the client can be stale
+	// by a whole term, and an export that lands between page load and save
+	// must still win.
+	if reason, err := s.ScheduleLockedReason(ctx, userID, termID); err != nil {
+		return err
+	} else if reason != "" {
+		return Invalid(reason)
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -231,5 +272,23 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	// The timetable this TA just saved may be the last one a pending TA request
+	// was waiting for. Finish those requests now so the lecturer sees a verdict
+	// immediately rather than at the next sweep — and so any session that
+	// clashes is dropped (and its quota released) before the TA can try to log
+	// time against it.
+	//
+	// Deliberately not inside the transaction above and deliberately not fatal:
+	// saving a timetable is the TA's action and must succeed on its own terms.
+	// SweepPendingRequests re-runs anything missed here.
+	if s.requests != nil {
+		if err := s.requests.ReevaluateForTA(ctx, userID, termID); err != nil {
+			log.Printf("worklist: reevaluate requests for TA %s: %v", userID, err)
+		}
+	}
+	return nil
 }

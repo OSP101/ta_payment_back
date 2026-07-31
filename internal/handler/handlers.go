@@ -294,6 +294,70 @@ func (h *TeachingHandler) ListMyTACourses(c *fiber.Ctx) error {
 // ListMyAssignments returns the assignment rows (one per section) held by the
 // current TA. Optional ?teaching_course_id= narrows to a single course — used by
 // the per-course TA view to resolve the assignment_id for /assignments/:id/worklog.
+// TimetableForm builds the faculty's signed weekly form for one TA and term —
+// their own classes and every TA duty they hold, in one grid.
+//
+// A TA may only ask for their own; staff, admin and a lecturer may ask for
+// anyone's, because the lecturer signs it and staff review against it.
+// timetableFormTarget resolves whose form is being asked for, and whether the
+// caller may see it. A TA gets their own; staff, admin and lecturers may name
+// anyone. Shared by the JSON and PDF handlers so the two cannot drift into
+// different permissions for the same document.
+func timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.UUID, yearMonth string, err error) {
+	taID = UserID(c)
+	if raw := c.Query("user_id"); raw != "" {
+		id, perr := uuid.Parse(raw)
+		if perr != nil {
+			return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusBadRequest, "invalid user_id")
+		}
+		if id != taID && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer) {
+			return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+		taID = id
+	}
+	termID, perr := uuid.Parse(c.Query("term_id"))
+	if perr != nil {
+		return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusBadRequest, "term_id is required")
+	}
+	return taID, termID, c.Query("year_month"), nil
+}
+
+func (h *TeachingHandler) TimetableForm(c *fiber.Ctx) error {
+	taID, termID, yearMonth, err := timetableFormTarget(c)
+	if err != nil {
+		return err
+	}
+	out, err := h.Svc.Teaching.BuildTimetableForm(c.Context(), taID, termID, yearMonth)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// TimetableFormPDF serves the same document as a real PDF, so it can be filed
+// and signed without a browser in the loop.
+func (h *TeachingHandler) TimetableFormPDF(c *fiber.Ctx) error {
+	taID, termID, yearMonth, err := timetableFormTarget(c)
+	if err != nil {
+		return err
+	}
+	body, err := h.Svc.Teaching.BuildTimetableFormPDF(c.Context(), taID, termID, yearMonth)
+	if errors.Is(err, service.ErrNoFontDir) {
+		// A deployment gap, not a bad request: say so instead of 400/500.
+		return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
+	}
+	if err != nil {
+		return err
+	}
+	name := "ตารางปฏิบัติงาน-TA"
+	if yearMonth != "" {
+		name += "-" + yearMonth
+	}
+	c.Set("Content-Type", "application/pdf")
+	c.Set("Content-Disposition", contentDisposition("inline", name+".pdf"))
+	return c.Send(body)
+}
+
 func (h *TeachingHandler) ListMyAssignments(c *fiber.Ctx) error {
 	taID := UserID(c)
 	var tcID *uuid.UUID
@@ -830,36 +894,54 @@ func (h *DocsHandler) UploadDoc(c *fiber.Ctx) error {
 	defer src.Close()
 	id, err := h.Svc.Docs.Upload(c.Context(), UserID(c), kind, fh.Filename, fh.Header.Get("Content-Type"), fh.Size, src)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		// Return the error as-is so ErrorHandler can honour a UserError's own
+		// status. Wrapping everything in StatusBadRequest flattened the
+		// distinctions the upload path is careful to make: a virus detection
+		// (422) and "the scanner is down, try again" (503) both arrived as 400,
+		// so a client could not tell a rejected file from an outage.
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"id": id})
 }
 
-// CreditorFormPDF renders the filled creditor-form PDF inline so the TA can
-// preview it in the browser (<iframe>) before confirming attachment. Any
-// authenticated caller may pass ?grid=1 to overlay a calibration grid on
-// their own preview — the grid draws over the caller's own filled data, so
-// it's not an information leak; it just makes on-form measurement possible.
+// CreditorFormPDF renders the filled creditor form from the posted payload so
+// the TA can preview it in an <iframe> before confirming.
+//
+// POST, not GET, because the body carries the data: nothing sensitive is
+// stored, so there is no server-side state to render from (see migration
+// 0047). That also keeps the national ID and account number out of the URL,
+// out of history, and out of access logs.
+//
+// ?grid=1 overlays a calibration grid on the caller's own preview — it draws
+// over data the caller just submitted, so it leaks nothing.
 func (h *DocsHandler) CreditorFormPDF(c *fiber.Ctx) error {
+	var in service.TAProfile
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
 	grid := c.Query("grid") == "1"
-	body, name, err := h.Svc.Docs.BuildCreditorFormPDF(c.Context(), UserID(c),
+	body, name, err := h.Svc.Docs.BuildCreditorFormPDF(c.Context(), UserID(c), in,
 		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir, grid)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
 	c.Set("Content-Type", "application/pdf")
-	c.Set("Content-Disposition", "inline; filename=\""+name+"\"")
+	c.Set("Content-Disposition", contentDisposition("inline", name))
 	c.Set("X-Content-Type-Options", "nosniff")
 	// Never let a browser or intermediary cache a PDF containing PII.
 	c.Set("Cache-Control", "no-store")
 	return c.Send(body)
 }
 
-// ConfirmCreditorForm generates the PDF server-side and attaches it as the
-// TA's creditor_form document (superseding any prior version), so the review
-// pipeline treats it identically to a manually-uploaded file.
+// ConfirmCreditorForm renders the PDF from the posted payload and attaches it
+// as the TA's creditor_form document (superseding any prior version), so the
+// review pipeline treats it identically to a manually-uploaded file.
 func (h *DocsHandler) ConfirmCreditorForm(c *fiber.Ctx) error {
-	id, err := h.Svc.Docs.AttachGeneratedCreditorForm(c.Context(), UserID(c),
+	var in service.TAProfile
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	id, err := h.Svc.Docs.AttachGeneratedCreditorForm(c.Context(), UserID(c), in,
 		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
@@ -872,7 +954,7 @@ func (h *DocsHandler) ConfirmCreditorForm(c *fiber.Ctx) error {
 // safe to serve without cache-control headers.
 func (h *DocsHandler) BlankCreditorForm(c *fiber.Ctx) error {
 	c.Set("Content-Type", "application/pdf")
-	c.Set("Content-Disposition", "attachment; filename=\"creditor_form_blank.pdf\"")
+	c.Set("Content-Disposition", contentDisposition("attachment", "creditor_form_blank.pdf"))
 	return c.SendFile(h.Svc.Cfg.CreditorTemplatePath)
 }
 
@@ -912,7 +994,7 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	// anything they can't render. `Content-Disposition: inline` gives them
 	// the choice while still setting a filename for downloads.
 	c.Set("Content-Type", firstNonEmpty(mime, "application/octet-stream"))
-	c.Set("Content-Disposition", "inline; filename=\""+filename+"\"")
+	c.Set("Content-Disposition", contentDisposition("inline", filename))
 	c.Set("X-Content-Type-Options", "nosniff")
 	return c.Send(body)
 }
@@ -1045,6 +1127,61 @@ func (h *DocsHandler) RejectBatch(c *fiber.Ctx) error {
 // Officer must re-confirm their password because the ZIP contains PII
 // (national ID + bank account) and this endpoint is reachable long after
 // the original approval action.
+// MintAllApprovedZipToken gates the bulk download behind the officer's password
+// and returns how many TAs the resulting file will cover, so the UI can say so
+// before the download starts.
+//
+// user_ids is required: the TAs the officer approved on the screen in front of
+// them. See MintAllApprovedZipToken for why there is no "everyone" default.
+func (h *DocsHandler) MintAllApprovedZipToken(c *fiber.Ctx) error {
+	var body struct {
+		Password string      `json:"password"`
+		UserIDs  []uuid.UUID `json:"user_ids"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	token, taCount, err := h.Svc.Docs.MintAllApprovedZipToken(
+		c.Context(), UserID(c), body.Password, body.UserIDs)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"zip_token": token, "ta_count": taCount})
+}
+
+// DownloadAllZip serves the bulk bundle. The token was minted against
+// uuid.Nil, so ConsumeZipToken's owner binding only matches here — a bulk token
+// cannot be redirected at the single-TA route, and vice versa.
+func (h *DocsHandler) DownloadAllZip(c *fiber.Ctx) error {
+	token := c.Query("token")
+	if token == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "token required")
+	}
+	docIDs, err := h.Svc.Docs.ConsumeZipToken(token, UserID(c), uuid.Nil)
+	if err != nil {
+		return err
+	}
+	taCount := h.Svc.Docs.CountTAsInDocs(c.Context(), docIDs)
+	// No ClaimZipDownload here: the bulk pull is exempt from the per-TA quota (it
+	// would otherwise spend everyone's allowance at once).
+	//
+	// It IS recorded as a hand-off, which is a different thing from being counted —
+	// BuildAllApprovedBundle does that itself, deliberately, so this route cannot
+	// serve documents without recording that they left.
+	body, name, err := h.Svc.Docs.BuildAllApprovedBundle(c.Context(), UserID(c), docIDs, taCount)
+	if err != nil {
+		return err
+	}
+	if strings.HasSuffix(name, ".pdf") {
+		c.Set("Content-Type", "application/pdf")
+	} else {
+		c.Set("Content-Type", "application/zip")
+	}
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
+	c.Set("Cache-Control", "no-store")
+	return c.Send(body)
+}
+
 func (h *DocsHandler) MintZipToken(c *fiber.Ctx) error {
 	uid, err := uuid.Parse(c.Params("userId"))
 	if err != nil {
@@ -1084,8 +1221,22 @@ func (h *DocsHandler) DownloadZip(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	c.Set("Content-Type", "application/zip")
-	c.Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	// Spend one of the round's allowed downloads. After the build so a failed
+	// build costs nothing, and before the send so the bytes never leave when
+	// the allowance is gone.
+	if err := h.Svc.Docs.ClaimZipDownload(c.Context(), UserID(c), uid); err != nil {
+		return err
+	}
+	// The bundle is normally a single merged PDF now; it falls back to a ZIP
+	// when a set contains a pre-PDF-only image. Derive the type from what was
+	// actually produced — a merged PDF served as application/zip downloads as
+	// an unopenable archive.
+	if strings.HasSuffix(name, ".pdf") {
+		c.Set("Content-Type", "application/pdf")
+	} else {
+		c.Set("Content-Type", "application/zip")
+	}
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
 	c.Set("Cache-Control", "no-store")
 	return c.Send(body)
 }
@@ -1134,7 +1285,7 @@ func (h *DocsHandler) PreviewWatermarked(c *fiber.Ctx) error {
 		return err
 	}
 	c.Set("Content-Type", outMime)
-	c.Set("Content-Disposition", "inline; filename=\""+meta.Filename+"\"")
+	c.Set("Content-Disposition", contentDisposition("inline", meta.Filename))
 	c.Set("Cache-Control", "private, no-store")
 	c.Set("X-Content-Type-Options", "nosniff")
 	return c.Send(stamped)
@@ -1153,7 +1304,13 @@ func (h *WorkloadHandler) ListClasses(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(out)
+	// The lock ships with the data so the page can render read-only instead of
+	// letting the TA edit for a minute and then fail on save.
+	reason, err := h.Svc.Workload.ScheduleLockedReason(c.Context(), UserID(c), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"blocks": out, "locked": reason != "", "lock_reason": reason})
 }
 
 func (h *WorkloadHandler) ReplaceClasses(c *fiber.Ctx) error {
@@ -1278,6 +1435,16 @@ func (h *WorkLogHandler) StaffListByCourse(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// A lecturer may only read their own course's rows; staff/admin see all.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
 	out, err := h.Svc.WorkLog.StaffListByCourse(c.Context(), tcID)
 	if err != nil {
 		return err
@@ -1292,6 +1459,16 @@ func (h *WorkLogHandler) StaffListAssignments(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// A lecturer may only read their own course's rows; staff/admin see all.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
 	out, err := h.Svc.WorkLog.StaffListAssignments(c.Context(), tcID)
 	if err != nil {
 		return err
@@ -1305,7 +1482,10 @@ func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
 	if err := c.BodyParser(&w); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	id, err := h.Svc.WorkLog.StaffUpsert(c.Context(), UserID(c), w)
+	// Staff/admin may edit any course; a lecturer only their own, enforced in
+	// the service so the rule survives a future caller.
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	id, err := h.Svc.WorkLog.StaffUpsert(c.Context(), UserID(c), privileged, w)
 	if err != nil {
 		return err
 	}
@@ -1333,7 +1513,8 @@ func (h *WorkLogHandler) StaffDelete(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	if err := h.Svc.WorkLog.StaffDelete(c.Context(), UserID(c), id); err != nil {
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if err := h.Svc.WorkLog.StaffDelete(c.Context(), UserID(c), privileged, id); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -1741,7 +1922,7 @@ func (h *DashboardHandler) Executive(c *fiber.Ctx) error {
 			termID = &id
 		}
 	}
-	out, err := h.Svc.Dashboard.Executive(c.Context(), termID)
+	out, err := h.Svc.Dashboard.Executive(c.Context(), termID, h.Svc.Budget)
 	if err != nil {
 		return err
 	}
@@ -1821,7 +2002,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	}
 
 	c.Set("Content-Type", "application/zip")
-	c.Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
 	return c.Send(body)
 }
 
@@ -1871,6 +2052,34 @@ func (h *ExportHandler) CourseHistory(c *fiber.Ctx) error {
 }
 
 // AppointmentOrder — POST /exports/appointment-order — returns ZIP with PDF+DOCX.
+// AppointmentPreview shows who the next คำสั่งแต่งตั้ง round would contain and
+// which courses it skips, so staff confirm before a document that cannot be
+// recalled gets printed.
+func (h *ExportHandler) AppointmentPreview(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "term_id is required")
+	}
+	out, err := h.Svc.Appointment.Preview(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AppointmentRounds lists the orders already issued for a term.
+func (h *ExportHandler) AppointmentRounds(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "term_id is required")
+	}
+	out, err := h.Svc.Appointment.ListRounds(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": out})
+}
+
 func (h *ExportHandler) AppointmentOrder(c *fiber.Ctx) error {
 	var in service.AppointmentOrderInput
 	if err := c.BodyParser(&in); err != nil {
@@ -1881,7 +2090,7 @@ func (h *ExportHandler) AppointmentOrder(c *fiber.Ctx) error {
 		return err
 	}
 	c.Set(fiber.HeaderContentType, "application/zip")
-	c.Set(fiber.HeaderContentDisposition, `attachment; filename="`+name+`"`)
+	c.Set(fiber.HeaderContentDisposition, contentDisposition("attachment", name))
 	return c.Send(body)
 }
 
@@ -2035,11 +2244,17 @@ func (h *HolidayHandler) Patch(c *fiber.Ctx) error {
 		NameTH string  `json:"name_th"`
 		NameEN *string `json:"name_en,omitempty"`
 		Note   *string `json:"note,omitempty"`
+		// Time window ("HH:MM"); both omitted/empty = all-day. Absent fields clear
+		// the window, which is what the staff form sends when the user switches a
+		// partial holiday back to "หยุดทั้งวัน".
+		StartTime *string `json:"start_time,omitempty"`
+		EndTime   *string `json:"end_time,omitempty"`
 	}
 	if err := c.BodyParser(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	if err := h.Svc.Holiday.Patch(c.Context(), UserID(c), id, body.NameTH, body.NameEN, body.Note); err != nil {
+	if err := h.Svc.Holiday.Patch(c.Context(), UserID(c), id, body.NameTH, body.NameEN, body.Note,
+		body.StartTime, body.EndTime); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})

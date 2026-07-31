@@ -17,9 +17,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	pdfcpuAPI "github.com/pdfcpu/pdfcpu/pkg/api"
+	pdfcpuModel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/auth"
+	"ta-payment-back/internal/timeutil"
 )
 
 // requiredDocKinds is the closed set the review flow expects: without all
@@ -300,6 +303,141 @@ func (s *DocsService) mintZipToken(actor, userID uuid.UUID, docIDs []uuid.UUID) 
 	return token, nil
 }
 
+// MintAllApprovedZipToken gates the bulk download behind the officer's password
+// and resolves the documents of the TAs the caller names.
+//
+// userIDs is REQUIRED and comes from the review screen: the people the officer
+// approved in the session they are looking at. It used to be every approved TA in
+// the database, which quietly swept in hand-offs from weeks ago — people who were
+// not even on the screen — and produced a file the officer could not account for.
+// "ที่อนุมัติ ณ ตอนนั้น" means this session's approvals, not all history.
+//
+// The list is not trusted, only used to narrow: each id still has to be an
+// approved profile with approved, current, undeleted documents. That makes a
+// tampered list unable to reach anything the officer could not already download
+// one TA at a time, and ids that no longer qualify simply drop out.
+//
+// Deliberately NOT subject to the per-TA download quota (maxDocDownloads). A
+// bulk pull would otherwise spend one of everyone's two allowances at once, and
+// two clicks would lock every TA out of individual re-download for good. The
+// audit entry is what keeps it accountable instead: who pulled it, when, and
+// exactly which TAs were inside.
+func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UUID, password string, userIDs []uuid.UUID) (string, int, error) {
+	password = strings.TrimSpace(password)
+	if password == "" {
+		return "", 0, Invalid("กรุณากรอกรหัสผ่านเพื่อยืนยันการดาวน์โหลด")
+	}
+	// No implicit "everyone": an empty list must not fall back to the whole
+	// database, which is exactly the behaviour being removed.
+	if len(userIDs) == 0 {
+		return "", 0, Invalid("ยังไม่มีใครในรายชื่อนี้ที่อนุมัติครบทั้ง 3 ไฟล์")
+	}
+	if err := s.verifyOfficerPassword(ctx, actor, password); err != nil {
+		return "", 0, err
+	}
+
+	// Approved required documents, still on disk, belonging to the named TAs.
+	// Ordered by student so the merged PDF reads like a stack of per-person
+	// folders rather than an interleaved pile.
+	rows, err := s.pool.Query(ctx, `
+		SELECT d.id, d.user_id
+		  FROM ta_documents d
+		  JOIN ta_profiles p ON p.user_id = d.user_id AND p.status = 'approved'
+		  JOIN users u ON u.id = d.user_id
+		 WHERE d.kind = ANY($1)
+		   AND d.user_id = ANY($2)
+		   AND d.superseded_at IS NULL
+		   AND d.status = 'approved'
+		   AND d.file_deleted_at IS NULL
+		 ORDER BY COALESCE(u.student_id, ''), u.first_name, d.kind`, requiredDocKinds, userIDs)
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+	var (
+		ids    []uuid.UUID
+		people = map[uuid.UUID]bool{}
+	)
+	for rows.Next() {
+		var id, uid uuid.UUID
+		if err := rows.Scan(&id, &uid); err != nil {
+			return "", 0, err
+		}
+		ids = append(ids, id)
+		people[uid] = true
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, err
+	}
+	if len(ids) == 0 {
+		return "", 0, &UserError{Status: 404, Msg: "ยังไม่มีเอกสารที่อนุมัติแล้วให้ดาวน์โหลด"}
+	}
+
+	included := make([]string, 0, len(people))
+	for uid := range people {
+		included = append(included, uid.String())
+	}
+	s.aud.Log(ctx, audit.Entry{
+		ActorID: &actor, Action: "ta_docs.download_all", Entity: "ta_profile",
+		After: map[string]any{
+			"ta_count":  len(people),
+			"doc_count": len(ids),
+			"ta_ids":    included,
+			// Recorded alongside the resolved set so a later reader can see when
+			// the two differ — a requested TA whose files were already purged, for
+			// instance, is silently absent from the file and this is the only place
+			// that says so.
+			"requested_count": len(userIDs),
+		},
+	})
+
+	// uuid.Nil for UserID marks the token as bulk: ConsumeZipToken's per-user
+	// binding does not apply, so DownloadAllZip must be the only route that
+	// accepts it (see the handler).
+	token, err := s.mintZipToken(actor, uuid.Nil, ids)
+	if err != nil {
+		return "", 0, err
+	}
+	return token, len(people), nil
+}
+
+// CountTAsInDocs reports how many distinct TAs a doc set covers — used to name
+// the bulk file. Returns 0 on error rather than failing the download: a wrong
+// number in a filename is not worth denying the officer their documents over.
+func (s *DocsService) CountTAsInDocs(ctx context.Context, docIDs []uuid.UUID) int {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(DISTINCT user_id) FROM ta_documents WHERE id = ANY($1)`, docIDs).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// verifyOfficerPassword re-authenticates the officer before a download that
+// carries PII. Shared by the single-TA and the bulk paths so both are gated
+// identically — the bulk file is every approved TA's national ID and bank
+// account in one document, so it cannot be the laxer of the two.
+//
+// Timing is dominated by bcrypt, so no extra dummy compare is needed; an account
+// deactivated mid-session simply has no row to match.
+func (s *DocsService) verifyOfficerPassword(ctx context.Context, actor uuid.UUID, password string) error {
+	var hash string
+	err := s.pool.QueryRow(ctx,
+		`SELECT password_hash FROM users WHERE id = $1 AND is_active AND deleted_at IS NULL`,
+		actor,
+	).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &UserError{Status: 401, Msg: "บัญชีนี้ไม่สามารถใช้งานได้"}
+	}
+	if err != nil {
+		return err
+	}
+	if !auth.CheckPassword(hash, password) {
+		return &UserError{Status: 401, Msg: "รหัสผ่านไม่ถูกต้อง"}
+	}
+	return nil
+}
+
 // MintZipToken lets the officer re-download the ZIP later from the approved
 // bucket. Fresh token every call; docs are the current non-superseded rows.
 // Returns 410-style error if the physical files have all been purged.
@@ -313,22 +451,8 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 	if password == "" {
 		return "", Invalid("กรุณากรอกรหัสผ่านเพื่อยืนยันการดาวน์โหลด")
 	}
-	// Verify the officer's password against the users row. Timing is
-	// dominated by bcrypt so we don't need an extra DummyCompare here —
-	// a missing row (deactivated mid-session) returns pgx.ErrNoRows.
-	var hash string
-	err := s.pool.QueryRow(ctx,
-		`SELECT password_hash FROM users WHERE id = $1 AND is_active AND deleted_at IS NULL`,
-		actor,
-	).Scan(&hash)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", &UserError{Status: 401, Msg: "บัญชีนี้ไม่สามารถใช้งานได้"}
-	}
-	if err != nil {
+	if err := s.verifyOfficerPassword(ctx, actor, password); err != nil {
 		return "", err
-	}
-	if !auth.CheckPassword(hash, password) {
-		return "", &UserError{Status: 401, Msg: "รหัสผ่านไม่ถูกต้อง"}
 	}
 
 	rows, err := s.pool.Query(ctx, `
@@ -353,9 +477,148 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 	if len(ids) == 0 {
 		return "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน"}
 	}
+	// Check the quota here as well as at the download itself. This is the copy
+	// that produces a useful message: the officer is standing at the password
+	// prompt and can read it. The one at download time is the enforcement that
+	// cannot be raced; hitting that one is already the unusual path.
+	used, err := s.docDownloadsUsed(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if used >= maxDocDownloads {
+		return "", quotaExceeded(used)
+	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.redownload_verify", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"doc_count": len(ids)}})
+		EntityID: userID.String(), After: map[string]any{"doc_count": len(ids), "downloads_used": used}})
 	return s.mintZipToken(actor, userID, ids)
+}
+
+// maxDocDownloads caps how many times one TA's approved bundle may be
+// downloaded. The bundle holds a national ID, a bank account number and a
+// signature; the password gate proves who is pulling it, this limits how many
+// copies exist at all.
+//
+// Counted per TA for good, NOT per submission round. Approval means all three
+// documents passed, and an approved TA never resubmits — so a round can only
+// change if someone rejects a document on purpose. Counting per round would make
+// that the loophole: reject one file, have it resubmitted and re-approved, and
+// two more copies are available. There is no way to hand a spent allowance back.
+//
+// `round` is still recorded on each row (which document set was pulled), it just
+// does not divide the allowance. See migrations 0051 and 0053.
+const maxDocDownloads = 2
+
+// docDownloadsUsed reports how many downloads of this TA's documents have been
+// taken, across every round.
+//
+// Bulk (all-approved) pulls are recorded in the same table but excluded here:
+// they are exempt from the allowance by design (see MintAllApprovedZipToken), and
+// counting them would let two bulk clicks lock every TA out of individual
+// re-download for good.
+func (s *DocsService) docDownloadsUsed(ctx context.Context, userID uuid.UUID) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_doc_downloads
+		  WHERE user_id = $1 AND counts_toward_quota`, userID).Scan(&n)
+	return n, err
+}
+
+// currentDocRound resolves the round the TA's current (non-superseded) approved
+// documents belong to, which is what the quota is counted against. Falls back to
+// the profile's round, then to 1, so a set predating rounds still gets a bucket.
+func (s *DocsService) currentDocRound(ctx context.Context, userID uuid.UUID) (int, error) {
+	var round *int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT MAX(round) FROM ta_documents
+		 WHERE user_id = $1 AND superseded_at IS NULL AND kind = ANY($2)`,
+		userID, requiredDocKinds).Scan(&round); err != nil {
+		return 0, err
+	}
+	if round != nil {
+		return *round, nil
+	}
+	var profileRound *int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT current_round FROM ta_profiles WHERE user_id = $1`, userID).Scan(&profileRound); err != nil &&
+		!errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	if profileRound != nil {
+		return *profileRound, nil
+	}
+	return 1, nil
+}
+
+// quotaExceeded is the shared refusal, so the message the officer sees is the
+// same whether they hit the limit at the password prompt or at the download.
+func quotaExceeded(used int) error {
+	return &UserError{
+		Status: 403,
+		Msg: fmt.Sprintf(
+			"ดาวน์โหลดครบ %d ครั้งแล้ว (จำกัด %d ครั้งต่อ TA หนึ่งคน) — ไม่สามารถดาวน์โหลดเพิ่มได้อีก โปรดใช้ไฟล์ที่ดาวน์โหลดไปแล้ว",
+			used, maxDocDownloads),
+	}
+}
+
+// recordDocDownload claims one download from the TA's allowance and returns the
+// refusal if none is left.
+//
+// The count and the insert share a transaction guarded by an advisory lock, so
+// two officers clicking at the same moment cannot both read "1 used" and both
+// write — a plain check-then-insert under READ COMMITTED allows exactly that,
+// and the whole point of a limit is that it cannot be raced past. The lock is
+// keyed on the TA, so it never blocks work on anyone else.
+func (s *DocsService) recordDocDownload(ctx context.Context, actor, userID uuid.UUID, round int) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtext($1))`, userID.String()+"/doc-download"); err != nil {
+		return err
+	}
+	var used int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_doc_downloads
+		  WHERE user_id = $1 AND counts_toward_quota`, userID).Scan(&used); err != nil {
+		return err
+	}
+	if used >= maxDocDownloads {
+		return quotaExceeded(used)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO ta_doc_downloads (user_id, round, actor_id, counts_toward_quota)
+		 VALUES ($1,$2,$3,TRUE)`,
+		userID, round, actor); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// RecordBulkDownload logs one row per TA covered by an all-approved download,
+// resolving the TA set from the documents that were actually served.
+//
+// No quota check and no advisory lock: these rows do not spend the allowance, so
+// there is no counter to race on. What they DO establish is that this TA's
+// documents have been handed off — which is what the "อย่าลืมดาวน์โหลด" reminder
+// asks, and what it previously could not see, because only quota-consuming pulls
+// were written here.
+//
+// One statement rather than a loop: a bulk pull can cover every approved TA, and
+// a partial write would leave some of them still marked as never downloaded.
+func (s *DocsService) RecordBulkDownload(ctx context.Context, actor uuid.UUID, docIDs []uuid.UUID) error {
+	if len(docIDs) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO ta_doc_downloads (user_id, round, actor_id, counts_toward_quota)
+		SELECT d.user_id, COALESCE(MAX(d.round), 1), $2, FALSE
+		  FROM ta_documents d
+		 WHERE d.id = ANY($1)
+		 GROUP BY d.user_id`, docIDs, actor)
+	return err
 }
 
 // ConsumeZipToken validates + consumes a token. Returns the doc set the
@@ -378,17 +641,89 @@ func (s *DocsService) ConsumeZipToken(token string, actor, userID uuid.UUID) ([]
 	return entry.DocIDs, nil
 }
 
+// ClaimZipDownload spends one of the TA's allowed downloads. Called by the
+// download handler once the bytes are ready, so a build that fails costs the
+// officer nothing, and returns the quota refusal when none is left.
+func (s *DocsService) ClaimZipDownload(ctx context.Context, actor, userID uuid.UUID) error {
+	round, err := s.currentDocRound(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if err := s.recordDocDownload(ctx, actor, userID, round); err != nil {
+		return err
+	}
+	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.download", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"round": round}})
+	return nil
+}
+
 // BuildDocsZip loads each doc's storage payload and packs the originals
 // (unwatermarked — this is the audit copy). Filenames inside the zip carry
 // the kind prefix so a later re-download stays intelligible.
+// mergePDFs concatenates PDFs into one document.
+//
+// pdfcpu PANICS on some malformed input rather than returning an error (its
+// own fault.Catch re-panics), and this runs on a request the officer triggered
+// by clicking approve. A panic here would 500 the approval they just completed,
+// so the recover converts it into the ZIP fallback instead.
+func mergePDFs(readers []io.ReadSeeker) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = nil, fmt.Errorf("pdfcpu panicked while merging: %v", r)
+		}
+	}()
+	conf := pdfcpuModel.NewDefaultConfiguration()
+	// Officer uploads are ordinary scanner/phone output; strict validation
+	// rejects PDFs that every reader opens without complaint.
+	conf.ValidationMode = pdfcpuModel.ValidationRelaxed
+
+	var buf bytes.Buffer
+	if err := pdfcpuAPI.MergeRaw(readers, &buf, false, conf); err != nil {
+		return nil, err
+	}
+	if !bytes.HasPrefix(buf.Bytes(), []byte("%PDF")) {
+		return nil, errors.New("merge produced something that is not a PDF")
+	}
+	return buf.Bytes(), nil
+}
+
 func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]byte, string, error) {
+	return s.buildDocsBundle(ctx, docIDs, "")
+}
+
+// BuildAllApprovedBundle merges the bulk set. Same packing as BuildDocsZip; only
+// the filename differs, because a file holding many people cannot be named after
+// whichever of them happened to sort first.
+// The actor is taken so the hand-off can be recorded HERE rather than in the
+// handler. The recording is what stops the "อย่าลืมดาวน์โหลด" reminder nagging
+// about files already saved, and leaving it to the caller made it a convention
+// somebody has to remember — the kind of wiring that gets dropped in a refactor
+// and produces a bug with no failing test. Building the bytes and recording that
+// they were handed over now happen in one place, and only after the build
+// succeeds: a bundle that failed to assemble is not a download.
+func (s *DocsService) BuildAllApprovedBundle(ctx context.Context, actor uuid.UUID, docIDs []uuid.UUID, taCount int) ([]byte, string, error) {
+	stem := fmt.Sprintf("เอกสารเบิกจ่าย_อนุมัติแล้ว_%dคน_%s",
+		taCount, timeutil.Now().Format("20060102"))
+	body, name, err := s.buildDocsBundle(ctx, docIDs, stem)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := s.RecordBulkDownload(ctx, actor, docIDs); err != nil {
+		return nil, "", err
+	}
+	return body, name, nil
+}
+
+// buildDocsBundle is the shared implementation. stemOverride names the output
+// when the set is not about one person; empty means "derive from the owner".
+func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, stemOverride string) ([]byte, string, error) {
 	if len(docIDs) == 0 {
 		return nil, "", errors.New("no docs to zip")
 	}
 	// Fetch metadata + owner for a suggested filename.
 	rows, err := s.pool.Query(ctx, `
 		SELECT d.id, d.kind, d.filename, d.storage_key, d.file_deleted_at,
-		       u.first_name, u.last_name
+		       u.first_name, u.last_name, COALESCE(u.student_id,'')
 		FROM ta_documents d
 		JOIN users u ON u.id = d.user_id
 		WHERE d.id = ANY($1)
@@ -401,11 +736,13 @@ func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]b
 		kind, filename, key string
 		deletedAt           *time.Time
 		first, last         string
+		studentID           string
 	}
 	var entries []entry
 	for rows.Next() {
 		var e entry
-		if err := rows.Scan(&e.id, &e.kind, &e.filename, &e.key, &e.deletedAt, &e.first, &e.last); err != nil {
+		if err := rows.Scan(&e.id, &e.kind, &e.filename, &e.key, &e.deletedAt,
+			&e.first, &e.last, &e.studentID); err != nil {
 			rows.Close()
 			return nil, "", err
 		}
@@ -425,8 +762,14 @@ func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]b
 		}
 	}
 
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
+	// Read every document into memory. They are capped at 2 MB each and there
+	// are three of them, so this is bounded; pdfcpu's merge needs io.ReadSeeker
+	// anyway, which a store stream is not.
+	type loaded struct {
+		entry entry
+		data  []byte
+	}
+	files := make([]loaded, 0, len(entries))
 	for _, e := range entries {
 		rc, err := s.store.Open(e.key)
 		if err != nil {
@@ -435,30 +778,70 @@ func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]b
 			}
 			return nil, "", err
 		}
-		ext := filepath.Ext(e.filename)
-		w, err := zw.Create(e.kind + ext)
-		if err != nil {
-			rc.Close()
-			return nil, "", err
-		}
-		if _, err := io.Copy(w, rc); err != nil {
-			rc.Close()
-			return nil, "", err
-		}
+		data, err := io.ReadAll(rc)
 		rc.Close()
+		if err != nil {
+			return nil, "", err
+		}
+		files = append(files, loaded{entry: e, data: data})
+	}
+
+	// รหัสนักศึกษา_ชื่อ_นามสกุล — same convention as every other per-person
+	// download (taFileStem). The download date used to be appended; it was
+	// dropped because the officers name these by the student they belong to, and
+	// a date made two pulls of the same person look like two different people.
+	stem := stemOverride
+	if stem == "" {
+		stem = taFileStem(entries[0].studentID, entries[0].first, entries[0].last)
+	}
+
+	// One merged PDF is what the officers asked for: three separate files meant
+	// three prints and three chances to mislay one. Uploads are PDF-only now
+	// (see acceptedDocMIMEs), so in practice every set merges.
+	//
+	// Rows predating that rule may still be JPEG/PNG, and merging those would
+	// need rasterising into pages — out of scope here. Rather than silently
+	// dropping them, fall back to the ZIP for that set: a complete archive in
+	// the older shape beats an incomplete book.
+	allPDF := true
+	for _, f := range files {
+		// Checked on bytes, not on the stored MIME column, which records only
+		// what the client claimed at upload time.
+		if !bytes.HasPrefix(f.data, []byte("%PDF")) {
+			allPDF = false
+			break
+		}
+	}
+
+	if allPDF {
+		readers := make([]io.ReadSeeker, 0, len(files))
+		for _, f := range files {
+			readers = append(readers, bytes.NewReader(f.data))
+		}
+		if merged, err := mergePDFs(readers); err == nil {
+			return merged, stem + ".pdf", nil
+		} else {
+			// A malformed member must not block the download entirely — fall
+			// through to the ZIP, which copies bytes without parsing them.
+			log.Printf("docs merge: falling back to zip for %s: %v", stem, err)
+		}
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range files {
+		w, err := zw.Create(f.entry.kind + filepath.Ext(f.entry.filename))
+		if err != nil {
+			return nil, "", err
+		}
+		if _, err := w.Write(f.data); err != nil {
+			return nil, "", err
+		}
 	}
 	if err := zw.Close(); err != nil {
 		return nil, "", err
 	}
-
-	safe := func(s string) string {
-		s = strings.ReplaceAll(s, " ", "_")
-		s = strings.ReplaceAll(s, "/", "_")
-		return s
-	}
-	name := fmt.Sprintf("%s_%s_%s.zip",
-		safe(entries[0].last), safe(entries[0].first), time.Now().Format("20060102"))
-	return buf.Bytes(), name, nil
+	return buf.Bytes(), stem + ".zip", nil
 }
 
 // LookupEmail returns the given user's email — used to compose the preview

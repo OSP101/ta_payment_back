@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # Match the version in docker-compose.yml. DROP DATABASE ... WITH FORCE,
+        # used by the test harness, needs PG13+.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ta_payment_ci
+          POSTGRES_PASSWORD: ta_payment_ci
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ta_payment_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # internal/testutil connects here and CREATE DATABASEs a throwaway per
+      # test. Without this the DB-backed tests skip instead of failing, which
+      # would quietly hide regressions in the money rules.
+      TEST_DATABASE_URL: postgres://ta_payment_ci:ta_payment_ci@localhost:5432/postgres?sslmode=disable
+      # Deliberately NOT Asia/Bangkok. The calendar guarantees are supposed to
+      # hold regardless of host zone; running CI in UTC is what catches a
+      # regression to time.Now(). See internal/timeutil.
+      TZ: UTC
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod / go.sum are tidy
+        run: |
+          go mod download
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # The harness skips when no database is reachable, which would turn a
+      # broken service container into a green build. Assert that the DB-backed
+      # suite actually executed.
+      - name: Assert database-backed tests ran
+        run: |
+          if go test -count=1 -v ./internal/db/... | grep -q -- "--- SKIP"; then
+            echo "::error::database-backed tests were skipped — check the postgres service"
+            exit 1
+          fi

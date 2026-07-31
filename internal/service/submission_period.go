@@ -97,9 +97,14 @@ type SubmissionTimeline struct {
 // transitions must strictly decrease the rank; the guarded upserts refuse to
 // move it backwards out of order. 'skipped' sits outside the linear flow.
 var statusRank = map[string]int{
-	"pending":      0,
-	"exported":     1,
-	"finance_sent": 2,
+	"pending": 0,
+	// Staff sign-off sits between the lecturer's approval and the export
+	// (24/07/2026 meeting). Inserting it here rather than appending keeps
+	// send-back's "must strictly decrease" rule meaningful: bouncing an
+	// exported month lands on staff_reviewed or pending, never past them.
+	StatusStaffReviewed: 1,
+	"exported":          2,
+	"finance_sent":      3,
 }
 
 // List returns all periods for a term (or every term when termID is Nil).
@@ -495,7 +500,10 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		   AND st.ta_id = a.ta_id
 		   AND st.teaching_course_id = tc.id
 		WHERE tc.id = $1
-		  AND COALESCE(st.status,'pending') NOT IN ('exported','finance_sent','skipped')
+		  -- Only months staff have signed off may be exported. Previously any
+		  -- lecturer-approved month qualified, which is the gap the meeting
+		  -- closed by making "ตรวจสอบเบิกจ่ายค่าตอบแทน" its own step.
+		  AND COALESCE(st.status,'pending') = 'staff_reviewed'
 		  AND EXISTS (
 		        SELECT 1 FROM work_logs wl
 		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id

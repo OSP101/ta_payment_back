@@ -40,13 +40,21 @@ type Holiday struct {
 	NameEN      *string   `json:"name_en,omitempty"`
 	Source      string    `json:"source"`
 	Note        *string   `json:"note,omitempty"`
-	CreatedAt   string    `json:"created_at"`
+	// StartTime/EndTime ("HH:MM") narrow the holiday to part of the day — a
+	// faculty ceremony that occupies the morning while the afternoon still
+	// teaches. Both nil = closed all day, which is what every pre-0058 row is.
+	// Only periods OVERLAPPING the window are blocked; see migration 0058.
+	StartTime *string `json:"start_time,omitempty"`
+	EndTime   *string `json:"end_time,omitempty"`
+	CreatedAt string  `json:"created_at"`
 }
 
 // List returns all holidays, optionally filtered to a single calendar year.
 // Year==0 returns everything (used by "show all" and bulk-export flows).
 func (s *HolidayService) List(ctx context.Context, year int) ([]Holiday, error) {
-	q := `SELECT id, TO_CHAR(holiday_date,'YYYY-MM-DD'), name_th, name_en, source, note, TO_CHAR(created_at,'YYYY-MM-DD"T"HH24:MI:SS')
+	q := `SELECT id, TO_CHAR(holiday_date,'YYYY-MM-DD'), name_th, name_en, source, note,
+	             TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI'),
+	             TO_CHAR(created_at,'YYYY-MM-DD"T"HH24:MI:SS')
 	      FROM public_holidays`
 	args := []any{}
 	if year > 0 {
@@ -62,7 +70,8 @@ func (s *HolidayService) List(ctx context.Context, year int) ([]Holiday, error) 
 	out := []Holiday{}
 	for rows.Next() {
 		var h Holiday
-		if err := rows.Scan(&h.ID, &h.HolidayDate, &h.NameTH, &h.NameEN, &h.Source, &h.Note, &h.CreatedAt); err != nil {
+		if err := rows.Scan(&h.ID, &h.HolidayDate, &h.NameTH, &h.NameEN, &h.Source, &h.Note,
+			&h.StartTime, &h.EndTime, &h.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -76,6 +85,9 @@ type HolidayInput struct {
 	NameEN      *string `json:"name_en,omitempty"`
 	Source      string  `json:"source,omitempty"`
 	Note        *string `json:"note,omitempty"`
+	// StartTime/EndTime ("HH:MM") — omit both for an all-day holiday.
+	StartTime *string `json:"start_time,omitempty"`
+	EndTime   *string `json:"end_time,omitempty"`
 }
 
 // validHolidaySource reports whether s is one of the allowed holiday types.
@@ -86,6 +98,53 @@ func validHolidaySource(s string) bool {
 		return true
 	}
 	return false
+}
+
+// normalizeHolidayWindow validates the optional [start, end) time window and
+// returns it normalized to "HH:MM" (or nil/nil for an all-day holiday). Empty
+// strings are treated as absent so a form that always sends the field — but
+// blank when the "all day" option is picked — doesn't have to null it out.
+//
+// Mirrors public_holidays_window_check (migration 0058): both or neither, and
+// end strictly after start. Enforced here as well so the caller gets a Thai
+// message instead of a raw constraint violation.
+func normalizeHolidayWindow(start, end *string) (*string, *string, error) {
+	trim := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return strings.TrimSpace(*p)
+	}
+	st, et := trim(start), trim(end)
+	if st == "" && et == "" {
+		return nil, nil, nil
+	}
+	if st == "" || et == "" {
+		return nil, nil, Invalid("กรุณาระบุทั้งเวลาเริ่มและเวลาสิ้นสุดของช่วงวันหยุด (หรือเว้นว่างทั้งคู่ถ้าหยุดทั้งวัน)")
+	}
+	sm, ok1 := parseHM(st)
+	em, ok2 := parseHM(et)
+	if !ok1 || !ok2 {
+		return nil, nil, Invalid("รูปแบบเวลาไม่ถูกต้อง (ต้องเป็น HH:MM)")
+	}
+	if sm >= em {
+		return nil, nil, Invalid("เวลาสิ้นสุดของช่วงวันหยุดต้องมากกว่าเวลาเริ่ม")
+	}
+	// Re-emit from the parsed minutes so "9:00" and "09:00" store identically —
+	// the unique index keys on the stored value.
+	sOut := fmt.Sprintf("%02d:%02d", sm/60, sm%60)
+	eOut := fmt.Sprintf("%02d:%02d", em/60, em%60)
+	return &sOut, &eOut, nil
+}
+
+// holidayWindowLabelTH renders a window for user-facing messages: "ทั้งวัน" or
+// "09:00–12:00". Used by every refusal that names a holiday, because "วันหยุด"
+// alone is misleading once a holiday can cover only part of the day.
+func holidayWindowLabelTH(start, end *string) string {
+	if start == nil || end == nil {
+		return "ทั้งวัน"
+	}
+	return *start + "–" + *end
 }
 
 // Create inserts a single holiday. Duplicate (date, source) → Invalid so the
@@ -106,14 +165,21 @@ func (s *HolidayService) Create(ctx context.Context, actor uuid.UUID, in Holiday
 	if !validHolidaySource(source) {
 		return uuid.Nil, Invalid("ประเภทวันหยุดไม่ถูกต้อง")
 	}
-	id := uuid.New()
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO public_holidays (id, holiday_date, name_th, name_en, source, note, created_by)
-		 VALUES ($1, $2::date, $3, $4, $5, $6, $7)`,
-		id, in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, actor)
+	startT, endT, err := normalizeHolidayWindow(in.StartTime, in.EndTime)
 	if err != nil {
-		// Postgres error code 23505 = unique_violation on (holiday_date, source).
-		return uuid.Nil, Invalid(fmt.Sprintf("มีวันหยุดสำหรับวันที่ %s (%s) อยู่แล้ว", in.HolidayDate, source))
+		return uuid.Nil, err
+	}
+	id := uuid.New()
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO public_holidays (id, holiday_date, name_th, name_en, source, note, start_time, end_time, created_by)
+		 VALUES ($1, $2::date, $3, $4, $5, $6, $7::time, $8::time, $9)`,
+		id, in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, startT, endT, actor)
+	if err != nil {
+		// Postgres 23505 = unique_violation on (date, source, window). Two windows
+		// on one date are allowed, so name the window in the message — otherwise
+		// "มีวันหยุดอยู่แล้ว" reads as a lie to someone adding the afternoon half.
+		return uuid.Nil, Invalid(fmt.Sprintf("มีวันหยุดสำหรับวันที่ %s (%s, %s) อยู่แล้ว",
+			in.HolidayDate, source, holidayWindowLabelTH(startT, endT)))
 	}
 	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "holiday.create", Entity: "holiday", EntityID: id.String()})
 	return id, nil
@@ -146,11 +212,17 @@ func (s *HolidayService) BulkCreate(ctx context.Context, actor uuid.UUID, ins []
 		if !validHolidaySource(source) {
 			return 0, Invalid("ประเภทวันหยุดไม่ถูกต้อง")
 		}
+		startT, endT, err := normalizeHolidayWindow(in.StartTime, in.EndTime)
+		if err != nil {
+			return 0, err
+		}
+		// Conflict target must name the index EXPRESSION, not the bare columns —
+		// the arbiter is the partial-window unique index from migration 0058.
 		tag, err := tx.Exec(ctx,
-			`INSERT INTO public_holidays (holiday_date, name_th, name_en, source, note, created_by)
-			 VALUES ($1::date, $2, $3, $4, $5, $6)
-			 ON CONFLICT (holiday_date, source) DO NOTHING`,
-			in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, actor)
+			`INSERT INTO public_holidays (holiday_date, name_th, name_en, source, note, start_time, end_time, created_by)
+			 VALUES ($1::date, $2, $3, $4, $5, $6::time, $7::time, $8)
+			 ON CONFLICT (holiday_date, source, (COALESCE(start_time, TIME '00:00'))) DO NOTHING`,
+			in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, startT, endT, actor)
 		if err != nil {
 			return 0, err
 		}
@@ -163,18 +235,31 @@ func (s *HolidayService) BulkCreate(ctx context.Context, actor uuid.UUID, ins []
 	return inserted, nil
 }
 
-// Patch updates a holiday's name/note only. Changing the date is disallowed —
-// makeups + worklogs reference the date directly and there is no cheap way to
-// cascade the rename. Delete + create is the sanctioned flow.
-func (s *HolidayService) Patch(ctx context.Context, actor, id uuid.UUID, nameTH string, nameEN, note *string) error {
+// Patch updates a holiday's name/note and its time window. Changing the DATE is
+// still disallowed — makeups + worklogs reference the date directly and there is
+// no cheap way to cascade the rename; delete + create is the sanctioned flow.
+//
+// The window is editable, unlike the date, because getting it wrong is the
+// expected mistake ("the ceremony runs till 13:00, not 12:00") and the blast
+// radius is bounded: nothing stores a copy of it. Validation re-runs on every
+// worklog write, so a corrected window takes effect immediately — a class that
+// was blocked becomes loggable, and vice versa.
+func (s *HolidayService) Patch(ctx context.Context, actor, id uuid.UUID, nameTH string, nameEN, note, startTime, endTime *string) error {
 	if nameTH == "" {
 		return Invalid("กรุณาระบุชื่อวันหยุด")
 	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE public_holidays SET name_th=$1, name_en=$2, note=$3 WHERE id=$4`,
-		nameTH, nameEN, note, id)
+	startT, endT, err := normalizeHolidayWindow(startTime, endTime)
 	if err != nil {
 		return err
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE public_holidays SET name_th=$1, name_en=$2, note=$3, start_time=$4::time, end_time=$5::time
+		 WHERE id=$6`,
+		nameTH, nameEN, note, startT, endT, id)
+	if err != nil {
+		// Only reachable via the unique index: the edited window now collides with
+		// another row on the same date+source.
+		return Invalid(fmt.Sprintf("มีวันหยุดของวันนี้ในช่วงเวลา %s อยู่แล้ว", holidayWindowLabelTH(startT, endT)))
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -195,35 +280,11 @@ func (s *HolidayService) Delete(ctx context.Context, actor, id uuid.UUID) error 
 	return nil
 }
 
-// InRange returns a map of "YYYY-MM-DD" -> Thai name for every holiday whose
-// date falls in [start, end] inclusive. Used by the worklog validator to
-// short-circuit an entry on a holiday date; the caller passes the term start/
-// end so the query stays tight (< 30 rows for a semester).
-func (s *HolidayService) InRange(ctx context.Context, start, end time.Time) (map[string]string, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT TO_CHAR(holiday_date,'YYYY-MM-DD'), name_th
-		 FROM public_holidays
-		 WHERE holiday_date BETWEEN $1::date AND $2::date`,
-		start.Format("2006-01-02"), end.Format("2006-01-02"))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]string{}
-	for rows.Next() {
-		var date, name string
-		if err := rows.Scan(&date, &name); err != nil {
-			return nil, err
-		}
-		// If two rows fall on the same date (e.g. national + university), keep
-		// the first — the surfaced name is informational, and both apply as
-		// "cannot log" anyway.
-		if _, exists := out[date]; !exists {
-			out[date] = name
-		}
-	}
-	return out, nil
-}
+// (An InRange helper used to live here, returning date→name and nothing else.
+// Nothing called it — the worklog validator has its own loadHolidaysInRange —
+// and a date-keyed map cannot express a partial-day holiday at all, so it was
+// removed rather than left as a window-blind shortcut for the next caller to
+// reach for. Use WorkLogService.loadHolidaysInRange / holidaySet.)
 
 // ---------------------------------------------------------------------------
 // Holiday impact — the per-course join used by the TA/lecturer holidays page
@@ -249,9 +310,15 @@ type HolidayImpactSection struct {
 }
 
 type HolidayImpact struct {
-	OriginalDate     string                 `json:"original_date"`
-	DayOfWeek        int                    `json:"day_of_week"`
-	HolidayNameTH    string                 `json:"holiday_name_th"`
+	OriginalDate  string `json:"original_date"`
+	DayOfWeek     int    `json:"day_of_week"`
+	HolidayNameTH string `json:"holiday_name_th"`
+	// HolidayStart/HolidayEnd are the closure's time window ("HH:MM"), nil for a
+	// whole-day holiday. Both UIs render it next to the name — with partial-day
+	// holidays in play, a date alone no longer tells the lecturer which of the
+	// day's periods actually died.
+	HolidayStart     *string                `json:"holiday_start,omitempty"`
+	HolidayEnd       *string                `json:"holiday_end,omitempty"`
 	AffectedSections []HolidayImpactSection `json:"affected_sections"`
 }
 
@@ -264,11 +331,15 @@ type HolidayImpactsResponse struct {
 // scheduled class day + which sections/kinds it affects + whether a makeup was
 // filed. Read by both the TA (view-only) and lecturer (edit) holidays pages.
 func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (*HolidayImpactsResponse, error) {
-	// Resolve term dates first — a course without dates has no window to check.
+	// Resolve the course window first. The fallback is the parent ACADEMIC TERM,
+	// not CURRENT_DATE: every course imported from the registrar leaves its own
+	// starts_on/ends_on NULL, and falling back to today gave a one-day window that
+	// matched nothing — so this page reported "no holidays" on courses whose
+	// sidebar badge (which used the term fallback) said 8. See CourseStartSQL.
 	var termStart, termEnd time.Time
 	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(starts_on, CURRENT_DATE), COALESCE(ends_on, CURRENT_DATE)
-		 FROM teaching_courses WHERE id = $1`, tcID).Scan(&termStart, &termEnd); err != nil {
+		`SELECT `+CourseStartSQL("tc")+`, `+CourseEndSQL("tc")+`
+		 FROM teaching_courses tc WHERE tc.id = $1`, tcID).Scan(&termStart, &termEnd); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -281,6 +352,7 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		SELECT TO_CHAR(h.holiday_date,'YYYY-MM-DD') AS original_date,
 		       EXTRACT(DOW FROM h.holiday_date)::int AS dow,
 		       h.name_th,
+		       TO_CHAR(h.start_time,'HH24:MI'), TO_CHAR(h.end_time,'HH24:MI'),
 		       sec.id, sec.sec_no, sec.track::text,
 		       sch.kind, sch.start_time::text, sch.end_time::text, sch.room,
 		       m.id,
@@ -291,19 +363,33 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		JOIN section_schedules sch
 		     ON sch.section_id = sec.id
 		     AND sch.day_of_week = EXTRACT(DOW FROM h.holiday_date)::int
+		     -- Partial-day holiday: only periods that OVERLAP the closure are
+		     -- affected. A faculty ceremony 08:00–12:00 does not touch the 13:00
+		     -- lab, so listing it here would send the lecturer off to reschedule
+		     -- a class that is still running. NULL window = all day = matches
+		     -- every period (migration 0058).
+		     AND (h.start_time IS NULL
+		          OR (sch.start_time < h.end_time AND sch.end_time > h.start_time))
+		-- kind is part of the match: each period of the day has its own makeup,
+		-- with its own replacement slot. Without it the lab's makeup appeared on
+		-- the lecture row, claiming both would run in the same slot.
 		LEFT JOIN makeup_schedules m
 		     ON m.section_id = sec.id
 		     AND m.original_date = h.holiday_date
+		     AND m.kind = sch.kind
 		WHERE h.holiday_date BETWEEN $2::date AND $3::date
-		ORDER BY h.holiday_date, sec.sec_no, sch.kind`,
+		ORDER BY h.holiday_date, h.start_time NULLS FIRST, sec.sec_no, sch.kind`,
 		tcID, termStart.Format("2006-01-02"), termEnd.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	// Bucket rows into per-date impact groups. Keep insertion order via a slice
-	// of keys — Go maps don't preserve iteration order.
+	// Bucket rows into impact groups. Keyed by (date, window) rather than date
+	// alone: one date can carry two faculty closures — a morning ceremony and a
+	// late-afternoon event — which affect different periods and are separate
+	// things to reschedule. Keeping insertion order via a slice of keys because
+	// Go maps don't preserve iteration order.
 	group := map[string]*HolidayImpact{}
 	order := []string{}
 	unresolved := 0
@@ -311,12 +397,13 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		var origDate string
 		var dow int
 		var nameTH string
+		var hStart, hEnd *string
 		var sec HolidayImpactSection
 		var trackStr string
 		var mID *uuid.UUID
 		var mDate, mStart, mEnd *string
 		var mNote *string
-		if err := rows.Scan(&origDate, &dow, &nameTH,
+		if err := rows.Scan(&origDate, &dow, &nameTH, &hStart, &hEnd,
 			&sec.SectionID, &sec.SecNo, &trackStr,
 			&sec.Kind, &sec.StartTime, &sec.EndTime, &sec.Room,
 			&mID, &mDate, &mStart, &mEnd, &mNote); err != nil {
@@ -334,11 +421,18 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		} else {
 			unresolved++
 		}
-		g, ok := group[origDate]
+		gkey := origDate + "|" + holidayWindowLabelTH(hStart, hEnd)
+		g, ok := group[gkey]
 		if !ok {
-			g = &HolidayImpact{OriginalDate: origDate, DayOfWeek: dow, HolidayNameTH: nameTH}
-			group[origDate] = g
-			order = append(order, origDate)
+			g = &HolidayImpact{
+				OriginalDate:  origDate,
+				DayOfWeek:     dow,
+				HolidayNameTH: nameTH,
+				HolidayStart:  hStart,
+				HolidayEnd:    hEnd,
+			}
+			group[gkey] = g
+			order = append(order, gkey)
 		}
 		g.AffectedSections = append(g.AffectedSections, sec)
 	}
@@ -397,8 +491,16 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		SELECT tc.code, tc.name_th
 		FROM teaching_courses tc
 		WHERE tc.id = $1`, tcID).Scan(&courseCode, &courseNameTH)
-	_ = s.pool.QueryRow(ctx,
-		`SELECT name_th FROM public_holidays WHERE holiday_date = $1::date LIMIT 1`,
+	// A date can now carry several closures (all-day + a faculty window, or two
+	// faculty windows). Name them all with their hours — "วันกีฬาคณะ" alone leaves
+	// the lecturer guessing which period the TA means.
+	_ = s.pool.QueryRow(ctx, `
+		SELECT string_agg(
+		         name_th || CASE WHEN start_time IS NULL THEN ''
+		                         ELSE ' ' || TO_CHAR(start_time,'HH24:MI') || '–' || TO_CHAR(end_time,'HH24:MI')
+		                    END,
+		         ', ' ORDER BY start_time NULLS FIRST)
+		  FROM public_holidays WHERE holiday_date = $1::date`,
 		originalDate).Scan(&holidayName)
 
 	// Fan-out to every lecturer teaching the course.
@@ -513,12 +615,15 @@ func (s *HolidayService) SyncFromBOT(ctx context.Context, actor uuid.UUID, year 
 			continue
 		}
 
-		// Look up existing (date, source='national') row.
+		// Look up existing (date, source='national') row. BOT publishes whole-day
+		// bank holidays only, so this stays on the all-day row: a staff-entered
+		// partial window on the same date is a different closure and must not be
+		// overwritten (nor counted as "already synced").
 		var existingID uuid.UUID
 		var existingNameEN *string
 		err := tx.QueryRow(ctx,
 			`SELECT id, name_en FROM public_holidays
-			 WHERE holiday_date = $1::date AND source = 'national'`, date).
+			 WHERE holiday_date = $1::date AND source = 'national' AND start_time IS NULL`, date).
 			Scan(&existingID, &existingNameEN)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
@@ -530,7 +635,7 @@ func (s *HolidayService) SyncFromBOT(ctx context.Context, actor uuid.UUID, year 
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO public_holidays (holiday_date, name_th, name_en, source, created_by)
 				 VALUES ($1::date, $2, $3, 'national', $4)
-				 ON CONFLICT (holiday_date, source) DO NOTHING`,
+				 ON CONFLICT (holiday_date, source, (COALESCE(start_time, TIME '00:00'))) DO NOTHING`,
 				date, nameTH, nameENArg, actor); err != nil {
 				return zero, err
 			}

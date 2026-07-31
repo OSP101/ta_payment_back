@@ -94,6 +94,23 @@ type CourseSummary struct {
 	TACount          int       `json:"ta_count"`
 	PendingMonths    []string  `json:"pending_months,omitempty"`   // labels of periods where no batch exists
 	LastExportAt     *string   `json:"last_export_at,omitempty"`
+	// UnreviewedMonths names periods that have lecturer-approved work but have
+	// NOT passed staff review (step 3). Export refuses these, so the screen has
+	// to name them — otherwise a download silently contains fewer TAs than the
+	// course actually has, which is the failure mode staff would notice last.
+	UnreviewedMonths []string `json:"unreviewed_months,omitempty"`
+
+	// HasAppointmentOrder is whether a printed appointment order covers this
+	// course (see AppointedSQL). Until it does, the TA's work is not official and
+	// there is nothing to export against.
+	HasAppointmentOrder bool `json:"has_appointment_order"`
+	// ReviewComplete is whether step 3 is finished for this course: at least one
+	// month signed off, and no month left waiting. "No months at all" is NOT
+	// complete — a course nobody has logged work on has nothing to export.
+	ReviewComplete bool `json:"review_complete"`
+	// ExportEligible is the rule itself, decided here rather than in the UI so the
+	// two screens cannot drift apart on what "ready to export" means.
+	ExportEligible bool `json:"export_eligible"`
 }
 
 // DashboardSummary aggregates budget + submission status per teaching_course
@@ -108,7 +125,17 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		          JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
 		          WHERE r.teaching_course_id = tc.id) AS ta_count,
 		       (SELECT TO_CHAR(MAX(generated_at),'YYYY-MM-DD"T"HH24:MI:SSTZ')
-		          FROM export_batches WHERE teaching_course_id = tc.id)
+		          FROM export_batches WHERE teaching_course_id = tc.id),
+		       `+CourseAppointedSQL("tc.id")+`,
+		       -- At least one month of this course has been signed off in step 3.
+		       -- Paired with UnreviewedMonths below to mean "review finished":
+		       -- this half rules out a course with no work at all, that half rules
+		       -- out one with work still waiting.
+		       EXISTS (
+		           SELECT 1 FROM submission_period_status st
+		            WHERE st.teaching_course_id = tc.id
+		              AND st.status IN ('staff_reviewed','exported','finance_sent')
+		       )
 		FROM teaching_courses tc
 		JOIN academic_terms t ON t.id = tc.term_id
 		WHERE ($1::uuid IS NULL OR tc.term_id = $1)
@@ -118,12 +145,18 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 	}
 	defer rows.Close()
 	out := []CourseSummary{}
+	// anySignedOff is scanned separately from ReviewComplete: completeness also
+	// needs UnreviewedMonths, which is only known after the query below.
+	anySignedOff := map[uuid.UUID]bool{}
 	for rows.Next() {
 		var s CourseSummary
+		var signedOff bool
 		if err := rows.Scan(&s.TeachingCourseID, &s.CourseCode, &s.CourseNameTH,
-			&s.TermLabel, &s.TACount, &s.LastExportAt); err != nil {
+			&s.TermLabel, &s.TACount, &s.LastExportAt,
+			&s.HasAppointmentOrder, &signedOff); err != nil {
 			return nil, err
 		}
+		anySignedOff[s.TeachingCourseID] = signedOff
 		out = append(out, s)
 	}
 	// Compute budget for each (heavy — done sequentially to avoid pool
@@ -161,6 +194,59 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		for i := range out {
 			out[i].PendingMonths = pending[out[i].TeachingCourseID]
 		}
+	}
+
+	// Months blocked by step 3. One query for the whole term rather than per
+	// course — this runs on the exports dashboard, which already pays for a
+	// budget computation per row.
+	unreviewedRows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tc.id, sp.label, sp.due_date
+		FROM teaching_courses tc
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		JOIN sections sec          ON sec.teaching_course_id = tc.id
+		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
+		JOIN work_logs wl          ON wl.assignment_id = a.id
+		                          AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                          AND wl.status = 'approved'
+		LEFT JOIN submission_period_status st
+		       ON st.submission_period_id = sp.id
+		      AND st.ta_id = a.ta_id
+		      AND st.teaching_course_id = tc.id
+		WHERE ($1::uuid IS NULL OR tc.term_id = $1)
+		  AND COALESCE(st.status, 'pending') = 'pending'
+		  -- Same appointment gate as the review queue, and it MUST be here too.
+		  -- A TA without a printed order cannot be reviewed (they are not in the
+		  -- queue), so counting their month as "unreviewed" would hold the course
+		  -- short of ReviewComplete forever — a deadlock where the screen asks for
+		  -- a sign-off that no screen offers.
+		  AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		ORDER BY sp.due_date`,
+		uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
+	if err == nil {
+		unreviewed := map[uuid.UUID][]string{}
+		for unreviewedRows.Next() {
+			var tc uuid.UUID
+			var label string
+			var due time.Time
+			if err := unreviewedRows.Scan(&tc, &label, &due); err == nil {
+				unreviewed[tc] = append(unreviewed[tc], label)
+			}
+		}
+		unreviewedRows.Close()
+		for i := range out {
+			out[i].UnreviewedMonths = unreviewed[out[i].TeachingCourseID]
+		}
+	}
+
+	// Decide eligibility last, once both inputs exist. Both conditions, not
+	// either: the order makes the work official, the review makes the amounts
+	// final, and an export missing either produces a package the finance office
+	// sends back.
+	for i := range out {
+		out[i].ReviewComplete = anySignedOff[out[i].TeachingCourseID] &&
+			len(out[i].UnreviewedMonths) == 0
+		out[i].ExportEligible = out[i].HasAppointmentOrder && out[i].ReviewComplete
 	}
 	return out, nil
 }
