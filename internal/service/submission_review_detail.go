@@ -30,6 +30,11 @@ type ReviewDay struct {
 	Note      *string   `json:"note,omitempty"`
 	Room      *string   `json:"room,omitempty"`
 	SecNo     string    `json:"sec_no"`
+	// Track is ภาคปกติ / ภาคพิเศษ. It rides along with the section number because
+	// the two are read together and never mean anything apart: the track decides
+	// the hourly rate, so "sec 2" alone does not tell a reviewer what the row is
+	// worth.
+	Track string `json:"track"`
 	// Source is 'auto' or 'manual' (migration 0057). The reviewer's attention
 	// belongs on the manual rows: an auto row reproduces class times the lecturer
 	// entered, so there is nothing in it that a second person can verify.
@@ -45,6 +50,7 @@ type ReviewDay struct {
 // day rows are read against.
 type ReviewSlot struct {
 	SecNo     string  `json:"sec_no"`
+	Track     string  `json:"track"`
 	Kind      string  `json:"kind"`
 	DayOfWeek int     `json:"day_of_week"`
 	StartTime string  `json:"start_time"`
@@ -81,7 +87,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 	rows, err := s.pool.Query(ctx, `
 		SELECT wl.id, TO_CHAR(wl.work_date,'YYYY-MM-DD'),
 		       wl.start_time::text, wl.end_time::text, wl.hours, wl.activity,
-		       wl.note, wl.room, sec.sec_no, wl.source,
+		       wl.note, wl.room, sec.sec_no, sec.track::text, wl.source,
 		       EXISTS (
 		         SELECT 1 FROM section_schedules sch
 		          WHERE sch.section_id = sec.id
@@ -111,7 +117,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 	for rows.Next() {
 		var d ReviewDay
 		if err := rows.Scan(&d.ID, &d.WorkDate, &d.StartTime, &d.EndTime, &d.Hours,
-			&d.Activity, &d.Note, &d.Room, &d.SecNo, &d.Source, &d.OnTimetable); err != nil {
+			&d.Activity, &d.Note, &d.Room, &d.SecNo, &d.Track, &d.Source, &d.OnTimetable); err != nil {
 			return nil, err
 		}
 		if d.Source == "auto" {
@@ -130,7 +136,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 	out.DaysWorked = len(seenDates)
 
 	slotRows, err := s.pool.Query(ctx, `
-		SELECT sec.sec_no, sch.kind, sch.day_of_week,
+		SELECT sec.sec_no, sec.track::text, sch.kind, sch.day_of_week,
 		       sch.start_time::text, sch.end_time::text, sch.room
 		  FROM section_schedules sch
 		  JOIN sections sec ON sec.id = sch.section_id
@@ -138,7 +144,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 		 WHERE sec.teaching_course_id = $1
 		   AND a.ta_id = $2
 		   AND a.state <> 'dropped'
-		 GROUP BY sec.sec_no, sch.kind, sch.day_of_week, sch.start_time, sch.end_time, sch.room
+		 GROUP BY sec.sec_no, sec.track, sch.kind, sch.day_of_week, sch.start_time, sch.end_time, sch.room
 		 ORDER BY sch.day_of_week, sch.start_time`, tcID, taID)
 	if err != nil {
 		return nil, err
@@ -146,7 +152,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 	defer slotRows.Close()
 	for slotRows.Next() {
 		var sl ReviewSlot
-		if err := slotRows.Scan(&sl.SecNo, &sl.Kind, &sl.DayOfWeek,
+		if err := slotRows.Scan(&sl.SecNo, &sl.Track, &sl.Kind, &sl.DayOfWeek,
 			&sl.StartTime, &sl.EndTime, &sl.Room); err != nil {
 			return nil, err
 		}

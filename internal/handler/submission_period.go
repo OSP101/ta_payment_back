@@ -1,6 +1,10 @@
 package handler
 
 import (
+	"encoding/json"
+	"io"
+	"strings"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
@@ -277,4 +281,175 @@ func (h *SubmissionPeriodHandler) ListByCourse(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(out)
+}
+
+// RemindLecturer — POST /submission-periods/courses/:tcId/remind-lecturer.
+// Staff nudge the course's lecturers about worklog rows still awaiting their
+// approval. Throttled to once a day per course by the service.
+func (h *SubmissionPeriodHandler) RemindLecturer(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	if err := h.Svc.SubmissionPeriods.RemindLecturerUnapproved(c.Context(), UserID(c), tcID); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// worklogEditMaxBytes caps one evidence image. Same 5MB as the announcement
+// composer — a phone photo of a printed timetable fits comfortably.
+const worklogEditMaxBytes = 5 * 1024 * 1024
+
+// StaffEditBatch — POST /submission-periods/courses/:tcId/tas/:taId/worklog-batch
+//
+// multipart/form-data:
+//
+//	payload  JSON {year_month, reason, password, changes:[…]}
+//	file     up to 3 images (repeated field)
+//
+// Multipart rather than JSON because the evidence is the point: a correction
+// that rewrites approved hours should carry what the officer was looking at, and
+// a two-step "upload then submit" leaves orphan files whenever the second step
+// fails.
+func (h *SubmissionPeriodHandler) StaffEditBatch(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+
+	var payload struct {
+		YearMonth string               `json:"year_month"`
+		Reason    string               `json:"reason"`
+		Password  string               `json:"password"`
+		Changes   []service.EditChange `json:"changes"`
+	}
+	raw := c.FormValue("payload")
+	if raw == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "payload required")
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid payload")
+	}
+
+	form, err := c.MultipartForm()
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid multipart body")
+	}
+	files := form.File["file"]
+	if len(files) > 3 {
+		return fiber.NewError(fiber.StatusBadRequest, "แนบรูปได้ไม่เกิน 3 รูป")
+	}
+
+	// Files are stored BEFORE the batch runs so the service can record their keys
+	// in the same call. If the batch is then refused, these are orphans in the
+	// object store — accepted deliberately: a stored blob nobody references is a
+	// cleanup problem, while a recorded batch whose evidence failed to save is an
+	// audit trail that lies.
+	var evidence []service.EditEvidence
+	for _, fh := range files {
+		if fh.Size > worklogEditMaxBytes {
+			return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 5MB")
+		}
+		mime := strings.ToLower(fh.Header.Get("Content-Type"))
+		ext, ok := announceImageMIME[mime]
+		if !ok {
+			return fiber.NewError(fiber.StatusUnsupportedMediaType, "รองรับเฉพาะ JPEG / PNG / WebP")
+		}
+		src, err := fh.Open()
+		if err != nil {
+			return err
+		}
+		head := make([]byte, 12)
+		n, _ := src.Read(head)
+		if !imageMagicMatches(head[:n], ext) {
+			src.Close()
+			return fiber.NewError(fiber.StatusUnsupportedMediaType, "ประเภทไฟล์ไม่ตรงกับเนื้อหา")
+		}
+		if _, err := src.Seek(0, 0); err != nil {
+			src.Close()
+			return err
+		}
+		key, size, err := h.Svc.Storage.Save("worklog-edits", uuid.New().String()+ext, src)
+		src.Close()
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		}
+		evidence = append(evidence, service.EditEvidence{
+			StorageKey: key, Filename: fh.Filename, Size: size, MIME: mime,
+		})
+	}
+
+	res, err := h.Svc.WorkLog.ApplyStaffEditBatch(c.Context(), UserID(c), service.EditBatchInput{
+		TeachingCourseID: tcID,
+		TAID:             taID,
+		YearMonth:        payload.YearMonth,
+		Reason:           payload.Reason,
+		Password:         payload.Password,
+		Changes:          payload.Changes,
+		Evidence:         evidence,
+	})
+	if err != nil {
+		return err
+	}
+	return c.JSON(res)
+}
+
+// StaffEditHistory — GET …/worklog-batches : the corrections already made to
+// this (TA, course), newest first, so the officer can see what a colleague
+// changed before changing it again.
+func (h *SubmissionPeriodHandler) StaffEditHistory(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
+	}
+	out, err := h.Svc.WorkLog.ListEditBatches(c.Context(), tcID, taID, c.Query("year_month"))
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": out})
+}
+
+// ServeEditFile streams one evidence image behind the same auth wall as the rest
+// of the API.
+//
+// The prefix check is the security boundary, not a tidiness rule: without it the
+// key parameter is a read primitive over the whole object store, which also
+// holds TA national-ID scans.
+func (h *SubmissionPeriodHandler) ServeEditFile(c *fiber.Ctx) error {
+	key := c.Params("*")
+	if key == "" || strings.Contains(key, "..") || !strings.HasPrefix(key, "worklog-edits/") {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid key")
+	}
+	rc, err := h.Svc.Storage.Open(key)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบรูปภาพ")
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	k := strings.TrimSuffix(key, ".enc")
+	switch strings.ToLower(k[strings.LastIndex(k, "."):]) {
+	case ".jpg", ".jpeg":
+		c.Set("Content-Type", "image/jpeg")
+	case ".png":
+		c.Set("Content-Type", "image/png")
+	case ".webp":
+		c.Set("Content-Type", "image/webp")
+	default:
+		c.Set("Content-Type", "application/octet-stream")
+	}
+	c.Set("Cache-Control", "private, max-age=3600")
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Send(body)
 }

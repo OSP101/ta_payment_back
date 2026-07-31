@@ -30,8 +30,18 @@ type ExecutiveSummary struct {
 	// queue could sit untouched for a week without anyone noticing.
 	PendingTARequests    int `json:"pending_ta_requests"`    // ขั้นที่ 1 — คำร้องขอ TA (/staff/approvals)
 	PendingReviews       int `json:"pending_reviews"`        // ขั้นที่ 2 — แบบฟอร์มใบแจ้งหนี้ (/staff/review)
-	PendingPayoutReviews int `json:"pending_payout_reviews"` // ขั้นที่ 3 — เบิกจ่ายค่าตอบแทน (/staff/worklog)
-	ReadyToExport        int `json:"ready_to_export"`        // ขั้นที่ 4 — ตรวจแล้วรอส่งออก (/staff/exports)
+	PendingPayoutReviews int `json:"pending_payout_reviews"` // ขั้นที่ 3 — เบิกจ่ายค่าตอบแทน
+	ReadyToExport        int `json:"ready_to_export"`        // ขั้นที่ 4 — ตรวจแล้วรอส่งออก
+
+	// PayoutCoursesActionable counts COURSES the officer can move right now —
+	// either a month is ready to review or the package is ready to download.
+	//
+	// The two counts above are (month × TA) tallies of two different things and
+	// were shown as two sidebar badges on two menus. Nobody could add them, and
+	// neither answered the only question the sidebar is asked: how much is on my
+	// desk? Since 31/07/2026 review and export are one screen, so the badge is
+	// one number in the unit that screen lists — courses.
+	PayoutCoursesActionable int `json:"payout_courses_actionable"`
 
 	// Budget covers only the courses that actually asked for a TA. Courses
 	// with no request commit no money, so counting all 127 courses in the term
@@ -54,7 +64,7 @@ type TACourseStatus struct {
 	CourseCode       string    `json:"course_code"`
 	CourseNameTH     string    `json:"course_name_th"`
 	TermLabel        string    `json:"term_label"`
-	Stage            string    `json:"stage"`          // draft/submitted/approved/exported
+	Stage            string    `json:"stage"` // draft/submitted/approved/exported
 	HoursApproved    float64   `json:"hours_approved"`
 	HoursPending     float64   `json:"hours_pending"`
 	EstimatedBaht    float64   `json:"estimated_baht"` // approved-hours × per-track rate (grad-special = flat)
@@ -331,6 +341,38 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 		FROM submission_period_status st
 		JOIN submission_periods sp ON sp.id = st.submission_period_id
 		WHERE sp.term_id = $1 AND st.status = 'staff_reviewed'`, tid).Scan(&sum.ReadyToExport)
+
+	// Courses with at least one month an officer can act on today: a month
+	// settled by the lecturer and awaiting sign-off, OR a month signed off and
+	// not yet exported. Counted as DISTINCT courses because that is the unit the
+	// screen lists — one row per course, whatever the month count behind it.
+	//
+	// Months still open with the TA or lecturer are deliberately excluded: they
+	// belong to the "waiting on someone else" group, and counting them made the
+	// badge promise work that could not be done.
+	_ = s.pool.QueryRow(ctx, `
+		WITH months AS (
+		    SELECT tc.id AS tc_id, sp.id AS period_id, a.ta_id,
+		           COALESCE(st.status, 'pending') AS status,
+		           COUNT(*) FILTER (WHERE wl.status <> 'approved') AS open_rows
+		    FROM teaching_courses tc
+		    JOIN submission_periods sp    ON sp.term_id = tc.term_id
+		    JOIN sections sec             ON sec.teaching_course_id = tc.id
+		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
+		    JOIN work_logs wl             ON wl.assignment_id = a.id
+		                                 AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		    LEFT JOIN submission_period_status st
+		           ON st.submission_period_id = sp.id
+		          AND st.ta_id = a.ta_id
+		          AND st.teaching_course_id = tc.id
+		    WHERE tc.term_id = $1
+		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		    GROUP BY tc.id, sp.id, a.ta_id, COALESCE(st.status, 'pending')
+		)
+		SELECT COUNT(DISTINCT tc_id) FROM months
+		 WHERE (status = 'pending' AND open_rows = 0)
+		    OR status = 'staff_reviewed'`, tid).Scan(&sum.PayoutCoursesActionable)
 
 	// Budget over exactly the courses counted above. Delegating to
 	// BudgetService.Compute rather than re-deriving the formula here is what

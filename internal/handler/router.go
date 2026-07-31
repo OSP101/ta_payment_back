@@ -281,6 +281,19 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Staff step 3 — ตรวจสอบเบิกจ่ายค่าตอบแทน. Sits between the lecturer's
 	// daily approval and the export, which now refuses months that skipped it.
 	authed.Get("/submission-periods/review-queue", adminOrStaff, spH.ReviewQueue)
+	// Nudge a course's lecturers about work still sitting in THEIR queue. The
+	// merged payout screen groups those months under "waiting on someone else";
+	// this is the one action available there.
+	authed.Post("/submission-periods/courses/:tcId/remind-lecturer",
+		adminOrStaff, spH.RemindLecturer)
+	// Staff corrections to a TA's month, committed as one accountable batch:
+	// reason + password + up to three evidence images, notifying the TA AND the
+	// lecturer whose approval is being overridden.
+	authed.Post("/submission-periods/courses/:tcId/tas/:taId/worklog-batch",
+		adminOrStaff, spH.StaffEditBatch)
+	authed.Get("/submission-periods/courses/:tcId/tas/:taId/worklog-batches",
+		staffOrLecturer, spH.StaffEditHistory)
+	authed.Get("/worklog-edit-files/*", staffOrLecturer, spH.ServeEditFile)
 	authed.Post("/submission-periods/:id/courses/:tcId/tas/:taId/staff-review",
 		adminOrStaff, spH.StaffReview)
 	// No digital signatures: the lecturer's daily worklog approval is the

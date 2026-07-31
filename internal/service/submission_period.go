@@ -47,7 +47,7 @@ type SubmissionPeriodStatus struct {
 	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
 	CourseCode       string    `json:"course_code"`
 	CourseNameTH     string    `json:"course_name_th"`
-	Status string `json:"status"`
+	Status           string    `json:"status"`
 	// Worklog readiness for this (TA, course, month). The month is "ready for
 	// staff" (derived, not stored) once WorklogTotal>0 and WorklogUnapproved==0
 	// — i.e. the lecturer has approved every daily row. WorklogUnapproved counts
@@ -803,14 +803,14 @@ func (s *SubmissionPeriodService) GetTimeline(ctx context.Context, actor, period
 		         WHERE a2.ta_id = $2 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
 		           AND wl.status IN ('draft','submitted','rejected')),
-		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.exported_by::text,
 		       st.exported_name,
-		       TO_CHAR(st.finance_sent_at,    'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(st.finance_sent_at,    'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.finance_sent_by::text,
 		       st.finance_sent_name,
 		       st.finance_note,
-		       TO_CHAR(st.sent_back_at,       'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(st.sent_back_at,       'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.sent_back_by::text,
 		       st.sent_back_name,
 		       st.sent_back_reason
@@ -873,14 +873,14 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		         WHERE a2.ta_id = u.id AND s2.teaching_course_id = tc.id
 		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
 		           AND wl.status IN ('draft','submitted','rejected')),
-		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.exported_by::text,
 		       st.exported_name,
-		       TO_CHAR(st.finance_sent_at,    'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(st.finance_sent_at,    'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.finance_sent_by::text,
 		       st.finance_sent_name,
 		       st.finance_note,
-		       TO_CHAR(st.sent_back_at,       'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(st.sent_back_at,       'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.sent_back_by::text,
 		       st.sent_back_name,
 		       st.sent_back_reason

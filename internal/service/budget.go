@@ -24,27 +24,27 @@ type BudgetRates struct {
 }
 
 type BudgetSnapshot struct {
-	TeachingCourseID    uuid.UUID `json:"teaching_course_id"`
-	NumStudents         int       `json:"num_students"`          // = regular + special (aggregate)
-	NumStudentsRegular  int       `json:"num_students_regular"`
-	NumStudentsSpecial  int       `json:"num_students_special"`
-	Credits             int       `json:"credits"`
-	LectureCredits      int       `json:"lecture_credits"`
-	LabCredits          int       `json:"lab_credits"`
-	PerCourseMaxBaht    float64   `json:"per_course_max"` // from budget_caps
+	TeachingCourseID   uuid.UUID `json:"teaching_course_id"`
+	NumStudents        int       `json:"num_students"` // = regular + special (aggregate)
+	NumStudentsRegular int       `json:"num_students_regular"`
+	NumStudentsSpecial int       `json:"num_students_special"`
+	Credits            int       `json:"credits"`
+	LectureCredits     int       `json:"lecture_credits"`
+	LabCredits         int       `json:"lab_credits"`
+	PerCourseMaxBaht   float64   `json:"per_course_max"` // from budget_caps
 	// Aggregate (regular + special)
-	WeeklyWorkload      float64   `json:"weekly_workload_hours"`
-	MonthlyPay          float64   `json:"monthly_pay_baht"`
-	TermPay             float64   `json:"term_pay_baht"`
+	WeeklyWorkload float64 `json:"weekly_workload_hours"`
+	MonthlyPay     float64 `json:"monthly_pay_baht"`
+	TermPay        float64 `json:"term_pay_baht"`
 	// Breakdown by track (per Excel: same rate, different student count)
-	WeeklyWorkloadRegular float64 `json:"weekly_workload_regular"`
-	MonthlyPayRegular     float64 `json:"monthly_pay_regular"`
-	TermPayRegular        float64 `json:"term_pay_regular"`
-	WeeklyWorkloadSpecial float64 `json:"weekly_workload_special"`
-	MonthlyPaySpecial     float64 `json:"monthly_pay_special"`
-	TermPaySpecial        float64 `json:"term_pay_special"`
-	Rates               BudgetRates `json:"rates"`
-	SuggestedTAs        struct {
+	WeeklyWorkloadRegular float64     `json:"weekly_workload_regular"`
+	MonthlyPayRegular     float64     `json:"monthly_pay_regular"`
+	TermPayRegular        float64     `json:"term_pay_regular"`
+	WeeklyWorkloadSpecial float64     `json:"weekly_workload_special"`
+	MonthlyPaySpecial     float64     `json:"monthly_pay_special"`
+	TermPaySpecial        float64     `json:"term_pay_special"`
+	Rates                 BudgetRates `json:"rates"`
+	SuggestedTAs          struct {
 		Undergrad int `json:"undergrad"`
 		Graduate  int `json:"graduate"`
 	} `json:"suggested_tas"`

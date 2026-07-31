@@ -5,7 +5,7 @@ import "testing"
 // deriveStudyYear: 2-digit Buddhist admission prefix vs current academic year.
 func TestDeriveStudyYear(t *testing.T) {
 	cases := []struct {
-		id       string
+		id        string
 		cur, want int
 	}{
 		{"673380001-2", 2569, 3}, // admitted 2567 → year 3 in academic year 2569

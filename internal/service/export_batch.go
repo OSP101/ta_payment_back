@@ -57,7 +57,7 @@ func (s *ExportBatchService) ListByCourse(ctx context.Context, tcID uuid.UUID) (
 	rows, err := s.pool.Query(ctx, `
 		SELECT b.id, b.teaching_course_id, b.submission_period_id,
 		       b.file_path, b.file_name, b.ta_count, b.total_baht,
-		       TO_CHAR(b.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(b.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       b.generated_by, u.first_name||' '||u.last_name
 		FROM export_batches b
 		JOIN users u ON u.id = b.generated_by
@@ -92,7 +92,7 @@ type CourseSummary struct {
 	RemainingBaht    float64   `json:"remaining_baht"`
 	OverBudget       bool      `json:"over_budget"`
 	TACount          int       `json:"ta_count"`
-	PendingMonths    []string  `json:"pending_months,omitempty"`   // labels of periods where no batch exists
+	PendingMonths    []string  `json:"pending_months,omitempty"` // labels of periods where no batch exists
 	LastExportAt     *string   `json:"last_export_at,omitempty"`
 	// UnreviewedMonths names periods that have lecturer-approved work but have
 	// NOT passed staff review (step 3). Export refuses these, so the screen has
@@ -111,6 +111,12 @@ type CourseSummary struct {
 	// ExportEligible is the rule itself, decided here rather than in the UI so the
 	// two screens cannot drift apart on what "ready to export" means.
 	ExportEligible bool `json:"export_eligible"`
+
+	// LecturerNames is who to talk to about this course. The payout list is a
+	// list of COURSES, and the person an officer chases when a row is stuck is
+	// the lecturer — not the TAs, whose names were taking the space and telling
+	// nobody anything they could act on.
+	LecturerNames string `json:"lecturer_names"`
 }
 
 // DashboardSummary aggregates budget + submission status per teaching_course
@@ -118,13 +124,17 @@ type CourseSummary struct {
 func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, termID uuid.UUID) ([]CourseSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT tc.id, tc.code, tc.name_th,
+		       COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', '
+		                                   ORDER BY tl.is_primary DESC, u.first_name)
+		                 FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
+		                 WHERE tl.teaching_course_id = tc.id), ''),
 		       t.academic_year || ' ' ||
 		           CASE t.semester WHEN 1 THEN 'ภาคต้น' WHEN 2 THEN 'ภาคปลาย' ELSE 'ภาคฤดูร้อน' END,
 		       (SELECT COUNT(DISTINCT a.ta_id)
 		          FROM ta_request_assignments a
 		          JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
 		          WHERE r.teaching_course_id = tc.id) AS ta_count,
-		       (SELECT TO_CHAR(MAX(generated_at),'YYYY-MM-DD"T"HH24:MI:SSTZ')
+		       (SELECT TO_CHAR(MAX(generated_at),'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		          FROM export_batches WHERE teaching_course_id = tc.id),
 		       `+CourseAppointedSQL("tc.id")+`,
 		       -- At least one month of this course has been signed off in step 3.
@@ -152,6 +162,7 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		var s CourseSummary
 		var signedOff bool
 		if err := rows.Scan(&s.TeachingCourseID, &s.CourseCode, &s.CourseNameTH,
+			&s.LecturerNames,
 			&s.TermLabel, &s.TACount, &s.LastExportAt,
 			&s.HasAppointmentOrder, &signedOff); err != nil {
 			return nil, err

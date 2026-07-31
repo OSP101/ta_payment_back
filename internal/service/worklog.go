@@ -1697,8 +1697,7 @@ func (s *WorkLogService) dailyHourCapFor(ctx context.Context, assignmentID uuid.
 // work_date do NOT exceed pay_rates.daily_pay_cap_baht (Q&A rule 6a: 300฿/day).
 // Skips grad-special (flat monthly, not billed hourly). Excludes the row
 // currently being upserted so re-saves aren't penalised.
-func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID, workDate string,
-	excludeRowID uuid.UUID, additionalBaht float64) error {
+func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID, w WorkLog) error {
 	var capBaht float64
 	if err := s.pool.QueryRow(ctx,
 		`SELECT daily_pay_cap_baht FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&capBaht); err != nil {
@@ -1707,29 +1706,70 @@ func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID
 	if capBaht <= 0 {
 		return nil
 	}
-	var existing float64
+
+	// The day is priced ONCE, with the candidate row folded in — not as
+	// "existing + this row".
+	//
+	// A sitting taught to sec 1 (ภาคปกติ) and sec 2 (โครงการพิเศษ) at the same
+	// hour is written against both, because the tracks draw on separate budgets,
+	// and export.go rule B2 then pays those shared hours once at the REGULAR
+	// rate ("เบิกภาคปกติก่อน"). Adding the two rows up charged this cap for money
+	// nobody is paid: one real Tuesday came to 360฿ against a 300฿ cap where the
+	// payout engine settles at 160฿, and every row of that day became uneditable.
+	//
+	// Folding the candidate in is what makes the second half work. Priced
+	// separately, the sec-2 row of a brand-new sitting still arrives as its own
+	// 200฿ on top of the sec-1 row's 160฿ — the same double count, one step
+	// later.
+	var total float64
 	if err := s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT COALESCE(SUM(wl.hours *
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		cand AS (
+		    SELECT $3::uuid AS id, $4::time AS start_time, $5::time AS end_time,
+		           $6::numeric AS hours, a.request_id, a.cotaught_group,
+		           a.level::text AS level, sec.track::text AS track
+		    FROM ta_request_assignments a
+		    JOIN sections sec ON sec.id = a.section_id
+		    WHERE a.id = $7
+		),
+		day_rows AS (
+		    SELECT wl.id, wl.start_time, wl.end_time, wl.hours, a.request_id,
+		           a.cotaught_group, a.level::text, sec.track::text
+		    FROM work_logs wl
+		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		    JOIN sections sec ON sec.id = a.section_id
+		    WHERE a.ta_id = $1 AND wl.work_date = $2::date
+		      AND wl.status <> 'rejected' AND wl.id <> $3
+		    UNION ALL
+		    SELECT * FROM cand
+		),
+		-- One row per sitting: same co-taught group, same request, same clock
+		-- interval. The regular-track row wins so the price matches what B2 pays.
+		-- COALESCE on the row id keeps ungrouped rows from merging with anything.
+		sitting AS (
+		    SELECT DISTINCT ON (
+		               COALESCE(cotaught_group::text, id::text),
+		               request_id, start_time, end_time)
+		           hours, level, track
+		    FROM day_rows
+		    ORDER BY COALESCE(cotaught_group::text, id::text),
+		             request_id, start_time, end_time, (track = 'regular') DESC
+		)
+		SELECT COALESCE(SUM(sitting.hours *
 		    CASE
-		        WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
-		        WHEN a.level='undergrad' AND sec.track='special' THEN pr.undergrad_special
-		        WHEN a.level IN ('master','phd') AND sec.track='regular' THEN pr.graduate_regular_hourly
+		        WHEN sitting.level='undergrad' AND sitting.track='regular' THEN pr.undergrad_regular
+		        WHEN sitting.level='undergrad' AND sitting.track='special' THEN pr.undergrad_special
+		        WHEN sitting.level IN ('master','phd') AND sitting.track='regular' THEN pr.graduate_regular_hourly
 		        ELSE 0  -- grad special = flat monthly, does not count toward daily cap
 		    END), 0)
-		FROM work_logs wl
-		JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		JOIN sections sec ON sec.id = a.section_id
-		CROSS JOIN latest pr
-		WHERE a.ta_id=$1 AND wl.work_date=$2::date
-		  AND wl.status <> 'rejected' AND wl.id <> $3`,
-		taID, workDate, excludeRowID).Scan(&existing); err != nil {
+		FROM sitting CROSS JOIN latest pr`,
+		taID, w.WorkDate, w.ID, w.StartTime, w.EndTime, w.Hours, w.AssignmentID).Scan(&total); err != nil {
 		return err
 	}
-	if existing+additionalBaht > capBaht+0.01 {
+	if total > capBaht+0.01 {
 		return Invalid(fmt.Sprintf(
-			"รวมค่าตอบแทนของวันนี้เกิน %.0f บาท (ปัจจุบัน %.2f บาท ต้องการเพิ่ม %.2f บาท)",
-			capBaht, existing, additionalBaht))
+			"รวมค่าตอบแทนของวันนี้เกิน %.0f บาท (รวมรายการนี้แล้วเป็น %.2f บาท)",
+			capBaht, total))
 	}
 	return nil
 }
@@ -2208,10 +2248,8 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 
 	// Q&A rule 6a — 300฿/day cap across every hourly-billed assignment the same
 	// TA holds. Grad-special (flat monthly) contributes 0 and is exempt.
-	if rate := s.assignmentRate(ctx, w.AssignmentID); rate > 0 {
-		if err := s.enforceDailyBahtCap(ctx, ac.TAID, w.WorkDate, w.ID, w.Hours*rate); err != nil {
-			return uuid.Nil, err
-		}
+	if err := s.enforceDailyBahtCap(ctx, ac.TAID, w); err != nil {
+		return uuid.Nil, err
 	}
 
 	// The same clock hours must not be billed twice across the TA's courses.
@@ -2435,11 +2473,37 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 // review.
 type PendingReport struct {
 	ID               uuid.UUID `json:"id"`
+	TAID             uuid.UUID `json:"ta_id"`
 	TAName           string    `json:"ta_name"`
 	CourseCode       string    `json:"course_code"`
 	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
-	TotalHours       float64   `json:"total_hours"`
-	PeriodLabel      string    `json:"period_label,omitempty"`
+	// Which section this row is for. The list is one row PER ASSIGNMENT, and a
+	// TA who helps with two sections of one course produces two rows carrying
+	// the same name, course and (when the sections are co-taught) the same hour
+	// count. Without the section they are indistinguishable on screen, and the
+	// reviewer's only reading is that the same request arrived twice.
+	SecNo string `json:"sec_no"`
+	Track string `json:"track"`
+	// CoTaughtGroup marks sections taught in ONE sitting. Rows sharing a group
+	// are the same hours written against each section, and export rule B2 pays
+	// them once at the regular rate — so their hours must never be added up.
+	CoTaughtGroup *int `json:"cotaught_group,omitempty"`
+	// TotalHours is this ASSIGNMENT's submitted hours. GroupHours is what the
+	// whole co-taught group is worth once each shared sitting is counted a
+	// single time — identical on every row of the group, and equal to
+	// TotalHours when there is no group.
+	//
+	// Both are needed and neither can be derived from the other: co-taught
+	// sections are not copies of each other. On CP321002 the pair holds 98 rows
+	// but only 82 distinct sittings, so the honest total is 164h — not 196
+	// (adding them) and not 98 (assuming one is a duplicate of the other).
+	TotalHours  float64 `json:"total_hours"`
+	GroupHours  float64 `json:"group_hours"`
+	PeriodLabel string  `json:"period_label,omitempty"`
+	// FirstDate / LastDate are the same span as PeriodLabel, unformatted, so the
+	// client can render it in Thai like every other date in the app.
+	FirstDate string `json:"first_date,omitempty"`
+	LastDate  string `json:"last_date,omitempty"`
 }
 
 // ListPending returns assignments with submitted (awaiting-review) work-logs.
@@ -2447,11 +2511,39 @@ type PendingReport struct {
 // (admin/staff) see all.
 func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privileged bool) ([]PendingReport, error) {
 	rows, err := s.pool.Query(ctx, `
+		WITH pend AS (
+		    SELECT a.id AS assignment_id, a.ta_id, a.cotaught_group,
+		           sec.teaching_course_id,
+		           wl.work_date, wl.start_time, wl.end_time, wl.hours
+		    FROM work_logs wl
+		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		    JOIN sections sec ON sec.id = a.section_id
+		    WHERE wl.status = 'submitted' AND a.cotaught_group IS NOT NULL
+		),
+		-- One sitting taught to several sections is ONE thing to review and one
+		-- thing to pay (export rule B2). Count it once per co-taught group
+		-- before the group's hours are reported.
+		sitting AS (
+		    SELECT DISTINCT ON (ta_id, teaching_course_id, cotaught_group,
+		                        work_date, start_time, end_time)
+		           ta_id, teaching_course_id, cotaught_group, hours
+		    FROM pend
+		),
+		grp AS (
+		    SELECT ta_id, teaching_course_id, cotaught_group, SUM(hours) AS hours
+		    FROM sitting
+		    GROUP BY ta_id, teaching_course_id, cotaught_group
+		)
 		SELECT a.id,
+		       a.ta_id,
 		       u.first_name || ' ' || u.last_name,
 		       tc.code,
 		       tc.id,
+		       sec.sec_no,
+		       sec.track::text,
+		       a.cotaught_group,
 		       COALESCE(SUM(wl.hours), 0),
+		       COALESCE(MAX(g.hours), SUM(wl.hours), 0),
 		       MIN(wl.work_date),
 		       MAX(wl.work_date),
 		       MIN(wl.submitted_at)
@@ -2460,12 +2552,16 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 		JOIN users u ON u.id = a.ta_id
 		JOIN work_logs wl ON wl.assignment_id = a.id AND wl.status = 'submitted'
+		LEFT JOIN grp g ON g.ta_id = a.ta_id
+		                AND g.teaching_course_id = tc.id
+		                AND g.cotaught_group = a.cotaught_group
 		WHERE $1 = TRUE OR EXISTS (
 		    SELECT 1 FROM teaching_lecturers tl
 		    WHERE tl.teaching_course_id = tc.id AND tl.lecturer_id = $2
 		)
-		GROUP BY a.id, u.first_name, u.last_name, tc.code, tc.id
-		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, tc.code`,
+		GROUP BY a.id, a.ta_id, u.first_name, u.last_name, tc.code, tc.id,
+		         sec.sec_no, sec.track, a.cotaught_group
+		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, tc.code, sec.sec_no`,
 		privileged, actor)
 	if err != nil {
 		return nil, err
@@ -2478,14 +2574,17 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 			minD, maxD  time.Time
 			submittedAt *time.Time
 		)
-		if err := rows.Scan(&p.ID, &p.TAName, &p.CourseCode, &p.TeachingCourseID,
-			&p.TotalHours, &minD, &maxD, &submittedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.TAID, &p.TAName, &p.CourseCode, &p.TeachingCourseID,
+			&p.SecNo, &p.Track, &p.CoTaughtGroup,
+			&p.TotalHours, &p.GroupHours, &minD, &maxD, &submittedAt); err != nil {
 			return nil, err
 		}
+		p.FirstDate = minD.Format("2006-01-02")
+		p.LastDate = maxD.Format("2006-01-02")
 		if minD.Equal(maxD) {
-			p.PeriodLabel = minD.Format("2006-01-02")
+			p.PeriodLabel = p.FirstDate
 		} else {
-			p.PeriodLabel = minD.Format("2006-01-02") + " – " + maxD.Format("2006-01-02")
+			p.PeriodLabel = p.FirstDate + " – " + p.LastDate
 		}
 		out = append(out, p)
 	}
@@ -2800,10 +2899,8 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 				"กิจกรรมอื่นๆ (คู่กับ%s) ต้องไม่เกิน %.1f ชั่วโมง/ครั้ง", kindTH, capHrs))
 		}
 	}
-	if rate := s.assignmentRate(ctx, w.AssignmentID); rate > 0 {
-		if err := s.enforceDailyBahtCap(ctx, ac.TAID, w.WorkDate, w.ID, w.Hours*rate); err != nil {
-			return uuid.Nil, err
-		}
+	if err := s.enforceDailyBahtCap(ctx, ac.TAID, w); err != nil {
+		return uuid.Nil, err
 	}
 	if err := s.enforceNoOverlap(ctx, ac.TAID, w); err != nil {
 		return uuid.Nil, err

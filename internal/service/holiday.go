@@ -728,11 +728,11 @@ func (s *HolidayService) fetchBOTHolidays(ctx context.Context, year int) ([]botH
 // ---------------------------------------------------------------------------
 
 type SyncFromBOTYearResult struct {
-	Year     int    `json:"year"`
-	Fetched  int    `json:"fetched"`
-	Inserted int    `json:"inserted"`
-	Updated  int    `json:"updated"`
-	Skipped  int    `json:"skipped"`
+	Year     int `json:"year"`
+	Fetched  int `json:"fetched"`
+	Inserted int `json:"inserted"`
+	Updated  int `json:"updated"`
+	Skipped  int `json:"skipped"`
 	// Error is populated only if the sync for THIS year failed. The loop keeps
 	// going so a transient failure on year N doesn't lose the result for year N+1.
 	Error string `json:"error,omitempty"`

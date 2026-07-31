@@ -546,12 +546,12 @@ func TestClashLines_NamesSessionTypeAndOwnCourse(t *testing.T) {
 	}
 	got := lines[0]
 	for _, want := range []string{
-		"ปฏิบัติการ",         // the session type they lost
-		"อังคาร",             // when
-		"13:00–15:00",        // which hour
-		"322201",             // their own course
+		"ปฏิบัติการ",  // the session type they lost
+		"อังคาร",      // when
+		"13:00–15:00", // which hour
+		"322201",      // their own course
 		"Data Structures",
-		"(บรรยาย)",           // and what kind of class of theirs takes the slot
+		"(บรรยาย)", // and what kind of class of theirs takes the slot
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("line missing %q\ngot: %s", want, got)
@@ -611,11 +611,11 @@ func TestApplyClashOutcome_ReasonNamesLostAndRemainingKinds(t *testing.T) {
 		t.Fatalf("state = %q, want trimmed (only one of two sessions clashes)", state)
 	}
 	for _, want := range []string{
-		"1 จาก 2 คาบ",                 // how much
-		"คาบปฏิบัติการ",                // WHICH session type was lost
-		"13:00–16:00",                  // when
-		"322201 Data Structures",       // the TA's own class that took the slot
-		"ยังลงเวลาในคาบบรรยายได้",      // and what they can still do
+		"1 จาก 2 คาบ",            // how much
+		"คาบปฏิบัติการ",          // WHICH session type was lost
+		"13:00–16:00",            // when
+		"322201 Data Structures", // the TA's own class that took the slot
+		"ยังลงเวลาในคาบบรรยายได้", // and what they can still do
 	} {
 		if !strings.Contains(reason, want) {
 			t.Errorf("state_reason missing %q\ngot:\n%s", want, reason)

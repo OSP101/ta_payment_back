@@ -35,21 +35,21 @@ var validAudienceRoles = map[string]bool{
 // end-users (feed). `CoverImageURL` is a virtual read-only field derived
 // from `CoverImageKey`; clients treat it as a resolvable URL.
 type Announcement struct {
-	ID             uuid.UUID  `json:"id"`
-	Title          string     `json:"title"`
-	Body           string     `json:"body"`
-	Category       string     `json:"category"`
-	Audience       []string   `json:"audience"`
-	Pinned         bool       `json:"pinned"`
-	CoverImageKey  *string    `json:"cover_image_key,omitempty"`
-	CoverImageURL  *string    `json:"cover_image_url,omitempty"`
-	PublishedAt    *time.Time `json:"published_at,omitempty"`
-	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
-	AnnouncedAt    *time.Time `json:"announced_at,omitempty"`
-	CreatedAt      *time.Time `json:"created_at,omitempty"`
-	UpdatedAt      *time.Time `json:"updated_at,omitempty"`
+	ID            uuid.UUID  `json:"id"`
+	Title         string     `json:"title"`
+	Body          string     `json:"body"`
+	Category      string     `json:"category"`
+	Audience      []string   `json:"audience"`
+	Pinned        bool       `json:"pinned"`
+	CoverImageKey *string    `json:"cover_image_key,omitempty"`
+	CoverImageURL *string    `json:"cover_image_url,omitempty"`
+	PublishedAt   *time.Time `json:"published_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	AnnouncedAt   *time.Time `json:"announced_at,omitempty"`
+	CreatedAt     *time.Time `json:"created_at,omitempty"`
+	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
 	// Derived state — computed in Go so the FE doesn't reimplement timing rules.
-	Status         string     `json:"status,omitempty"` // draft | scheduled | live | expired
+	Status string `json:"status,omitempty"` // draft | scheduled | live | expired
 }
 
 type AnnounceService struct {
@@ -61,8 +61,8 @@ type AnnounceService struct {
 // ListFilter narrows the announcement list for a caller. Non-staff callers
 // must supply RoleFilter; staff may pass IncludeAll to see drafts+scheduled+expired.
 type ListFilter struct {
-	RoleFilter  string
-	IncludeAll  bool
+	RoleFilter string
+	IncludeAll bool
 }
 
 // ============================================================================
@@ -369,10 +369,10 @@ func (s *AnnounceService) fanout(ctx context.Context, id uuid.UUID) {
 		return
 	}
 	var (
-		title    string
-		body     string
-		category string
-		audience []string
+		title       string
+		body        string
+		category    string
+		audience    []string
 		announcedAt *time.Time
 	)
 	if err := s.pool.QueryRow(ctx, `

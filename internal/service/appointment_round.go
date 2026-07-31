@@ -42,11 +42,11 @@ type SkippedCourse struct {
 // paper act that cannot be recalled, so nothing here is issued until it is
 // confirmed.
 type AppointmentPreview struct {
-	TermID     uuid.UUID              `json:"term_id"`
-	NextRound  int                    `json:"next_round"`
-	IsLate     bool                   `json:"is_late"`
-	Include    []AppointmentCandidate `json:"include"`
-	Skipped    []SkippedCourse        `json:"skipped"`
+	TermID    uuid.UUID              `json:"term_id"`
+	NextRound int                    `json:"next_round"`
+	IsLate    bool                   `json:"is_late"`
+	Include   []AppointmentCandidate `json:"include"`
+	Skipped   []SkippedCourse        `json:"skipped"`
 	// AlreadyIssued counts pairs printed on an earlier round. Shown so the
 	// number of names on this round reads as deliberate rather than truncated.
 	AlreadyIssued int `json:"already_issued"`
@@ -227,7 +227,7 @@ type AppointmentRound struct {
 func (s *AppointmentOrderService) ListRounds(ctx context.Context, termID uuid.UUID) ([]AppointmentRound, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT o.id, o.round_no, o.order_no, o.order_date, o.ta_count,
-		       TO_CHAR(o.generated_at, 'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(o.generated_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       COALESCE(u.first_name || ' ' || u.last_name, '')
 		FROM appointment_orders o
 		LEFT JOIN users u ON u.id = o.generated_by

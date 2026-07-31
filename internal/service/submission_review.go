@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -50,6 +51,26 @@ type ReviewQueueRow struct {
 	// not ready for staff to sign off, and the queue says so rather than
 	// letting staff approve a moving target.
 	OpenRows int `json:"open_rows"`
+	// Who the month is actually waiting on. OpenRows alone could not say, so the
+	// merged payout screen blamed the lecturer for rows the TA had not even
+	// submitted — and offered a "remind the lecturer" button the server then
+	// refused, because there was nothing in their queue.
+	//   WaitingTA       = draft + rejected, still with the TA
+	//   WaitingLecturer = submitted, sitting in the lecturer's approval queue
+	WaitingTA       int `json:"waiting_ta"`
+	WaitingLecturer int `json:"waiting_lecturer"`
+	// What is inside the month, so the grid cell can say whether opening it is
+	// worth the click. RowCount is the approved rows behind ApprovedHours;
+	// ManualCount is how many of them the TA typed themselves.
+	//
+	// ManualCount is the only number on that screen that selects work for a
+	// human: a generated row copies class times the lecturer already entered and
+	// holds nothing a second person can verify, so a month that is entirely
+	// generated can be signed off without reading it. Without this the officer
+	// had to open all five months of every TA to find out which one had a claim
+	// in it.
+	RowCount    int `json:"row_count"`
+	ManualCount int `json:"manual_count"`
 }
 
 // ListReviewQueue returns every (period, TA, course) whose month has approved
@@ -65,7 +86,11 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		           a.ta_id AS ta_id,
 		           tc.id   AS tc_id,
 		           SUM(wl.hours) FILTER (WHERE wl.status = 'approved')                      AS approved_hours,
-		           COUNT(*)      FILTER (WHERE wl.status IN ('draft','submitted','rejected')) AS open_rows
+		           COUNT(*)      FILTER (WHERE wl.status IN ('draft','submitted','rejected')) AS open_rows,
+		           COUNT(*)      FILTER (WHERE wl.status IN ('draft','rejected'))             AS waiting_ta,
+		           COUNT(*)      FILTER (WHERE wl.status = 'submitted')                       AS waiting_lecturer,
+		           COUNT(*)      FILTER (WHERE wl.status = 'approved')                        AS row_count,
+		           COUNT(*)      FILTER (WHERE wl.status = 'approved' AND wl.source = 'manual') AS manual_count
 		    FROM teaching_courses tc
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
 		    JOIN sections sec          ON sec.teaching_course_id = tc.id
@@ -77,7 +102,7 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		      -- Nothing to review until the appointment order is printed: the
 		      -- work is not yet payable, and signing it off here would release
 		      -- it to an export the finance office cannot accept.
-		      AND ` + AppointedSQL("tc.id", "a.ta_id") + `
+		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
 		    GROUP BY sp.id, a.ta_id, tc.id
 		)
 		SELECT sp.id, sp.label, sp.year_month,
@@ -85,7 +110,11 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
 		       COALESCE(ml.approved_hours, 0),
-		       COALESCE(ml.open_rows, 0)
+		       COALESCE(ml.open_rows, 0),
+		       COALESCE(ml.waiting_ta, 0),
+		       COALESCE(ml.waiting_lecturer, 0),
+		       COALESCE(ml.row_count, 0),
+		       COALESCE(ml.manual_count, 0)
 		FROM month_logs ml
 		JOIN submission_periods sp ON sp.id = ml.period_id
 		JOIN users u               ON u.id = ml.ta_id
@@ -106,7 +135,9 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		var r ReviewQueueRow
 		if err := rows.Scan(&r.PeriodID, &r.PeriodLabel, &r.YearMonth,
 			&r.TAID, &r.TAName, &r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
-			&r.Status, &r.ApprovedHours, &r.OpenRows); err != nil {
+			&r.Status, &r.ApprovedHours, &r.OpenRows,
+			&r.WaitingTA, &r.WaitingLecturer,
+			&r.RowCount, &r.ManualCount); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -282,4 +313,93 @@ func (s *SubmissionPeriodService) UnreviewedCourseNames(ctx context.Context, tcI
 		out = append(out, label)
 	}
 	return out, rows.Err()
+}
+
+// RemindLecturerUnapproved nudges a course's lecturers that TA work is still
+// sitting unapproved in their queue.
+//
+// Added 31/07/2026 with the merged payout screen. The "waiting on someone else"
+// group is, by definition, work the officer cannot do — and until now the screen
+// offered them nothing but the word "waiting". A month can sit there because a
+// lecturer forgot, and the officer's only recourse was to leave the system and
+// send a message by hand.
+//
+// Throttled to one reminder per course per day, read off audit_logs rather than
+// a new table: the reminder IS an auditable act, so the record it must leave is
+// the same record the throttle needs.
+func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, actor, tcID uuid.UUID) error {
+	var code, nameTH string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT code, COALESCE(name_th,'') FROM teaching_courses WHERE id = $1`, tcID).
+		Scan(&code, &nameTH); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+
+	var lastSent *time.Time
+	if err := s.pool.QueryRow(ctx, `
+		SELECT MAX(at) FROM audit_logs
+		 WHERE action = 'payout.remind_lecturer' AND entity_id = $1`,
+		tcID.String()).Scan(&lastSent); err != nil {
+		return err
+	}
+	if lastSent != nil && time.Since(*lastSent) < 24*time.Hour {
+		return Invalid("แจ้งเตือนอาจารย์วิชานี้ไปแล้ววันนี้ — ส่งได้อีกครั้งใน 24 ชั่วโมง")
+	}
+
+	// How much is actually outstanding. Sending "please approve" without the
+	// number is what makes reminders easy to ignore.
+	var openRows int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sections sec
+		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		JOIN work_logs wl  ON wl.assignment_id = a.id AND wl.status = 'submitted'
+		WHERE sec.teaching_course_id = $1`, tcID).Scan(&openRows); err != nil {
+		return err
+	}
+	if openRows == 0 {
+		return Invalid("ไม่มีรายการที่รออาจารย์อนุมัติในวิชานี้แล้ว")
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT lecturer_id FROM teaching_lecturers WHERE teaching_course_id = $1`, tcID)
+	if err != nil {
+		return err
+	}
+	var lecturerIDs []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		lecturerIDs = append(lecturerIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(lecturerIDs) == 0 {
+		return Invalid("วิชานี้ยังไม่มีอาจารย์ผู้สอนในระบบ จึงยังแจ้งเตือนไม่ได้")
+	}
+
+	title := "มีบันทึกเวลา TA รออนุมัติ"
+	body := fmt.Sprintf(
+		"%s %s — มี %d รายการที่ TA ส่งมาแล้วและรอการอนุมัติของอาจารย์ "+
+			"เจ้าหน้าที่ยังตรวจเบิกจ่ายเดือนนั้นไม่ได้จนกว่าจะอนุมัติครบ",
+		code, nameTH, openRows)
+	for _, id := range lecturerIDs {
+		s.notify.Send(ctx, id, title, body, "/lecturer/courses/"+tcID.String()+"/worklog")
+	}
+
+	s.aud.Log(ctx, audit.Entry{
+		ActorID: &actor, Action: "payout.remind_lecturer",
+		Entity: "teaching_course", EntityID: tcID.String(),
+		Note: fmt.Sprintf("%s — %d รายการรออนุมัติ, แจ้ง %d คน", code, openRows, len(lecturerIDs)),
+	})
+	return nil
 }

@@ -384,9 +384,9 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		        TO_CHAR(COALESCE(tc.starts_on, at.starts_on), 'YYYY-MM-DD'),
 		        TO_CHAR(COALESCE(tc.ends_on,   at.ends_on),   'YYYY-MM-DD'),
 		        tc.num_students, tc.num_students_regular, tc.num_students_special,
-		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		        -- คาบที่ตรงวันหยุดและยังไม่กำหนดวันชดเชย — see UnresolvedMakeupsSQL.
-		        ` + UnresolvedMakeupsSQL("tc") + `,
+		        `+UnresolvedMakeupsSQL("tc")+`,
 		        -- ≥1 section ยังไม่มีตารางเรียน (WBA จากทะเบียน) — บล็อกการส่งคำขอ TA.
 		        -- List() คำนวณค่านี้อยู่แล้ว; Get() ไม่เคยส่งมา ทำให้หน้าเดียวเปิดวิชา
 		        -- เดียวกันแล้วเห็นสถานะไม่ตรงกับหน้ารายการ
@@ -407,7 +407,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	// Sections
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, sec_no, track::text, room, num_students,
-		        TO_CHAR(schedule_set_by_lecturer_at,'YYYY-MM-DD"T"HH24:MI:SSTZ')
+		        TO_CHAR(schedule_set_by_lecturer_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		   FROM sections WHERE teaching_course_id=$1 ORDER BY sec_no`, id)
 	if err != nil {
 		return nil, err
@@ -662,9 +662,9 @@ type TAAssignment struct {
 	// UnsentCount is draft + rejected: exactly what pressing "ส่งอนุมัติ" would
 	// send (see WorkLogService.Submit), so the number on the button and the number
 	// it acts on cannot disagree.
-	UnsentCount    int     `json:"unsent_count"`
-	SubmittedCount int     `json:"submitted_count"`
-	ApprovedCount  int     `json:"approved_count"`
+	UnsentCount    int `json:"unsent_count"`
+	SubmittedCount int `json:"submitted_count"`
+	ApprovedCount  int `json:"approved_count"`
 	// HoursLogged counts everything not rejected, matching the term-ceiling
 	// arithmetic the worklog screen already shows.
 	HoursLogged float64 `json:"hours_logged"`

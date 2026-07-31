@@ -104,13 +104,13 @@ func (s *DocumentProgressService) GetByTerm(ctx context.Context, termID uuid.UUI
 	// LEFT-style load: no row yet → stage 0.
 	err = s.pool.QueryRow(ctx, `
 		SELECT stage,
-		       TO_CHAR(ta_signed_at,        'YYYY-MM-DD"T"HH24:MI:SSTZ'),
-		       TO_CHAR(lecturer_signed_at,  'YYYY-MM-DD"T"HH24:MI:SSTZ'),
-		       TO_CHAR(certifier_signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZ'),
-		       TO_CHAR(sent_finance_at,     'YYYY-MM-DD"T"HH24:MI:SSTZ'),
-		       TO_CHAR(sent_treasury_at,    'YYYY-MM-DD"T"HH24:MI:SSTZ'),
+		       TO_CHAR(ta_signed_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+		       TO_CHAR(lecturer_signed_at,  'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+		       TO_CHAR(certifier_signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+		       TO_CHAR(sent_finance_at,     'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+		       TO_CHAR(sent_treasury_at,    'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       note, updated_by_name,
-		       TO_CHAR(updated_at,          'YYYY-MM-DD"T"HH24:MI:SSTZ')
+		       TO_CHAR(updated_at,          'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		FROM document_progress WHERE term_id = $1`, termID).Scan(
 		&p.Stage, &p.TASignedAt, &p.LecturerSignedAt, &p.CertifierSignedAt,
 		&p.SentFinanceAt, &p.SentTreasuryAt, &p.Note, &p.UpdatedByName, &p.UpdatedAt)
@@ -245,9 +245,9 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 	}
 	defer rows.Close()
 	type courseRow struct {
-		id                          uuid.UUID
-		code, name, lecturers, tas  string
-		exported                    bool
+		id                         uuid.UUID
+		code, name, lecturers, tas string
+		exported                   bool
 	}
 	var courses []courseRow
 	for rows.Next() {
@@ -264,7 +264,7 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 	// Signed timestamps keyed by "tcID|role".
 	signed := map[string]*string{}
 	srows, err := s.pool.Query(ctx, `
-		SELECT teaching_course_id, role, TO_CHAR(signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZ')
+		SELECT teaching_course_id, role, TO_CHAR(signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		FROM signature_checklist WHERE term_id = $1 AND signed_at IS NOT NULL`, termID)
 	if err != nil {
 		return nil, err

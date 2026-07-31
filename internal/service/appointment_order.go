@@ -32,7 +32,7 @@ type AppointmentOrderService struct {
 type AppointmentOrderInput struct {
 	TermID          uuid.UUID `json:"term_id"`
 	OrderNo         string    `json:"order_no"`
-	OrderDate       string    `json:"order_date"`     // "24 มกราคม 2569"
+	OrderDate       string    `json:"order_date"` // "24 มกราคม 2569"
 	EffectiveDate   string    `json:"effective_date"`
 	SignerOfficerID uuid.UUID `json:"signer_officer_id"`
 }

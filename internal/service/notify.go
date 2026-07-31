@@ -69,8 +69,8 @@ func (s *NotifyService) List(ctx context.Context, userID uuid.UUID, limit int, u
 	q := strings.Builder{}
 	q.WriteString(`
 		SELECT id, title, body, link,
-		       TO_CHAR(read_at, 'YYYY-MM-DD"T"HH24:MI:SSOF'),
-		       TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SSOF'),
+		       TO_CHAR(read_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+		       TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       channel::text
 		  FROM notifications
 		 WHERE user_id = $1 AND channel = 'in_app'`)

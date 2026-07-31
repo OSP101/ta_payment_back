@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
+	"ta-payment-back/internal/auth"
 	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/mail"
 	"ta-payment-back/internal/testutil"
@@ -89,11 +90,15 @@ type fixture struct {
 
 	Periods *SubmissionPeriodService
 
-	TermID       uuid.UUID
-	CourseID     uuid.UUID
-	SectionID    uuid.UUID
-	LecturerID   uuid.UUID
-	TAID         uuid.UUID
+	TermID     uuid.UUID
+	CourseID   uuid.UUID
+	SectionID  uuid.UUID
+	LecturerID uuid.UUID
+	TAID       uuid.UUID
+	// StaffID is an officer with a real password hash. The edit-batch endpoint
+	// re-authenticates before it will touch approved hours, so a fixture user
+	// with a NULL password could never exercise the happy path.
+	StaffID      uuid.UUID
 	RequestID    uuid.UUID
 	AssignmentID uuid.UUID
 
@@ -129,6 +134,7 @@ func newFixture(t *testing.T, opts fixtureOpts) *fixture {
 	f.TermID = f.insertTerm(opts)
 	f.LecturerID = f.insertUser("lecturer", "lecturer")
 	f.TAID = f.insertUser("ta", "ta")
+	f.StaffID = f.insertStaffWithPassword()
 	f.CourseID = f.insertCourse(opts)
 	f.SectionID = f.insertSection(opts.Track)
 	f.insertSectionSchedule()
@@ -258,6 +264,23 @@ func (f *fixture) insertCourse(o fixtureOpts) uuid.UUID {
 		id, f.TermID, "CP"+id.String()[:6], courseLevel, o.NumStudents, o.TermStart, o.TermEnd)
 	f.exec(`INSERT INTO teaching_lecturers (teaching_course_id, lecturer_id, is_primary)
 	        VALUES ($1, $2, TRUE)`, id, f.LecturerID)
+	return id
+}
+
+// fixturePassword is the plaintext every fixture officer authenticates with.
+// A throwaway value for the test database only.
+const fixturePassword = "fixture-officer-pw"
+
+// insertStaffWithPassword creates an officer who can actually pass
+// VerifyUserPassword — insertUser leaves password_hash NULL, which the gate
+// (correctly) refuses.
+func (f *fixture) insertStaffWithPassword() uuid.UUID {
+	id := f.insertUser("staff", "staff")
+	hash, err := auth.HashPassword(fixturePassword)
+	if err != nil {
+		f.t.Fatalf("hash fixture password: %v", err)
+	}
+	f.exec(`UPDATE users SET password_hash = $1 WHERE id = $2`, hash, id)
 	return id
 }
 

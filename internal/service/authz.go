@@ -124,9 +124,9 @@ func courseAccess(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID
 // The Allow* flags are the finer-grained "what did the lecturer actually
 // declare this TA doing" gate, derived from ta_workload_forms:
 //   - undergrad: attendance_hrs → lecture, lab_hrs → lab,
-//                check_work_hrs → review, ug_other_hrs → other
+//     check_work_hrs → review, ug_other_hrs → other
 //   - grad (master/phd): help_teach_hrs → lecture+lab,
-//                        grade_hrs → review, other_hrs → other
+//     grade_hrs → review, other_hrs → other
 //
 // If no workload form exists yet (older data or partial setup) all flags
 // default to true so existing flows don't break — the scope gate above is
@@ -166,9 +166,9 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 	// comparison and get treated as "no hours declared" (which then falls
 	// back to "allow all" below).
 	var (
-		help, prep, grade, other       float64
+		help, prep, grade, other        float64
 		attendance, check, ugOther, lab float64
-		hasForm                        bool
+		hasForm                         bool
 	)
 	err := pool.QueryRow(ctx, `
 		SELECT sec.teaching_course_id, sec.id, a.ta_id, r.status::text,

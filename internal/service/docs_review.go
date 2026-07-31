@@ -21,7 +21,6 @@ import (
 	pdfcpuModel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 
 	"ta-payment-back/internal/audit"
-	"ta-payment-back/internal/auth"
 	"ta-payment-back/internal/timeutil"
 )
 
@@ -421,21 +420,7 @@ func (s *DocsService) CountTAsInDocs(ctx context.Context, docIDs []uuid.UUID) in
 // Timing is dominated by bcrypt, so no extra dummy compare is needed; an account
 // deactivated mid-session simply has no row to match.
 func (s *DocsService) verifyOfficerPassword(ctx context.Context, actor uuid.UUID, password string) error {
-	var hash string
-	err := s.pool.QueryRow(ctx,
-		`SELECT password_hash FROM users WHERE id = $1 AND is_active AND deleted_at IS NULL`,
-		actor,
-	).Scan(&hash)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return &UserError{Status: 401, Msg: "บัญชีนี้ไม่สามารถใช้งานได้"}
-	}
-	if err != nil {
-		return err
-	}
-	if !auth.CheckPassword(hash, password) {
-		return &UserError{Status: 401, Msg: "รหัสผ่านไม่ถูกต้อง"}
-	}
-	return nil
+	return VerifyUserPassword(ctx, s.pool, actor, password)
 }
 
 // MintZipToken lets the officer re-download the ZIP later from the approved

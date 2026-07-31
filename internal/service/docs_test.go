@@ -26,11 +26,11 @@ func TestIsAllDigits(t *testing.T) {
 
 func TestStripNonDigits(t *testing.T) {
 	cases := map[string]string{
-		"1234567890":         "1234567890",
-		"123-456-7":          "1234567",
-		" 12 34 ":            "1234",
-		"1-2345-67890-12-3":  "1234567890123",
-		"abc":                "",
+		"1234567890":        "1234567890",
+		"123-456-7":         "1234567",
+		" 12 34 ":           "1234",
+		"1-2345-67890-12-3": "1234567890123",
+		"abc":               "",
 	}
 	for in, want := range cases {
 		if got := stripNonDigits(in); got != want {
@@ -43,12 +43,12 @@ func TestStudentIDPattern(t *testing.T) {
 	ok := []string{"653020123-4", "999999999-0"}
 	bad := []string{
 		"",
-		"6530201234",     // no dash
-		"65302012-34",    // dash at wrong position
-		"6530201234-",    // trailing dash
-		"6530a0123-4",    // non-digit
-		"653020123-45",   // too long
-		"65302012-4",     // too short
+		"6530201234",   // no dash
+		"65302012-34",  // dash at wrong position
+		"6530201234-",  // trailing dash
+		"6530a0123-4",  // non-digit
+		"653020123-45", // too long
+		"65302012-4",   // too short
 	}
 	for _, s := range ok {
 		if !studentIDPattern(s) {
