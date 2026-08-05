@@ -25,7 +25,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -146,7 +145,51 @@ type gridBlock struct {
 	StartMin int
 	EndMin   int
 	Label    string
-	TARow    bool // TA duty style (small red) vs class style
+	Course   string // course code, "" for the TA's own classes
+	TARow    bool   // TA duty style (small red) vs class style
+}
+
+// timetableCoursePalette is the set of fills the college's own filled
+// timetables use to tell one course's blocks from another's: every course gets
+// ONE colour, worn by its class row, its TA duty row and its line in the
+// signature block alike. Cycled over courses sorted by code, which reproduces
+// the college's example exactly (CP321002 green, SC362004 peach, SC363101
+// blue). The TA's own classes stay yellow, outside the palette.
+var timetableCoursePalette = []string{"D8E4BD", "FEE9D9", "DAEEF3"}
+
+const timetableOwnClassFill = "FFFF00"
+
+// timetableCourseColors assigns each course the TA assists its palette colour.
+// Deterministic (codes sorted, palette cycled) so the grid and the signature
+// block — filled by different functions — always agree on a course's colour.
+func (s *ExportService) timetableCourseColors(ctx context.Context, taID, termID uuid.UUID) (map[string]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tc.code
+		FROM ta_request_assignments a
+		JOIN sections sec ON sec.id=a.section_id
+		JOIN teaching_courses tc ON tc.id=sec.teaching_course_id AND tc.term_id=$2
+		WHERE a.ta_id=$1 AND a.state <> 'dropped'`, taID, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var codes []string
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			return nil, err
+		}
+		codes = append(codes, code)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(codes)
+	colors := make(map[string]string, len(codes))
+	for i, code := range codes {
+		colors[code] = timetableCoursePalette[i%len(timetableCoursePalette)]
+	}
+	return colors, nil
 }
 
 // dayRow: the sheet fixes two rows per day.
@@ -162,134 +205,6 @@ func trackWords(tracks map[string]bool) string {
 	default:
 		return "ปกติ"
 	}
-}
-
-// BuildClaimWorkbook renders the official workbook for one TA × course ×
-// month. monthIdx is the 1-based position of the month within the term, used
-// only by callers for the file name.
-func (s *ExportService) BuildClaimWorkbook(ctx context.Context, taID, courseID uuid.UUID, year, month int) ([]byte, error) {
-	f, err := excelize.OpenFile(s.claimTemplatePath())
-	if err != nil {
-		return nil, fmt.Errorf("open claim template: %w", err)
-	}
-	defer f.Close()
-
-	// ── identity + term ─────────────────────────────────────────────────────
-	var fullName, studentID, level string
-	if err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
-		       COALESCE(u.student_id,''), COALESCE(u.study_level,'undergrad')
-		FROM users u WHERE u.id=$1`, taID).Scan(&fullName, &studentID, &level); err != nil {
-		return nil, err
-	}
-	var termID uuid.UUID
-	var semester int
-	var acadYear int
-	var courseCode string
-	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.term_id, at.semester, at.academic_year, tc.code
-		FROM teaching_courses tc JOIN academic_terms at ON at.id=tc.term_id
-		WHERE tc.id=$1`, courseID).Scan(&termID, &semester, &acadYear, &courseCode); err != nil {
-		return nil, err
-	}
-	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ฤดูร้อน"}[semester]
-	tt := "ตารางสอน"
-	f.SetCellValue(tt, "B1", fmt.Sprintf("ตารางเรียนและตารางปฏิบัติงาน (TA)  %s  ปีการศึกษา %d", semTH, acadYear))
-	// The clean-name convention the forms use: "นาย" prefix already lives in
-	// first_name for these users; write as stored.
-	f.SetCellValue(tt, "I3", fullName)
-	f.SetCellValue(tt, "O3", studentID)
-	var returning bool
-	_ = s.pool.QueryRow(ctx, `SELECT EXISTS (
-	    SELECT 1 FROM ta_request_assignments a
-	    JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
-	    JOIN teaching_courses tc ON tc.id=r.teaching_course_id
-	    WHERE a.ta_id=$1 AND tc.term_id <> $2 AND a.state <> 'dropped')`,
-		taID, termID).Scan(&returning)
-	if returning {
-		f.SetCellValue(tt, "AA1", "TA เดิม")
-	}
-
-	// ── timetable blocks ────────────────────────────────────────────────────
-	if err := s.fillTimetableGrid(ctx, f, taID, termID); err != nil {
-		return nil, err
-	}
-
-	// ── signatures ──────────────────────────────────────────────────────────
-	if err := s.fillClaimSignatures(ctx, f, taID, termID, fullName); err != nil {
-		return nil, err
-	}
-
-	// ── claim sheets ────────────────────────────────────────────────────────
-	logRows, err := s.claimLogs(ctx, taID, courseID, year, month)
-	if err != nil {
-		return nil, err
-	}
-	monthTH := fmt.Sprintf("ประจำเดือน %s %d ", thaiMonthNames[month], year+543)
-	var lecturerName string
-	_ = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,'')
-		FROM ta_requests r JOIN users u ON u.id=r.lecturer_id
-		JOIN ta_request_assignments a ON a.request_id=r.id
-		WHERE r.teaching_course_id=$1 AND a.ta_id=$2 AND r.status='approved' LIMIT 1`,
-		courseID, taID).Scan(&lecturerName)
-
-	for _, sheet := range []struct {
-		name, track, word string
-	}{
-		{"ภาคปกติ", "regular", "ปกติ"},
-		{"โครงการพิเศษ", "special", "พิเศษ"},
-	} {
-		var trackRows []claimLogRow
-		for _, r := range logRows {
-			if r.Track == sheet.track {
-				trackRows = append(trackRows, r)
-			}
-		}
-		rows := buildClaimSheetRows(trackRows, sheet.word)
-		// Header cells are written on ภาคปกติ only: the special sheet mirrors
-		// them by the template's own formulas (=ภาคปกติ!A4 …), exactly as the
-		// college's file does.
-		if sheet.track == "regular" {
-			f.SetCellValue(sheet.name, "A4", monthTH)
-			f.SetCellValue(sheet.name, "J5", courseCode)
-			if level == "undergrad" {
-				f.SetCellValue(sheet.name, "C5", "( / )")
-				f.SetCellValue(sheet.name, "F5", "(  )")
-			} else {
-				f.SetCellValue(sheet.name, "C5", "(  )")
-				f.SetCellValue(sheet.name, "F5", "( / )")
-			}
-		}
-		var lastDate time.Time
-		for i, r := range rows {
-			rr := 9 + i
-			if rr > 23 {
-				break // the paper form holds 15 rows; a real month never exceeds it
-			}
-			if !r.Date.Equal(lastDate) {
-				f.SetCellValue(sheet.name, fmt.Sprintf("D%d", rr), thaiDayAbbrev[int(r.Date.Weekday())])
-				// BE date, matching the college's own files (year+543 stored in
-				// the cell itself, template's mm-dd-yy format shows it).
-				f.SetCellValue(sheet.name, fmt.Sprintf("E%d", rr),
-					time.Date(r.Date.Year()+543, r.Date.Month(), r.Date.Day(), 0, 0, 0, 0, time.UTC))
-				lastDate = r.Date
-			}
-			f.SetCellValue(sheet.name, fmt.Sprintf("F%d", rr), r.Group)
-			f.SetCellValue(sheet.name, fmt.Sprintf("G%d", rr), r.Range)
-			f.SetCellValue(sheet.name, fmt.Sprintf("J%d", rr), r.Note)
-		}
-		if lecturerName != "" && sheet.track == "regular" {
-			f.SetCellValue(sheet.name, "D36", "("+lecturerName+")")
-			f.SetCellValue(sheet.name, "H36", "("+lecturerName+")")
-		}
-	}
-
-	buf, err := f.WriteToBuffer()
-	if err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
 }
 
 func (s *ExportService) claimTemplatePath() string {
@@ -335,34 +250,51 @@ func (s *ExportService) claimLogs(ctx context.Context, taID, courseID uuid.UUID,
 // fillTimetableGrid draws the weekly grid: row A of each day carries the
 // teaching schedule of the TA's courses, their own classes, and their grading
 // slots; row B carries the TA's working blocks (เช็คชื่อ and lab duty).
+// claimDutyLabel names a TA-nominated duty slot the way the printed grid does.
+// "ตรวจงาน" used to be hard-coded here, which was right when grading was the
+// only kind of slot and wrong the moment other-work joined it.
+func claimDutyLabel(kind string) string {
+	if kind == DutyReview {
+		return "ตรวจงาน"
+	}
+	return "งานอื่นๆ"
+}
+
 func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File, taID, termID uuid.UUID) error {
 	const tt = "ตารางสอน"
-	classStyle, err := f.NewStyle(&excelize.Style{
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"D8E4BD"}},
-		Font:      &excelize.Font{Family: "TH Sarabun New", Size: 12, Bold: true},
-		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
-		Border:    thinBorder(),
-	})
+	colors, err := s.timetableCourseColors(ctx, taID, termID)
 	if err != nil {
 		return err
 	}
-	taStyle, err := f.NewStyle(&excelize.Style{
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"D8E4BD"}},
-		Font:      &excelize.Font{Family: "TH Sarabun New", Size: 8.5, Bold: true, Color: "FF0000"},
-		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
-		Border:    thinBorder(),
-	})
-	if err != nil {
-		return err
+	// Block styles, built per (fill, kind, size) as needed. Class blocks are
+	// TH Sarabun New 12 bold black; TA duty blocks bold RED, sized to fit
+	// their box the way the college's file hand-shrinks them.
+	type blockStyleKey struct {
+		fill string
+		ta   bool
+		size float64
 	}
-	ownStyle, err := f.NewStyle(&excelize.Style{
-		Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{"FFFF00"}},
-		Font:      &excelize.Font{Family: "TH Sarabun New", Size: 12, Bold: true},
-		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
-		Border:    thinBorder(),
-	})
-	if err != nil {
-		return err
+	styleCache := map[blockStyleKey]int{}
+	blockStyle := func(fill string, ta bool, size float64) (int, error) {
+		k := blockStyleKey{fill, ta, size}
+		if id, ok := styleCache[k]; ok {
+			return id, nil
+		}
+		font := &excelize.Font{Family: "TH Sarabun New", Size: size, Bold: true}
+		if ta {
+			font.Color = "FF0000"
+		}
+		id, err := f.NewStyle(&excelize.Style{
+			Fill:      excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{fill}},
+			Font:      font,
+			Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
+			Border:    thinBorder(),
+		})
+		if err != nil {
+			return 0, err
+		}
+		styleCache[k] = id
+		return id, nil
 	}
 
 	var blocks []gridBlock
@@ -416,7 +348,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 			kindLbl = "Lab"
 		}
 		blocks = append(blocks, gridBlock{
-			Row: claimDayRow[k.day], StartMin: k.s, EndMin: k.e,
+			Row: claimDayRow[k.day], StartMin: k.s, EndMin: k.e, Course: k.code,
 			Label: fmt.Sprintf("%s %s %s", k.code, secRunLabel(v.secs), kindLbl),
 		})
 	}
@@ -454,7 +386,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		SELECT tc.code, rs.day_of_week,
 		       EXTRACT(HOUR FROM rs.start_time)*60+EXTRACT(MINUTE FROM rs.start_time),
 		       EXTRACT(HOUR FROM rs.end_time)*60+EXTRACT(MINUTE FROM rs.end_time),
-		       sec.sec_no, sec.track::text
+		       sec.sec_no, sec.track::text, rs.kind
 		FROM ta_review_schedules rs
 		JOIN ta_request_assignments a ON a.id=rs.assignment_id
 		JOIN sections sec ON sec.id=a.section_id
@@ -464,14 +396,16 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		return err
 	}
 	for revRows.Next() {
-		var code, secNo, track string
+		var code, secNo, track, dutyKind string
 		var day int
 		var sm, em float64
-		if err := revRows.Scan(&code, &day, &sm, &em, &secNo, &track); err != nil {
+		if err := revRows.Scan(&code, &day, &sm, &em, &secNo, &track, &dutyKind); err != nil {
 			revRows.Close()
 			return err
 		}
-		k := sitKey{code, "review", day, int(sm), int(em)}
+		// Key on the duty kind so grading and other-work never merge into one
+		// block — they print under different labels.
+		k := sitKey{code, dutyKind, day, int(sm), int(em)}
 		if revSits[k] == nil {
 			revSits[k] = &struct {
 				secs   []string
@@ -484,8 +418,8 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 	revRows.Close()
 	for k, v := range revSits {
 		blocks = append(blocks, gridBlock{
-			Row: claimDayRow[k.day], StartMin: k.s, EndMin: k.e, TARow: true,
-			Label: fmt.Sprintf("TA %s %s ตรวจงาน (%s)", k.code, secRunLabel(v.secs), trackWords(v.tracks)),
+			Row: claimDayRow[k.day], StartMin: k.s, EndMin: k.e, Course: k.code, TARow: true,
+			Label: fmt.Sprintf("TA %s %s %s (%s)", k.code, secRunLabel(v.secs), claimDutyLabel(k.kind), trackWords(v.tracks)),
 		})
 	}
 
@@ -538,12 +472,13 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		}
 		blocks = append(blocks, gridBlock{
 			Row: claimDayRow[claimDOW(k.day)] + 1, StartMin: k.s, EndMin: k.e,
-			Label: label, TARow: true,
+			Course: k.code, Label: label, TARow: true,
 		})
 	}
 
 	// Draw. Blocks in the same lane never overlap by construction (clash gates
-	// upstream); a duplicate key would merge over itself harmlessly.
+	// upstream); a duplicate key would merge over itself harmlessly. Each block
+	// wears its course's colour; the TA's own classes stay yellow.
 	for _, b := range blocks {
 		c1 := ttColOf(b.StartMin)
 		c2 := ttColOf(b.EndMin) - 1
@@ -557,17 +492,27 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 				return err
 			}
 		}
-		style := classStyle
-		if b.TARow {
-			style = taStyle
-		} else if !strings.Contains(b.Label, " ") || strings.HasPrefix(b.Label, "TA ") {
-			// own-class rows have bare labels; TA-prefixed review blocks keep
-			// the class row but the duty style
-			if strings.HasPrefix(b.Label, "TA ") {
-				style = taStyle
-			} else if !strings.Contains(b.Label, "Lect.") && !strings.Contains(b.Label, "Lab") {
-				style = ownStyle
+		fill := timetableOwnClassFill
+		if b.Course != "" {
+			if c, ok := colors[b.Course]; ok {
+				fill = c
+			} else {
+				fill = timetableCoursePalette[0]
 			}
+		}
+		size := 12.0
+		if b.TARow {
+			// The college hand-shrinks red duty labels to their box; a label
+			// that fits about eight characters per column keeps the larger
+			// size, a denser one drops to the small one their file uses.
+			size = 11.0
+			if len([]rune(b.Label)) > (c2-c1+1)*8 {
+				size = 8.5
+			}
+		}
+		style, err := blockStyle(fill, b.TARow, size)
+		if err != nil {
+			return err
 		}
 		if err := f.SetCellStyle(tt, start, end, style); err != nil {
 			return err
@@ -590,44 +535,79 @@ func (s *ExportService) fillClaimSignatures(ctx context.Context, f *excelize.Fil
 	// literals over them would break the linkage their file relies on.
 	_ = fullName
 
+	// Lecturers sign with their academic title, and each course line wears the
+	// same fill its blocks wear on the grid above — both straight from the
+	// college's own filled examples.
+	colors, err := s.timetableCourseColors(ctx, taID, termID)
+	if err != nil {
+		return err
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
-		       tc.code || ' ' || COALESCE(tc.name_th,'')
+		SELECT COALESCE(NULLIF(u.title,''),'')||COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
+		       tc.code, COALESCE(tc.name_th,'')
 		FROM ta_requests r
 		JOIN users u ON u.id=r.lecturer_id
 		JOIN teaching_courses tc ON tc.id=r.teaching_course_id AND tc.term_id=$2
 		JOIN ta_request_assignments a ON a.request_id=r.id
 		WHERE a.ta_id=$1 AND r.status='approved' AND a.state <> 'dropped'
-		GROUP BY u.id, u.first_name, u.last_name, tc.code, tc.name_th, r.submitted_at
+		GROUP BY u.id, u.title, u.first_name, u.last_name, tc.code, tc.name_th, r.submitted_at
 		ORDER BY MIN(r.submitted_at)`, taID, termID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	type courseRef struct{ code, nameTH string }
 	type signer struct {
 		name    string
-		courses []string
+		courses []courseRef
 	}
 	var signers []signer
 	for rows.Next() {
-		var name, course string
-		if err := rows.Scan(&name, &course); err != nil {
+		var name, code, nameTH string
+		if err := rows.Scan(&name, &code, &nameTH); err != nil {
 			return err
 		}
 		found := false
 		for i := range signers {
 			if signers[i].name == name {
-				signers[i].courses = append(signers[i].courses, course)
+				signers[i].courses = append(signers[i].courses, courseRef{code, nameTH})
 				found = true
 			}
 		}
 		if !found {
-			signers = append(signers, signer{name, []string{course}})
+			signers = append(signers, signer{name, []courseRef{{code, nameTH}}})
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 	sort.SliceStable(signers, func(i, j int) bool {
 		return len(signers[i].courses) < len(signers[j].courses)
 	})
+	// The template keeps the fills of the example it was cut from in the
+	// course-line cells; clear them first so a signer with fewer courses does
+	// not leave a stale coloured box behind.
+	courseLine := func(size float64, fill string) (int, error) {
+		st := &excelize.Style{
+			Font:      &excelize.Font{Family: "TH Sarabun New", Size: size},
+			Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
+		}
+		if fill != "" {
+			st.Fill = excelize.Fill{Type: "pattern", Pattern: 1, Color: []string{fill}}
+		}
+		return f.NewStyle(st)
+	}
+	for _, col := range []string{"I", "R"} {
+		for r := 23; r <= 25; r++ {
+			plain, err := courseLine(14, "")
+			if err != nil {
+				return err
+			}
+			if err := f.SetCellStyle(tt, col+fmt.Sprint(r), col+fmt.Sprint(r), plain); err != nil {
+				return err
+			}
+		}
+	}
 	cols := []string{"I", "R"}
 	for i, sg := range signers {
 		if i >= len(cols) {
@@ -637,11 +617,19 @@ func (s *ExportService) fillClaimSignatures(ctx context.Context, f *excelize.Fil
 		f.SetCellValue(tt, col+"21", "ลงชื่อ .......................................................")
 		f.SetCellValue(tt, col+"22", "("+sg.name+")")
 		for j, course := range sg.courses {
-			prefix := ""
+			prefix, size := "", 12.0
 			if j == 0 {
-				prefix = "อาจารย์ประจำวิชา "
+				prefix, size = "อาจารย์ประจำวิชา ", 14.0
 			}
-			f.SetCellValue(tt, fmt.Sprintf("%s%d", col, 23+j), prefix+course)
+			cell := fmt.Sprintf("%s%d", col, 23+j)
+			f.SetCellValue(tt, cell, prefix+course.code+" "+course.nameTH)
+			style, err := courseLine(size, colors[course.code])
+			if err != nil {
+				return err
+			}
+			if err := f.SetCellStyle(tt, cell, cell, style); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

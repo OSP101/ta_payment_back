@@ -170,18 +170,24 @@ func (s *HolidayService) Create(ctx context.Context, actor uuid.UUID, in Holiday
 		return uuid.Nil, err
 	}
 	id := uuid.New()
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO public_holidays (id, holiday_date, name_th, name_en, source, note, start_time, end_time, created_by)
-		 VALUES ($1, $2::date, $3, $4, $5, $6, $7::time, $8::time, $9)`,
-		id, in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, startT, endT, actor)
-	if err != nil {
-		// Postgres 23505 = unique_violation on (date, source, window). Two windows
-		// on one date are allowed, so name the window in the message — otherwise
-		// "มีวันหยุดอยู่แล้ว" reads as a lie to someone adding the afternoon half.
-		return uuid.Nil, Invalid(fmt.Sprintf("มีวันหยุดสำหรับวันที่ %s (%s, %s) อยู่แล้ว",
-			in.HolidayDate, source, holidayWindowLabelTH(startT, endT)))
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "holiday.create", Entity: "holiday", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO public_holidays (id, holiday_date, name_th, name_en, source, note, start_time, end_time, created_by)
+				 VALUES ($1, $2::date, $3, $4, $5, $6, $7::time, $8::time, $9)`,
+				id, in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, startT, endT, actor)
+			if err != nil {
+				// Postgres 23505 = unique_violation on (date, source, window). Two windows
+				// on one date are allowed, so name the window in the message — otherwise
+				// "มีวันหยุดอยู่แล้ว" reads as a lie to someone adding the afternoon half.
+				return Invalid(fmt.Sprintf("มีวันหยุดสำหรับวันที่ %s (%s, %s) อยู่แล้ว",
+					in.HolidayDate, source, holidayWindowLabelTH(startT, endT)))
+			}
+			return nil
+		}); err != nil {
+		return uuid.Nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "holiday.create", Entity: "holiday", EntityID: id.String()})
 	return id, nil
 }
 
@@ -228,10 +234,12 @@ func (s *HolidayService) BulkCreate(ctx context.Context, actor uuid.UUID, ins []
 		}
 		inserted += int(tag.RowsAffected())
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "holiday.bulk_create", Entity: "holiday", Note: fmt.Sprintf("inserted %d/%d", inserted, len(ins))}); err != nil {
+		return 0, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "holiday.bulk_create", Entity: "holiday", Note: fmt.Sprintf("inserted %d/%d", inserted, len(ins))})
 	return inserted, nil
 }
 
@@ -252,32 +260,38 @@ func (s *HolidayService) Patch(ctx context.Context, actor, id uuid.UUID, nameTH 
 	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE public_holidays SET name_th=$1, name_en=$2, note=$3, start_time=$4::time, end_time=$5::time
-		 WHERE id=$6`,
-		nameTH, nameEN, note, startT, endT, id)
-	if err != nil {
-		// Only reachable via the unique index: the edited window now collides with
-		// another row on the same date+source.
-		return Invalid(fmt.Sprintf("มีวันหยุดของวันนี้ในช่วงเวลา %s อยู่แล้ว", holidayWindowLabelTH(startT, endT)))
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "holiday.patch", Entity: "holiday", EntityID: id.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "holiday.patch", Entity: "holiday", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`UPDATE public_holidays SET name_th=$1, name_en=$2, note=$3, start_time=$4::time, end_time=$5::time
+				 WHERE id=$6`,
+				nameTH, nameEN, note, startT, endT, id)
+			if err != nil {
+				// Only reachable via the unique index: the edited window now collides with
+				// another row on the same date+source.
+				return Invalid(fmt.Sprintf("มีวันหยุดของวันนี้ในช่วงเวลา %s อยู่แล้ว", holidayWindowLabelTH(startT, endT)))
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		})
 }
 
 func (s *HolidayService) Delete(ctx context.Context, actor, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM public_holidays WHERE id=$1`, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "holiday.delete", Entity: "holiday", EntityID: id.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "holiday.delete", Entity: "holiday", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `DELETE FROM public_holidays WHERE id=$1`, id)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		})
 }
 
 // (An InRange helper used to live here, returning date→name and nothing else.
@@ -534,15 +548,17 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 			s.notify.Send(ctx, lid, "TA แจ้งให้กำหนดวันชดเชย", body, link)
 		}
 	}
-	// Audit + rate-limit ledger
-	if _, err := s.pool.Exec(ctx,
-		`INSERT INTO holiday_remind_log (ta_id, teaching_course_id, original_date, note)
-		 VALUES ($1, $2, $3::date, $4)`,
-		taID, tcID, originalDate, nilStrOrEmpty(note)); err != nil {
-		return err
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &taID, Action: "holiday.remind", Entity: "teaching_course", EntityID: tcID.String(), Note: originalDate})
-	return nil
+	// Audit + rate-limit ledger. The ledger is what stops a TA sending the same
+	// reminder repeatedly, so it and its audit row have to agree.
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &taID, Action: "holiday.remind", Entity: "teaching_course", EntityID: tcID.String(), Note: originalDate},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO holiday_remind_log (ta_id, teaching_course_id, original_date, note)
+				 VALUES ($1, $2, $3::date, $4)`,
+				taID, tcID, originalDate, nilStrOrEmpty(note))
+			return err
+		})
 }
 
 func nilStrOrEmpty(s string) any {
@@ -657,14 +673,16 @@ func (s *HolidayService) SyncFromBOT(ctx context.Context, actor uuid.UUID, year 
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return zero, err
-	}
-	s.aud.Log(ctx, audit.Entry{
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
 		ActorID: &actor, Action: "holiday.sync_bot", Entity: "holiday",
 		Note: fmt.Sprintf("year=%d fetched=%d inserted=%d updated=%d skipped=%d",
 			year, result.Fetched, result.Inserted, result.Updated, result.Skipped),
-	})
+	}); err != nil {
+		return SyncFromBOTResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, err
+	}
 	return result, nil
 }
 

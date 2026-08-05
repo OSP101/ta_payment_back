@@ -58,13 +58,16 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	// finalise the requests that were waiting for it (deferred-decision model).
 	c.Workload = &WorkloadService{pool: pool, requests: c.TARequest}
 	c.WorkLog = &WorkLogService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
-	c.Export = &ExportService{pool: pool, store: store, budget: c.Budget, fontDir: cfg.FontDir, teaching: c.Teaching}
+	c.Export = &ExportService{pool: pool, aud: auditor, notify: c.Notify, store: store, budget: c.Budget, teaching: c.Teaching}
+	// Back-reference, set after both exist: approving is what moves the budget,
+	// and the settlement that decides the shortfall lives on Export.
+	c.WorkLog.export = c.Export
 	c.Announce = &AnnounceService{pool: pool, aud: auditor, notify: c.Notify}
 	c.Dashboard = &DashboardService{pool: pool}
 	c.AdminOfficers = &AdminOfficerService{pool: pool, aud: auditor}
 	c.SubmissionPeriods = &SubmissionPeriodService{pool: pool, aud: auditor, notify: c.Notify}
 	c.ExportBatches = &ExportBatchService{pool: pool, aud: auditor}
-	c.DocProgress = &DocumentProgressService{pool: pool, aud: auditor, notify: c.Notify}
+	c.DocProgress = &DocumentProgressService{pool: pool, aud: auditor, notify: c.Notify, export: c.Export}
 	c.Appointment = &AppointmentOrderService{pool: pool, aud: auditor, fontDir: cfg.FontDir}
 	c.Holiday = &HolidayService{
 		pool: pool, aud: auditor, notify: c.Notify,

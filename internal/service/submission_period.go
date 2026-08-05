@@ -52,8 +52,21 @@ type SubmissionPeriodStatus struct {
 	// staff" (derived, not stored) once WorklogTotal>0 and WorklogUnapproved==0
 	// — i.e. the lecturer has approved every daily row. WorklogUnapproved counts
 	// draft/submitted/rejected rows (anything not yet approved).
-	WorklogTotal       int     `json:"worklog_total"`
-	WorklogUnapproved  int     `json:"worklog_unapproved"`
+	WorklogTotal      int `json:"worklog_total"`
+	WorklogUnapproved int `json:"worklog_unapproved"`
+	// WHO the unapproved rows are actually sitting with. WorklogUnapproved alone
+	// could not say, and the TA home page read it as "the lecturer has not
+	// approved these" — so a TA who had never pressed ส่งอนุมัติ was told their
+	// lecturer was holding up work the lecturer had never seen.
+	//   WorklogWaitingTA       = draft + rejected, still the TA's move
+	//   WorklogWaitingLecturer = submitted, genuinely in the approval queue
+	WorklogWaitingTA       int `json:"worklog_waiting_ta"`
+	WorklogWaitingLecturer int `json:"worklog_waiting_lecturer"`
+	// WorklogRejected is the part of WorklogWaitingTA the lecturer sent BACK.
+	// Folded into "waiting on the TA" it was invisible: the screen said
+	// "ยังไม่ได้ส่งอนุมัติ", which is true of a bounced row and tells the TA
+	// nothing about why it came back or that it ever went.
+	WorklogRejected    int     `json:"worklog_rejected"`
 	WorklogApprovedHrs float64 `json:"worklog_approved_hrs"`
 }
 
@@ -167,31 +180,34 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 	if in.RemindDaysBefore <= 0 {
 		in.RemindDaysBefore = 3
 	}
-	if in.ID == uuid.Nil {
+	isNew := in.ID == uuid.Nil
+	if isNew {
 		in.ID = uuid.New()
-		_, err := s.pool.Exec(ctx, `
-			INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label, remind_days_before, is_closed)
-			VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8)
-			ON CONFLICT (term_id, year_month) DO UPDATE
-			SET starts_on=EXCLUDED.starts_on, due_date=EXCLUDED.due_date, label=EXCLUDED.label,
-			    remind_days_before=EXCLUDED.remind_days_before, is_closed=EXCLUDED.is_closed`,
-			in.ID, in.TermID, in.YearMonth, in.StartsOn, in.DueDate, in.Label, in.RemindDaysBefore, in.IsClosed)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		_, err := s.pool.Exec(ctx, `
-			UPDATE submission_periods
-			SET year_month=$2, starts_on=$3::date, due_date=$4::date, label=$5,
-			    remind_days_before=$6, is_closed=$7
-			WHERE id=$1`,
-			in.ID, in.YearMonth, in.StartsOn, in.DueDate, in.Label, in.RemindDaysBefore, in.IsClosed)
-		if err != nil {
-			return nil, err
-		}
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.upsert",
-		Entity: "submission_period", EntityID: in.ID.String(), After: in})
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "submission_period.upsert",
+			Entity: "submission_period", EntityID: in.ID.String(), After: in},
+		func(tx pgx.Tx) error {
+			if isNew {
+				_, err := tx.Exec(ctx, `
+					INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label, remind_days_before, is_closed)
+					VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8)
+					ON CONFLICT (term_id, year_month) DO UPDATE
+					SET starts_on=EXCLUDED.starts_on, due_date=EXCLUDED.due_date, label=EXCLUDED.label,
+					    remind_days_before=EXCLUDED.remind_days_before, is_closed=EXCLUDED.is_closed`,
+					in.ID, in.TermID, in.YearMonth, in.StartsOn, in.DueDate, in.Label, in.RemindDaysBefore, in.IsClosed)
+				return err
+			}
+			_, err := tx.Exec(ctx, `
+				UPDATE submission_periods
+				SET year_month=$2, starts_on=$3::date, due_date=$4::date, label=$5,
+				    remind_days_before=$6, is_closed=$7
+				WHERE id=$1`,
+				in.ID, in.YearMonth, in.StartsOn, in.DueDate, in.Label, in.RemindDaysBefore, in.IsClosed)
+			return err
+		}); err != nil {
+		return nil, err
+	}
 	return &in, nil
 }
 
@@ -210,12 +226,13 @@ func (s *SubmissionPeriodService) Delete(ctx context.Context, actor, id uuid.UUI
 	if lockedCount > 0 {
 		return Conflict("ลบงวดนี้ไม่ได้ — มีเดือนที่ส่งออกไฟล์หรือส่งการเงินไปแล้ว กรุณาตีกลับหรือให้ผู้ดูแลระบบปลดล็อกก่อน")
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM submission_periods WHERE id=$1`, id); err != nil {
-		return err
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.delete",
-		Entity: "submission_period", EntityID: id.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "submission_period.delete",
+			Entity: "submission_period", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `DELETE FROM submission_periods WHERE id=$1`, id)
+			return err
+		})
 }
 
 // validYearMonth reports whether ym is exactly "<acadYear>-MM" with MM in 01..12.
@@ -269,6 +286,14 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 	}
 
 	out := []SubmissionPeriod{}
+	// One transaction for the whole batch: a half-created set of periods with no
+	// record of the run is worse than none, and the audit row reports a COUNT
+	// that only means something if every insert it counts actually landed.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
 	for _, t := range templates {
 		// year_month is the SUBMISSION month (Buddhist); due_date uses the same
 		// Buddhist year but is a Gregorian DATE — Postgres will interpret e.g.
@@ -302,7 +327,7 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 			ID: uuid.New(), TermID: termID, YearMonth: ym,
 			StartsOn: starts, DueDate: due, Label: label, RemindDaysBefore: 3, IsClosed: false,
 		}
-		_, err := s.pool.Exec(ctx, `
+		_, err := tx.Exec(ctx, `
 			INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label, remind_days_before, is_closed)
 			VALUES ($1,$2,$3,$4::date,$5::date,$6,$7,$8)
 			ON CONFLICT (term_id, year_month) DO NOTHING`,
@@ -312,8 +337,13 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 		}
 		out = append(out, p)
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.bulk_create",
-		Entity: "term", EntityID: termID.String(), After: map[string]int{"count": len(out)}})
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.bulk_create",
+		Entity: "term", EntityID: termID.String(), After: map[string]int{"count": len(out)}}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -342,6 +372,24 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
 		           AND wl2.status IN ('draft','submitted','rejected')),
+		       (SELECT COUNT(*) FROM work_logs wl2
+		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
+		          JOIN sections s2 ON s2.id = a2.section_id
+		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
+		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND wl2.status IN ('draft','rejected')),
+		       (SELECT COUNT(*) FROM work_logs wl2
+		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
+		          JOIN sections s2 ON s2.id = a2.section_id
+		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
+		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND wl2.status = 'submitted'),
+		       (SELECT COUNT(*) FROM work_logs wl2
+		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
+		          JOIN sections s2 ON s2.id = a2.section_id
+		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
+		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND wl2.status = 'rejected'),
 		       COALESCE((SELECT SUM(wl2.hours) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
@@ -370,7 +418,9 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		if err := rows.Scan(&s.PeriodID, &s.Label, &s.YearMonth, &s.StartsOn, &s.DueDate, &s.IsClosed,
 			&s.TeachingCourseID, &s.CourseCode, &s.CourseNameTH,
 			&s.Status,
-			&s.WorklogTotal, &s.WorklogUnapproved, &s.WorklogApprovedHrs); err != nil {
+			&s.WorklogTotal, &s.WorklogUnapproved,
+			&s.WorklogWaitingTA, &s.WorklogWaitingLecturer, &s.WorklogRejected,
+			&s.WorklogApprovedHrs); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -485,7 +535,15 @@ func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taI
 // of (TA × month) cells newly locked.
 func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor, tcID uuid.UUID) (int, error) {
 	name := s.userDisplayName(ctx, actor)
-	rows, err := s.pool.Query(ctx, `
+	// This is the freeze point for a course's payout numbers, so the lock rows
+	// and the record of the lock go in together.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
 		INSERT INTO submission_period_status
 		    (id, submission_period_id, ta_id, teaching_course_id, status,
 		     exported_at, exported_by, exported_name)
@@ -544,9 +602,17 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		return 0, err
 	}
 	if len(cells) > 0 {
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.exported",
+		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.exported",
 			Entity: "teaching_course", EntityID: tcID.String(),
-			After: map[string]int{"locked_cells": len(cells)}})
+			After: map[string]int{"locked_cells": len(cells)}}); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	if len(cells) > 0 {
+		// After the commit: notifications reach TAs and cannot be recalled.
 		if s.notify != nil {
 			for _, c := range cells {
 				s.notify.Send(ctx, c.taID,
@@ -576,24 +642,30 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 		return err
 	}
 	name := s.userDisplayName(ctx, actor)
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE submission_period_status
-		SET status            = 'finance_sent',
-		    finance_sent_at   = now(),
-		    finance_sent_by   = $4,
-		    finance_sent_name = $5,
-		    finance_note      = NULLIF($6,'')
-		WHERE submission_period_id = $1 AND ta_id = $2 AND teaching_course_id = $3
-		  AND status IN ('exported','finance_sent')`,
-		periodID, taID, tcID, actor, name, note)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "submission_period.finance_sent",
+			Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE submission_period_status
+				SET status            = 'finance_sent',
+				    finance_sent_at   = now(),
+				    finance_sent_by   = $4,
+				    finance_sent_name = $5,
+				    finance_note      = NULLIF($6,'')
+				WHERE submission_period_id = $1 AND ta_id = $2 AND teaching_course_id = $3
+				  AND status IN ('exported','finance_sent')`,
+				periodID, taID, tcID, actor, name, note)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ยังไม่พร้อมส่งการเงิน — ต้องส่งออกไฟล์เบิกจ่ายของเดือนนี้ก่อน")
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("ยังไม่พร้อมส่งการเงิน — ต้องส่งออกไฟล์เบิกจ่ายของเดือนนี้ก่อน")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.finance_sent",
-		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String()})
 	if s.notify != nil {
 		s.notify.Send(ctx, taID,
 			"ส่งเบิกจ่ายไปยังการเงินแล้ว",
@@ -696,12 +768,14 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 		periodID, taID, tcID, toStatus, actor, name, reason); err != nil {
 		return err
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.sent_back",
+		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
+		Note: reason, After: map[string]string{"from": cur, "to": toStatus}}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.sent_back",
-		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-		Note: reason, After: map[string]string{"from": cur, "to": toStatus}})
 	if s.notify != nil {
 		body := "บันทึกเวลาประจำเดือนของคุณถูกตีกลับให้แก้ไข: " + reason
 		s.notify.Send(ctx, taID, "บันทึกเวลาประจำเดือนถูกตีกลับ", body, "/ta/reminders")
@@ -711,7 +785,7 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 				if lid != actor {
 					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกตีกลับ",
 						"เจ้าหน้าที่ตีกลับบันทึกเวลาประจำเดือนของ TA ในรายวิชาของคุณ: "+reason,
-						"/lecturer/approvals")
+						"/lecturer/courses/"+tcID.String()+"/reports")
 				}
 			}
 		}
@@ -739,29 +813,35 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 		return err
 	}
 	name := s.userDisplayName(ctx, actor)
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE submission_period_status SET
-		  status            = 'exported',
-		  finance_sent_at   = NULL,
-		  finance_sent_by   = NULL,
-		  finance_sent_name = NULL,
-		  finance_note      = NULL,
-		  sent_back_at      = now(),
-		  sent_back_by      = $4,
-		  sent_back_name    = $5,
-		  sent_back_reason  = $6
-		WHERE submission_period_id=$1 AND ta_id=$2 AND teaching_course_id=$3
-		  AND status = 'finance_sent'`,
-		periodID, taID, tcID, actor, name, reason)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "submission_period.finance_revert",
+			Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
+			Note: reason},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE submission_period_status SET
+				  status            = 'exported',
+				  finance_sent_at   = NULL,
+				  finance_sent_by   = NULL,
+				  finance_sent_name = NULL,
+				  finance_note      = NULL,
+				  sent_back_at      = now(),
+				  sent_back_by      = $4,
+				  sent_back_name    = $5,
+				  sent_back_reason  = $6
+				WHERE submission_period_id=$1 AND ta_id=$2 AND teaching_course_id=$3
+				  AND status = 'finance_sent'`,
+				periodID, taID, tcID, actor, name, reason)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("รายการนี้ยังไม่อยู่ในสถานะส่งการเงิน")
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("รายการนี้ยังไม่อยู่ในสถานะส่งการเงิน")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "submission_period.finance_revert",
-		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-		Note: reason})
 	if s.notify != nil {
 		s.notify.Send(ctx, taID, "ปลดล็อกสถานะส่งการเงิน",
 			"ผู้ดูแลระบบปลดล็อกบันทึกเวลาประจำเดือนของคุณเพื่อแก้ไข: "+reason,
@@ -770,7 +850,7 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 			for _, lid := range lects {
 				s.notify.Send(ctx, lid, "ปลดล็อกสถานะส่งการเงิน",
 					"ผู้ดูแลระบบปลดล็อกบันทึกเวลาประจำเดือนของ TA ในรายวิชาของคุณ: "+reason,
-					"/lecturer/approvals")
+					"/lecturer/courses/"+tcID.String()+"/reports")
 			}
 		}
 	}

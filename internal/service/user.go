@@ -128,10 +128,12 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 			return nil, err
 		}
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: id.String(), After: in}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: id.String(), After: in})
 	u, err := s.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -226,7 +228,9 @@ func (s *UserService) SetAvatar(ctx context.Context, id uuid.UUID, key string) (
 		}
 		return "", "", err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.set", Entity: "user", EntityID: id.String()})
+	if err := s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.set", Entity: "user", EntityID: id.String()}); err != nil {
+		return "", "", err
+	}
 	if old != nil && *old != "" && *old != key {
 		replaced = *old
 	}
@@ -249,7 +253,9 @@ func (s *UserService) ClearAvatar(ctx context.Context, id uuid.UUID) (string, er
 		}
 		return "", err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.clear", Entity: "user", EntityID: id.String()})
+	if err := s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.clear", Entity: "user", EntityID: id.String()}); err != nil {
+		return "", err
+	}
 	if old == nil {
 		return "", nil
 	}
@@ -278,29 +284,90 @@ func (s *UserService) FindByEmail(ctx context.Context, email string) (*User, str
 	return u, *pwHash, nil
 }
 
-func (s *UserService) List(ctx context.Context, role, search string, limit, offset int) ([]User, int, error) {
-	if limit <= 0 || limit > 200 {
+// maxUserPage caps one page of List. The screen pages at 15; this ceiling only
+// bounds what a hand-written request can ask for.
+const maxUserPage = 500
+
+// UserListFilter is every knob the users screen can turn. It is a struct rather
+// than more positional arguments because role/search/status/sort are all
+// optional strings — as parameters they were trivially swappable at the call
+// site with nothing to catch it.
+//
+// Status and Sort belong HERE, on the server, not in the browser. The screen
+// pages at 15 rows; filtering or sorting a page after the fact would drop rows
+// out of a page that still claimed to hold 15, and would sort only within the
+// page — the first page of a name sort would not be the first 15 names.
+type UserListFilter struct {
+	Role   string // "" = any role
+	Search string // matches email, first/last name, or student id
+	Status string // "", "active", "inactive"
+	Sort   string // "name" (default) or "email"
+	Desc   bool
+	Limit  int
+	Offset int
+}
+
+// orderBy maps the sort key to SQL. It is a whitelist, never interpolation of
+// caller input: the ORDER BY clause cannot be parameterized, so an unknown key
+// must fall back to the default rather than reach the query.
+func (f UserListFilter) orderBy() string {
+	dir := "ASC"
+	if f.Desc {
+		dir = "DESC"
+	}
+	switch f.Sort {
+	case "email":
+		return "u.email " + dir
+	default:
+		return "u.first_name " + dir + ", u.last_name " + dir
+	}
+}
+
+func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, error) {
+	limit, offset := f.Limit, f.Offset
+	// An over-large limit clamps to the ceiling; it must NOT fall back to the
+	// default. It used to do both in one condition, so asking for 500 returned
+	// the SMALLEST page — the users screen requested 500, got 50, and printed an
+	// honest total of 51 above a list missing its last row. The one account that
+	// sorts last was invisible, and the count above it said otherwise.
+	if limit <= 0 {
 		limit = 50
+	}
+	if limit > maxUserPage {
+		limit = maxUserPage
+	}
+	if offset < 0 {
+		offset = 0
 	}
 	where := "u.deleted_at IS NULL"
 	args := []any{}
 	i := 1
-	if role != "" {
+	if f.Role != "" {
 		where += " AND EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id=u.id AND ur.role=$" + itoa(i) + "::role_code)"
-		args = append(args, role)
+		args = append(args, f.Role)
 		i++
 	}
-	if search != "" {
+	if f.Search != "" {
 		where += " AND (u.email ILIKE $" + itoa(i) + " OR u.first_name ILIKE $" + itoa(i) + " OR u.last_name ILIKE $" + itoa(i) + " OR COALESCE(u.student_id,'') ILIKE $" + itoa(i) + ")"
-		args = append(args, "%"+search+"%")
+		args = append(args, "%"+f.Search+"%")
 		i++
+	}
+	switch f.Status {
+	case "active":
+		where += " AND u.is_active"
+	case "inactive":
+		where += " AND NOT u.is_active"
 	}
 	var total int
 	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM users u WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+	// u.id closes the ordering. Two people can share a name, and LIMIT/OFFSET
+	// over a non-unique sort key lets Postgres return tied rows in a different
+	// order per query — the same person could appear on two pages while someone
+	// else appeared on none.
 	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.avatar_key, u.avatar_updated_at
-	      FROM users u WHERE ` + where + ` ORDER BY u.first_name, u.last_name
+	      FROM users u WHERE ` + where + ` ORDER BY ` + f.orderBy() + `, u.id
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)
 	rows, err := s.pool.Query(ctx, q, args...)
@@ -501,10 +568,12 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 	// 0047. Rejecting them would break older clients for no benefit; silently
 	// dropping them is what "never stored" means here.
 
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.update", Entity: "user", EntityID: id.String(), After: in}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.update", Entity: "user", EntityID: id.String(), After: in})
 	return s.Get(ctx, id)
 }
 
@@ -512,25 +581,29 @@ func (s *UserService) Deactivate(ctx context.Context, actor, id uuid.UUID) error
 	if actor == id {
 		return Invalid("ไม่สามารถปิดใช้งานบัญชีของตนเองได้")
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE users SET is_active = FALSE, updated_at=NOW() WHERE id=$1`, id)
-	if err == nil {
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.deactivate", Entity: "user", EntityID: id.String()})
-	}
-	return err
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "user.deactivate", Entity: "user", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE users SET is_active = FALSE, updated_at=NOW() WHERE id=$1`, id)
+			return err
+		})
 }
 
 // Activate re-enables a previously deactivated account.
 func (s *UserService) Activate(ctx context.Context, actor, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE users SET is_active = TRUE, updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.activate", Entity: "user", EntityID: id.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "user.activate", Entity: "user", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`UPDATE users SET is_active = TRUE, updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`, id)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		})
 }
 
 // GetEmail returns the current email for a user (used for deactivation confirmation).
@@ -560,12 +633,15 @@ func (s *UserService) ResetPassword(ctx context.Context, actor, id uuid.UUID) (s
 	if err != nil {
 		return "", err
 	}
-	_, err = s.pool.Exec(ctx,
-		`UPDATE users SET password_hash=$1, must_change_password=TRUE, updated_at=NOW() WHERE id=$2`, h, id)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "user.reset_password", Entity: "user", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`UPDATE users SET password_hash=$1, must_change_password=TRUE, updated_at=NOW() WHERE id=$2`, h, id)
+			return err
+		}); err != nil {
 		return "", err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.reset_password", Entity: "user", EntityID: id.String()})
 	return tempPw, nil
 }
 

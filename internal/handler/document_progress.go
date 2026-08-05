@@ -65,13 +65,22 @@ func (h *DocProgressHandler) ToggleSignature(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid tcId")
 	}
 	var body struct {
-		Role   string `json:"role"`
-		Signed bool   `json:"signed"`
+		Role     string  `json:"role"`
+		SignerID *string `json:"signer_id"`
+		Signed   bool    `json:"signed"`
 	}
 	if err := c.BodyParser(&body); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	if err := h.Svc.DocProgress.ToggleSignature(c.Context(), UserID(c), tcID, body.Role, body.Signed); err != nil {
+	var signerID *uuid.UUID
+	if body.SignerID != nil && *body.SignerID != "" {
+		id, perr := uuid.Parse(*body.SignerID)
+		if perr != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid signer_id")
+		}
+		signerID = &id
+	}
+	if err := h.Svc.DocProgress.ToggleSignature(c.Context(), UserID(c), tcID, body.Role, signerID, body.Signed); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})

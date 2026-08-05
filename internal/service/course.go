@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
@@ -156,7 +157,10 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 	if in.UGSpecialMonthlyCap == 0 {
 		in.UGSpecialMonthlyCap = 2000
 	}
-	_, err := s.pool.Exec(ctx, `
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "pay_rate.create", Entity: "pay_rate", EntityID: in.ID.String(), After: in},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
 		INSERT INTO pay_rates (id, effective_from, undergrad_regular, undergrad_special,
 		    graduate_regular, graduate_special_lumpsum,
 		    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
@@ -167,19 +171,19 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		    ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
 		    ug_special_monthly_cap, note)
 		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
-		in.ID, in.EffectiveFrom, in.UndergradRegular, in.UndergradSpecial,
-		in.GraduateRegular, in.GraduateSpecialLumpsum,
-		in.UGLectureHoursPerCredit, in.UGLabHoursPerCredit,
-		in.BaselineStudentsLecture, in.BaselineStudentsLab,
-		in.UGWorkloadRateRegular, in.TermMonths,
-		in.UGMaxHoursPerDay, in.MaxCoursesPerStudent,
-		in.GraduateRegularHourly, in.GradSpecialTermCap, in.DailyPayCapBaht,
-		in.UGRegularDailyHourCap, in.UGSpecialDailyHourCap, in.GradRegularDailyHourCap,
-		in.UGSpecialMonthlyCap, in.Note)
-	if err != nil {
+				in.ID, in.EffectiveFrom, in.UndergradRegular, in.UndergradSpecial,
+				in.GraduateRegular, in.GraduateSpecialLumpsum,
+				in.UGLectureHoursPerCredit, in.UGLabHoursPerCredit,
+				in.BaselineStudentsLecture, in.BaselineStudentsLab,
+				in.UGWorkloadRateRegular, in.TermMonths,
+				in.UGMaxHoursPerDay, in.MaxCoursesPerStudent,
+				in.GraduateRegularHourly, in.GradSpecialTermCap, in.DailyPayCapBaht,
+				in.UGRegularDailyHourCap, in.UGSpecialDailyHourCap, in.GradRegularDailyHourCap,
+				in.UGSpecialMonthlyCap, in.Note)
+			return err
+		}); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "pay_rate.create", Entity: "pay_rate", EntityID: in.ID.String(), After: in})
 	return &in, nil
 }
 
@@ -206,12 +210,15 @@ func (s *CourseService) UpsertBudgetCap(ctx context.Context, actor uuid.UUID, in
 		return nil, Invalid("จำนวนเงินต้องไม่ติดลบ")
 	}
 	in.ID = uuid.New()
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO budget_caps (id, effective_from, per_course_max, note) VALUES ($1,$2::date,$3,$4)`,
-		in.ID, in.EffectiveFrom, in.PerCourseMax, in.Note)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "budget_cap.create", Entity: "budget_cap", EntityID: in.ID.String(), After: in},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO budget_caps (id, effective_from, per_course_max, note) VALUES ($1,$2::date,$3,$4)`,
+				in.ID, in.EffectiveFrom, in.PerCourseMax, in.Note)
+			return err
+		}); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "budget_cap.create", Entity: "budget_cap", EntityID: in.ID.String(), After: in})
 	return &in, nil
 }

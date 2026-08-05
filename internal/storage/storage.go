@@ -36,6 +36,7 @@ type Local struct {
 // ParseKeyFromBase64 decodes a 32-byte AES-256 key. Accepts either
 //   - 64 hex characters (openssl rand -hex 32), or
 //   - base64 (standard or URL-safe) that decodes to 32 bytes.
+//
 // Named "…FromBase64" for backward compatibility with the wiring in main.
 func ParseKeyFromBase64(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)

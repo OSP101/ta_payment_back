@@ -29,9 +29,16 @@ type BudgetSnapshot struct {
 	NumStudentsRegular int       `json:"num_students_regular"`
 	NumStudentsSpecial int       `json:"num_students_special"`
 	Credits            int       `json:"credits"`
-	LectureCredits     int       `json:"lecture_credits"`
-	LabCredits         int       `json:"lab_credits"`
-	PerCourseMaxBaht   float64   `json:"per_course_max"` // from budget_caps
+	// LectureHrs / LabHrs are the weekly CONTACT HOURS from the registrar's
+	// "3 (2-2-5)" — what teaching_courses actually stores. LectureCredits /
+	// LabCredits are the CREDITS the budget formula wants, derived below. The
+	// two were treated as the same number until 04/08/2026, which inflated the
+	// ceiling of every course that has a lab.
+	LectureHrs       int     `json:"lecture_hrs"`
+	LabHrs           int     `json:"lab_hrs"`
+	LectureCredits   int     `json:"lecture_credits"`
+	LabCredits       int     `json:"lab_credits"`
+	PerCourseMaxBaht float64 `json:"per_course_max"` // from budget_caps
 	// Aggregate (regular + special)
 	WeeklyWorkload float64 `json:"weekly_workload_hours"`
 	MonthlyPay     float64 `json:"monthly_pay_baht"`
@@ -74,10 +81,23 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 		       tc.credits, tc.lecture_hrs, tc.lab_hrs
 		FROM teaching_courses tc
 		WHERE tc.id = $1`, tcID).Scan(&snap.NumStudents, &snap.NumStudentsRegular, &snap.NumStudentsSpecial,
-		&snap.Credits, &snap.LectureCredits, &snap.LabCredits)
+		&snap.Credits, &snap.LectureHrs, &snap.LabHrs)
 	if err != nil {
 		return nil, err
 	}
+	// Contact hours → credits, exactly as the faculty workbook derives them from
+	// the course code (ชีต "2_59 ป.ตรี", cells D21/E21):
+	//
+	//	D21 = ROUNDDOWN((C-…)/100, 0)                → นก.บรรยาย = ชม.บรรยาย
+	//	E21 = ROUNDDOWN(MOD(…,10) × 0.5, 0)          → นก.แล็บ  = ⌊ชม.แล็บ ÷ 2⌋
+	//
+	// One lecture hour a week is one credit; a lab credit is two hours. Feeding
+	// lab HOURS in where the formula wants lab CREDITS doubled the lab term and
+	// put SC362102's regular ceiling at 14,400 instead of the 9,000 the faculty
+	// budgeted (30 นศ. × 300). Both of the college's own files — Ngamnij.xlsx
+	// for 2569 and the 2560 workbook — reproduce exactly once this is right.
+	snap.LectureCredits = snap.LectureHrs
+	snap.LabCredits = snap.LabHrs / 2
 	// If regular/special not filled yet, treat aggregate num_students as regular
 	// so budget stays computable during migration.
 	if snap.NumStudentsRegular == 0 && snap.NumStudentsSpecial == 0 && snap.NumStudents > 0 {

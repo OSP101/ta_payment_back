@@ -22,7 +22,8 @@ import (
 //
 //	own classes  → ta_class_schedules   (TA fills these in "ตารางเรียนของฉัน")
 //	TA duties    → section_schedules of the sections they are assigned
-//	grading      → ta_review_schedules  (the TA's own weekly grading slot)
+//	grading      → ta_review_schedules kind='review'      (own grading slot)
+//	other work   → ta_review_schedules kind='other_*'     (own other-work slot)
 //	ปกติ/พิเศษ    → sections.track
 //	signatures   → the lecturer who SUBMITTED each request (ta_requests.lecturer_id)
 
@@ -30,7 +31,7 @@ import (
 type TimetableBlock struct {
 	// Kind drives the colour and the label:
 	//   own_class → the TA's own lecture/lab as a student
-	//   lecture / lab / review → their duty on a course they assist
+	//   lecture / lab / review / other → their duty on a course they assist
 	Kind       string `json:"kind"`
 	CourseCode string `json:"course_code"`
 	CourseName string `json:"course_name,omitempty"`
@@ -153,10 +154,12 @@ func (s *TeachingService) BuildTimetableForm(
 		out.Blocks = append(out.Blocks, b)
 	}
 
-	// Grading slots the TA set for themselves. They belong to an assignment, so
-	// they carry the course they grade for.
+	// Duty slots the TA set for themselves — grading and other work. They
+	// belong to an assignment, so they carry the course they are for. The kind
+	// has to come along: drawing an "อื่น ๆ" slot as ตรวจงาน would put the wrong
+	// label on the signed form.
 	revRows, err := s.pool.Query(ctx, `
-		SELECT tc.code, tc.name_th, sec.sec_no, sec.track::text,
+		SELECT tc.code, tc.name_th, sec.sec_no, sec.track::text, rs.kind,
 		       rs.day_of_week, rs.start_time::text, rs.end_time::text, rs.room
 		  FROM ta_review_schedules rs
 		  JOIN ta_request_assignments a ON a.id = rs.assignment_id
@@ -170,10 +173,18 @@ func (s *TeachingService) BuildTimetableForm(
 	}
 	defer revRows.Close()
 	for revRows.Next() {
-		b := TimetableBlock{Kind: "review"}
-		if err := revRows.Scan(&b.CourseCode, &b.CourseName, &b.SecNo, &b.Track,
+		var b TimetableBlock
+		var dutyKind string
+		if err := revRows.Scan(&b.CourseCode, &b.CourseName, &b.SecNo, &b.Track, &dutyKind,
 			&b.DayOfWeek, &b.StartTime, &b.EndTime, &b.Room); err != nil {
 			return nil, err
+		}
+		// The grid distinguishes grading from other work; both lecture-side and
+		// lab-side other-work draw the same, since the grid has no column for
+		// which session they hang off.
+		b.Kind = "other"
+		if dutyKind == DutyReview {
+			b.Kind = "review"
 		}
 		out.Blocks = append(out.Blocks, b)
 	}

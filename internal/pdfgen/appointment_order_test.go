@@ -89,3 +89,29 @@ func TestBuildAppointmentOrderPDF_MissingFonts(t *testing.T) {
 		t.Errorf("expected error when FontDir is missing")
 	}
 }
+
+// The acting-signer form adds a line to the signature block. The PDF is binary,
+// so this cannot read the text back — but a renderer that dropped the line (or
+// drew it on top of the one above without advancing y) would produce a file the
+// same size as the plain form.
+func TestBuildAppointmentOrderPDF_ActingSignerAddsALine(t *testing.T) {
+	fonts := filepath.FromSlash("../../assets/fonts")
+	if _, err := os.Stat(filepath.Join(fonts, "Sarabun-Regular.ttf")); err != nil {
+		t.Skipf("fonts missing")
+	}
+	plain, err := BuildAppointmentOrderPDF(AppointmentOrderInput{FontDir: fonts, Data: sampleOrder()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := sampleOrder()
+	d.SignerTitle = "รองคณบดีฝ่ายวิชาการ รักษาการแทน"
+	d.SignerActingFor = "คณบดีวิทยาลัยการคอมพิวเตอร์"
+	acting, err := BuildAppointmentOrderPDF(AppointmentOrderInput{FontDir: fonts, Data: d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acting) <= len(plain) {
+		t.Errorf("acting form is %d bytes vs plain %d — the extra authority line "+
+			"does not appear to have been drawn", len(acting), len(plain))
+	}
+}

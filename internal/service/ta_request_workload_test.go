@@ -50,10 +50,13 @@ func (rf *requestFixture) inputFor(per []SectionWorkload, level string) CreateTA
 }
 
 // ---------------------------------------------------------------------------
-// The per-section ceiling comes from the credit notation
+// The per-section ceiling comes from the TIMETABLE
 // ---------------------------------------------------------------------------
 
-// The fixture course is 3 credits with lecture_hrs=3 and lab_hrs=3.
+// It used to come from the credit notation (lecture_hrs / lab_hrs). Those do not
+// track reality — a course with 1 credit-hour of lab can meet for 3 real hours —
+// so the ceiling now sums the section's own weekly sessions. The fixture section
+// meets 3h for lecture and 3h for lab, which is why these figures are unchanged.
 func TestWorkload_SectionCapFromContactHours(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{})
 
@@ -66,8 +69,8 @@ func TestWorkload_SectionCapFromContactHours(t *testing.T) {
 	if err == nil {
 		t.Fatal("hours above the course's weekly lecture hours must be refused")
 	}
-	if !strings.Contains(err.Error(), "เกินชั่วโมงของวิชาต่อสัปดาห์") {
-		t.Errorf("message should point at the contact-hour ceiling, got: %v", err)
+	if !strings.Contains(err.Error(), "เกินชั่วโมงสอนจริงของกลุ่มนี้") {
+		t.Errorf("message should point at the section's real teaching hours, got: %v", err)
 	}
 }
 

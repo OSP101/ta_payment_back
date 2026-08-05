@@ -78,9 +78,9 @@ type CreditorData struct {
 
 // CreditorInput controls a single render.
 type CreditorInput struct {
-	TemplatePath string       // path to the blank PDF (single page, A4)
-	FontDir      string       // directory containing Sarabun-Regular.ttf / Sarabun-Bold.ttf
-	Debug        bool         // draw a coordinate grid for calibration
+	TemplatePath string // path to the blank PDF (single page, A4)
+	FontDir      string // directory containing Sarabun-Regular.ttf / Sarabun-Bold.ttf
+	Debug        bool   // draw a coordinate grid for calibration
 	Data         CreditorData
 }
 
@@ -143,18 +143,19 @@ type coords struct {
 // no such offset — draw them at their target visible Y directly.
 //
 // Row baselines in the template (all visible Y from top):
-//   ชื่อ-สกุล          =  95.9
-//   ประเภท              = 120.4
-//   ลักษณะการแจ้ง       = 145.0
-//   NID label (2 lines) = 174.7 / 193.4  →  digit boxes centred ~184
-//   โทรศัพท์ / E-Mail    = 217.9
-//   ข้อมูลธนาคาร (header)= 242.4
-//   ชื่อบัญชี            = 263.8
-//   ชื่อธนาคาร           = 306.6
-//   รหัสสาขา / ชื่อสาขา   = 330.6
-//   เลขที่บัญชี         = 360.6
-//   ลงชื่อ               = 417.9
-//   วันที่               = 479.1
+//
+//	ชื่อ-สกุล          =  95.9
+//	ประเภท              = 120.4
+//	ลักษณะการแจ้ง       = 145.0
+//	NID label (2 lines) = 174.7 / 193.4  →  digit boxes centred ~184
+//	โทรศัพท์ / E-Mail    = 217.9
+//	ข้อมูลธนาคาร (header)= 242.4
+//	ชื่อบัญชี            = 263.8
+//	ชื่อธนาคาร           = 306.6
+//	รหัสสาขา / ชื่อสาขา   = 330.6
+//	เลขที่บัญชี         = 360.6
+//	ลงชื่อ               = 417.9
+//	วันที่               = 479.1
 var c = coords{
 	// Prefix circles live inside "(นาย/นาง/นางสาว)" on the ชื่อ-สกุล row.
 	// Row baseline is 95.9; the glyphs' vertical centre sits ~4 pt above it.
@@ -181,9 +182,9 @@ var c = coords{
 
 	// Bank block.
 	accountNameX: 210, accountNameY: 252, // baseline 263.8
-	bankNameX:    175, bankNameY:    295, // 306.6
-	branchCodeX:  175, branchCodeY:  319, // 330.6 (same row as ชื่อสาขา)
-	branchX:      320, branchY:      319,
+	bankNameX: 175, bankNameY: 295, // 306.6
+	branchCodeX: 175, branchCodeY: 319, // 330.6 (same row as ชื่อสาขา)
+	branchX: 320, branchY: 319,
 	// Account digits go into the same 13-cell box grid as the NID row
 	// (identical X layout on the template); Y targets the boxes at
 	// visible 341.7..375.5 (centre 358.6, digit baseline ≈361).
@@ -196,7 +197,7 @@ var c = coords{
 	// Check-mark glyph spans (x, y-3) → (x+12, y+8) so x = box_center - 6,
 	// y = box_center_Y - 2 places it centred inside the ☐ frame.
 	kkuStudentX: 441, kkuStudentY: 115, // 3rd checkbox on ประเภท row
-	newDataX:    180, newDataY:    140, // 1st checkbox on ลักษณะการแจ้ง row
+	newDataX: 180, newDataY: 140, // 1st checkbox on ลักษณะการแจ้ง row
 
 	// Signature block (extracted): "ลงชื่อ" label at X=305.7 with its dotted
 	// line spanning X=329..455, baseline 441.9. The image sits on the dots.

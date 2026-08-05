@@ -145,12 +145,14 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		actor, userID, round); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_profile.approve_all", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"docs": ids, "round": round}}); err != nil {
 		return nil, err
 	}
 
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_profile.approve_all", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"docs": ids, "round": round}})
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 
 	token, err := s.mintZipToken(actor, userID, ids)
 	if err != nil {
@@ -262,12 +264,14 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 		WHERE user_id=$3 AND round=$4`, summary, actor, userID, round); err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_docs.reject_batch", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"batch_id": batchID, "items": items, "round": round}}); err != nil {
 		return err
 	}
 
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.reject_batch", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"batch_id": batchID, "items": items, "round": round}})
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -376,7 +380,7 @@ func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UU
 	for uid := range people {
 		included = append(included, uid.String())
 	}
-	s.aud.Log(ctx, audit.Entry{
+	if err := s.aud.Log(ctx, audit.Entry{
 		ActorID: &actor, Action: "ta_docs.download_all", Entity: "ta_profile",
 		After: map[string]any{
 			"ta_count":  len(people),
@@ -388,7 +392,9 @@ func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UU
 			// that says so.
 			"requested_count": len(userIDs),
 		},
-	})
+	}); err != nil {
+		return "", 0, err
+	}
 
 	// uuid.Nil for UserID marks the token as bulk: ConsumeZipToken's per-user
 	// binding does not apply, so DownloadAllZip must be the only route that
@@ -473,8 +479,10 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 	if used >= maxDocDownloads {
 		return "", quotaExceeded(used)
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.redownload_verify", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"doc_count": len(ids), "downloads_used": used}})
+	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.redownload_verify", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"doc_count": len(ids), "downloads_used": used}}); err != nil {
+		return "", err
+	}
 	return s.mintZipToken(actor, userID, ids)
 }
 
@@ -637,8 +645,10 @@ func (s *DocsService) ClaimZipDownload(ctx context.Context, actor, userID uuid.U
 	if err := s.recordDocDownload(ctx, actor, userID, round); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.download", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"round": round}})
+	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.download", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"round": round}}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -969,14 +979,23 @@ func (s *DocsService) sweepExpired(ctx context.Context) {
 				log.Printf("retention: delete %s failed: %v", p.key, err)
 				continue
 			}
-			if _, err := s.pool.Exec(ctx,
-				`UPDATE ta_documents SET file_deleted_at = NOW()
-				 WHERE id = $1 AND file_deleted_at IS NULL`, p.id); err != nil {
+			// The blob is already gone from storage, so the row must be marked and
+			// the expiry recorded together — a mark without a record leaves a
+			// document that looks retained and has no file behind it.
+			if err := writeAudited(ctx, s.pool, s.aud,
+				audit.Entry{Action: "ta_doc.expire", Entity: "ta_document",
+					EntityID: p.id.String(), Before: map[string]any{"storage_key": p.key}},
+				func(tx pgx.Tx) error {
+					_, err := tx.Exec(ctx,
+						`UPDATE ta_documents SET file_deleted_at = NOW()
+						 WHERE id = $1 AND file_deleted_at IS NULL`, p.id)
+					return err
+				}); err != nil {
+				// This is a background sweep with no caller to return to; the next
+				// pass retries the same document.
 				log.Printf("retention: mark deleted %s failed: %v", p.id, err)
 				continue
 			}
-			s.aud.Log(ctx, audit.Entry{Action: "ta_doc.expire", Entity: "ta_document",
-				EntityID: p.id.String(), Before: map[string]any{"storage_key": p.key}})
 		}
 		if len(batch) < retentionBatchLimit {
 			return

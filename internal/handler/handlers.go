@@ -21,17 +21,24 @@ import (
 type UserHandler struct{ Svc *service.Container }
 
 func (h *UserHandler) List(c *fiber.Ctx) error {
-	role := c.Query("role")
-	search := c.Query("q")
 	limit, _ := strconv.Atoi(c.Query("limit", "50"))
 	offset, _ := strconv.Atoi(c.Query("offset", "0"))
+	f := service.UserListFilter{
+		Role:   c.Query("role"),
+		Search: c.Query("q"),
+		Status: c.Query("status"),
+		Sort:   c.Query("sort"),
+		Desc:   c.Query("dir") == "desc",
+		Limit:  limit,
+		Offset: offset,
+	}
 	// Lecturers may only list TA accounts (used by the "request TA" flow)
 	if rbac.Has(Roles(c), rbac.RoleLecturer) && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
-		if role != rbac.RoleTA {
+		if f.Role != rbac.RoleTA {
 			return fiber.NewError(fiber.StatusForbidden, "lecturers may only list TA accounts")
 		}
 	}
-	users, total, err := h.Svc.Users.List(c.Context(), role, search, limit, offset)
+	users, total, err := h.Svc.Users.List(c.Context(), f)
 	if err != nil {
 		return err
 	}
@@ -1405,6 +1412,42 @@ func (h *WorkLogHandler) Approve(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// ApproveBatch — POST /worklog/approve-batch — approve several assignments in
+// ONE transaction. The lecturer's "อนุมัติทั้งคนนี้" covers a TA who helps with
+// several sections; looping over the single-assignment endpoint left them
+// half-approved whenever the second call was refused.
+func (h *WorkLogHandler) ApproveBatch(c *fiber.Ctx) error {
+	var body struct {
+		AssignmentIDs []string `json:"assignment_ids"`
+		YearMonth     string   `json:"year_month"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if len(body.AssignmentIDs) == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "assignment_ids required")
+	}
+	// A cap on the batch: this is one transaction holding an advisory lock per
+	// course, and an unbounded list would hold it for as long as the caller
+	// cared to make it.
+	if len(body.AssignmentIDs) > 100 {
+		return fiber.NewError(fiber.StatusBadRequest, "assignment_ids: มากเกินไป (สูงสุด 100)")
+	}
+	ids := make([]uuid.UUID, 0, len(body.AssignmentIDs))
+	for _, raw := range body.AssignmentIDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid assignment id: "+raw)
+		}
+		ids = append(ids, id)
+	}
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if err := h.Svc.WorkLog.ApproveMany(c.Context(), UserID(c), ids, body.YearMonth, privileged); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *WorkLogHandler) PendingReports(c *fiber.Ctx) error {
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
 	out, err := h.Svc.WorkLog.ListPending(c.Context(), UserID(c), privileged)
@@ -1958,6 +2001,17 @@ func (h *DashboardHandler) LecturerOverview(c *fiber.Ctx) error {
 type ExportHandler struct{ Svc *service.Container }
 
 func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
+	// HEAD must not reach the body below. Fiber's Get() registers HEAD on the
+	// same handler, and this handler is not a read: it locks every fully
+	// approved month, writes the PII access trail and records the batch. A
+	// link prefetcher, a monitoring probe or a scanner issuing HEAD would
+	// freeze a course's worklogs — irreversibly, since only an admin can
+	// unlock — while transferring no file at all. Verified live on 04/08/2026:
+	// a HEAD returned 200 and left a locked course and a history row behind.
+	if c.Method() == fiber.MethodHead {
+		return fiber.NewError(fiber.StatusMethodNotAllowed,
+			"ต้องใช้ GET — การดาวน์โหลดล็อกข้อมูล จึงไม่รองรับ HEAD")
+	}
 	raw := strings.TrimSuffix(c.Params("id"), ".zip")
 	id, err := uuid.Parse(raw)
 	if err != nil {
@@ -1983,8 +2037,14 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// are already locked above and staff can mark sections manually if needed.
 	_ = h.Svc.Teaching.MarkExported(c.Context(), id)
 	// The export contains national IDs + bank details — audit who pulled it and
-	// when (PII access trail, M5).
-	h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.course", Entity: "teaching_course", EntityID: id.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")})
+	// when (PII access trail, M5). This one must NOT be best-effort: the file is
+	// about to leave the server carrying personal data, and an access trail with
+	// a hole in it is the failure the trail exists to prevent. Refusing here
+	// costs staff a retry; letting it through costs a PII disclosure nobody can
+	// account for afterwards.
+	if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.course", Entity: "teaching_course", EntityID: id.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")}); err != nil {
+		return err
+	}
 
 	// Persist the batch so the dashboard can list history + budget snapshot.
 	// TotalBaht is the ACTUAL paid sum (Σ actual_paid after the pro-rata cap) so
@@ -2017,7 +2077,7 @@ func (h *ExportHandler) CoursesSummary(c *fiber.Ctx) error {
 		}
 		termID = id
 	}
-	out, err := h.Svc.ExportBatches.DashboardSummary(c.Context(), h.Svc.Budget, termID)
+	out, err := h.Svc.ExportBatches.DashboardSummary(c.Context(), h.Svc.Budget, h.Svc.Export, termID)
 	if err != nil {
 		return err
 	}
@@ -2032,6 +2092,22 @@ func (h *ExportHandler) CoursePreview(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	out, err := h.Svc.Export.CoursePreview(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// BudgetSettlement reports which months of a course the budget can pay for.
+// Readable by the course's lecturers and its TAs as well as staff — it decides
+// their own pay, and warning them is the whole point of computing it early.
+func (h *ExportHandler) BudgetSettlement(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Export.SettlementForViewer(
+		c.Context(), UserID(c), id, rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff))
 	if err != nil {
 		return err
 	}
@@ -2086,6 +2162,68 @@ func (h *ExportHandler) AppointmentOrder(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	body, name, err := h.Svc.Appointment.Build(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	c.Set(fiber.HeaderContentType, "application/zip")
+	c.Set(fiber.HeaderContentDisposition, contentDisposition("attachment", name))
+	return c.Send(body)
+}
+
+// Certifier reports who will sign the ผู้รับรอง block on this term's claim
+// forms — the explicit choice if one was made, otherwise the seat holder.
+func (h *ExportHandler) Certifier(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid term id")
+	}
+	out, err := h.Svc.Export.ResolveCertifier(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// SetCertifier records the choice. An empty officer_id clears it, returning the
+// term to following whoever holds the seat.
+func (h *ExportHandler) SetCertifier(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid term id")
+	}
+	var body struct {
+		OfficerID string `json:"officer_id"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	var officer *uuid.UUID
+	if strings.TrimSpace(body.OfficerID) != "" {
+		id, err := uuid.Parse(body.OfficerID)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid officer id")
+		}
+		officer = &id
+	}
+	if err := h.Svc.Export.SetCertifier(c.Context(), UserID(c), termID, officer); err != nil {
+		return err
+	}
+	out, err := h.Svc.Export.ResolveCertifier(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AppointmentReprint hands back a copy of an order already issued. It is a GET
+// because it changes nothing: no new round, no ledger row, no renumbering —
+// the same bytes the original download produced.
+func (h *ExportHandler) AppointmentReprint(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	body, name, err := h.Svc.Appointment.Reprint(c.Context(), UserID(c), id)
 	if err != nil {
 		return err
 	}

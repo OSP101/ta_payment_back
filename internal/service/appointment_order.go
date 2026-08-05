@@ -9,6 +9,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -52,12 +53,11 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		return nil, "", Invalid("ไม่พบภาคเรียนที่ระบุ")
 	}
 
-	// Load signer (must be active admin_officer).
-	var signerName, signerTitle string
-	if err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(academic_prefix,'') || full_name, title
-		FROM admin_officers WHERE id = $1`, in.SignerOfficerID).Scan(&signerName, &signerTitle); err != nil {
-		return nil, "", Invalid("ไม่พบข้อมูลผู้ลงนามในระบบ")
+	// Load signer, and work out whether they hold the dean's seat or are acting
+	// in it — the printed signature block differs (see signer_authority.go).
+	signer, err := loadSignerAuthority(ctx, s.pool, in.SignerOfficerID)
+	if err != nil {
+		return nil, "", err
 	}
 
 	// Roster: one line per distinct (TA × course), scoped to approved
@@ -194,9 +194,58 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		})
 	}
 
-	// Mirror the same hierarchy for the PDF renderer.
-	pdfLevels := make([]pdfgen.AppointmentLevel, 0, len(docxLevels))
-	for _, lv := range docxLevels {
+	// Dates arrive from the form as ISO (YYYY-MM-DD) and are formatted here into
+	// the Thai government style: order date with the era marker
+	// ("14 มกราคม พ.ศ. 2569"), effective date without ("24 พฤศจิกายน 2568"),
+	// matching the registrar template.
+	doc := docxgen.AppointmentOrderData{
+		OrderNo:         in.OrderNo,
+		AcademicYear:    academicYear,
+		SemesterLabel:   semLabel,
+		OrderDate:       thaiGovDate(in.OrderDate, true),
+		EffectiveDate:   thaiGovDate(in.EffectiveDate, false),
+		SignerName:      signer.Name,
+		SignerTitle:     signer.Title,
+		SignerActingFor: signer.ActingFor,
+		Levels:          docxLevels,
+	}
+
+	// Record the round BEFORE returning the bytes. If the ledger write fails
+	// we must not hand over a document, because an unrecorded order gets
+	// reprinted in the next round and the same TA is appointed twice on paper.
+	round, err := s.nextRoundNo(ctx, in.TermID)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := s.recordRound(ctx, actor, in, round, pairs, doc); err != nil {
+		return nil, "", err
+	}
+
+	zipBytes, name, err := s.renderBundle(doc, round)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if err := s.aud.Log(ctx, audit.Entry{
+		ActorID: &actor, Action: "appointment_order.build",
+		Entity: "academic_term", EntityID: in.TermID.String(),
+		After: map[string]any{"order_no": in.OrderNo, "count": len(list)},
+	}); err != nil {
+		return nil, "", err
+	}
+	return zipBytes, name, nil
+}
+
+// renderBundle turns one composed order into the PDF+DOCX zip.
+//
+// Split out of Build so a reprint can reach it with a document loaded from the
+// ledger instead of one just assembled from live tables — that is the whole
+// mechanism by which a re-issue is a COPY rather than a fresh document. It
+// touches no database: everything it needs is in `d`.
+func (s *AppointmentOrderService) renderBundle(d docxgen.AppointmentOrderData, round int) ([]byte, string, error) {
+	// Mirror the hierarchy for the PDF renderer.
+	pdfLevels := make([]pdfgen.AppointmentLevel, 0, len(d.Levels))
+	for _, lv := range d.Levels {
 		pl := pdfgen.AppointmentLevel{Heading: lv.Heading}
 		for _, c := range lv.Courses {
 			pc := pdfgen.AppointmentCourse{Code: c.Code, Name: c.Name, CreditText: c.CreditText}
@@ -210,25 +259,18 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		pdfLevels = append(pdfLevels, pl)
 	}
 
-	// Dates arrive from the form as ISO (YYYY-MM-DD) and are formatted here into
-	// the Thai government style: order date with the era marker
-	// ("14 มกราคม พ.ศ. 2569"), effective date without ("24 พฤศจิกายน 2568"),
-	// matching the registrar template.
-	orderDate := thaiGovDate(in.OrderDate, true)
-	effectiveDate := thaiGovDate(in.EffectiveDate, false)
-
-	// Render both formats.
 	pdfBytes, err := pdfgen.BuildAppointmentOrderPDF(pdfgen.AppointmentOrderInput{
 		FontDir: s.fontDir,
 		Data: pdfgen.AppointmentOrderData{
-			OrderNo:       in.OrderNo,
-			AcademicYear:  academicYear,
-			SemesterLabel: semLabel,
-			OrderDate:     orderDate,
-			EffectiveDate: effectiveDate,
-			SignerName:    signerName,
-			SignerTitle:   signerTitle,
-			Levels:        pdfLevels,
+			OrderNo:         d.OrderNo,
+			AcademicYear:    d.AcademicYear,
+			SemesterLabel:   d.SemesterLabel,
+			OrderDate:       d.OrderDate,
+			EffectiveDate:   d.EffectiveDate,
+			SignerName:      d.SignerName,
+			SignerTitle:     d.SignerTitle,
+			SignerActingFor: d.SignerActingFor,
+			Levels:          pdfLevels,
 		},
 	})
 	if err != nil {
@@ -236,28 +278,8 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		pdfBytes = nil
 	}
 
-	docxBytes, err := docxgen.BuildAppointmentOrderDOCX(docxgen.AppointmentOrderData{
-		OrderNo:       in.OrderNo,
-		AcademicYear:  academicYear,
-		SemesterLabel: semLabel,
-		OrderDate:     orderDate,
-		EffectiveDate: effectiveDate,
-		SignerName:    signerName,
-		SignerTitle:   signerTitle,
-		Levels:        docxLevels,
-	})
+	docxBytes, err := docxgen.BuildAppointmentOrderDOCX(d)
 	if err != nil {
-		return nil, "", err
-	}
-
-	// Record the round BEFORE returning the bytes. If the ledger write fails
-	// we must not hand over a document, because an unrecorded order gets
-	// reprinted in the next round and the same TA is appointed twice on paper.
-	round, err := s.nextRoundNo(ctx, in.TermID)
-	if err != nil {
-		return nil, "", err
-	}
-	if err := s.recordRound(ctx, actor, in, round, pairs); err != nil {
 		return nil, "", err
 	}
 
@@ -265,7 +287,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	// inside the archive.
 	buf := &bytes.Buffer{}
 	zw := zip.NewWriter(buf)
-	safeOrderNo := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(in.OrderNo)
+	safeOrderNo := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(d.OrderNo)
 	base := fmt.Sprintf("appointment-order-%s%s", safeOrderNo, appointmentRoundSuffix(round))
 	if pdfBytes != nil {
 		w, _ := zw.Create(base + ".pdf")
@@ -276,13 +298,50 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	if err := zw.Close(); err != nil {
 		return nil, "", err
 	}
-
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "appointment_order.build",
-		Entity: "academic_term", EntityID: in.TermID.String(),
-		After: map[string]any{"order_no": in.OrderNo, "count": len(list)},
-	})
 	return buf.Bytes(), base + ".zip", nil
+}
+
+// Reprint hands back a copy of an order that was already issued.
+//
+// It renders the snapshot frozen when the order was produced and reads nothing
+// else, so a TA who has since changed their name, a corrected credit count, or
+// a new dean cannot alter a document that has already been signed. An order
+// issued before snapshots existed has nothing to copy and is refused rather
+// than rebuilt from today's tables — a "copy" that quietly differs from the
+// paper in the file is worse than no copy at all.
+func (s *AppointmentOrderService) Reprint(ctx context.Context, actor, orderID uuid.UUID) ([]byte, string, error) {
+	var raw []byte
+	var round int
+	var orderNo string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT document, round_no, order_no FROM appointment_orders WHERE id = $1`,
+		orderID).Scan(&raw, &round, &orderNo); err != nil {
+		return nil, "", ErrNotFound
+	}
+	if len(raw) == 0 {
+		return nil, "", Invalid("คำสั่งรอบนี้ออกก่อนระบบจะเก็บสำเนาเอกสาร — " +
+			"ออกซ้ำให้ไม่ได้ เพราะไม่มีหลักฐานว่าฉบับเดิมพิมพ์ข้อความใดไว้")
+	}
+	var d docxgen.AppointmentOrderData
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, "", fmt.Errorf("appointment order %s: snapshot unreadable: %w", orderID, err)
+	}
+
+	zipBytes, name, err := s.renderBundle(d, round)
+	if err != nil {
+		return nil, "", err
+	}
+	// Reprints are audited separately from the original: "who else has a copy of
+	// this order, and when did they take it" is a different question from "who
+	// issued it", and the round ledger only answers the second.
+	if err := s.aud.Log(ctx, audit.Entry{
+		ActorID: &actor, Action: "appointment_order.reprint",
+		Entity: "appointment_order", EntityID: orderID.String(),
+		After: map[string]any{"order_no": orderNo, "round_no": round},
+	}); err != nil {
+		return nil, "", err
+	}
+	return zipBytes, name, nil
 }
 
 // ensureBuddhistEra inserts "พ.ศ." before a trailing 4-digit year when staff

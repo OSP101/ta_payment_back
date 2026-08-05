@@ -99,7 +99,7 @@ func TestExportSummary_EligibilityNeedsOrderAndCompletedReview(t *testing.T) {
 
 	row := func() CourseSummary {
 		t.Helper()
-		all, err := exp.DashboardSummary(f.ctx, budget, f.TermID)
+		all, err := exp.DashboardSummary(f.ctx, budget, exportSvcFor(f), f.TermID)
 		if err != nil {
 			t.Fatalf("DashboardSummary: %v", err)
 		}
@@ -158,7 +158,7 @@ func TestExportSummary_NoWorkIsNotReviewComplete(t *testing.T) {
 	f.addAppointmentOrder()
 
 	exp := &ExportBatchService{pool: f.Pool, aud: audit.New(f.Pool)}
-	all, err := exp.DashboardSummary(f.ctx, &BudgetService{pool: f.Pool}, f.TermID)
+	all, err := exp.DashboardSummary(f.ctx, &BudgetService{pool: f.Pool}, exportSvcFor(f), f.TermID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestExportSummary_UnappointedWorkDoesNotBlockExportForever(t *testing.T) {
 	}
 
 	exp := &ExportBatchService{pool: f.Pool, aud: audit.New(f.Pool)}
-	all, err := exp.DashboardSummary(f.ctx, &BudgetService{pool: f.Pool}, f.TermID)
+	all, err := exp.DashboardSummary(f.ctx, &BudgetService{pool: f.Pool}, exportSvcFor(f), f.TermID)
 	if err != nil {
 		t.Fatal(err)
 	}

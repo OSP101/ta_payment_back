@@ -55,8 +55,14 @@ type AppointmentOrderData struct {
 	OrderDate     string // "14 มกราคม 2569"
 	EffectiveDate string // "24 พฤศจิกายน 2568"
 	SignerName    string // "รองศาสตราจารย์สิรภัทร เชี่ยวชาญวัฒนา"
-	SignerTitle   string // "คณบดีวิทยาลัยการคอมพิวเตอร์"
-	Levels        []AppointmentLevel
+	// SignerTitle is the position line, already carrying the acting phrase when
+	// there is one ("รองคณบดีฝ่ายวิชาการ รักษาการแทน"). Wording is the
+	// caller's business; this renderer only places the lines.
+	SignerTitle string
+	// SignerActingFor is the seat whose authority is being exercised, printed on
+	// its own line under SignerTitle. Empty when the signer holds the seat.
+	SignerActingFor string
+	Levels          []AppointmentLevel
 }
 
 // AppointmentOrderInput controls a single render.
@@ -136,11 +142,18 @@ func BuildAppointmentOrderPDF(in AppointmentOrderInput) ([]byte, error) {
 	textAt(&pdf, orderMarginX+60, y, "สั่ง  ณ  วันที่  "+d.OrderDate)
 	y += 66
 
-	// Signature block.
+	// Signature block. A deputy signing for the dean gets the two-line acting
+	// form required of Thai official documents — own position + the acting
+	// phrase, then the seat whose authority is being exercised — because the
+	// order is issued under the DEAN's power, not the deputy's.
 	setReg(&pdf, 16)
 	centerText(&pdf, y, "("+d.SignerName+")")
 	y += 22
 	centerText(&pdf, y, d.SignerTitle)
+	if d.SignerActingFor != "" {
+		y += 22
+		centerText(&pdf, y, d.SignerActingFor)
+	}
 
 	// ---- Attached roster page --------------------------------------------
 	pdf.AddPage()

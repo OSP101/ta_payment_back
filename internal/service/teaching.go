@@ -303,10 +303,12 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 			return uuid.Nil, err
 		}
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "teaching_course.create", Entity: "teaching_course", EntityID: id.String(), After: in}); err != nil {
+		return uuid.Nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return uuid.Nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "teaching_course.create", Entity: "teaching_course", EntityID: id.String(), After: in})
 	return id, nil
 }
 
@@ -365,12 +367,13 @@ func (s *TeachingService) Delete(ctx context.Context, actor, id uuid.UUID) error
 	case hasHoliday:
 		return Conflict("ลบไม่ได้ — วิชานี้มีข้อมูลที่เกี่ยวข้องอยู่")
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM teaching_courses WHERE id=$1`, id); err != nil {
-		return err
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "teaching_course.delete",
-		Entity: "teaching_course", EntityID: id.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "teaching_course.delete",
+			Entity: "teaching_course", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `DELETE FROM teaching_courses WHERE id=$1`, id)
+			return err
+		})
 }
 
 func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCourse, error) {
@@ -662,9 +665,21 @@ type TAAssignment struct {
 	// UnsentCount is draft + rejected: exactly what pressing "ส่งอนุมัติ" would
 	// send (see WorkLogService.Submit), so the number on the button and the number
 	// it acts on cannot disagree.
-	UnsentCount    int `json:"unsent_count"`
-	SubmittedCount int `json:"submitted_count"`
-	ApprovedCount  int `json:"approved_count"`
+	UnsentCount int `json:"unsent_count"`
+	// SubmittableCount is the part of UnsentCount that pressing the button would
+	// actually send — rows whose month is still open. The difference is stranded:
+	// the TA missed the deadline and only staff can move those now. Counted with
+	// the same predicate Submit skips by (unsubmittableMonthSQL), so the button
+	// can never offer to send something the server will refuse.
+	SubmittableCount int `json:"submittable_count"`
+	// MonthsInReview lists the "YYYY-MM" months of this assignment that have
+	// entered review — anything submitted or approved. Upsert refuses a NEW row
+	// in exactly these, so the screen hides its "+ เพิ่ม" affordance there rather
+	// than offering a button the server will reject. Server-derived on purpose: a
+	// second copy of the rule in the client is a copy that drifts.
+	MonthsInReview []string `json:"months_in_review"`
+	SubmittedCount int      `json:"submitted_count"`
+	ApprovedCount  int      `json:"approved_count"`
 	// HoursLogged counts everything not rejected, matching the term-ceiling
 	// arithmetic the worklog screen already shows.
 	HoursLogged float64 `json:"hours_logged"`
@@ -690,6 +705,13 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	             a.state::text, a.state_reason,
 	             (SELECT COUNT(*) FROM work_logs wl
 	               WHERE wl.assignment_id = a.id AND wl.status IN ('draft','rejected')),
+	             (SELECT COUNT(*) FROM work_logs wl
+	               WHERE wl.assignment_id = a.id AND wl.status IN ('draft','rejected')
+	                 AND NOT ` + unsubmittableMonthSQL("wl") + `),
+	             COALESCE((SELECT ARRAY_AGG(DISTINCT to_char(wl.work_date,'YYYY-MM'))
+	               FROM work_logs wl
+	               WHERE wl.assignment_id = a.id
+	                 AND wl.status IN ('submitted','approved')), '{}'),
 	             (SELECT COUNT(*) FROM work_logs wl
 	               WHERE wl.assignment_id = a.id AND wl.status = 'submitted'),
 	             (SELECT COUNT(*) FROM work_logs wl
@@ -723,7 +745,7 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 			&a.SectionID, &a.SecNo, &a.Track, &a.Level, &a.ReimburseScope, &a.HasSchedule,
 			&a.WeeklyCapLecture, &a.WeeklyCapLab, &a.WeeklyCapReview, &a.WeeklyCapOther,
 			&a.WeeklyLectureLabShared, &a.WeeklyCapsSet, &a.State, &a.StateReason,
-			&a.UnsentCount, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged); err != nil {
+			&a.UnsentCount, &a.SubmittableCount, &a.MonthsInReview, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -788,19 +810,20 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 	} else if total < 0 {
 		total = curTotal
 	}
-	_, err = s.pool.Exec(ctx, `
-		UPDATE teaching_courses
-		SET num_students = $1,
-		    num_students_regular = $2,
-		    num_students_special = $3,
-		    updated_at = NOW()
-		WHERE id = $4`, total, regular, special, id)
-	if err == nil {
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "teaching_course.num_students",
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "teaching_course.num_students",
 			Entity: "teaching_course", EntityID: id.String(),
-			After: map[string]int{"num_students": total, "regular": regular, "special": special}})
-	}
-	return err
+			After: map[string]int{"num_students": total, "regular": regular, "special": special}},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				UPDATE teaching_courses
+				SET num_students = $1,
+				    num_students_regular = $2,
+				    num_students_special = $3,
+				    updated_at = NOW()
+				WHERE id = $4`, total, regular, special, id)
+			return err
+		})
 }
 
 // UpdateSettingsInput overrides the course's own date range, which otherwise
@@ -847,14 +870,15 @@ func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUI
 	sets = append(sets, "updated_at = NOW()")
 	args = append(args, id)
 	q := fmt.Sprintf("UPDATE teaching_courses SET %s WHERE id = $%d", strings.Join(sets, ", "), i)
-	if _, err := s.pool.Exec(ctx, q, args...); err != nil {
-		return err
-	}
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "teaching_course.update_settings",
-		Entity: "teaching_course", EntityID: id.String(), After: in,
-	})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{
+			ActorID: &actor, Action: "teaching_course.update_settings",
+			Entity: "teaching_course", EntityID: id.String(), After: in,
+		},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, q, args...)
+			return err
+		})
 }
 
 // ErrCourseLocked is returned when a mutation would change a course whose
@@ -963,11 +987,13 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 	if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
 		return uuid.Nil, err
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.add",
+		Entity: "teaching_course", EntityID: tcID.String(), After: in}); err != nil {
+		return uuid.Nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return uuid.Nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "section.add",
-		Entity: "teaching_course", EntityID: tcID.String(), After: in})
 	return id, nil
 }
 
@@ -1058,11 +1084,13 @@ func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tc
 			return err
 		}
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.schedules.replace",
+		Entity: "section", EntityID: sectionID.String(), After: schedules}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "section.schedules.replace",
-		Entity: "section", EntityID: sectionID.String(), After: schedules})
 	return nil
 }
 
@@ -1252,11 +1280,13 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 			return err
 		}
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.update",
+		Entity: "section", EntityID: sectionID.String(), After: in}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "section.update",
-		Entity: "section", EntityID: sectionID.String(), After: in})
 	return nil
 }
 
@@ -1286,11 +1316,13 @@ func (s *TeachingService) DeleteSection(ctx context.Context, actor, tcID, sectio
 	if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
 		return err
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.delete",
+		Entity: "section", EntityID: sectionID.String()}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "section.delete",
-		Entity: "section", EntityID: sectionID.String()})
 	return nil
 }
 
@@ -1305,16 +1337,19 @@ func (s *TeachingService) MarkExported(ctx context.Context, tcID uuid.UUID) erro
 // Unexport clears the export lock so an accidentally-exported course can be
 // edited again. Admin-only (enforced at the route).
 func (s *TeachingService) Unexport(ctx context.Context, actor, tcID uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE teaching_courses SET exported_at = NULL WHERE id = $1 AND exported_at IS NOT NULL`, tcID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("รายวิชานี้ยังไม่ได้ส่งออก จึงไม่มีอะไรให้ปลดล็อก")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "course.unexport", Entity: "teaching_course", EntityID: tcID.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "course.unexport", Entity: "teaching_course", EntityID: tcID.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`UPDATE teaching_courses SET exported_at = NULL WHERE id = $1 AND exported_at IS NOT NULL`, tcID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("รายวิชานี้ยังไม่ได้ส่งออก จึงไม่มีอะไรให้ปลดล็อก")
+			}
+			return nil
+		})
 }
 
 // kindLabelTH names a class period the way the UI does, so a refusal the
@@ -1341,7 +1376,7 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 		}
 		return err
 	}
-	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+	if err := assertMakeupManager(ctx, s.pool, actor, tcID); err != nil {
 		return err
 	}
 	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
@@ -1425,19 +1460,22 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note, kind)
-		 VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8)`,
-		uuid.New(), sectionID, m.OriginalDate, m.MakeupDate, m.StartTime, m.EndTime, m.Note, m.Kind)
-	if err != nil {
-		// UNIQUE (section_id, original_date, kind) violation — this PERIOD already
-		// has a filed makeup. Names the period, because the other period of the
-		// same day is a separate row the lecturer may still need to file.
-		return Invalid(fmt.Sprintf("คาบ%sของวันที่ %s มีวันชดเชยอยู่แล้ว — กรุณาลบวันเดิมก่อนแล้วเพิ่มใหม่",
-			kindLabelTH(m.Kind), m.OriginalDate))
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "makeup.add", Entity: "section", EntityID: sectionID.String(), After: m})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "makeup.add", Entity: "section", EntityID: sectionID.String(), After: m},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note, kind)
+				 VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8)`,
+				uuid.New(), sectionID, m.OriginalDate, m.MakeupDate, m.StartTime, m.EndTime, m.Note, m.Kind)
+			if err != nil {
+				// UNIQUE (section_id, original_date, kind) violation — this PERIOD already
+				// has a filed makeup. Names the period, because the other period of the
+				// same day is a separate row the lecturer may still need to file.
+				return Invalid(fmt.Sprintf("คาบ%sของวันที่ %s มีวันชดเชยอยู่แล้ว — กรุณาลบวันเดิมก่อนแล้วเพิ่มใหม่",
+					kindLabelTH(m.Kind), m.OriginalDate))
+			}
+			return nil
+		})
 }
 
 // DeleteMakeup removes a filed makeup. Guards against silently invalidating
@@ -1460,7 +1498,7 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 		}
 		return err
 	}
-	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
+	if err := assertMakeupManager(ctx, s.pool, actor, tcID); err != nil {
 		return err
 	}
 	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
@@ -1525,10 +1563,12 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 	if _, err := tx.Exec(ctx, `DELETE FROM makeup_schedules WHERE id = $1`, makeupID); err != nil {
 		return err
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "makeup.delete", Entity: "section", EntityID: sectionID.String(), Note: makeupDateStr}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "makeup.delete", Entity: "section", EntityID: sectionID.String(), Note: makeupDateStr})
 	if s.notify != nil {
 		body := fmt.Sprintf("อาจารย์ยกเลิกวันชดเชย %s — รายการชั่วโมงร่างในวันนั้นถูกลบ", makeupDateStr)
 		for _, taID := range notifyTargets {
@@ -1571,14 +1611,15 @@ func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uu
 			return Invalid("เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม")
 		}
 	}
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO lecture_review_dates (id, section_id, review_date, start_time, end_time, hours, note)
-		 VALUES ($1,$2,$3::date,$4,$5,$6,$7)`,
-		uuid.New(), sectionID, r.ReviewDate, r.StartTime, r.EndTime, r.Hours, r.Note)
-	if err == nil {
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "review_date.add", Entity: "section", EntityID: sectionID.String(), After: r})
-	}
-	return err
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "review_date.add", Entity: "section", EntityID: sectionID.String(), After: r},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO lecture_review_dates (id, section_id, review_date, start_time, end_time, hours, note)
+				 VALUES ($1,$2,$3::date,$4,$5,$6,$7)`,
+				uuid.New(), sectionID, r.ReviewDate, r.StartTime, r.EndTime, r.Hours, r.Note)
+			return err
+		})
 }
 
 // -----------------------------------------------------------------------------
@@ -2297,11 +2338,20 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		"skipped_count": len(res.SkippedCodes),
 		"error_count":   res.ErrorCount,
 	}
-	_, _ = s.pool.Exec(ctx,
-		`INSERT INTO schedule_imports (id, imported_by, filename, row_count, error_count, summary, at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		uuid.New(), actor, filename, res.RowCount, res.ErrorCount, summary, time.Now())
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "schedule.import", Entity: "term", EntityID: termID.String(), After: summary})
+	// The import ledger row and its audit entry describe the same run, so they
+	// go in together. The ledger write used to be `_, _ =` — discarded outright,
+	// which meant a failed insert left the import unrecorded and unnoticed.
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "schedule.import", Entity: "term", EntityID: termID.String(), After: summary},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO schedule_imports (id, imported_by, filename, row_count, error_count, summary, at)
+				 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+				uuid.New(), actor, filename, res.RowCount, res.ErrorCount, summary, time.Now())
+			return err
+		}); err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
@@ -2504,6 +2554,28 @@ func (s *TeachingService) TermYearsCount(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// demoteOtherActiveTerms clears is_active on every term except keep, so that
+// promoting one term automatically retires the previous current term.
+//
+// "ภาคเรียนปัจจุบัน" is a system-wide singleton — the term switcher, the default
+// on every screen, and the windows that open "this term" all read it. Without
+// this the box could be ticked on a second term while the first stayed ticked,
+// and which one won depended on row order.
+//
+// It must run in the SAME transaction as the write that promotes `keep`, and
+// before it: ux_academic_terms_single_active is a non-deferrable unique index,
+// so a promotion landing while the old row is still active is rejected outright.
+// Called with active=false it does nothing — unticking the only current term is
+// allowed, since a year can end before the next one is set up.
+func demoteOtherActiveTerms(ctx context.Context, tx pgx.Tx, keep uuid.UUID, active bool) error {
+	if !active {
+		return nil
+	}
+	_, err := tx.Exec(ctx,
+		`UPDATE academic_terms SET is_active = FALSE WHERE is_active AND id <> $1`, keep)
+	return err
+}
+
 // UpsertTerm creates a new term (when in.ID is nil) or updates an existing
 // one by ID. On update, academic_year and semester are LOCKED — changing
 // them would orphan any teaching_courses / schedules / budgets that already
@@ -2546,20 +2618,27 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 		if exists {
 			return nil, ErrConflict
 		}
-		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO academic_terms
-			   (id, academic_year, semester, starts_on, ends_on,
-			    midterm_starts_on, midterm_ends_on, final_starts_on, final_ends_on,
-			    months, is_active)
-			 VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8::date,$9::date,$10,$11)`,
-			in.ID, in.AcademicYear, in.Semester,
-			nilStr(in.StartsOn), nilStr(in.EndsOn),
-			nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),
-			nilStr(in.FinalStartsOn), nilStr(in.FinalEndsOn),
-			in.Months, in.IsActive); err != nil {
+		if err := writeAudited(ctx, s.pool, s.aud,
+			audit.Entry{ActorID: &actor, Action: "term.create", Entity: "term", EntityID: in.ID.String(), After: in},
+			func(tx pgx.Tx) error {
+				if err := demoteOtherActiveTerms(ctx, tx, in.ID, in.IsActive); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx,
+					`INSERT INTO academic_terms
+					   (id, academic_year, semester, starts_on, ends_on,
+					    midterm_starts_on, midterm_ends_on, final_starts_on, final_ends_on,
+					    months, is_active)
+					 VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8::date,$9::date,$10,$11)`,
+					in.ID, in.AcademicYear, in.Semester,
+					nilStr(in.StartsOn), nilStr(in.EndsOn),
+					nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),
+					nilStr(in.FinalStartsOn), nilStr(in.FinalEndsOn),
+					in.Months, in.IsActive)
+				return err
+			}); err != nil {
 			return nil, err
 		}
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "term.create", Entity: "term", EntityID: in.ID.String(), After: in})
 		return &in, nil
 	}
 
@@ -2575,21 +2654,28 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 	if existYear != in.AcademicYear || existSem != in.Semester {
 		return nil, ErrConflict
 	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE academic_terms SET
-		   starts_on=$2::date, ends_on=$3::date,
-		   midterm_starts_on=$4::date, midterm_ends_on=$5::date,
-		   final_starts_on=$6::date,   final_ends_on=$7::date,
-		   months=$8, is_active=$9
-		 WHERE id=$1`,
-		in.ID,
-		nilStr(in.StartsOn), nilStr(in.EndsOn),
-		nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),
-		nilStr(in.FinalStartsOn), nilStr(in.FinalEndsOn),
-		in.Months, in.IsActive); err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "term.update", Entity: "term", EntityID: in.ID.String(), After: in},
+		func(tx pgx.Tx) error {
+			if err := demoteOtherActiveTerms(ctx, tx, in.ID, in.IsActive); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx,
+				`UPDATE academic_terms SET
+				   starts_on=$2::date, ends_on=$3::date,
+				   midterm_starts_on=$4::date, midterm_ends_on=$5::date,
+				   final_starts_on=$6::date,   final_ends_on=$7::date,
+				   months=$8, is_active=$9
+				 WHERE id=$1`,
+				in.ID,
+				nilStr(in.StartsOn), nilStr(in.EndsOn),
+				nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),
+				nilStr(in.FinalStartsOn), nilStr(in.FinalEndsOn),
+				in.Months, in.IsActive)
+			return err
+		}); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "term.update", Entity: "term", EntityID: in.ID.String(), After: in})
 	return &in, nil
 }
 
@@ -2599,16 +2685,22 @@ func nonEmpty(s *string) bool { return s != nil && *s != "" }
 // TermUsage summarizes how many rows reference this term. Used to preview
 // the blast radius before a delete or to prevent it.
 type TermUsage struct {
-	TeachingCourses   int `json:"teaching_courses"`
-	ClassSchedules    int `json:"class_schedules"`
-	BudgetAllocations int `json:"budget_allocations"`
-	RequestWindows    int `json:"request_windows"`
+	TeachingCourses int `json:"teaching_courses"`
+	ClassSchedules  int `json:"class_schedules"`
+	Exports         int `json:"exports"`
+	RequestWindows  int `json:"request_windows"`
 }
 
 // Blocking returns true if any references would be orphaned by a delete.
-// Request windows CASCADE with academic_terms so they don't block.
+//
+// The counted tables are exactly the ones whose FK to academic_terms is
+// ON DELETE NO ACTION — with any of them present the DELETE fails inside
+// Postgres, so this set has to mirror them or the user gets a 500 instead of a
+// reason. Everything else that points at a term (request windows, submission
+// periods, appointment orders, document progress, signature checklist)
+// CASCADEs, so it doesn't block.
 func (u TermUsage) Blocking() bool {
-	return u.TeachingCourses+u.ClassSchedules+u.BudgetAllocations > 0
+	return u.TeachingCourses+u.ClassSchedules+u.Exports > 0
 }
 
 func (s *TeachingService) TermUsage(ctx context.Context, id uuid.UUID) (*TermUsage, error) {
@@ -2617,9 +2709,9 @@ func (s *TeachingService) TermUsage(ctx context.Context, id uuid.UUID) (*TermUsa
 		SELECT
 		  (SELECT COUNT(*) FROM teaching_courses    WHERE term_id = $1),
 		  (SELECT COUNT(*) FROM ta_class_schedules  WHERE term_id = $1),
-		  (SELECT COUNT(*) FROM budget_allocations  WHERE term_id = $1),
+		  (SELECT COUNT(*) FROM exports             WHERE term_id = $1),
 		  (SELECT COUNT(*) FROM ta_request_windows  WHERE term_id = $1)
-	`, id).Scan(&u.TeachingCourses, &u.ClassSchedules, &u.BudgetAllocations, &u.RequestWindows)
+	`, id).Scan(&u.TeachingCourses, &u.ClassSchedules, &u.Exports, &u.RequestWindows)
 	if err != nil {
 		return nil, err
 	}
@@ -2645,10 +2737,14 @@ func (s *TeachingService) DeleteTerm(ctx context.Context, actor uuid.UUID, id uu
 	if usage.Blocking() {
 		return usage, ErrConflict
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM academic_terms WHERE id=$1`, id); err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "term.delete", Entity: "term", EntityID: id.String(), Before: t},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `DELETE FROM academic_terms WHERE id=$1`, id)
+			return err
+		}); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "term.delete", Entity: "term", EntityID: id.String(), Before: t})
 	return usage, nil
 }
 

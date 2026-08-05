@@ -295,11 +295,13 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 		return err
 	}
 
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &userID, Action: "ta_profile.submit", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"round": round}}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &userID, Action: "ta_profile.submit", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"round": round}})
 	return nil
 }
 
@@ -382,13 +384,15 @@ func (s *DocsService) scanUpload(ctx context.Context, userID uuid.UUID, kind, fi
 
 	var infected *antivirus.ErrInfected
 	if errors.As(err, &infected) {
-		s.aud.Log(ctx, audit.Entry{
+		if err := s.aud.Log(ctx, audit.Entry{
 			ActorID: &userID, Action: "ta_doc.upload_infected", Entity: "ta_document",
 			After: map[string]any{
 				"kind": kind, "filename": filename,
 				"signature": infected.Signature, "size_bytes": len(body),
 			},
-		})
+		}); err != nil {
+			return err
+		}
 		return &UserError{
 			Status: 422,
 			Msg:    "ไฟล์นี้ตรวจพบความเสี่ยงด้านความปลอดภัย จึงไม่รับอัปโหลด — กรุณาสแกนไวรัสในเครื่องแล้วสร้างไฟล์ PDF ใหม่",
@@ -398,10 +402,12 @@ func (s *DocsService) scanUpload(ctx context.Context, userID uuid.UUID, kind, fi
 	// Scan could not complete. Log the reason for whoever has to fix clamd, and
 	// refuse — see the fail-closed note above.
 	log.Printf("antivirus: scan failed for %s upload by %s: %v", kind, userID, err)
-	s.aud.Log(ctx, audit.Entry{
+	if err := s.aud.Log(ctx, audit.Entry{
 		ActorID: &userID, Action: "ta_doc.upload_scan_failed", Entity: "ta_document",
 		After: map[string]any{"kind": kind, "filename": filename, "error": err.Error()},
-	})
+	}); err != nil {
+		return err
+	}
 	return &UserError{
 		Status: 503,
 		Msg:    "ระบบตรวจไวรัสไม่พร้อมใช้งานชั่วคราว จึงยังไม่รับอัปโหลด — กรุณาลองใหม่อีกครั้ง หากยังไม่ได้โปรดแจ้งผู้ดูแลระบบ",
@@ -530,12 +536,18 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 			return uuid.Nil, err
 		}
 	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &userID, Action: "ta_doc.upload", Entity: "ta_document",
+		EntityID: id.String(), After: map[string]any{"kind": kind, "filename": filename, "round": newRound}}); err != nil {
+		// The blob is already in object storage but the row will roll back, so
+		// it has to go too — same cleanup every other failure below the upload
+		// performs. Without it a failed audit leaks an unreferenced file.
+		_ = s.store.Delete(key)
+		return uuid.Nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		_ = s.store.Delete(key)
 		return uuid.Nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &userID, Action: "ta_doc.upload", Entity: "ta_document",
-		EntityID: id.String(), After: map[string]any{"kind": kind, "filename": filename, "round": newRound}})
 	return id, nil
 }
 
@@ -640,14 +652,25 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	}
 
 	if !approve {
-		_, err := s.pool.Exec(ctx,
-			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3 WHERE id=$4`,
-			status, reason, actor, docID)
-		if err == nil {
-			s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
-				EntityID: docID.String(), After: map[string]any{"status": status, "reason": reason}})
+		// A transaction for a single UPDATE, so the rejection and the record of
+		// it land together — the approve branch below already works that way,
+		// and a document whose rejection is missing from the trail is exactly
+		// the case a TA would dispute.
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return err
 		}
-		return err
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3 WHERE id=$4`,
+			status, reason, actor, docID); err != nil {
+			return err
+		}
+		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
+			EntityID: docID.String(), After: map[string]any{"status": status, "reason": reason}}); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
 	// Approve. Three things happen together, so they share a transaction: the
 	// document flips, its 7-day retention clock starts, and — if this was the
@@ -679,16 +702,22 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	if err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
+		EntityID: docID.String(), After: map[string]any{"status": status}}); err != nil {
 		return err
 	}
-
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
-		EntityID: docID.String(), After: map[string]any{"status": status}})
+	// The auto-approval happened inside finalizeProfileIfComplete, on this same
+	// transaction — so its record belongs here too, not after the commit.
 	if profileApproved {
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_profile.auto_approved", Entity: "ta_profile",
+		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_profile.auto_approved", Entity: "ta_profile",
 			EntityID: userID.String(),
-			After:    map[string]any{"round": round, "trigger_doc": docID.String()}})
+			After:    map[string]any{"round": round, "trigger_doc": docID.String()}}); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -813,11 +842,13 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 		return err
 	}
 
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_profile.review", Entity: "ta_profile",
+		EntityID: userID.String(), After: map[string]any{"status": status, "reason": reason, "round": round}}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_profile.review", Entity: "ta_profile",
-		EntityID: userID.String(), After: map[string]any{"status": status, "reason": reason, "round": round}})
 	return nil
 }
 

@@ -211,3 +211,34 @@ func assertXMLWellFormed(t *testing.T, docBytes []byte) {
 		}
 	}
 }
+
+// A deputy signing for the dean gets a third signature line naming the seat
+// whose authority the order is issued under. Without it the document reads as
+// though a รองคณบดี issued an order only the dean may issue.
+func TestDocumentXML_ActingSignerNamesTheSeat(t *testing.T) {
+	d := sampleData()
+	d.SignerName = "ผู้ช่วยศาสตราจารย์ ดร.ณกร วัฒนกิจ"
+	d.SignerTitle = "รองคณบดีฝ่ายวิชาการ รักษาการแทน"
+	d.SignerActingFor = "คณบดีวิทยาลัยการคอมพิวเตอร์"
+
+	doc := partText(t, docBytesFor(t, d), "word/document.xml")
+	for _, needle := range []string{d.SignerName, d.SignerTitle, d.SignerActingFor} {
+		if !strings.Contains(doc, needle) {
+			t.Errorf("document.xml missing signature line %q", needle)
+		}
+	}
+	// Order matters: own position and acting phrase first, then the seat.
+	if strings.Index(doc, d.SignerTitle) > strings.Index(doc, d.SignerActingFor) {
+		t.Error("the acting-for seat must come AFTER the signer's own position line")
+	}
+}
+
+// The dean signing their own order gets no extra line — an empty ActingFor must
+// not leave a blank paragraph under the title.
+func TestDocumentXML_DeanSignerHasNoActingLine(t *testing.T) {
+	d := sampleData() // SignerActingFor left empty
+	doc := partText(t, docBytesFor(t, d), "word/document.xml")
+	if strings.Contains(doc, "รักษาการแทน") {
+		t.Error("a dean signing their own order must not carry an acting phrase")
+	}
+}

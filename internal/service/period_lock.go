@@ -16,9 +16,14 @@ import (
 //     payout file; the numbers must not change under it). Admin can send it
 //     back to pending to reopen for edits;
 //   - a month whose submission_period is closed (is_closed, or past the
-//     due_date + 1-day grace used by AutoCloseExpired) is frozen for TA actors
-//     only — lecturers can still approve stragglers and staff can still fix
-//     rows on the TA's behalf.
+//     due_date + 1-day grace used by AutoCloseExpired) is frozen for EVERY
+//     role. It used to be frozen for TA actors only, so staff could still edit
+//     on a TA's behalf; that was closed on 03/08/2026 at the staff's own
+//     request — no back-dated entry at all, by anyone. Rows not submitted by
+//     the deadline are treated as not claimed (ไม่ประสงค์ลงเวลา).
+//
+//     Approving is NOT a write: a lecturer can still approve rows a TA
+//     submitted before the deadline, which is the whole point of having one.
 //
 // year_month mapping: submission_periods.year_month is the term's Buddhist
 // ACADEMIC year + submission month (see BulkCreateForTerm — semester-2 months
@@ -67,9 +72,12 @@ func resolvePeriodState(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid
 }
 
 // assertWorklogWritable rejects a write touching workDate when its month is
-// finance-locked (every role) or closed (TA actors only). No period defined
-// for that month → allowed.
-func assertWorklogWritable(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.UUID, workDate string, taActor bool) error {
+// finance-locked or closed. No period defined for that month → allowed.
+//
+// There is deliberately no actor parameter. There was one, and it made "closed"
+// mean two different things depending on who asked — which is how a deadline
+// stops being a deadline.
+func assertWorklogWritable(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.UUID, workDate string) error {
 	st, err := resolvePeriodState(ctx, pool, tcID, taID, workDate)
 	if err != nil {
 		return err
@@ -85,9 +93,10 @@ func assertWorklogWritable(ctx context.Context, pool *pgxpool.Pool, tcID, taID u
 		return Conflict(fmt.Sprintf(
 			"บันทึกเวลาเดือน %s ถูกส่งออกไฟล์เบิกจ่ายแล้ว — แก้ไขไม่ได้ (เจ้าหน้าที่ตีกลับหรือผู้ดูแลระบบปลดล็อกได้)", st.Label))
 	}
-	if taActor && st.IsClosed {
+	if st.IsClosed {
 		return Invalid(fmt.Sprintf(
-			"งวดส่งบันทึกเวลาเดือน %s ปิดรับแล้ว — ไม่สามารถเพิ่ม/แก้ไข/ส่งรายการของเดือนนี้ได้ กรุณาติดต่อเจ้าหน้าที่", st.Label))
+			"งวดส่งบันทึกเวลาเดือน %s ปิดแล้ว — เพิ่ม/แก้ไข/ส่งย้อนหลังไม่ได้ "+
+				"รายการที่ไม่ได้ส่งภายในกำหนดถือว่าไม่ประสงค์ลงเวลา", st.Label))
 	}
 	return nil
 }
@@ -183,4 +192,55 @@ func loadBlockedMonths(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.
 		out[mm] = bm
 	}
 	return out, rows.Err()
+}
+
+// unsubmittableMonthSQL is the predicate that decides whether a work_log's month
+// is beyond a TA's reach: the period is closed (flag or past the grace day), or
+// staff have already exported / sent it to finance.
+//
+// Shared between WorkLogService.Submit, which skips such rows, and the
+// assignment tally the TA screen counts with. They used to differ: the screen
+// counted every draft and offered a "ส่งอนุมัติ 10 รายการ" button that the
+// server then refused in full, so a TA who missed a deadline was left pressing a
+// live button that could never work. The button's number and the number the
+// server acts on now come from one predicate.
+//
+// The parameter is the alias of the work_logs row in the caller's query.
+func unsubmittableMonthSQL(wl string) string {
+	return `EXISTS (
+		SELECT 1
+		FROM ta_request_assignments a2
+		JOIN sections sec2 ON sec2.id = a2.section_id
+		JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id
+		JOIN academic_terms trm2 ON trm2.id = tc2.term_id
+		JOIN submission_periods sp2 ON sp2.term_id = tc2.term_id
+		 AND sp2.year_month = trm2.academic_year::text || '-' || to_char(` + wl + `.work_date, 'MM')
+		LEFT JOIN submission_period_status st2
+		  ON st2.submission_period_id = sp2.id
+		 AND st2.ta_id = a2.ta_id
+		 AND st2.teaching_course_id = tc2.id
+		WHERE a2.id = ` + wl + `.assignment_id
+		  AND (sp2.is_closed OR CURRENT_DATE > sp2.due_date + INTERVAL '1 day'
+		       OR COALESCE(st2.status, '') IN ('exported','finance_sent'))
+	)`
+}
+
+// waitingLecturerSQL / waitingTASQL / outstandingRowSQL are the one definition
+// of who a work-log row is still waiting on.
+//
+// The two halves are disjoint and outstandingRowSQL is exactly their union, so
+// "how many rows are open" and "who do I chase" can never drift apart. Rows the
+// TA can no longer send — unsent when their period closed — are in NEITHER:
+// nobody is going to move them, so counting them as open would block the month
+// from ever being signed off and the course from ever exporting.
+//
+// The parameter is the alias of the work_logs row in the caller's query.
+func waitingLecturerSQL(wl string) string { return wl + `.status = 'submitted'` }
+
+func waitingTASQL(wl string) string {
+	return `(` + wl + `.status IN ('draft','rejected') AND NOT ` + unsubmittableMonthSQL(wl) + `)`
+}
+
+func outstandingRowSQL(wl string) string {
+	return `(` + waitingLecturerSQL(wl) + ` OR ` + waitingTASQL(wl) + `)`
 }

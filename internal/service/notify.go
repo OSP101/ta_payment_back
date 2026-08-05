@@ -33,13 +33,33 @@ func (s *NotifyService) Send(ctx context.Context, userID uuid.UUID, title, body,
 	linkArg := nilStr(&link)
 
 	// in-app row — the source of truth for the bell/inbox.
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO notifications (id, user_id, channel, title, body, link)
-		 VALUES (gen_random_uuid(), $1, 'in_app', $2, $3, $4)`,
+	//
+	// An UNREAD notice with the same title and link is REFRESHED rather than
+	// repeated. Rejections arrive one per assignment, so a TA holding two
+	// sections of a course got the same sentence twice, and a lecturer who
+	// bounced the batch again got it twice more — four identical lines about one
+	// thing. Collapsing on (user, title, link) folds them into the one line the
+	// TA actually reads, carrying the newest reason and moving back to the top.
+	//
+	// Only while unread: once they have seen it, a later notice is news again.
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE notifications
+		SET body = $3, link = $4, created_at = NOW()
+		WHERE user_id = $1 AND channel = 'in_app' AND read_at IS NULL
+		  AND title = $2 AND link IS NOT DISTINCT FROM $4`,
 		userID, title, body, linkArg)
 	if err != nil {
-		log.Printf("notify in_app: %v", err)
+		log.Printf("notify in_app coalesce: %v", err)
 		return
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO notifications (id, user_id, channel, title, body, link)
+			 VALUES (gen_random_uuid(), $1, 'in_app', $2, $3, $4)`,
+			userID, title, body, linkArg); err != nil {
+			log.Printf("notify in_app: %v", err)
+			return
+		}
 	}
 
 	// email — informational only, so keep failures out of the caller's path.

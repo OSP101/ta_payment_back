@@ -27,20 +27,33 @@ import (
 // TermPay and ExportService prorata-caps payouts against it, so an understated
 // ceiling quietly cuts money the faculty had budgeted.
 
+// The columns are the CONTACT HOURS from the printed "3 (2-2-5)", because that
+// is what teaching_courses stores. Until 04/08/2026 this struct held pre-
+// converted CREDITS and inserted them into lecture_hrs/lab_hrs, so the test
+// exercised a conversion production never did and passed while every real
+// course with a lab had a ceiling ~60% too high.
 type workbookCase struct {
 	code        string
 	credits     string // as printed, for the failure message
-	lectureCr   int
-	labCr       int
+	lectureHrs  int
+	labHrs      int
 	students    int
 	wantCeiling float64 // วงเงินสูงสุด from the workbook
 }
 
 func TestBudget_MatchesFacultyWorkbook(t *testing.T) {
 	cases := []workbookCase{
+		// ค่า-TA-ภาคต้น-ปี-2560, ชีต "2_59 ป.ตรี"
 		{"322238", "3(3-0-6)", 3, 0, 69, 12420},
-		{"322339", "1(0-2-2)", 0, 1, 76, 13680},
+		{"322339", "1(0-2-2)", 0, 2, 76, 13680},
 		{"322391", "3(3-0-6)", 3, 0, 66, 11880},
+		// Ngamnij.xlsx — the college's own งบประมาณ column for THIS term (2569),
+		// which is where the discrepancy was spotted. Every one of its four
+		// figures is จำนวน นศ. × 300, and the formula must land on them.
+		{"CP363205-reg", "3(2-2-5)", 2, 2, 49, 14700},
+		{"CP363205-spc", "3(2-2-5)", 2, 2, 40, 12000},
+		{"CP410872-reg", "3(2-2-5)", 2, 2, 62, 18600},
+		{"CP410872-spc", "3(2-2-5)", 2, 2, 13, 3900},
 	}
 
 	pool := testutil.NewPool(t)
@@ -64,7 +77,7 @@ func TestBudget_MatchesFacultyWorkbook(t *testing.T) {
 				     num_students, num_students_regular)
 				VALUES ($1,$2,$3,'วิชาจากสมุดงานคณะ','undergrad',$4,$5,$6,$7,$7)`,
 				tcID, termID, c.code+"-"+tcID.String()[:4],
-				c.lectureCr+c.labCr, c.lectureCr, c.labCr, c.students); err != nil {
+				c.lectureHrs+c.labHrs/2, c.lectureHrs, c.labHrs, c.students); err != nil {
 				t.Fatalf("insert course: %v", err)
 			}
 

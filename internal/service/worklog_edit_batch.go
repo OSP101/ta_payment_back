@@ -189,8 +189,17 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	if err != nil {
 		return nil, err
 	}
+	// The batch row, its evidence and the audit entry are one record of one act:
+	// a batch saved without its evidence rows, or without the audit entry, is a
+	// correction to approved hours that cannot be explained afterwards.
 	var batchID uuid.UUID
-	if err := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO worklog_edit_batches
 		    (teaching_course_id, ta_id, year_month, actor_id, reason, changes)
 		VALUES ($1,$2,$3,$4,$5,$6::jsonb) RETURNING id`,
@@ -201,7 +210,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	res.BatchID = batchID
 
 	for _, f := range in.Evidence {
-		if _, err := s.pool.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO worklog_edit_files (batch_id, storage_key, filename, size_bytes, mime)
 			VALUES ($1,$2,$3,$4,$5)`,
 			batchID, f.StorageKey, f.Filename, f.Size, f.MIME); err != nil {
@@ -209,15 +218,22 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 		}
 	}
 
-	s.notifyEditBatch(ctx, in, res.Applied, len(in.Evidence))
-
-	s.aud.Log(ctx, audit.Entry{
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
 		ActorID: &actor, Action: "worklog.staff_edit_batch",
 		Entity: "worklog_edit_batch", EntityID: batchID.String(),
 		Note: fmt.Sprintf("%s — แก้ %d รายการ, แนบ %d รูป: %s",
 			in.YearMonth, res.Applied, len(in.Evidence), strings.TrimSpace(in.Reason)),
 		After: applied,
-	})
+	}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	// After the commit: notifications reach people and cannot be taken back if
+	// the transaction were to fail behind them.
+	s.notifyEditBatch(ctx, in, res.Applied, len(in.Evidence))
 	return res, nil
 }
 
@@ -234,14 +250,15 @@ func (s *WorkLogService) notifyEditBatch(ctx context.Context, in EditBatchInput,
 		`SELECT code, COALESCE(name_th,'') FROM teaching_courses WHERE id=$1`,
 		in.TeachingCourseID).Scan(&code, &nameTH)
 
-	title := "เจ้าหน้าที่แก้ไขบันทึกเวลา"
+	title := "เจ้าหน้าที่แก้ไขบันทึกเวลา " + code
 	body := fmt.Sprintf("%s %s · เดือน %s — แก้ไข %d รายการ\nเหตุผล: %s",
 		code, nameTH, in.YearMonth, applied, strings.TrimSpace(in.Reason))
 	if files > 0 {
 		body += fmt.Sprintf("\n(แนบหลักฐาน %d รูป)", files)
 	}
 
-	s.notify.Send(ctx, in.TAID, title, body, "/ta/courses")
+	s.notify.Send(ctx, in.TAID, title, body,
+		"/ta/courses/"+in.TeachingCourseID.String()+"/worklog")
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT lecturer_id FROM teaching_lecturers WHERE teaching_course_id = $1`,

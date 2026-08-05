@@ -7,6 +7,7 @@ import (
 	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -472,19 +473,19 @@ func validateWorkLogEntry(
 		if isHoliday && !isMakeupDay {
 			if holiday.allDay {
 				return Invalid(fmt.Sprintf(
-					"วันที่ %s ตรงกับวันหยุด (%s) — กรุณาให้อาจารย์กำหนดวันชดเชยก่อน จึงจะลงเวลาได้",
+					"วันที่ %s ตรงกับวันหยุด (%s) — ต้องกำหนดวันชดเชยก่อน จึงจะลงเวลาได้ (ไปที่หน้า “วันหยุดและวันชดเชย”)",
 					dkey, holiday.labelTH()))
 			}
 			// Partial closure: the fix may be as small as moving the entry to the
 			// free part of the same day, so say which hours are closed instead of
 			// sending the TA to wait for a makeup they may not need.
 			return Invalid(fmt.Sprintf(
-				"เวลา %s–%s ของวันที่ %s อยู่ในช่วงวันหยุด (%s) — ลงเวลาได้เฉพาะช่วงที่ไม่ตรงกับวันหยุด หรือรอให้อาจารย์กำหนดวันชดเชย",
+				"เวลา %s–%s ของวันที่ %s อยู่ในช่วงวันหยุด (%s) — ลงเวลาได้เฉพาะช่วงที่ไม่ตรงกับวันหยุด หรือกำหนดวันชดเชยที่หน้า “วันหยุดและวันชดเชย”",
 				w.StartTime, w.EndTime, dkey, holiday.labelTH()))
 		}
 	case "makeup":
 		if !isMakeupDay {
-			return Invalid("วันที่เลือกไม่ได้ถูกกำหนดเป็นวันชดเชยโดยอาจารย์ — โปรดให้อาจารย์ระบุวันชดเชยในระบบก่อน")
+			return Invalid("วันที่เลือกยังไม่ได้ถูกกำหนดเป็นวันชดเชย — กรุณาระบุวันชดเชยที่หน้า “วันหยุดและวันชดเชย” ก่อน")
 		}
 	case "review":
 		// Intentional no-op — reviewing homework can happen on any date.
@@ -507,6 +508,28 @@ type WorkLogService struct {
 	aud    *audit.Auditor
 	budget *BudgetService
 	notify *NotifyService
+	// export owns the budget settlement. Approving is the moment the committed
+	// figure moves, so it is where the shortfall warning is worth recomputing —
+	// not on every work-log write, which would recompute it dozens of times a
+	// day to say the same thing.
+	export *ExportService
+}
+
+// warnBudgetAfterApproval fires the shortfall notice, once per change. Runs
+// after the approval has committed and never affects its outcome: a warning
+// that failed to send must not undo work that was correctly approved.
+func (s *WorkLogService) warnBudgetAfterApproval(ctx context.Context, courseIDs ...uuid.UUID) {
+	if s.export == nil {
+		return
+	}
+	seen := map[uuid.UUID]bool{}
+	for _, c := range courseIDs {
+		if c == uuid.Nil || seen[c] {
+			continue
+		}
+		seen[c] = true
+		s.export.NotifyBudgetShortfall(ctx, c)
+	}
 }
 
 type WorkLog struct {
@@ -1086,96 +1109,135 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		}
 		reviewRows.Close()
 
-		// TA-owned weekly review pattern (วันตรวจการบ้าน). Same weekly-expansion
-		// as class schedules, but source is per-assignment and activity=review.
-		// Reviews are allowed on holidays (Q&A rule 7), so we do NOT skip holiday
-		// dates here — only exam windows and the daily hour cap can prevent an
-		// entry.
-		type trs struct {
-			day   int
-			start string
-			end   string
-			hours float64
-		}
-		var trss []trs
-		trRows, err := tx.Query(ctx,
-			`SELECT day_of_week, start_time::text, end_time::text,
-			        EXTRACT(EPOCH FROM (end_time - start_time))/3600
-			 FROM ta_review_schedules WHERE assignment_id=$1`, assignmentID)
-		if err != nil {
+	}
+
+	// TA-owned weekly duty slots. Same weekly expansion as class schedules, but
+	// the source is per-assignment and the kind decides which activity it lands
+	// on. This block sits OUTSIDE the AllowReview gate on purpose: "อื่น ๆ" is
+	// authorized by ug_other_hrs / lab_other_hrs, and keeping it inside meant a
+	// TA whose lecturer asked only for other-work generated nothing at all.
+	//
+	// These are allowed on holidays (Q&A rule 7) — the work happens off-site —
+	// so holiday dates are NOT skipped here; only exam windows and the hour and
+	// baht ceilings can stop an entry.
+	type trs struct {
+		kind       string
+		activity   string
+		parentKind *string
+		day        int
+		start      string
+		end        string
+		hours      float64
+	}
+	var trss []trs
+	trRows, err := tx.Query(ctx,
+		`SELECT kind, day_of_week, start_time::text, end_time::text,
+		        EXTRACT(EPOCH FROM (end_time - start_time))/3600
+		 FROM ta_review_schedules WHERE assignment_id=$1`, assignmentID)
+	if err != nil {
+		return nil, err
+	}
+	for trRows.Next() {
+		var r trs
+		if err := trRows.Scan(&r.kind, &r.day, &r.start, &r.end, &r.hours); err != nil {
+			trRows.Close()
 			return nil, err
 		}
-		for trRows.Next() {
-			var r trs
-			if err := trRows.Scan(&r.day, &r.start, &r.end, &r.hours); err != nil {
-				trRows.Close()
-				return nil, err
+		// Workload gate, per kind rather than per table.
+		switch r.kind {
+		case DutyReview:
+			if !ac.AllowReview {
+				continue
 			}
-			trss = append(trss, r)
+			r.activity = "review"
+		case DutyOtherLecture, DutyOtherLab:
+			if !ac.AllowOther {
+				continue
+			}
+			r.activity = "other"
+			parent := "lecture"
+			if r.kind == DutyOtherLab {
+				parent = "lab"
+			}
+			// A request approved for one side only must not grow rows on the
+			// other — same rule the manual-entry path applies.
+			if (ac.ReimburseScope == "lecture" && parent == "lab") ||
+				(ac.ReimburseScope == "lab" && parent == "lecture") {
+				continue
+			}
+			r.parentKind = &parent
+		default:
+			continue
 		}
-		trRows.Close()
+		trss = append(trss, r)
+	}
+	trRows.Close()
+	if err := trRows.Err(); err != nil {
+		return nil, err
+	}
 
-		if len(trss) > 0 {
-			for d := startsOn; !d.After(endsOn); d = d.AddDate(0, 0, 1) {
-				dkey := d.Format("2006-01-02")
-				if examDates[dkey] {
+	if len(trss) > 0 {
+		for d := startsOn; !d.After(endsOn); d = d.AddDate(0, 0, 1) {
+			dkey := d.Format("2006-01-02")
+			if examDates[dkey] {
+				continue
+			}
+			if inExamWindow(d) {
+				continue
+			}
+			if monthBlocked(d.Format("01")) {
+				continue
+			}
+			weekday := int(d.Weekday())
+			for _, r := range trss {
+				if r.day != weekday {
 					continue
 				}
-				if inExamWindow(d) {
-					continue
-				}
-				if monthBlocked(d.Format("01")) {
-					continue
-				}
-				weekday := int(d.Weekday())
-				for _, r := range trss {
-					if r.day != weekday {
-						continue
-					}
-					// Same reason as the lecture_review_dates loop above.
-					// AddTAReviewSchedule already refuses a clashing slot, but
-					// a timetable edited AFTER the slot was created can make an
-					// existing one clash.
-					if rs, okS := parseHM(r.start); okS {
-						if re, okE := parseHM(r.end); okE {
-							if clash := findOwnClassClash(ownClasses, weekday, rs, re); clash != nil {
-								skippedByClass[clash.describe()]++
-								continue
-							}
+				// Add/Update already refuse a clashing slot, but a timetable
+				// edited AFTER the slot was created can make an existing one
+				// clash.
+				if rs, okS := parseHM(r.start); okS {
+					if re, okE := parseHM(r.end); okE {
+						if clash := findOwnClassClash(ownClasses, weekday, rs, re); clash != nil {
+							skippedByClass[clash.describe()]++
+							continue
 						}
 					}
-					if dailyHrs[dkey]+r.hours > dailyHourCap {
-						continue
-					}
-					if bahtBlocks(dkey, r.hours) {
-						continue
-					}
-					if termBlocks(r.hours) {
-						continue
-					}
-					id := uuid.New()
-					note := autoNoteFor("review", false)
-					if _, err := tx.Exec(ctx,
-						`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, note, status, source)
-						 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,'review',$7,'draft','auto')`,
-						id, assignmentID, dkey, r.start, r.end, r.hours, note); err != nil {
-						return nil, err
-					}
-					out = append(out, WorkLog{ID: id, AssignmentID: assignmentID,
-						WorkDate: dkey, StartTime: r.start, EndTime: r.end,
-						Hours: r.hours, Activity: "review", Note: &note, Status: "draft"})
-					dailyHrs[dkey] += r.hours
-					dailyBaht[dkey] += r.hours * genRate
-					termHours += r.hours
 				}
+				if dailyHrs[dkey]+r.hours > dailyHourCap {
+					continue
+				}
+				if bahtBlocks(dkey, r.hours) {
+					continue
+				}
+				if termBlocks(r.hours) {
+					continue
+				}
+				id := uuid.New()
+				note := autoNoteFor(r.activity, false)
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, parent_kind, note, status, source)
+					 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,$9,'draft','auto')`,
+					id, assignmentID, dkey, r.start, r.end, r.hours, r.activity, r.parentKind, note); err != nil {
+					return nil, err
+				}
+				out = append(out, WorkLog{ID: id, AssignmentID: assignmentID,
+					WorkDate: dkey, StartTime: r.start, EndTime: r.end,
+					Hours: r.hours, Activity: r.activity, ParentKind: r.parentKind,
+					Note: &note, Status: "draft"})
+				dailyHrs[dkey] += r.hours
+				dailyBaht[dkey] += r.hours * genRate
+				termHours += r.hours
 			}
 		}
 	}
 
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "worklog.generate", Entity: "assignment", EntityID: assignmentID.String(), After: map[string]int{"count": len(out)}}); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.generate", Entity: "assignment", EntityID: assignmentID.String(), After: map[string]int{"count": len(out)}})
 
 	skips := make([]SkipGroup, 0, len(skippedByClass))
 	for reason, n := range skippedByClass {
@@ -1203,9 +1265,40 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 // TAReviewSchedule is one weekly slot the TA sets aside for grading homework.
 // Auto-generate expands each slot into individual review entries across the
 // term. Persistent across regenerations — TAs configure once per term.
+// dutyKind is which declared duty a weekly slot belongs to. The three share one
+// table because they are the same shape — a recurring slot the TA nominates —
+// and because the conflict check has to see all of them at once.
+//
+//	review        → activity='review'                    (ช่วยตรวจงาน)
+//	other_lecture → activity='other', parent_kind=lecture (อื่น ๆ ของบรรยาย)
+//	other_lab     → activity='other', parent_kind=lab     (อื่น ๆ ของปฏิบัติการ)
+const (
+	DutyReview       = "review"
+	DutyOtherLecture = "other_lecture"
+	DutyOtherLab     = "other_lab"
+)
+
+func validDutyKind(k string) bool {
+	return k == DutyReview || k == DutyOtherLecture || k == DutyOtherLab
+}
+
+// dutyKindTH names the duty the way the request form does, for error messages.
+func dutyKindTH(k string) string {
+	switch k {
+	case DutyReview:
+		return "ช่วยตรวจงาน"
+	case DutyOtherLecture:
+		return "อื่น ๆ (บรรยาย)"
+	case DutyOtherLab:
+		return "อื่น ๆ (ปฏิบัติการ)"
+	}
+	return k
+}
+
 type TAReviewSchedule struct {
 	ID           uuid.UUID `json:"id"`
 	AssignmentID uuid.UUID `json:"assignment_id"`
+	Kind         string    `json:"kind"`
 	DayOfWeek    int       `json:"day_of_week"` // 0=Sunday..6=Saturday
 	StartTime    string    `json:"start_time"`  // "HH:MM"
 	EndTime      string    `json:"end_time"`
@@ -1214,6 +1307,7 @@ type TAReviewSchedule struct {
 }
 
 type TAReviewScheduleInput struct {
+	Kind      string `json:"kind"`
 	DayOfWeek int    `json:"day_of_week"`
 	StartTime string `json:"start_time"`
 	EndTime   string `json:"end_time"`
@@ -1222,6 +1316,9 @@ type TAReviewScheduleInput struct {
 }
 
 func validateReviewInput(in TAReviewScheduleInput) error {
+	if !validDutyKind(in.Kind) {
+		return Invalid("ประเภทงานไม่ถูกต้อง")
+	}
 	if in.DayOfWeek < 0 || in.DayOfWeek > 6 {
 		return Invalid("วันของสัปดาห์ไม่ถูกต้อง")
 	}
@@ -1239,14 +1336,59 @@ func validateReviewInput(in TAReviewScheduleInput) error {
 	return nil
 }
 
-// TAReviewScheduleList wraps the recurring pattern along with the weekly
-// budget so the UI can show "2/3 ชม./สัปดาห์" and disable "add" when full.
-// Business rule (per user): total review hours per week must not exceed the
-// section's weekly lecture hours (summed from section_schedules kind='lecture').
+// TAReviewScheduleList wraps the recurring slots along with the weekly budget
+// per duty, so the UI can show "2/3 ชม./สัปดาห์", disable "add" when full, and
+// — the part that was missing — render a card ONLY for a duty the lecturer
+// actually asked this TA to do.
+//
+// The budget is the DECLARED hours from ta_workload_forms, not the section's
+// timetable. It used to be the timetable's lecture hours, which let a TA
+// nominate far more grading time than the lecturer requested and had nothing
+// to say about "อื่น ๆ" at all.
 type TAReviewScheduleList struct {
-	Items               []TAReviewSchedule `json:"items"`
-	LectureHoursPerWeek float64            `json:"lecture_hours_per_week"`
-	ReviewHoursPerWeek  float64            `json:"review_hours_per_week"`
+	Items []TAReviewSchedule `json:"items"`
+	// Declared[kind] is the lecturer's weekly ceiling; a kind absent from the
+	// map (or zero) was not requested and must not get a card.
+	Declared map[string]float64 `json:"declared_hours_per_week"`
+	// Used[kind] is what the TA has already nominated.
+	Used map[string]float64 `json:"used_hours_per_week"`
+}
+
+// declaredDutyHours maps each duty kind to the weekly hours the lecturer
+// declared for this assignment. Undergrad only — grad TAs declare a single
+// grade_hrs / other_hrs pair, mapped onto the same duties.
+func (s *WorkLogService) declaredDutyHours(ctx context.Context, assignmentID uuid.UUID) (map[string]float64, error) {
+	var level string
+	var grade, other, prep, check, ugOther, labOther float64
+	err := s.pool.QueryRow(ctx, `
+		SELECT a.level::text,
+		       COALESCE(wf.grade_hrs,0), COALESCE(wf.other_hrs,0), COALESCE(wf.prep_hrs,0),
+		       COALESCE(wf.check_work_hrs,0), COALESCE(wf.ug_other_hrs,0),
+		       COALESCE(wf.lab_other_hrs,0)
+		FROM ta_request_assignments a
+		LEFT JOIN ta_workload_forms wf ON wf.assignment_id = a.id
+		WHERE a.id = $1`, assignmentID).Scan(
+		&level, &grade, &other, &prep, &check, &ugOther, &labOther)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if level == "master" || level == "phd" {
+		// Grad has no lecture/lab split for other-work; both flavours draw on
+		// the one pool so the TA can place it wherever it belongs.
+		return map[string]float64{
+			DutyReview:       grade,
+			DutyOtherLecture: other + prep,
+			DutyOtherLab:     other + prep,
+		}, nil
+	}
+	return map[string]float64{
+		DutyReview:       check,
+		DutyOtherLecture: ugOther,
+		DutyOtherLab:     labOther,
+	}, nil
 }
 
 // weeklyLectureHoursForAssignment sums the section's kind='lecture' hours from
@@ -1265,13 +1407,15 @@ func (s *WorkLogService) weeklyLectureHoursForAssignment(ctx context.Context, as
 // weeklyReviewHoursForAssignment sums existing review-slot hours. When
 // excludeID is non-nil, that row is left out — used when updating an existing
 // slot so it doesn't count against itself.
-func (s *WorkLogService) weeklyReviewHoursForAssignment(ctx context.Context, assignmentID uuid.UUID, excludeID *uuid.UUID) (float64, error) {
+// The sum is scoped to ONE kind: the three duties have separate ceilings, so
+// grading time must not eat into the other-work allowance or vice versa.
+func (s *WorkLogService) weeklyReviewHoursForAssignment(ctx context.Context, assignmentID uuid.UUID, kind string, excludeID *uuid.UUID) (float64, error) {
 	var h float64
 	q := `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_time - start_time))/3600), 0)
-	      FROM ta_review_schedules WHERE assignment_id=$1`
-	args := []any{assignmentID}
+	      FROM ta_review_schedules WHERE assignment_id=$1 AND kind=$2`
+	args := []any{assignmentID, kind}
 	if excludeID != nil {
-		q += " AND id <> $2"
+		q += " AND id <> $3"
 		args = append(args, *excludeID)
 	}
 	err := s.pool.QueryRow(ctx, q, args...).Scan(&h)
@@ -1293,19 +1437,19 @@ func (s *WorkLogService) ListTAReviewSchedules(ctx context.Context, actor, assig
 		return TAReviewScheduleList{}, err
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, assignment_id, day_of_week, start_time::text, end_time::text,
+		`SELECT id, assignment_id, kind, day_of_week, start_time::text, end_time::text,
 		        COALESCE(room,''), COALESCE(note,'')
 		 FROM ta_review_schedules WHERE assignment_id=$1
-		 ORDER BY day_of_week, start_time`, assignmentID)
+		 ORDER BY kind, day_of_week, start_time`, assignmentID)
 	if err != nil {
 		return TAReviewScheduleList{}, err
 	}
 	defer rows.Close()
 	items := []TAReviewSchedule{}
-	var totalReview float64
+	used := map[string]float64{}
 	for rows.Next() {
 		var r TAReviewSchedule
-		if err := rows.Scan(&r.ID, &r.AssignmentID, &r.DayOfWeek,
+		if err := rows.Scan(&r.ID, &r.AssignmentID, &r.Kind, &r.DayOfWeek,
 			&r.StartTime, &r.EndTime, &r.Room, &r.Note); err != nil {
 			return TAReviewScheduleList{}, err
 		}
@@ -1316,18 +1460,17 @@ func (s *WorkLogService) ListTAReviewSchedules(ctx context.Context, actor, assig
 		if len(r.EndTime) >= 5 {
 			r.EndTime = r.EndTime[:5]
 		}
-		totalReview += slotHours(r.StartTime, r.EndTime)
+		used[r.Kind] += slotHours(r.StartTime, r.EndTime)
 		items = append(items, r)
 	}
-	lecH, err := s.weeklyLectureHoursForAssignment(ctx, assignmentID)
+	if err := rows.Err(); err != nil {
+		return TAReviewScheduleList{}, err
+	}
+	declared, err := s.declaredDutyHours(ctx, assignmentID)
 	if err != nil {
 		return TAReviewScheduleList{}, err
 	}
-	return TAReviewScheduleList{
-		Items:               items,
-		LectureHoursPerWeek: lecH,
-		ReviewHoursPerWeek:  totalReview,
-	}, nil
+	return TAReviewScheduleList{Items: items, Declared: declared, Used: used}, nil
 }
 
 // ScheduleBusyBlock is one occupied weekly slot on the TA's timetable, used by
@@ -1450,22 +1593,28 @@ func (s *WorkLogService) AddTAReviewSchedule(ctx context.Context, actor, assignm
 	if err := s.enforceReviewNoConflict(ctx, assignmentID, in, nil); err != nil {
 		return uuid.Nil, err
 	}
-	if err := s.enforceReviewCap(ctx, assignmentID, nil, slotHours(in.StartTime, in.EndTime)); err != nil {
+	if err := s.enforceReviewCap(ctx, assignmentID, in.Kind, nil, slotHours(in.StartTime, in.EndTime)); err != nil {
 		return uuid.Nil, err
 	}
 	id := uuid.New()
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO ta_review_schedules (id, assignment_id, day_of_week, start_time, end_time, room, note)
-		 VALUES ($1,$2,$3,$4::time,$5::time,NULLIF($6,''),NULLIF($7,''))`,
-		id, assignmentID, in.DayOfWeek, in.StartTime, in.EndTime, in.Room, in.Note)
-	if err != nil {
-		// Postgres 23505 = unique_violation — friendly message for the dup case.
-		if isUniqueViolation(err) {
-			return uuid.Nil, Invalid("มีตารางตรวจการบ้านนี้อยู่แล้ว")
-		}
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "ta_review_schedule.add", Entity: "assignment", EntityID: assignmentID.String(), After: in},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO ta_review_schedules (id, assignment_id, kind, day_of_week, start_time, end_time, room, note)
+				 VALUES ($1,$2,$3,$4,$5::time,$6::time,NULLIF($7,''),NULLIF($8,''))`,
+				id, assignmentID, in.Kind, in.DayOfWeek, in.StartTime, in.EndTime, in.Room, in.Note)
+			if err != nil {
+				// Postgres 23505 = unique_violation — friendly message for the dup case.
+				if isUniqueViolation(err) {
+					return Invalid(fmt.Sprintf("มีตารางงาน '%s' ช่วงเวลานี้อยู่แล้ว", dutyKindTH(in.Kind)))
+				}
+				return err
+			}
+			return nil
+		}); err != nil {
 		return uuid.Nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_review_schedule.add", Entity: "assignment", EntityID: assignmentID.String(), After: in})
 	return id, nil
 }
 
@@ -1594,25 +1743,33 @@ func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignment
 
 // enforceReviewCap rejects an add/update that would push the section's total
 // weekly review hours past the section's lecture hours per week.
-func (s *WorkLogService) enforceReviewCap(ctx context.Context, assignmentID uuid.UUID, excludeID *uuid.UUID, addedHours float64) error {
+// enforceReviewCap bounds a duty's weekly slots by what the LECTURER declared
+// for it, and refuses the kind entirely when nothing was declared.
+//
+// That second half is the gate that was missing: a TA could nominate grading
+// days for an assignment whose lecturer never ticked ช่วยตรวจงาน, then press
+// "สร้างอัตโนมัติ" and receive nothing, with no explanation anywhere.
+func (s *WorkLogService) enforceReviewCap(ctx context.Context, assignmentID uuid.UUID, kind string, excludeID *uuid.UUID, addedHours float64) error {
 	if addedHours <= 0 {
 		return nil
 	}
-	lecH, err := s.weeklyLectureHoursForAssignment(ctx, assignmentID)
+	declared, err := s.declaredDutyHours(ctx, assignmentID)
 	if err != nil {
 		return err
 	}
-	if lecH <= 0 {
-		return Invalid("ยังไม่พบชั่วโมงบรรยายของ section นี้ในระบบ — อาจารย์ต้องกำหนดตารางสอนก่อน จึงจะเพิ่มวันตรวจการบ้านได้")
-	}
-	existing, err := s.weeklyReviewHoursForAssignment(ctx, assignmentID, excludeID)
-	if err != nil {
-		return err
-	}
-	if existing+addedHours > lecH+0.01 {
+	capH := declared[kind]
+	if capH <= 0 {
 		return Invalid(fmt.Sprintf(
-			"ชั่วโมงตรวจการบ้านรวมต่อสัปดาห์ (%.1f ชม.) ต้องไม่เกินชั่วโมงบรรยายของ section (%.1f ชม.) — ปัจจุบันใช้ไปแล้ว %.1f ชม.",
-			existing+addedHours, lecH, existing))
+			"อาจารย์ไม่ได้ระบุชั่วโมง '%s' ในคำขอ จึงกำหนดตารางงานนี้ไม่ได้", dutyKindTH(kind)))
+	}
+	existing, err := s.weeklyReviewHoursForAssignment(ctx, assignmentID, kind, excludeID)
+	if err != nil {
+		return err
+	}
+	if existing+addedHours > capH+0.01 {
+		return Invalid(fmt.Sprintf(
+			"ชั่วโมง '%s' รวมต่อสัปดาห์ (%.1f ชม.) ต้องไม่เกินที่อาจารย์ระบุไว้ (%.1f ชม.) — ปัจจุบันใช้ไปแล้ว %.1f ชม.",
+			dutyKindTH(kind), existing+addedHours, capH, existing))
 	}
 	return nil
 }
@@ -1627,43 +1784,49 @@ func (s *WorkLogService) UpdateTAReviewSchedule(ctx context.Context, actor, assi
 	if err := s.enforceReviewNoConflict(ctx, assignmentID, in, &rsID); err != nil {
 		return err
 	}
-	if err := s.enforceReviewCap(ctx, assignmentID, &rsID, slotHours(in.StartTime, in.EndTime)); err != nil {
+	if err := s.enforceReviewCap(ctx, assignmentID, in.Kind, &rsID, slotHours(in.StartTime, in.EndTime)); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE ta_review_schedules
-		 SET day_of_week=$3, start_time=$4::time, end_time=$5::time,
-		     room=NULLIF($6,''), note=NULLIF($7,'')
-		 WHERE id=$1 AND assignment_id=$2`,
-		rsID, assignmentID, in.DayOfWeek, in.StartTime, in.EndTime, in.Room, in.Note)
-	if err != nil {
-		if isUniqueViolation(err) {
-			return Invalid("มีตารางตรวจการบ้านนี้อยู่แล้ว")
-		}
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("ไม่พบตารางตรวจการบ้านที่ต้องการแก้ไข")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_review_schedule.update", Entity: "ta_review_schedule", EntityID: rsID.String(), After: in})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "ta_review_schedule.update", Entity: "ta_review_schedule", EntityID: rsID.String(), After: in},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`UPDATE ta_review_schedules
+				 SET kind=$3, day_of_week=$4, start_time=$5::time, end_time=$6::time,
+				     room=NULLIF($7,''), note=NULLIF($8,'')
+				 WHERE id=$1 AND assignment_id=$2`,
+				rsID, assignmentID, in.Kind, in.DayOfWeek, in.StartTime, in.EndTime, in.Room, in.Note)
+			if err != nil {
+				if isUniqueViolation(err) {
+					return Invalid(fmt.Sprintf("มีตารางงาน '%s' ช่วงเวลานี้อยู่แล้ว", dutyKindTH(in.Kind)))
+				}
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ไม่พบตารางงานที่ต้องการแก้ไข")
+			}
+			return nil
+		})
 }
 
 func (s *WorkLogService) DeleteTAReviewSchedule(ctx context.Context, actor, assignmentID, rsID uuid.UUID) error {
 	if _, err := s.assertTAOwnsAssignment(ctx, actor, assignmentID); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM ta_review_schedules WHERE id=$1 AND assignment_id=$2`,
-		rsID, assignmentID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("ไม่พบตารางตรวจการบ้านที่ต้องการลบ")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_review_schedule.delete", Entity: "ta_review_schedule", EntityID: rsID.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "ta_review_schedule.delete", Entity: "ta_review_schedule", EntityID: rsID.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`DELETE FROM ta_review_schedules WHERE id=$1 AND assignment_id=$2`,
+				rsID, assignmentID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ไม่พบตารางตรวจการบ้านที่ต้องการลบ")
+			}
+			return nil
+		})
 }
 
 // dailyHourCapFor resolves the daily hour cap that applies to an assignment
@@ -2193,7 +2356,7 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	// additionally blocks TA writes. Check the incoming date, and for edits also
 	// the row's current date so an entry can't be moved into or out of a locked
 	// month from either side.
-	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate, true); err != nil {
+	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate); err != nil {
 		return uuid.Nil, err
 	}
 	if w.ID != uuid.Nil {
@@ -2201,7 +2364,7 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		if err := s.pool.QueryRow(ctx,
 			`SELECT TO_CHAR(work_date,'YYYY-MM-DD') FROM work_logs WHERE id=$1 AND assignment_id=$2`,
 			w.ID, w.AssignmentID).Scan(&oldDate); err == nil && oldDate[:7] != w.WorkDate[:7] {
-			if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, oldDate, true); err != nil {
+			if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, oldDate); err != nil {
 				return uuid.Nil, err
 			}
 		}
@@ -2265,40 +2428,59 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	}
 
 	if w.ID == uuid.Nil {
-		// Block adding new rows once the assignment has entered review, so hours
-		// cannot be inflated after approval.
+		// Block adding new rows once THAT MONTH has entered review, so hours
+		// cannot be inflated after the lecturer and staff have signed it off.
+		//
+		// Scoped to the month (03/08/2026). It used to look at the whole
+		// assignment, which meant submitting June closed October too: a TA who
+		// picked up an extra session mid-term could never log it, all term. The
+		// month is the unit everything downstream uses — approval, staff review
+		// and export are all per (assignment, month) — so it is the unit that
+		// should close.
 		var reviewed int
 		if err := s.pool.QueryRow(ctx,
-			`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status IN ('submitted','approved')`,
-			w.AssignmentID).Scan(&reviewed); err != nil {
+			`SELECT COUNT(*) FROM work_logs
+			 WHERE assignment_id=$1 AND status IN ('submitted','approved')
+			   AND to_char(work_date, 'YYYY-MM') = $2`,
+			w.AssignmentID, w.WorkDate[:7]).Scan(&reviewed); err != nil {
 			return uuid.Nil, err
 		}
 		if reviewed > 0 {
-			return uuid.Nil, Invalid("ไม่สามารถเพิ่มรายการใหม่ได้ เนื่องจากมีรายการที่ส่งอนุมัติหรืออนุมัติแล้ว")
+			return uuid.Nil, Invalid("เดือนนี้ส่งอนุมัติหรืออนุมัติไปแล้ว — เพิ่มรายการใหม่ในเดือนนี้ไม่ได้")
 		}
 		w.ID = uuid.New()
-		_, err := s.pool.Exec(ctx,
-			`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, parent_kind, room, note, status)
-			 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,$9,$10,'draft')`,
-			w.ID, w.AssignmentID, w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note)
-		if err == nil {
-			s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.create", Entity: "work_log", EntityID: w.ID.String(), After: w})
+		if err := writeAudited(ctx, s.pool, s.aud,
+			audit.Entry{ActorID: &actor, Action: "worklog.create", Entity: "work_log", EntityID: w.ID.String(), After: w},
+			func(tx pgx.Tx) error {
+				_, err := tx.Exec(ctx,
+					`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, parent_kind, room, note, status)
+					 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,$9,$10,'draft')`,
+					w.ID, w.AssignmentID, w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note)
+				return err
+			}); err != nil {
+			return uuid.Nil, err
 		}
-		return w.ID, err
+		return w.ID, nil
 	}
 	// Editable states: draft (in progress) and rejected (TA fixing after a
 	// bounce — the update resets it to draft so it can be resubmitted).
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8, status='draft'
-		 WHERE id=$9 AND assignment_id=$10 AND status IN ('draft','rejected')`,
-		w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note, w.ID, w.AssignmentID)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "worklog.update", Entity: "work_log", EntityID: w.ID.String(), After: w},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8, status='draft'
+				 WHERE id=$9 AND assignment_id=$10 AND status IN ('draft','rejected')`,
+				w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note, w.ID, w.AssignmentID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ไม่พบรายการที่แก้ไขได้ (อาจถูกส่งอนุมัติหรืออนุมัติแล้ว)")
+			}
+			return nil
+		}); err != nil {
 		return uuid.Nil, err
 	}
-	if tag.RowsAffected() == 0 {
-		return uuid.Nil, Invalid("ไม่พบรายการที่แก้ไขได้ (อาจถูกส่งอนุมัติหรืออนุมัติแล้ว)")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.update", Entity: "work_log", EntityID: w.ID.String(), After: w})
 	return w.ID, nil
 }
 
@@ -2320,22 +2502,7 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE work_logs wl SET status='submitted', submitted_at=NOW(), reject_reason=NULL
 		WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM ta_request_assignments a
-			JOIN sections sec ON sec.id = a.section_id
-			JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-			JOIN academic_terms trm ON trm.id = tc.term_id
-			JOIN submission_periods sp ON sp.term_id = tc.term_id
-			 AND sp.year_month = trm.academic_year::text || '-' || to_char(wl.work_date, 'MM')
-			LEFT JOIN submission_period_status st
-			  ON st.submission_period_id = sp.id
-			 AND st.ta_id = a.ta_id
-			 AND st.teaching_course_id = tc.id
-			WHERE a.id = wl.assignment_id
-			  AND (sp.is_closed OR CURRENT_DATE > sp.due_date + INTERVAL '1 day'
-			       OR COALESCE(st.status, '') IN ('exported','finance_sent'))
-		  )`, assignmentID)
+		  AND NOT `+unsubmittableMonthSQL("wl"), assignmentID)
 	if err != nil {
 		return err
 	}
@@ -2346,11 +2513,16 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 		if err := s.pool.QueryRow(ctx,
 			`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status IN ('draft','rejected')`,
 			assignmentID).Scan(&candidates); err == nil && candidates > 0 {
-			return Invalid("รายการทั้งหมดอยู่ในงวดที่ปิดรับหรือส่งการเงินไปแล้ว — ส่งอนุมัติไม่ได้ กรุณาติดต่อเจ้าหน้าที่")
+			// No back-dated submission (staff decision, 03/08/2026): a month
+			// whose deadline passed unsent is a month the TA did not claim. The
+			// message says so instead of offering an appeal that will be refused.
+			return Invalid("รายการทั้งหมดอยู่ในงวดที่ปิดไปแล้ว — ถือว่าไม่ประสงค์ลงเวลา ส่งย้อนหลังไม่ได้")
 		}
 		return Invalid("ไม่มีรายการที่ส่งอนุมัติได้")
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.submit", Entity: "assignment", EntityID: assignmentID.String()})
+	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.submit", Entity: "assignment", EntityID: assignmentID.String()}); err != nil {
+		return err
+	}
 	// Tell the course's lecturers there is work waiting — without this the
 	// approver only discovers pending batches by polling their reports page.
 	if s.notify != nil {
@@ -2359,7 +2531,7 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 				s.notify.Send(ctx, lid,
 					"มีบันทึกเวลารอการอนุมัติ",
 					"TA ส่งบันทึกเวลาปฏิบัติงานรอการอนุมัติจากคุณ",
-					"/lecturer/approvals")
+					"/lecturer/courses/"+ac.TeachingCourseID.String()+"/reports")
 			}
 		}
 	}
@@ -2376,6 +2548,166 @@ func validateYearMonth(ym string) error {
 		return nil
 	}
 	return Invalid("รูปแบบเดือนไม่ถูกต้อง (ต้องเป็น YYYY-MM)")
+}
+
+// pendingApprovalBaht is the extra pay the not-yet-approved rows of one
+// assignment represent. Read on the CALLER'S transaction so a batch sees the
+// rows it has already flipped in the same transaction.
+//
+// Both undergrad (hourly, per-track) AND graduate-regular (hourly per ประกาศ)
+// are billed by hours. Grad-special is flat monthly, so its hours contribute 0.
+func pendingApprovalBaht(ctx context.Context, tx pgx.Tx, assignmentID uuid.UUID, yearMonth string) (float64, error) {
+	var addBaht float64
+	err := tx.QueryRow(ctx, `
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
+		SELECT COALESCE(SUM(wl.hours *
+			CASE
+			    WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
+			    WHEN a.level='undergrad' AND sec.track='special' THEN pr.undergrad_special
+			    WHEN a.level IN ('master','phd') AND sec.track='regular' THEN pr.graduate_regular_hourly
+			    ELSE 0
+			END), 0)
+		FROM work_logs wl
+		JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		JOIN sections sec ON sec.id = a.section_id
+		CROSS JOIN latest pr
+		WHERE wl.assignment_id = $1 AND wl.status = 'submitted'
+		  AND ($2 = '' OR to_char(wl.work_date, 'YYYY-MM') = $2)`,
+		assignmentID, yearMonth).Scan(&addBaht)
+	return addBaht, err
+}
+
+// ApproveMany approves several assignments in ONE transaction: all of them land
+// or none does.
+//
+// The lecturer screen's "อนุมัติทั้งคนนี้" covers a TA who helps with several
+// sections, which is several assignments. Looping over the single-assignment
+// endpoint left a half-approved TA whenever the second call was refused — the
+// caller saw an error for something that had partly happened, and retrying
+// silently skipped whatever had already gone through.
+//
+// It also fixes a check the loop could not do. The per-assignment budget guard
+// compares each assignment against the course cap on its own; two sections that
+// each fit can still exceed it together. Here the batch's cost is summed per
+// course FIRST, then compared once.
+func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assignmentIDs []uuid.UUID, yearMonth string, privileged bool) error {
+	if len(assignmentIDs) == 0 {
+		return Invalid("ไม่ได้ระบุรายการที่จะอนุมัติ")
+	}
+	if err := validateYearMonth(yearMonth); err != nil {
+		return err
+	}
+
+	// Permission and finance-lock checks first, on the pool: they are reads, and
+	// a refusal here should not have opened a transaction at all.
+	ctxs := make(map[uuid.UUID]*assignmentContext, len(assignmentIDs))
+	ids := make([]uuid.UUID, 0, len(assignmentIDs))
+	for _, id := range assignmentIDs {
+		if _, seen := ctxs[id]; seen {
+			continue // the same assignment named twice is one assignment
+		}
+		ac, err := s.assertCanReview(ctx, actor, id, privileged)
+		if err != nil {
+			return err
+		}
+		if err := assertNoFinanceLockedRows(ctx, s.pool, id, []string{"submitted"}, yearMonth); err != nil {
+			return err
+		}
+		ctxs[id] = ac
+		ids = append(ids, id)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Serialize on every course involved, so two reviewers cannot both push the
+	// same course over budget. Sorted to give every caller the same lock order
+	// and rule out a deadlock between two overlapping batches.
+	courses := make([]uuid.UUID, 0, len(ids))
+	seenCourse := map[uuid.UUID]bool{}
+	for _, id := range ids {
+		if c := ctxs[id].TeachingCourseID; !seenCourse[c] {
+			seenCourse[c] = true
+			courses = append(courses, c)
+		}
+	}
+	sort.Slice(courses, func(i, j int) bool { return courses[i].String() < courses[j].String() })
+	for _, c := range courses {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 42))`, c); err != nil {
+			return err
+		}
+	}
+
+	// No budget guard here, by design (04/08/2026).
+	//
+	// It used to price the batch and refuse the whole approval when the course
+	// would go over its cap. The work had already happened, so refusing did not
+	// un-happen it — it left real hours with nowhere to go and the lecturer with
+	// a button that could not be pressed. What the budget decides now is which
+	// MONTHS get paid (budget_settlement.go), settled at export; recording what
+	// somebody did is not the place to enforce it.
+	//
+	// The advisory lock above stays: it still serialises concurrent approvals on
+	// one course, which the cap recheck below depends on.
+
+	var affected int64
+	for _, id := range ids {
+		if err := s.recheckCapsForApproval(ctx, tx, ctxs[id], id); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx,
+			`UPDATE work_logs SET status='approved', approved_at=NOW(), approved_by=$1
+			 WHERE assignment_id=$2 AND status='submitted'
+			   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`, actor, id, yearMonth)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			// One section of a co-taught pair can legitimately be finished
+			// already. Only an entirely empty batch is worth refusing.
+			continue
+		}
+		affected += tag.RowsAffected()
+		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "worklog.approve",
+			Entity: "assignment", EntityID: id.String(), Note: yearMonth}); err != nil {
+			return err
+		}
+	}
+	if affected == 0 {
+		return Invalid("ไม่มีรายการที่รออนุมัติ (อาจถูกดำเนินการไปแล้ว)")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	// The course budget just moved. Warn if the term no longer fits — after the
+	// commit, so a warning cannot roll back an approval.
+	courseIDs := make([]uuid.UUID, 0, len(courses))
+	courseIDs = append(courseIDs, courses...)
+	s.warnBudgetAfterApproval(ctx, courseIDs...)
+
+	// After the commit, and once per PERSON — a TA on two sections should not be
+	// told twice about one decision.
+	if s.notify != nil {
+		scope := "บันทึกเวลาปฏิบัติงานของคุณได้รับการอนุมัติแล้ว"
+		if yearMonth != "" {
+			scope = "บันทึกเวลาเดือน " + yearMonth + " ของคุณได้รับการอนุมัติแล้ว"
+		}
+		told := map[uuid.UUID]bool{}
+		for _, id := range ids {
+			ta := ctxs[id].TAID
+			if told[ta] {
+				continue
+			}
+			told[ta] = true
+			t := s.notifyTarget(ctx, ctxs[id].TeachingCourseID)
+			s.notify.Send(ctx, ta, "อนุมัติบันทึกเวลา "+t.Code, scope, t.Link)
+		}
+	}
+	return nil
 }
 
 // yearMonth ("YYYY-MM") approves only that month's submitted rows — lecturers
@@ -2406,37 +2738,8 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 		return err
 	}
 
-	// Budget guard (C3): the additional pay these newly-approved hours represent
-	// must not push the course past its derived cap.
-	// Both undergrad (hourly, per-track) AND graduate-regular (hourly per ประกาศ)
-	// are billed by hours. Grad-special is flat monthly, so its hours contribute 0.
-	var addBaht float64
-	if err := tx.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT COALESCE(SUM(wl.hours *
-			CASE
-			    WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
-			    WHEN a.level='undergrad' AND sec.track='special' THEN pr.undergrad_special
-			    WHEN a.level IN ('master','phd') AND sec.track='regular' THEN pr.graduate_regular_hourly
-			    ELSE 0
-			END), 0)
-		FROM work_logs wl
-		JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		JOIN sections sec ON sec.id = a.section_id
-		CROSS JOIN latest pr
-		WHERE wl.assignment_id = $1 AND wl.status = 'submitted'
-		  AND ($2 = '' OR to_char(wl.work_date, 'YYYY-MM') = $2)`, assignmentID, yearMonth).Scan(&addBaht); err != nil {
-		return err
-	}
-	if addBaht > 0 {
-		snap, err := s.budget.Compute(ctx, ac.TeachingCourseID)
-		if err != nil {
-			return err
-		}
-		if snap.PerCourseMaxBaht > 0 && snap.UsedBaht+addBaht > snap.PerCourseMaxBaht+0.01 {
-			return Conflict(fmt.Sprintf("อนุมัติไม่ได้: จะทำให้เกินงบประมาณของรายวิชา (คงเหลือ %.2f บาท ต้องการ %.2f บาท)", snap.RemainingBaht, addBaht))
-		}
-	}
+	// No budget guard — see ApproveMany for why. The month cutoff at export is
+	// what the budget controls, not whether the hours may be recorded.
 
 	// Last-gate cap recheck: staff edits after submit can push a day/week past
 	// its cap; refuse rather than approve hours that violate the pay rules.
@@ -2454,17 +2757,26 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	if tag.RowsAffected() == 0 {
 		return Invalid("ไม่มีรายการที่รออนุมัติ (อาจถูกดำเนินการไปแล้ว)")
 	}
+	// Audit INSIDE the transaction, before the commit. Written afterwards on a
+	// pool connection it can fail on its own, and then there is no honest answer
+	// left: the hours are approved and the record says they never were, or we
+	// report a failure for something that did happen and the lecturer retries
+	// into "ไม่มีรายการที่รออนุมัติ". Here the two land together or neither does.
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "worklog.approve", Entity: "assignment", EntityID: assignmentID.String(), Note: yearMonth}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.approve", Entity: "assignment", EntityID: assignmentID.String(), Note: yearMonth})
 	if s.notify != nil {
-		scope := "บันทึกเวลาปฏิบัติงานของคุณได้รับการอนุมัติแล้ว"
-		if yearMonth != "" {
-			scope = "บันทึกเวลาเดือน " + yearMonth + " ของคุณได้รับการอนุมัติแล้ว"
+		t := s.notifyTarget(ctx, ac.TeachingCourseID)
+		scope := "บันทึกเวลาปฏิบัติงานวิชา " + t.Code + " ของคุณได้รับการอนุมัติแล้ว"
+		if when := thaiYearMonth(yearMonth); when != "" {
+			scope = "บันทึกเวลาวิชา " + t.Code + " เดือน" + when + " ของคุณได้รับการอนุมัติแล้ว"
 		}
-		s.notify.Send(ctx, ac.TAID, "อนุมัติบันทึกเวลา", scope, "/ta/worklog")
+		s.notify.Send(ctx, ac.TAID, "อนุมัติบันทึกเวลา "+t.Code, scope, t.Link)
 	}
+	s.warnBudgetAfterApproval(ctx, ac.TeachingCourseID)
 	return nil
 }
 
@@ -2658,9 +2970,13 @@ type WorkLogWithTA struct {
 	SectionNo  string    `json:"section_no"`
 	Track      string    `json:"track"`
 	Level      string    `json:"level"`
-	// Locked is true when this row's month has reached exported/finance_sent for
-	// the TA — the row is frozen for every role (assertWorklogWritable). The
-	// editor renders locked rows read-only instead of letting a save 409.
+	// Locked is true when this row's month is closed to writes for EVERY role —
+	// past its deadline, or already exported / sent to finance. The editor
+	// renders locked rows read-only instead of letting a save 409.
+	//
+	// Widened on 03/08/2026 when the deadline stopped exempting staff: without
+	// it the editor kept offering a pencil on rows the server would refuse,
+	// which is the same trap the TA's submit button used to be.
 	Locked bool `json:"locked"`
 }
 
@@ -2689,24 +3005,14 @@ func (s *WorkLogService) StaffListByCourse(ctx context.Context, tcID uuid.UUID) 
 		       wl.parent_kind, wl.room, wl.note, wl.status::text,
 		       a.ta_id, u.first_name || ' ' || u.last_name,
 		       tc.code, sec.sec_no, sec.track, a.level,
-		       -- Month is frozen for this TA once it reaches exported/finance_sent.
-		       -- Same (ta_id, tc, year_month, status) predicate as financeLockedMonths.
-		       EXISTS (
-		         SELECT 1 FROM submission_periods sp
-		         JOIN submission_period_status st
-		           ON st.submission_period_id = sp.id
-		          AND st.ta_id = a.ta_id
-		          AND st.teaching_course_id = tc.id
-		          AND st.status IN ('exported','finance_sent')
-		         WHERE sp.term_id = tc.term_id
-		           AND sp.year_month = trm.academic_year::text || '-' || to_char(wl.work_date, 'MM')
-		       ) AS locked
+		       -- Exactly what assertWorklogWritable refuses, so the pencil the
+		       -- editor draws and the write the server accepts cannot disagree.
+		       `+unsubmittableMonthSQL("wl")+` AS locked
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN users u ON u.id = a.ta_id
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN academic_terms trm ON trm.id = tc.term_id
 		WHERE tc.id = $1
 		ORDER BY u.first_name, wl.work_date, wl.start_time`, tcID)
 	if err != nil {
@@ -2854,10 +3160,11 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}); err != nil {
 		return uuid.Nil, err
 	}
-	// Finance lock applies to staff too — once a month reached finance_sent the
-	// paperwork is out the door; edits must go through the admin unlock first.
-	// (Closed-but-not-sent months stay staff-editable: taActor=false.)
-	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate, false); err != nil {
+	// Staff get no exemption from the monthly deadline. A closed month is closed
+	// for them too (03/08/2026, at the staff's own request): the only way to
+	// correct a month after it closes is to move the period's due date in
+	// settings, which is a deliberate, visible act rather than a quiet edit.
+	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate); err != nil {
 		return uuid.Nil, err
 	}
 	if w.ID != uuid.Nil {
@@ -2865,7 +3172,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		if err := s.pool.QueryRow(ctx,
 			`SELECT TO_CHAR(work_date,'YYYY-MM-DD') FROM work_logs WHERE id=$1 AND assignment_id=$2`,
 			w.ID, w.AssignmentID).Scan(&oldDate); err == nil && oldDate[:7] != w.WorkDate[:7] {
-			if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, oldDate, false); err != nil {
+			if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, oldDate); err != nil {
 				return uuid.Nil, err
 			}
 		}
@@ -2913,35 +3220,43 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		return uuid.Nil, err
 	}
 
-	if w.ID == uuid.Nil {
+	isNew := w.ID == uuid.Nil
+	if isNew {
 		w.ID = uuid.New()
-		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, parent_kind, room, note, status)
-			 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,$9,$10,'draft')`,
-			w.ID, w.AssignmentID, w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note); err != nil {
-			return uuid.Nil, err
-		}
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(), After: w})
-	} else {
-		// Preserve status so approved rows stay approved; staff cannot silently unlock review state.
-		// The assignment_id predicate is defence-in-depth on top of the pin above.
-		tag, err := s.pool.Exec(ctx,
-			`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8
-			 WHERE id=$9 AND assignment_id=$10`,
-			w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note, w.ID, w.AssignmentID)
-		if err != nil {
-			return uuid.Nil, err
-		}
-		if tag.RowsAffected() == 0 {
-			return uuid.Nil, Invalid("ไม่พบรายการที่ต้องการแก้ไข")
-		}
-		s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(), After: w})
+	}
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(), After: w},
+		func(tx pgx.Tx) error {
+			if isNew {
+				_, err := tx.Exec(ctx,
+					`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, parent_kind, room, note, status)
+					 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,$9,$10,'draft')`,
+					w.ID, w.AssignmentID, w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note)
+				return err
+			}
+			// Preserve status so approved rows stay approved; staff cannot silently unlock review state.
+			// The assignment_id predicate is defence-in-depth on top of the pin above.
+			tag, err := tx.Exec(ctx,
+				`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8
+				 WHERE id=$9 AND assignment_id=$10`,
+				w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note, w.ID, w.AssignmentID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ไม่พบรายการที่ต้องการแก้ไข")
+			}
+			return nil
+		}); err != nil {
+		return uuid.Nil, err
 	}
 	if s.notify != nil {
+		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		s.notify.Send(ctx, ac.TAID,
-			"เจ้าหน้าที่แก้ไขบันทึกเวลา",
-			fmt.Sprintf("เจ้าหน้าที่ปรับข้อมูลบันทึกเวลาวันที่ %s เวลา %s–%s", w.WorkDate, w.StartTime, w.EndTime),
-			"/ta/worklog")
+			"เจ้าหน้าที่แก้ไขบันทึกเวลา "+t.Code,
+			fmt.Sprintf("เจ้าหน้าที่ปรับข้อมูลบันทึกเวลาวิชา %s วันที่ %s เวลา %s–%s",
+				t.Code, w.WorkDate, w.StartTime, w.EndTime),
+			t.Link)
 	}
 	return w.ID, nil
 }
@@ -2967,19 +3282,22 @@ func (s *WorkLogService) Delete(ctx context.Context, actor, logID uuid.UUID) err
 	if status != "draft" && status != "rejected" {
 		return Invalid("ลบไม่ได้: รายการนี้ถูกส่งอนุมัติหรืออนุมัติแล้ว")
 	}
-	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, workDate, true); err != nil {
+	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, workDate); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM work_logs WHERE id=$1 AND status IN ('draft','rejected')`, logID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("ลบไม่ได้: รายการอาจถูกดำเนินการไปแล้ว")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.delete", Entity: "work_log", EntityID: logID.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "worklog.delete", Entity: "work_log", EntityID: logID.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`DELETE FROM work_logs WHERE id=$1 AND status IN ('draft','rejected')`, logID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ลบไม่ได้: รายการอาจถูกดำเนินการไปแล้ว")
+			}
+			return nil
+		})
 }
 
 // StaffDelete removes a work_log entry. Only draft/rejected can be removed;
@@ -3010,23 +3328,30 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, actor uuid.UUID, privi
 			return ErrForbidden
 		}
 	}
-	if err := assertWorklogWritable(ctx, s.pool, tcID, taID, workDate, false); err != nil {
+	if err := assertWorklogWritable(ctx, s.pool, tcID, taID, workDate); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM work_logs WHERE id=$1 AND status IN ('draft','rejected')`, id)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: auditDeleteAction(privileged), Entity: "work_log", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`DELETE FROM work_logs WHERE id=$1 AND status IN ('draft','rejected')`, id)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ลบไม่ได้: รายการอาจถูกส่งอนุมัติหรืออนุมัติแล้ว")
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("ลบไม่ได้: รายการอาจถูกส่งอนุมัติหรืออนุมัติแล้ว")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: auditDeleteAction(privileged), Entity: "work_log", EntityID: id.String()})
 	if s.notify != nil {
+		t := s.notifyTarget(ctx, tcID)
 		s.notify.Send(ctx, taID,
-			"เจ้าหน้าที่ลบบันทึกเวลา",
-			fmt.Sprintf("เจ้าหน้าที่ลบรายการบันทึกเวลาวันที่ %s เวลา %s", workDate, timeSpan),
-			"/ta/worklog")
+			"เจ้าหน้าที่ลบบันทึกเวลา "+t.Code,
+			fmt.Sprintf("เจ้าหน้าที่ลบรายการบันทึกเวลาวิชา %s วันที่ %s เวลา %s", t.Code, workDate, timeSpan),
+			t.Link)
 	}
 	return nil
 }
@@ -3048,23 +3373,67 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 	if err := assertNoFinanceLockedRows(ctx, s.pool, assignmentID, []string{"submitted"}, yearMonth); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE work_logs SET status='rejected', reject_reason=$1
-		 WHERE assignment_id=$2 AND status='submitted'
-		   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`,
-		reason, assignmentID, yearMonth)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "worklog.reject", Entity: "assignment", EntityID: assignmentID.String(), Note: reason},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx,
+				`UPDATE work_logs SET status='rejected', reject_reason=$1
+				 WHERE assignment_id=$2 AND status='submitted'
+				   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`,
+				reason, assignmentID, yearMonth)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("ไม่มีรายการที่รออนุมัติ (อาจถูกดำเนินการไปแล้ว)")
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("ไม่มีรายการที่รออนุมัติ (อาจถูกดำเนินการไปแล้ว)")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "worklog.reject", Entity: "assignment", EntityID: assignmentID.String(), Note: reason})
 	if s.notify != nil {
+		t := s.notifyTarget(ctx, ac.TeachingCourseID)
+		when := thaiYearMonth(yearMonth)
+		if when != "" {
+			when = " เดือน" + when
+		}
 		s.notify.Send(ctx, ac.TAID,
-			"บันทึกเวลาถูกปฏิเสธ",
-			"บันทึกเวลาของคุณถูกส่งกลับให้แก้ไข: "+reason,
-			"/ta/worklog")
+			"บันทึกเวลา "+t.Code+" ถูกตีกลับ",
+			"อาจารย์ส่งบันทึกเวลาวิชา "+t.Code+when+" กลับมาให้แก้ไข: "+reason,
+			t.Link)
 	}
 	return nil
+}
+
+// worklogNotifyTarget is the course a work-log notification is about, worded and
+// linked so the TA can act on it.
+//
+// Every notification this service sent used to read "บันทึกเวลาของคุณถูกส่งกลับ
+// ให้แก้ไข" and link to /ta/worklog — a route that does not exist, on a screen
+// that is per-course, for a TA who assists three courses. Four identical lines
+// in the bell told them something had happened somewhere. The course code and a
+// working link are the whole difference between a notice and a nuisance.
+type worklogNotifyTarget struct {
+	Code string
+	Link string
+}
+
+func (s *WorkLogService) notifyTarget(ctx context.Context, tcID uuid.UUID) worklogNotifyTarget {
+	t := worklogNotifyTarget{Link: "/ta/courses/" + tcID.String() + "/worklog"}
+	_ = s.pool.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id=$1`, tcID).Scan(&t.Code)
+	return t
+}
+
+// thaiYearMonth turns "2026-09" into "กันยายน 2569". Empty stays empty — the
+// caller then means "the whole batch", not one month.
+func thaiYearMonth(ym string) string {
+	if len(ym) != 7 {
+		return ""
+	}
+	y, err1 := strconv.Atoi(ym[:4])
+	m, err2 := strconv.Atoi(ym[5:])
+	if err1 != nil || err2 != nil || m < 1 || m > 12 {
+		return ""
+	}
+	return fmt.Sprintf("%s %d", thaiMonthNames[m], y+543)
 }

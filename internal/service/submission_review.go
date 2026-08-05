@@ -51,6 +51,11 @@ type ReviewQueueRow struct {
 	// not ready for staff to sign off, and the queue says so rather than
 	// letting staff approve a moving target.
 	OpenRows int `json:"open_rows"`
+	// Forfeited counts rows the TA never sent before their period closed. They
+	// read as "TA ยังไม่ส่ง" on the staff grid until 04/08/2026, which was both
+	// wrong — nobody is waiting on the TA, the deadline has passed — and a dead
+	// end: a month whose only open rows were forfeited could never be signed off.
+	Forfeited int `json:"forfeited"`
 	// Who the month is actually waiting on. OpenRows alone could not say, so the
 	// merged payout screen blamed the lecturer for rows the TA had not even
 	// submitted — and offered a "remind the lecturer" button the server then
@@ -71,6 +76,25 @@ type ReviewQueueRow struct {
 	// in it.
 	RowCount    int `json:"row_count"`
 	ManualCount int `json:"manual_count"`
+	// NeedsStaff is the one answer to "is this month work for the officer".
+	//
+	// Three things have to be true: staff have not signed it off, nobody else
+	// still holds a row, and there IS approved work in it. That last clause is
+	// the one both screens have to agree on — a month whose rows were all
+	// forfeited has nothing to sign and nothing to pay, and the staff grid
+	// already skipped it while the payout LIST still counted it, so two courses
+	// sat under "รอคุณดำเนินการ" over months worth ฿0 with no way to clear them.
+	NeedsStaff bool `json:"needs_staff"`
+}
+
+// needsStaff decides whether this month is work for the officer. Kept as one
+// function so the flag the screens read and the rule anybody edits are the same
+// thing — the two screens deriving it independently is the bug it exists to
+// close.
+func (r ReviewQueueRow) needsStaff() bool {
+	return r.Status == "pending" && // nobody has signed it off yet
+		r.OpenRows == 0 && //   nothing still with the TA or the lecturer
+		r.RowCount > 0 //       and there IS approved work to sign
 }
 
 // ListReviewQueue returns every (period, TA, course) whose month has approved
@@ -81,14 +105,33 @@ type ReviewQueueRow struct {
 // list would be dominated by history.
 func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uuid.UUID) ([]ReviewQueueRow, error) {
 	rows, err := s.pool.Query(ctx, `
-		WITH month_logs AS (
+		WITH`+mergedSittingsCTE+`,
+		-- Approved hours are counted as SITTINGS, matching the signed claim form:
+		-- two sections taught in one sitting are paid once (billable_hours.go).
+		-- The open/waiting counts below stay row-based — they are workload, not
+		-- money, and an officer chasing four unsubmitted rows wants four.
+		month_sittings AS (
+		    SELECT ta_id, teaching_course_id,
+		           to_char(work_date, 'MM') AS mm,
+		           SUM(hours) AS approved_hours
+		    FROM sittings
+		    GROUP BY ta_id, teaching_course_id, to_char(work_date, 'MM')
+		),
+		month_logs AS (
 		    SELECT sp.id   AS period_id,
 		           a.ta_id AS ta_id,
 		           tc.id   AS tc_id,
-		           SUM(wl.hours) FILTER (WHERE wl.status = 'approved')                      AS approved_hours,
-		           COUNT(*)      FILTER (WHERE wl.status IN ('draft','submitted','rejected')) AS open_rows,
-		           COUNT(*)      FILTER (WHERE wl.status IN ('draft','rejected'))             AS waiting_ta,
-		           COUNT(*)      FILTER (WHERE wl.status = 'submitted')                       AS waiting_lecturer,
+		           RIGHT(sp.year_month, 2) AS mm,
+		           -- Rows the TA can no longer move: unsent when their period
+		           -- closed. They are NOT outstanding work — nobody is going to
+		           -- send them — so they must not sit in open_rows, where they
+		           -- would block staff from ever signing the month off and the
+		           -- course from ever exporting.
+		           COUNT(*)      FILTER (WHERE wl.status IN ('draft','rejected')
+		                                   AND `+unsubmittableMonthSQL("wl")+`)      AS forfeited,
+		           COUNT(*)      FILTER (WHERE `+outstandingRowSQL("wl")+`)   AS open_rows,
+		           COUNT(*)      FILTER (WHERE `+waitingTASQL("wl")+`)         AS waiting_ta,
+		           COUNT(*)      FILTER (WHERE `+waitingLecturerSQL("wl")+`)   AS waiting_lecturer,
 		           COUNT(*)      FILTER (WHERE wl.status = 'approved')                        AS row_count,
 		           COUNT(*)      FILTER (WHERE wl.status = 'approved' AND wl.source = 'manual') AS manual_count
 		    FROM teaching_courses tc
@@ -103,19 +146,23 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		      -- work is not yet payable, and signing it off here would release
 		      -- it to an export the finance office cannot accept.
 		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
-		    GROUP BY sp.id, a.ta_id, tc.id
+		    GROUP BY sp.id, a.ta_id, tc.id, RIGHT(sp.year_month, 2)
 		)
 		SELECT sp.id, sp.label, sp.year_month,
 		       u.id, u.first_name || ' ' || u.last_name,
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
-		       COALESCE(ml.approved_hours, 0),
+		       COALESCE(ms.approved_hours, 0),
+		       COALESCE(ml.forfeited, 0),
 		       COALESCE(ml.open_rows, 0),
 		       COALESCE(ml.waiting_ta, 0),
 		       COALESCE(ml.waiting_lecturer, 0),
 		       COALESCE(ml.row_count, 0),
 		       COALESCE(ml.manual_count, 0)
 		FROM month_logs ml
+		LEFT JOIN month_sittings ms
+		       ON ms.ta_id = ml.ta_id AND ms.teaching_course_id = ml.tc_id
+		      AND ms.mm = ml.mm
 		JOIN submission_periods sp ON sp.id = ml.period_id
 		JOIN users u               ON u.id = ml.ta_id
 		JOIN teaching_courses tc   ON tc.id = ml.tc_id
@@ -135,11 +182,12 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		var r ReviewQueueRow
 		if err := rows.Scan(&r.PeriodID, &r.PeriodLabel, &r.YearMonth,
 			&r.TAID, &r.TAName, &r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
-			&r.Status, &r.ApprovedHours, &r.OpenRows,
+			&r.Status, &r.ApprovedHours, &r.Forfeited, &r.OpenRows,
 			&r.WaitingTA, &r.WaitingLecturer,
 			&r.RowCount, &r.ManualCount); err != nil {
 			return nil, err
 		}
+		r.NeedsStaff = r.needsStaff()
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -198,21 +246,21 @@ func (s *SubmissionPeriodService) CountAwaitingAppointment(ctx context.Context, 
 func (s *SubmissionPeriodService) approvedBahtForMonth(ctx context.Context, taID, tcID uuid.UUID, yearMonth string) (float64, error) {
 	var baht float64
 	err := s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT COALESCE(SUM(wl.hours *
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),`+
+		mergedSittingsCTE+`
+		-- Priced from SITTINGS, not from work_log rows: the same rule the claim
+		-- form bills by (billable_hours.go).
+		SELECT COALESCE(SUM(st.hours *
 		    CASE
-		        WHEN a.level = 'undergrad' AND sec.track = 'regular' THEN pr.undergrad_regular
-		        WHEN a.level = 'undergrad' AND sec.track = 'special' THEN pr.undergrad_special
-		        WHEN a.level IN ('master','phd') AND sec.track = 'regular' THEN pr.graduate_regular_hourly
+		        WHEN st.level = 'undergrad' AND st.track = 'regular' THEN pr.undergrad_regular
+		        WHEN st.level = 'undergrad' AND st.track = 'special' THEN pr.undergrad_special
+		        WHEN st.level IN ('master','phd') AND st.track = 'regular' THEN pr.graduate_regular_hourly
 		        ELSE 0
 		    END), 0)
-		FROM work_logs wl
-		JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		JOIN sections sec ON sec.id = a.section_id
+		FROM sittings st
 		CROSS JOIN latest pr
-		WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
-		  AND wl.status = 'approved'
-		  AND to_char(wl.work_date, 'MM') = RIGHT($3, 2)`,
+		WHERE st.ta_id = $1 AND st.teaching_course_id = $2
+		  AND to_char(st.work_date, 'MM') = RIGHT($3, 2)`,
 		taID, tcID, yearMonth).Scan(&baht)
 	return baht, err
 }
@@ -252,31 +300,33 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 	}
 
 	name := s.userDisplayName(ctx, actor)
-	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO submission_period_status
-		    (id, submission_period_id, ta_id, teaching_course_id, status,
-		     staff_reviewed_by, staff_reviewed_name, staff_comment)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NULLIF($7, ''))
-		ON CONFLICT (submission_period_id, ta_id, teaching_course_id) DO UPDATE
-		SET status              = $4,
-		    staff_reviewed_by   = EXCLUDED.staff_reviewed_by,
-		    staff_reviewed_name = EXCLUDED.staff_reviewed_name,
-		    staff_comment       = EXCLUDED.staff_comment
-		WHERE submission_period_status.status = 'pending'`,
-		periodID, taID, tcID, StatusStaffReviewed, actor, name, comment)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return Invalid("รายการนี้ผ่านการตรวจสอบหรือส่งออกไปแล้ว")
-	}
-
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "submission.staff_reviewed",
-		Entity: "submission_period_status", EntityID: periodID.String(),
-		Note: fmt.Sprintf("ta=%s course=%s", taID, tcID),
-	})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{
+			ActorID: &actor, Action: "submission.staff_reviewed",
+			Entity: "submission_period_status", EntityID: periodID.String(),
+			Note: fmt.Sprintf("ta=%s course=%s", taID, tcID),
+		},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				INSERT INTO submission_period_status
+				    (id, submission_period_id, ta_id, teaching_course_id, status,
+				     staff_reviewed_by, staff_reviewed_name, staff_comment)
+				VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NULLIF($7, ''))
+				ON CONFLICT (submission_period_id, ta_id, teaching_course_id) DO UPDATE
+				SET status              = $4,
+				    staff_reviewed_by   = EXCLUDED.staff_reviewed_by,
+				    staff_reviewed_name = EXCLUDED.staff_reviewed_name,
+				    staff_comment       = EXCLUDED.staff_comment
+				WHERE submission_period_status.status = 'pending'`,
+				periodID, taID, tcID, StatusStaffReviewed, actor, name, comment)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return Invalid("รายการนี้ผ่านการตรวจสอบหรือส่งออกไปแล้ว")
+			}
+			return nil
+		})
 }
 
 // UnreviewedCourseNames lists the courses in a term that still have months
@@ -393,13 +443,16 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 			"เจ้าหน้าที่ยังตรวจเบิกจ่ายเดือนนั้นไม่ได้จนกว่าจะอนุมัติครบ",
 		code, nameTH, openRows)
 	for _, id := range lecturerIDs {
-		s.notify.Send(ctx, id, title, body, "/lecturer/courses/"+tcID.String()+"/worklog")
+		// The lecturer approves on .../reports; there is no .../worklog for them.
+		s.notify.Send(ctx, id, title, body, "/lecturer/courses/"+tcID.String()+"/reports")
 	}
 
-	s.aud.Log(ctx, audit.Entry{
+	if err := s.aud.Log(ctx, audit.Entry{
 		ActorID: &actor, Action: "payout.remind_lecturer",
 		Entity: "teaching_course", EntityID: tcID.String(),
 		Note: fmt.Sprintf("%s — %d รายการรออนุมัติ, แจ้ง %d คน", code, openRows, len(lecturerIDs)),
-	})
+	}); err != nil {
+		return err
+	}
 	return nil
 }

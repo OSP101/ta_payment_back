@@ -54,10 +54,12 @@ func (rf *requestFixture) addTAClass(dayOfWeek int, start, end string) {
 		rf.TAID, rf.TermID, dayOfWeek, start, end)
 }
 
-// allSessionsLab turns the fixture section's lecture period into a second lab,
-// so "every session clashes" is reachable at all. Since 31/07/2026 only lab
-// periods block, and the fixture section is one lecture + one lab — a timetable
-// covering the whole day now costs the TA the lab alone.
+// allSessionsLab turns the fixture section's lecture period into a second lab.
+//
+// It existed because between 31/07/2026 and 05/08/2026 only lab periods blocked,
+// so "every session clashes" was otherwise unreachable. Lectures block again, so
+// a whole-day class now clashes with both sessions on its own — the helper
+// survives for the tests that want a lab-only section, not for that reason.
 func (rf *requestFixture) allSessionsLab() {
 	rf.exec(`UPDATE section_schedules SET kind = 'lab' WHERE section_id = $1`, rf.SectionID)
 }
@@ -145,9 +147,13 @@ func TestReevaluate_TrimsOnlyTheClashingSession(t *testing.T) {
 	}
 }
 
-// The other half of the 31/07/2026 rule, on the DEFERRED path: a timetable that
-// lands only on lecture periods costs the TA nothing at all.
-func TestReevaluate_LectureOnlyClashLeavesSectionIntact(t *testing.T) {
+// The DEFERRED path must reach the same verdict as the submit path — that is the
+// whole point of routing both through applyClashOutcome. A timetable landing on
+// the lecture costs the TA that lecture and nothing else.
+//
+// Until 05/08/2026 it cost them nothing, because lecture periods were exempt.
+// See lecture_clash_exemption_test.go for both sides of that decision.
+func TestReevaluate_LectureOnlyClashTrimsTheLecture(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{})
 	res, err := rf.Req.Create(rf.ctx, rf.LecturerID, rf.createInput())
 	if err != nil {
@@ -160,10 +166,12 @@ func TestReevaluate_LectureOnlyClashLeavesSectionIntact(t *testing.T) {
 	}
 
 	state, reason := rf.assignmentState(res.ID)
-	if state != "active" {
-		t.Fatalf("state = %q, want \"active\" — a lecture period may sit on the TA's own "+
-			"class; trimming it here would take back what the request gate allowed (reason: %v)",
+	if state != "trimmed" {
+		t.Fatalf("state = %q, want \"trimmed\" — the lecture is lost, the lab is not (reason: %v)",
 			state, reason)
+	}
+	if reason == nil || !strings.Contains(*reason, "1 จาก 2") {
+		t.Errorf("reason should quantify what was lost, got: %v", reason)
 	}
 }
 
@@ -248,7 +256,9 @@ func TestReevaluate_IgnoresWBARows(t *testing.T) {
 // approved), so the lecturer loses nothing by it and gains a record of why.
 func TestCreate_RejectsWhenEverySessionClashes(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{})
-	rf.allSessionsLab()
+	// A class covering the whole day collides with both the lecture and the lab.
+	// The declared workload is attendance + lab teaching — both performed inside
+	// the session — so nothing survives and dropping is right.
 	rf.addTAClass(1, "08:00", "17:00") // timetable first
 
 	res, err := rf.Req.Create(rf.ctx, rf.LecturerID, rf.createInput())
@@ -263,6 +273,32 @@ func TestCreate_RejectsWhenEverySessionClashes(t *testing.T) {
 	}
 	if !strings.Contains(res.RejectReason, "ติดตารางเรียน") {
 		t.Errorf("reject reason should say why, got: %q", res.RejectReason)
+	}
+}
+
+// The counterpart to the drop test above: the same total collision, but the
+// lecturer asked for grading — work done outside the session. The assignment
+// must SURVIVE. Dropping it was the old behaviour and it threw away the only
+// work the TA could actually have done.
+func TestCreate_KeepsFullyClashingSectionWhenOffSlotWorkDeclared(t *testing.T) {
+	rf := newRequestFixture(t, fixtureOpts{})
+	rf.addTAClass(1, "08:00", "17:00") // covers every session
+
+	in := rf.inputFor([]SectionWorkload{{
+		SectionID: rf.SectionID,
+		Workload:  WorkloadInput{CheckWorkHrs: 2}, // grading only — never in the room
+	}}, "undergrad")
+
+	res, err := rf.Req.Create(rf.ctx, rf.LecturerID, in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	state, reason := rf.assignmentState(res.ID)
+	if state == "dropped" {
+		t.Fatalf("the assignment must survive — grading happens outside the session (reason: %v)", reason)
+	}
+	if reason == nil || !strings.Contains(*reason, "นอกคาบ") {
+		t.Errorf("the reason should tell the TA what they can still do, got: %v", reason)
 	}
 }
 
@@ -338,29 +374,32 @@ func TestClashVerdict_IsTheSameWhicheverOrderTheTimetableArrives(t *testing.T) {
 	}
 }
 
-// THE REGRESSION TEST. Create is the path a lecturer actually walks, and it does
-// not call checkOwnClassConflict — it calls assertNoKnownClash → sectionClash.
-// When the lecture exemption was added on 31/07/2026 only the former was changed,
-// so the exemption was covered by a passing test and dead in production at the
-// same time. Anything that asserts the rule must assert it HERE.
+// A lecture sitting on the TA's own class is a real collision again.
 //
-// From จิรายุ's real timetable (CP351203 ภาคต้น 2569): SC362004's lecture sits on
-// his own SA lab, and CP351203's lecture on his ITPE lecture. Both requests were
-// refused outright, taking two of his three courses with them.
-func TestCreate_AllowsLectureOnlyClash(t *testing.T) {
+// It was exempted on 31/07/2026 — taking attendance was held not to require the
+// TA in the room for the hour — and un-exempted on 05/08/2026 by the college:
+// a TA whose class covers every lecture of a group does not get that group's
+// เช็คชื่อ duty. clashBlockingKind is the single place that decides it, so this
+// path and checkOwnClassConflict move together; the earlier bug was that they
+// did not, and the exemption was dead in production while a test asserted it.
+//
+// The submission is still WRITTEN rather than refused. Refusing here would make
+// the answer depend on whether the timetable arrived before or after the
+// lecturer pressed Send — see the order-independence test above.
+func TestCreate_TrimsLectureOnlyClash(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{})
 	rf.addTAClass(1, "09:00", "12:00") // exactly the lecture session
 
 	res, err := rf.Req.Create(rf.ctx, rf.LecturerID, rf.createInput())
 	if err != nil {
-		t.Fatalf("a lecture period overlapping the TA's own class must not refuse the "+
-			"request — the request gate exempts it, so this path must too: %v", err)
+		t.Fatalf("a clash must never refuse the submission outright: %v", err)
 	}
-	if res.Status != "approved" {
-		t.Errorf("status = %q, want approved — nothing blocking is left unresolved", res.Status)
+	state, reason := rf.assignmentState(res.ID)
+	if state != "trimmed" {
+		t.Fatalf("assignment state = %q, want trimmed — the lecture is lost, the lab is not (reason: %v)", state, reason)
 	}
-	if state, reason := rf.assignmentState(res.ID); state != "active" {
-		t.Errorf("assignment state = %q, want active (reason: %v)", state, reason)
+	if reason == nil || !strings.Contains(*reason, "1 จาก 2") {
+		t.Errorf("reason should quantify what was lost, got: %v", reason)
 	}
 }
 

@@ -1,0 +1,15 @@
+-- Every work-log notification ever sent pointed at /ta/worklog, which is not a
+-- route: the work-log screen is per course (/ta/courses/{id}/worklog). A TA who
+-- clicked a rejection got a not-found page.
+--
+-- New notifications carry the right per-course link (worklog.go). The rows
+-- already sitting in people's inboxes cannot be repaired the same way — nothing
+-- on the row says which course it was about, and the wording of the old ones
+-- ("บันทึกเวลาของคุณถูกส่งกลับให้แก้ไข") does not say either. Guessing a course
+-- id here would be inventing history.
+--
+-- So they are pointed at the TA home instead, which is real and now carries a
+-- per-course "อาจารย์ตีกลับบันทึกเวลา" alert naming the course and linking on to
+-- it. The click lands one step further from the work than a fresh notice, but it
+-- lands somewhere true.
+UPDATE notifications SET link = '/ta' WHERE link = '/ta/worklog';

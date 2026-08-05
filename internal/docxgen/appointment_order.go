@@ -6,9 +6,11 @@
 // page break to the บัญชีแนบท้าย (attached roster) grouped by TA level and course.
 //
 // The file is assembled as a minimal-but-valid OOXML ZIP (no unioffice/gooxml):
-//   [Content_Types].xml, _rels/.rels,
-//   word/document.xml, word/styles.xml,
-//   word/_rels/document.xml.rels, word/media/image1.png
+//
+//	[Content_Types].xml, _rels/.rels,
+//	word/document.xml, word/styles.xml,
+//	word/_rels/document.xml.rels, word/media/image1.png
+//
 // Word / LibreOffice / Pages all accept this shape. Staff open it, tweak in
 // Word if needed, and forward to the registrar.
 package docxgen
@@ -66,8 +68,14 @@ type AppointmentOrderData struct {
 	OrderDate     string // "14 มกราคม 2569"
 	EffectiveDate string // "24 พฤศจิกายน 2568"
 	SignerName    string // "รองศาสตราจารย์สิรภัทร เชี่ยวชาญวัฒนา"
-	SignerTitle   string // "คณบดีวิทยาลัยการคอมพิวเตอร์"
-	Levels        []LevelGroup
+	// SignerTitle is the position line, already carrying the acting phrase when
+	// there is one ("รองคณบดีฝ่ายวิชาการ รักษาการแทน"). Wording is the
+	// caller's business; this renderer only places the lines.
+	SignerTitle string
+	// SignerActingFor is the seat whose authority is being exercised, printed on
+	// its own line under SignerTitle. Empty when the signer holds the seat.
+	SignerActingFor string
+	Levels          []LevelGroup
 }
 
 const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -194,6 +202,11 @@ func buildDocumentXML(d AppointmentOrderData) string {
 	}
 	writePara(&b, "center", false, 0, "("+d.SignerName+")")
 	writePara(&b, "center", false, 0, d.SignerTitle)
+	// A deputy signing for the dean takes the two-line acting form: the order is
+	// issued under the dean's authority, so the seat has to be named.
+	if d.SignerActingFor != "" {
+		writePara(&b, "center", false, 0, d.SignerActingFor)
+	}
 
 	// ---- Page break to the attached roster --------------------------------
 	writePageBreak(&b)

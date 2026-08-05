@@ -88,6 +88,42 @@ func assertCourseManager(ctx context.Context, pool *pgxpool.Pool, actor, tcID uu
 	return err
 }
 
+// assertMakeupManager gates the compensation-day (วันชดเชย) endpoints. It is
+// deliberately wider than assertCourseManager: a TA holding an approved
+// assignment anywhere in the course may file and remove makeups too.
+//
+// Rationale — the makeup date is operational scheduling, not an approval. The
+// TA is usually the first to know the rescheduled slot, and while only the
+// lecturer could file it, periods sat unresolved and the TA could not log (or
+// be paid for) hours they had actually worked. The nudge endpoint
+// (RemindLecturer) stays as the escalation path for a TA who does not want to
+// decide the date themselves.
+//
+// Scope is the whole course, not just the TA's own sections: a course's TAs
+// coordinate as one team and a section-scoped rule would leave the other
+// sections' periods stuck for exactly the reason above.
+//
+// Callers keep every other guard: assertNotExported still locks an exported
+// course, and DeleteMakeup still refuses to drop a makeup that already carries
+// submitted/approved worklogs.
+func assertMakeupManager(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID) error {
+	err := assertCourseManager(ctx, pool, actor, tcID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrForbidden) {
+		return err
+	}
+	ok, taErr := taHasApprovedAssignment(ctx, pool, actor, tcID)
+	if taErr != nil {
+		return taErr
+	}
+	if !ok {
+		return ErrForbidden
+	}
+	return nil
+}
+
 // courseAccess is assertCourseManager plus the answer to "which kind of
 // manager". Both may act on the course, but not equally: admin/staff have full
 // control, while an owning lecturer is restricted to the narrow set of edits
@@ -168,6 +204,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 	var (
 		help, prep, grade, other        float64
 		attendance, check, ugOther, lab float64
+		labOther                        float64
 		hasForm                         bool
 	)
 	err := pool.QueryRow(ctx, `
@@ -181,6 +218,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		       COALESCE(wf.check_work_hrs, 0),
 		       COALESCE(wf.ug_other_hrs, 0),
 		       COALESCE(wf.lab_hrs, 0),
+		       COALESCE(wf.lab_other_hrs, 0),
 		       (wf.id IS NOT NULL)
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
@@ -191,6 +229,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		&ac.ReimburseScope, &ac.Level,
 		&help, &prep, &grade, &other,
 		&attendance, &check, &ugOther, &lab,
+		&labOther,
 		&hasForm,
 	)
 	if err != nil {
@@ -210,16 +249,18 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		ac.AllowLecture = attendance > 0
 		ac.AllowLab = lab > 0
 		ac.AllowReview = check > 0
-		// Undergrad "อื่นๆ" is a lecture-slot activity per the form's field
-		// grouping; prep_hrs doesn't exist for undergrad so we only use
-		// ug_other_hrs here.
-		ac.AllowOther = ugOther > 0
+		// Undergrad "อื่นๆ" comes in two flavours that share activity='other'
+		// and are told apart by parent_kind: ug_other_hrs sits beside the
+		// lecture, lab_other_hrs beside the lab. Either one authorizes the
+		// activity, and the weekly cap is their sum because the cap is checked
+		// per activity, not per parent_kind. prep_hrs is grad-only.
+		ac.AllowOther = ugOther > 0 || labOther > 0
 		ac.WeeklyCapLecture = attendance
 		ac.WeeklyCapLab = lab
 		ac.WeeklyCapReview = check
-		ac.WeeklyCapOther = ugOther
+		ac.WeeklyCapOther = ugOther + labOther
 		ac.WeeklyLectureLabShared = false
-		ac.WeeklyTotalHours = attendance + lab + check + ugOther
+		ac.WeeklyTotalHours = attendance + lab + check + ugOther + labOther
 	} else { // master / phd → grad workload fields
 		// help_teach = ช่วยสอน covers both lecture and lab sessions
 		// depending on section schedule, so authorize both when > 0.

@@ -8,20 +8,21 @@ import (
 	"io"
 	"math"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"ta-payment-back/internal/pdfgen"
+	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/storage"
 )
 
 type ExportService struct {
-	pool    *pgxpool.Pool
-	store   storage.Store
-	budget  *BudgetService
-	fontDir string // path to Sarabun-Regular/Bold TTFs, used by the PDF renderer
+	pool   *pgxpool.Pool
+	aud    *audit.Auditor
+	store  storage.Store
+	budget *BudgetService
+	// notify carries the budget-shortfall warning to the lecturer and the TAs.
+	notify *NotifyService
 	// teaching renders the weekly timetable form. Held as a dependency rather
 	// than duplicated here so the zip ships the same document the TA prints.
 	teaching *TeachingService
@@ -53,6 +54,7 @@ type exportComputation struct {
 	records    []exportRow
 	budgetMax  float64
 	prorated   bool
+	settlement *CourseSettlement
 }
 
 // ExportPreviewRow is one TA's payout line for the staff preview (read-only).
@@ -79,119 +81,34 @@ type ExportPreviewRow struct {
 
 // ExportPreview is the JSON payload for GET /exports/course/:id/preview.
 type ExportPreview struct {
-	TeachingCourseID string             `json:"teaching_course_id"`
-	CourseCode       string             `json:"course_code"`
-	CourseNameTH     string             `json:"course_name_th"`
-	TermMonths       int                `json:"term_months"`
-	BudgetMax        float64            `json:"budget_max"`
-	TotalPay         float64            `json:"total_pay"`    // Σ pay_baht
-	TotalActual      float64            `json:"total_actual"` // Σ actual_paid
-	OverBudget       bool               `json:"over_budget"`
-	Prorated         bool               `json:"prorated"`
-	AllReady         bool               `json:"all_ready"` // false blocks the download
-	Rows             []ExportPreviewRow `json:"rows"`
+	TeachingCourseID string  `json:"teaching_course_id"`
+	CourseCode       string  `json:"course_code"`
+	CourseNameTH     string  `json:"course_name_th"`
+	TermMonths       int     `json:"term_months"`
+	BudgetMax        float64 `json:"budget_max"`
+	TotalPay         float64 `json:"total_pay"`    // Σ pay_baht
+	TotalActual      float64 `json:"total_actual"` // Σ actual_paid
+	OverBudget       bool    `json:"over_budget"`
+	Prorated         bool    `json:"prorated"`
+	// Settlement names the months the budget could not reach. Sent to every
+	// screen that has to warn somebody, so the lecturer and the TA see the same
+	// months the export will actually drop.
+	Settlement *CourseSettlement `json:"settlement,omitempty"`
+	// AllReady covers the TA PROFILES (approved profile + creditor form).
+	AllReady bool `json:"all_ready"`
+	// Blockers is every stage of the pipeline still unfinished — the same list
+	// BuildCourseZip refuses on. CanExport is the single answer the download
+	// button reads; deriving it on the client is how the button came to offer
+	// what the server refuses.
+	Blockers  []ExportBlocker    `json:"blockers"`
+	CanExport bool               `json:"can_export"`
+	Rows      []ExportPreviewRow `json:"rows"`
 }
 
 // round2 rounds a baht amount to 2 decimals — every figure that lands on a
 // payroll document goes through this so float64 accumulation noise (e.g.
 // 1234.5600000001) never reaches the spreadsheet.
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
-
-// applyProrataCap is superseded by applyTrackProrataCap (two-pool, per-track
-// budget). Retained for reference/tests; not used by buildExportRows anymore.
-//
-// applyProrataCap scales actualPaid on each row when Σ payBaht > budgetMax
-// so that Σ actualPaid lands on budgetMax (rounding drift is settled on the
-// trailing rows). Returns true if scaling was applied. Pure — no I/O, DB-free.
-//
-// Semantics:
-//   - budgetMax ≤ 0 → no-op (unlimited).
-//   - Σ payBaht ≤ budgetMax → no-op (each actualPaid stays at payBaht).
-//   - Σ payBaht > budgetMax → each actualPaid = round2(payBaht × k) with
-//     k = budgetMax / Σ payBaht; residual is folded into the trailing rows,
-//     clamped to [0, payBaht] per row so no TA is paid a negative amount or
-//     more than they earned. Σ actualPaid never exceeds budgetMax (it may
-//     fall marginally short when clamping eats the residual).
-func applyProrataCap(records []exportRow, budgetMax float64) bool {
-	if budgetMax <= 0 || len(records) == 0 {
-		return false
-	}
-	var totalRaw float64
-	for _, r := range records {
-		totalRaw += r.payBaht
-	}
-	if totalRaw <= budgetMax+0.01 {
-		return false
-	}
-	k := budgetMax / totalRaw
-	var scaledSum float64
-	for i := range records {
-		records[i].actualPaid = round2(records[i].payBaht * k)
-		scaledSum += records[i].actualPaid
-	}
-	// Fold the residual (positive or negative) into the trailing rows, clamping
-	// each row to [0, payBaht]. Walk backwards so the adjustment stays
-	// deterministic; k < 1 keeps every row strictly below payBaht, so a small
-	// positive residual almost always fits on the last row alone.
-	residual := round2(budgetMax - scaledSum)
-	for i := len(records) - 1; i >= 0 && residual != 0; i-- {
-		adjusted := round2(records[i].actualPaid + residual)
-		if adjusted < 0 {
-			adjusted = 0
-		}
-		if adjusted > records[i].payBaht {
-			adjusted = records[i].payBaht
-		}
-		residual = round2(residual - (adjusted - records[i].actualPaid))
-		records[i].actualPaid = adjusted
-	}
-	return true
-}
-
-// applyTrackProrataCap caps each track's pay against its own budget pool:
-// regular-track pay at regularPool (งบภาคปกติ) and special-track pay at
-// specialPool (งบภาคพิเศษ), independently. Within a track, if that track's
-// total earned exceeds its pool, every row's share of that track is scaled by
-// k_track = pool / Σ(track pay). Each row's actualPaid = scaled regular +
-// scaled special. Returns true if either track was scaled. A pool ≤ 0 means
-// "unlimited" for that track (no data → don't zero people out). Pure, DB-free.
-func applyTrackProrataCap(records []exportRow, regularPool, specialPool, spillableReg float64) bool {
-	var sumReg, sumSpec float64
-	for _, r := range records {
-		sumReg += r.payRegular
-		sumSpec += r.paySpecial
-	}
-	// Concurrent-section spill (B2): when the regular pool is exhausted, the
-	// regular pay attributable to overlap TAs (spillableReg) may overflow into
-	// the special pool's UNUSED capacity — "เบิกภาคปกติก่อน ถ้างบปกติหมดค่อยไหล
-	// ไปพิเศษ". Non-overlap regular pay never borrows from special.
-	effReg, effSpec := regularPool, specialPool
-	if regularPool > 0 && specialPool > 0 && spillableReg > 0 && sumReg > regularPool+0.01 {
-		spill := sumReg - regularPool // regular shortfall
-		if unused := specialPool - sumSpec; unused < spill {
-			spill = unused
-		}
-		if spillableReg < spill {
-			spill = spillableReg
-		}
-		if spill > 0 {
-			effReg = regularPool + spill
-			effSpec = specialPool - spill
-		}
-	}
-	regScale, specScale := 1.0, 1.0
-	if effReg > 0 && sumReg > effReg+0.01 {
-		regScale = effReg / sumReg
-	}
-	if effSpec > 0 && sumSpec > effSpec+0.01 {
-		specScale = effSpec / sumSpec
-	}
-	scaled := regScale < 1 || specScale < 1
-	for i := range records {
-		records[i].actualPaid = round2(records[i].payRegular*regScale + records[i].paySpecial*specScale)
-	}
-	return scaled
-}
 
 // isReturningTA reports whether the TA had an approved assignment in any prior
 // academic term. Used by exports to badge each row as "เก่า/ใหม่". Q&A rule:
@@ -227,8 +144,8 @@ func (s *ExportService) isReturningTA(ctx context.Context, taID, currentTermID u
 //	บัณฑิต ปกติ → 50 ฿ × approved hours (hourly per Q&A rule 6c, was lump-sum)
 //	บัณฑิต พิเศษ → min(4,000 × term_months, 12,000) — flat monthly capped per term
 //
-// Billing uses two independent budget pools (ภาคปกติ / ภาคพิเศษ), each capped
-// separately (applyTrackProrataCap). Concurrent-section rule (B2): when an
+// Billing uses two independent budget pools (ภาคปกติ / ภาคพิเศษ), each settled
+// separately in budget_settlement.go. Concurrent-section rule (B2): when an
 // undergrad TA logs regular AND special work at the SAME clock time, the
 // overlapping hours are counted ONCE at the regular rate ("เบิกภาคปกติก่อน") —
 // the duplicated hours are removed from the special side after aggregation.
@@ -265,10 +182,29 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		termMonths = 4
 	}
 
+	// Billable hours per (TA, track), counted as SITTINGS rather than as raw
+	// work_logs rows — two sections taught in one sitting are paid once. This is
+	// what the signed claim form has always billed; see billable_hours.go.
+	//
+	// Loaded separately because a sitting spans sections and cannot be split back
+	// across the per-assignment rows below: the whole (TA, track) total is
+	// attributed to the FIRST assignment of that pair and the rest are zeroed,
+	// which leaves the per-TA aggregation underneath exactly as it was.
+	billable, err := s.billableHoursByTATrack(ctx, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	claimed := map[taTrackKey]bool{}
+
 	// Pull per-assignment rows; each is billed at its own track's rate into the
 	// regular or special pool (two-pool cap applied after aggregation).
+	// Names carry the คำนำหน้า: the timetable files in the export ZIP are
+	// named after the TA the way the office files them
+	// ("ตารางเรียน-นายสุพพิธาน ภักสวัสดิ์.xlsx"), prefix included.
 	assignRows, err := s.pool.Query(ctx, `
-		SELECT a.id, a.ta_id, u.first_name||' '||u.last_name, u.email,
+		SELECT a.id, a.ta_id,
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       u.first_name||' '||u.last_name, u.email,
 		       sec.track::text, a.level::text,
 		       COALESCE(SUM(wl.hours) FILTER (WHERE wl.status='approved'), 0) AS approved_hrs,
 		       (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_time-start_time))/3600),0)
@@ -276,10 +212,11 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status='approved'
 		JOIN users u ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		JOIN sections sec ON sec.id = a.section_id
 		LEFT JOIN work_logs wl ON wl.assignment_id = a.id
 		WHERE r.teaching_course_id = $1
-		GROUP BY a.id, a.ta_id, u.first_name, u.last_name, u.email,
+		GROUP BY a.id, a.ta_id, tp.prefix, u.title, u.first_name, u.last_name, u.email,
 		         sec.track, sec.id, a.level, sec.sec_no
 		ORDER BY u.first_name, a.ta_id, (sec.track='regular') DESC, sec.sec_no`, teachingCourseID)
 	if err != nil {
@@ -323,6 +260,16 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 			&track, &level, &approvedHrs, &schedHrsPerWeek); err != nil {
 			return nil, err
 		}
+		// Replace the raw per-assignment sum with this (TA, track)'s sitting
+		// total, once. Rows are ordered by TA then track, so "once" is the first
+		// row of each pair.
+		key := taTrackKey{taID, track}
+		if claimed[key] {
+			approvedHrs = 0
+		} else {
+			approvedHrs = billable[key]
+			claimed[key] = true
+		}
 		agg, ok := byTA[taID]
 		if !ok {
 			agg = &taAgg{
@@ -344,24 +291,32 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		}
 		agg.hoursTotal += approvedHrs
 
-		// Bill each assignment at its own track's rate and accumulate into the
-		// matching pool. Regular-track work → payRegular; special-track work →
-		// paySpecial. The two pools are capped independently downstream.
-		switch {
-		case level == "undergrad" && track == "regular":
-			agg.payRegular += approvedHrs * pr.UndergradRegular
-
-		case level == "undergrad" && track == "special":
-			agg.paySpecial += approvedHrs * pr.UndergradSpecial
-
-		case (level == "master" || level == "phd") && track == "regular":
-			// Q&A rule 6c: บัณฑิต regular is HOURLY (50฿/hr per ประกาศ).
-			agg.payRegular += approvedHrs * pr.GraduateRegularHourly
-
-		case (level == "master" || level == "phd") && track == "special":
-			// Q&A rule 6b: บัณฑิต special is a flat lump (special-track pool),
-			// added once per TA after the loop (see below).
+		// Hourly pay is priced AFTER the loop, for everyone at once, by
+		// claimCostByTASlot — the same source the settlement reads. Here only
+		// the grad-special flag is noted (Q&A rule 6b: บัณฑิต special is a flat
+		// lump, not hourly, added once per TA below).
+		if (level == "master" || level == "phd") && track == "special" {
 			agg.hasGradSpecial = true
+		}
+	}
+
+	// One pricing source for every hourly baht (merged sittings, B2 overlap off
+	// the special side, monthly cap) — shared with SettleCourse and
+	// dropUnpaidMonths so the pay column, the settlement, and the cut months
+	// can never disagree about what an hour costs.
+	costs, err := s.claimCostByTASlot(ctx, teachingCourseID, pr, mergedSittingsCTE)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range costs {
+		agg, ok := byTA[c.TA]
+		if !ok {
+			continue
+		}
+		if c.Track == "regular" {
+			agg.payRegular += c.Baht
+		} else {
+			agg.paySpecial += c.Baht
 		}
 	}
 
@@ -375,109 +330,6 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		agg := byTA[taID]
 		if agg.hasGradSpecial && agg.hoursTotal > 0 {
 			agg.paySpecial += gradLump
-		}
-	}
-
-	// Concurrent-section rule (B2): when an undergrad TA logs regular AND special
-	// work at the SAME clock time (time-overlapping sections), those overlapping
-	// hours are counted ONCE — the time is already paid on the regular side (at
-	// the regular rate = "เบิกภาคปกติก่อน"), so remove the duplicated hours from
-	// the special side. Only undergrad (both tracks hourly); grad-special is a
-	// flat lump so it is unaffected.
-	overlapRows, oerr := s.pool.Query(ctx, `
-		SELECT a1.ta_id,
-		       SUM(GREATEST(0, EXTRACT(EPOCH FROM (
-		           LEAST(w1.end_time, w2.end_time) - GREATEST(w1.start_time, w2.start_time)
-		       )) / 3600.0)) AS overlap_hrs
-		FROM work_logs w1
-		JOIN ta_request_assignments a1 ON a1.id = w1.assignment_id
-		JOIN sections s1 ON s1.id = a1.section_id AND s1.track = 'regular'
-		JOIN ta_request_assignments a2 ON a2.ta_id = a1.ta_id
-		JOIN sections s2 ON s2.id = a2.section_id AND s2.track = 'special'
-		JOIN work_logs w2 ON w2.assignment_id = a2.id AND w2.work_date = w1.work_date
-		WHERE s1.teaching_course_id = $1 AND s2.teaching_course_id = $1
-		  AND w1.status = 'approved' AND w2.status = 'approved'
-		  AND w1.start_time < w2.end_time AND w2.start_time < w1.end_time
-		GROUP BY a1.ta_id`, teachingCourseID)
-	if oerr != nil {
-		return nil, oerr
-	}
-	overlapByTA := map[uuid.UUID]float64{}
-	for overlapRows.Next() {
-		var taID uuid.UUID
-		var hrs float64
-		if err := overlapRows.Scan(&taID, &hrs); err != nil {
-			overlapRows.Close()
-			return nil, err
-		}
-		overlapByTA[taID] = hrs
-	}
-	overlapRows.Close()
-	if err := overlapRows.Err(); err != nil {
-		return nil, err
-	}
-	var spillableReg float64
-	for _, taID := range order {
-		agg := byTA[taID]
-		if agg.level != "undergrad" {
-			continue
-		}
-		if oh := overlapByTA[taID]; oh > 0 {
-			deduct := oh * pr.UndergradSpecial
-			if deduct > agg.paySpecial {
-				deduct = agg.paySpecial
-			}
-			agg.paySpecial -= deduct
-			// Regular pay for the overlap hours may spill into the special pool
-			// if the regular budget runs out (see applyTrackProrataCap).
-			spillableReg += oh * pr.UndergradRegular
-		}
-	}
-
-	// ป.ตรี ภาคพิเศษ: ประกาศกำหนด "50 ฿/ชม. หรือ 2,000 ฿/เดือน" — จ่ายรายชั่วโมง
-	// ตามจริงแต่ไม่เกินเพดานรายเดือน คิดแยกทีละเดือน (เดือนที่ทำเกินไม่ไปหักลบ
-	// กับเดือนที่ทำน้อย) แล้วรวมเป็นยอดของเทอม. ทำหลังหักชั่วโมงซ้อน (B2) เพื่อ
-	// ไม่ให้ชั่วโมงที่ถูกตัดออกไปแล้วมากินเพดาน.
-	if pr.UGSpecialMonthlyCap > 0 {
-		capRows, cerr := s.pool.Query(ctx, `
-			SELECT monthly.ta_id, SUM(LEAST(monthly.hrs * $2, $3)) AS capped_pay
-			FROM (
-			    SELECT a.ta_id AS ta_id, to_char(wl.work_date,'YYYY-MM') AS ym,
-			           SUM(wl.hours) AS hrs
-			    FROM work_logs wl
-			    JOIN ta_request_assignments a ON a.id = wl.assignment_id
-			    JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
-			    JOIN sections sec ON sec.id = a.section_id AND sec.track = 'special'
-			    WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
-			      AND a.level = 'undergrad'
-			    GROUP BY a.ta_id, to_char(wl.work_date,'YYYY-MM')
-			) monthly
-			GROUP BY monthly.ta_id`, teachingCourseID, pr.UndergradSpecial, pr.UGSpecialMonthlyCap)
-		if cerr != nil {
-			return nil, cerr
-		}
-		cappedByTA := map[uuid.UUID]float64{}
-		for capRows.Next() {
-			var taID uuid.UUID
-			var capped float64
-			if err := capRows.Scan(&taID, &capped); err != nil {
-				capRows.Close()
-				return nil, err
-			}
-			cappedByTA[taID] = capped
-		}
-		capRows.Close()
-		if err := capRows.Err(); err != nil {
-			return nil, err
-		}
-		for _, taID := range order {
-			agg := byTA[taID]
-			if agg.level != "undergrad" {
-				continue
-			}
-			if capped, ok := cappedByTA[taID]; ok && agg.paySpecial > capped {
-				agg.paySpecial = capped
-			}
 		}
 	}
 
@@ -509,20 +361,30 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	// (TermPaySpecial), independently. This is the "หักงบภาคปกติจนหมดก่อน แล้ว
 	// ค่อยภาคพิเศษ" rule — each track draws only from its own pool. budgetMax
 	// stays the combined figure for display.
-	var budgetMax, regularPool, specialPool float64
+	var budgetMax float64
 	if s.budget != nil {
 		if snap, err := s.budget.Compute(ctx, teachingCourseID); err == nil {
 			budgetMax = snap.PerCourseMaxBaht
-			regularPool = snap.TermPayRegular
-			specialPool = snap.TermPaySpecial
 		}
 	}
-	prorata := applyTrackProrataCap(records, regularPool, specialPool, spillableReg)
-
+	// Month cutoff replaces pro-rata (04/08/2026). Instead of scaling everyone
+	// down by a factor nobody can derive from the claim form, whole months are
+	// paid in order until the pool runs out and the rest are paid nothing —
+	// see budget_settlement.go. Two TAs with the same hours are paid the same.
+	settlement, serr := s.SettleCourse(ctx, teachingCourseID)
+	if serr != nil {
+		return nil, serr
+	}
+	if settlement.OverBudget {
+		if err := s.dropUnpaidWork(ctx, teachingCourseID, records, settlement, pr); err != nil {
+			return nil, err
+		}
+	}
 	return &exportComputation{
 		courseCode: courseCode, courseName: courseName,
 		termMonths: termMonths, records: records,
-		budgetMax: budgetMax, prorated: prorata,
+		budgetMax: budgetMax, prorated: settlement.OverBudget,
+		settlement: settlement,
 	}, nil
 }
 
@@ -549,98 +411,94 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	if err := s.validatePayoutReadiness(ctx, teachingCourseID); err != nil {
 		return nil, "", 0, err
 	}
+	// Pipeline gate: every stage — TA sent, lecturer approved, staff signed off
+	// — must be finished for every month before any of it becomes a claim
+	// document. This is checked on the way OUT, not just in the UI: downloading
+	// is the freeze point, and a half-finished download freezes the wrong
+	// numbers (see CourseExportBlockers).
+	blockers, err := s.CourseExportBlockers(ctx, teachingCourseID)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if len(blockers) > 0 {
+		return nil, "", 0, exportBlockedError(blockers)
+	}
 	// Needed by the timetable form, which is scoped to a TERM rather than a
 	// course. A missing term is not fatal — the form is simply skipped.
 	var termID uuid.UUID
-	_ = s.pool.QueryRow(ctx,
-		`SELECT term_id FROM teaching_courses WHERE id=$1`, teachingCourseID).Scan(&termID)
+	var academicYear, semester int
+	_ = s.pool.QueryRow(ctx, `
+		SELECT tc.term_id, t.academic_year, t.semester
+		FROM teaching_courses tc JOIN academic_terms t ON t.id = tc.term_id
+		WHERE tc.id = $1`, teachingCourseID).Scan(&termID, &academicYear, &semester)
 
 	comp, err := s.buildExportRows(ctx, teachingCourseID)
 	if err != nil {
 		return nil, "", 0, err
 	}
-	courseCode, courseName := comp.courseCode, comp.courseName
+	courseCode := comp.courseCode
 	records := comp.records
 
 	buf := &bytes.Buffer{}
 	zw := zip.NewWriter(buf)
-	// Folder convention per ประกาศ 2569:
-	//   {course_code}/{TA name}/{course_code} - {TA name}.xlsx
-	//   {course_code}/{TA name}/{course_code} - {TA name}.pdf
-	// (Phase 3 will add /{month} between name and file when the export scopes
-	// to a specific submission period.)
-	for _, r := range records {
-		safeName := sanitize(r.fullName)
-		folder := fmt.Sprintf("%s/%s", courseCode, safeName)
-		fileBase := fmt.Sprintf("%s - %s", courseCode, safeName)
-
-		// The official claim workbook, one per term month with activity —
-		// the exact document the college signs. This replaced the old
-		// system-invented summary .xlsx outright (31/07/2026): shipping both
-		// meant two documents claiming to be "the" reimbursement workbook,
-		// and only the monthly one matches what the faculty actually files.
-		// Months with no logged work produce no file.
-		if termID != uuid.Nil {
-			tstart, tend := time.Time{}, time.Time{}
-			_ = s.pool.QueryRow(ctx, `SELECT starts_on, ends_on FROM academic_terms WHERE id=$1`, termID).Scan(&tstart, &tend)
-			idx := 0
-			for ym := time.Date(tstart.Year(), tstart.Month(), 1, 0, 0, 0, 0, time.UTC); !ym.After(tend); ym = ym.AddDate(0, 1, 0) {
-				idx++
-				logs, lerr := s.claimLogs(ctx, r.taID, teachingCourseID, ym.Year(), int(ym.Month()))
-				if lerr != nil || len(logs) == 0 {
-					continue
-				}
-				book, berr := s.BuildClaimWorkbook(ctx, r.taID, teachingCourseID, ym.Year(), int(ym.Month()))
-				if berr != nil {
-					continue // best-effort, like the PDF below
-				}
-				bn := fmt.Sprintf("%s/%d_%s-%s-%s.xlsx", folder, idx, courseCode, safeName, thaiMonthNames[int(ym.Month())])
-				bw, werr := zw.Create(bn)
-				if werr != nil {
-					return nil, "", 0, werr
-				}
-				if _, werr := io.Copy(bw, bytes.NewReader(book)); werr != nil {
-					return nil, "", 0, werr
-				}
-			}
+	add := func(name string, body []byte) error {
+		w, err := zw.Create(name)
+		if err != nil {
+			return err
 		}
+		_, err = io.Copy(w, bytes.NewReader(body))
+		return err
+	}
 
-		// PDF is best-effort: without a fontDir configured we skip it rather
-		// than fail the whole export. The zip still ships the .xlsx.
-		if s.fontDir != "" {
-			pdfBytes, perr := s.buildPerTAPDF(ctx, teachingCourseID, courseCode, courseName, "", r)
-			if perr == nil {
-				pw, err := zw.Create(folder + "/" + fileBase + ".pdf")
-				if err != nil {
-					return nil, "", 0, err
-				}
-				if _, err := io.Copy(pw, bytes.NewReader(pdfBytes)); err != nil {
-					return nil, "", 0, err
-				}
+	// ONE combined workbook for the whole course, then one timetable per TA —
+	// flat, no per-person folders.
+	//
+	// The old layout was a folder per TA holding a claim workbook per month plus
+	// two PDFs. It matched how the data is shaped, not how the paperwork is
+	// used: the office prints a course in one go, in a fixed order, and was
+	// reassembling twenty files by hand every time. The combined book already
+	// carries every person and every month in that order (see
+	// export_combined_book.go), so the folders had nothing left to hold.
+	//
+	// The PDF coversheet and the PDF timetable are gone with them: both were
+	// second renderings of what the workbooks already say, and a printed pack
+	// containing two versions of one claim is a pack somebody has to reconcile.
+	book, err := s.BuildCombinedClaimWorkbook(ctx, teachingCourseID)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	if err := add(fmt.Sprintf("%s-เบิกจ่าย.xlsx", courseCode), book); err != nil {
+		return nil, "", 0, err
+	}
+
+	// ตารางเรียนและตารางปฏิบัติงาน stays per person: it covers EVERY course the
+	// TA assists, not just this one, which is the point of it — the signature
+	// attests that the duties do not collide with the classes the TA has to
+	// attend, and that cannot be judged one course at a time. Best-effort, so a
+	// TA with no timetable does not sink the payout pack.
+	if termID != uuid.Nil {
+		for _, r := range records {
+			tt, terr := s.BuildTimetableWorkbook(ctx, r.taID, termID)
+			if terr != nil {
+				continue
 			}
-		}
-
-		// ตารางเรียนและตารางปฏิบัติงาน — the weekly form the lecturer signs.
-		// It covers EVERY course the TA assists, not just this one, which is the
-		// point of it: the signature attests that the duties do not collide with
-		// the classes the TA has to attend, and that cannot be judged one course
-		// at a time. Best-effort for the same reason as above.
-		if s.teaching != nil && termID != uuid.Nil {
-			if tf, terr := s.teaching.BuildTimetableFormPDF(ctx, r.taID, termID, ""); terr == nil {
-				tw, err := zw.Create(folder + "/ตารางปฏิบัติงาน - " + safeName + ".pdf")
-				if err != nil {
-					return nil, "", 0, err
-				}
-				if _, err := io.Copy(tw, bytes.NewReader(tf)); err != nil {
-					return nil, "", 0, err
-				}
+			if err := add(fmt.Sprintf("%s-ตารางเรียน-%s.xlsx", courseCode, sanitize(r.fullName)), tt); err != nil {
+				return nil, "", 0, err
 			}
 		}
 	}
 	if err := zw.Close(); err != nil {
 		return nil, "", 0, err
 	}
-	name := fmt.Sprintf("%s_%s.zip", courseCode, time.Now().Format("20060102_150405"))
+	// ปีการศึกษา_เทอม_รหัสวิชา — the way the finance office files these. It used
+	// to carry a download timestamp, which made every re-download a differently
+	// named copy of the same pack and left staff guessing which was current.
+	// A term is exported once, so the term itself is the identity.
+	name := fmt.Sprintf("%d_%d_%s.zip", academicYear, semester, courseCode)
+	if academicYear == 0 {
+		// No term on the course — fall back rather than ship "0_0_CODE.zip".
+		name = courseCode + ".zip"
+	}
 	return buf.Bytes(), name, len(records), nil
 }
 
@@ -763,6 +621,10 @@ func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid
 	if err != nil {
 		return nil, err
 	}
+	blockers, err := s.CourseExportBlockers(ctx, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
 	out := &ExportPreview{
 		TeachingCourseID: teachingCourseID.String(),
 		CourseCode:       comp.courseCode,
@@ -770,8 +632,13 @@ func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid
 		TermMonths:       comp.termMonths,
 		BudgetMax:        comp.budgetMax,
 		Prorated:         comp.prorated,
+		Settlement:       comp.settlement,
 		AllReady:         true,
+		Blockers:         blockers,
 		Rows:             []ExportPreviewRow{},
+	}
+	if out.Blockers == nil {
+		out.Blockers = []ExportBlocker{}
 	}
 	for _, r := range comp.records {
 		issue := ready[r.taID]
@@ -798,6 +665,7 @@ func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid
 	}
 	out.TotalPay = round2(out.TotalPay)
 	out.TotalActual = round2(out.TotalActual)
+	out.CanExport = out.AllReady && len(out.Blockers) == 0
 	out.OverBudget = comp.budgetMax > 0 && out.TotalPay > comp.budgetMax+0.01
 	return out, nil
 }
@@ -822,119 +690,6 @@ func trackLabelTH(track string) string {
 		return "ภาคพิเศษ"
 	}
 	return track
-}
-
-// buildPerTAPDF assembles the monthly worklog PDF for one TA. The
-// yearMonthLabel is optional (empty = "รวมทุกเดือน") and is used to filter
-// the approved worklog entries embedded on the sheet.
-func (s *ExportService) buildPerTAPDF(ctx context.Context, tcID uuid.UUID,
-	code, name, yearMonthLabel string,
-	r exportRow) ([]byte, error) {
-
-	// Human-friendly level/track labels for the coversheet.
-	levelTH := r.level
-	switch r.level {
-	case "undergrad":
-		levelTH = "ปริญญาตรี"
-	case "master":
-		levelTH = "ปริญญาโท"
-	case "phd":
-		levelTH = "ปริญญาเอก"
-	}
-	trackTH := r.track
-	switch r.track {
-	case "regular":
-		trackTH = "ภาคปกติ"
-	case "special":
-		trackTH = "ภาคพิเศษ"
-	}
-
-	// Schedule (Block B) — combine all sections this TA holds for the course.
-	sched := []pdfgen.ScheduleRow{}
-	dayName := []string{"อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัส", "ศุกร์", "เสาร์"}
-	rows, _ := s.pool.Query(ctx, `
-		SELECT ss.day_of_week, ss.start_time::text, ss.end_time::text, ss.kind, COALESCE(ss.room,'')
-		FROM section_schedules ss
-		JOIN sections sec ON sec.id = ss.section_id
-		JOIN ta_request_assignments a ON a.section_id = sec.id
-		JOIN ta_requests req ON req.id = a.request_id AND req.status='approved'
-		WHERE req.teaching_course_id = $1 AND a.ta_id = $2
-		ORDER BY ss.day_of_week, ss.start_time`, tcID, r.taID)
-	for rows.Next() {
-		var day int
-		var start, end, kind, room string
-		if err := rows.Scan(&day, &start, &end, &kind, &room); err == nil {
-			kindTH := kind
-			if kind == "lecture" {
-				kindTH = "บรรยาย"
-			} else if kind == "lab" {
-				kindTH = "ปฏิบัติการ"
-			}
-			d := ""
-			if day >= 0 && day < len(dayName) {
-				d = dayName[day]
-			}
-			sched = append(sched, pdfgen.ScheduleRow{
-				DayTH: d, StartTime: start, EndTime: end, Kind: kindTH, Room: room,
-			})
-		}
-	}
-	rows.Close()
-
-	// Approved worklog entries (Block C).
-	entries := []pdfgen.WorklogRow{}
-	entryRows, _ := s.pool.Query(ctx, `
-		SELECT TO_CHAR(wl.work_date,'YYYY-MM-DD'), wl.start_time::text, wl.end_time::text,
-		       wl.hours, wl.activity, COALESCE(wl.room,''), COALESCE(wl.note,'')
-		FROM work_logs wl
-		JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		JOIN ta_requests req ON req.id = a.request_id
-		WHERE req.teaching_course_id = $1 AND a.ta_id = $2 AND wl.status = 'approved'
-		ORDER BY wl.work_date, wl.start_time`, tcID, r.taID)
-	for entryRows.Next() {
-		var date, start, end, activity, room, note string
-		var hours float64
-		if err := entryRows.Scan(&date, &start, &end, &hours, &activity, &room, &note); err == nil {
-			label := activity
-			switch activity {
-			case "lecture":
-				label = "บรรยาย"
-			case "lab":
-				label = "ปฏิบัติการ"
-			case "review":
-				label = "ตรวจงาน"
-			case "makeup":
-				label = "ชดเชย"
-			case "other":
-				label = "อื่นๆ"
-			}
-			entries = append(entries, pdfgen.WorklogRow{
-				Date: date, Start: start, End: end, Hours: hours,
-				Activity: label, Room: room, Note: note,
-			})
-		}
-	}
-	entryRows.Close()
-
-	if yearMonthLabel == "" {
-		yearMonthLabel = "รวมทุกเดือน"
-	}
-
-	return pdfgen.BuildWorklogPDF(pdfgen.WorklogPDFInput{
-		FontDir: s.fontDir,
-		Data: pdfgen.WorklogPDFData{
-			CourseCode: code, CourseName: name,
-			YearMonthLabel: yearMonthLabel,
-			FullName:       r.fullName,
-			Email:          r.email,
-			Level:          levelTH,
-			Track:          trackTH,
-			HoursTotal:     r.hoursTotal,
-			PayBaht:        r.payBaht,
-			Schedule:       sched,
-			Entries:        entries,
-		},
-	})
 }
 
 func sanitize(s string) string {

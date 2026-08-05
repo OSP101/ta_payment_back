@@ -116,28 +116,22 @@ func courseTermID(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID) (uuid
 }
 
 // clashBlockingKind reports whether a period of this kind may NOT overlap the
-// TA's own timetable.
+// TA's own timetable. Every kind may not: a TA sitting in their own class is
+// not available for any duty during that hour.
 //
-// LECTURE duty is the exemption, added 31/07/2026. Taking attendance or handing
-// out sheets does not require the TA to be in the lecture room for the hour, so a
-// TA whose own class sits on a lecture slot can still do the job — and blocking
-// it ruled those TAs out of the course entirely.
+// History matters here. On 31/07/2026 LECTURE was exempted, on the argument that
+// taking attendance does not require the TA to be in the room for the full hour,
+// and that blocking it ruled those TAs out of the course entirely. On 05/08/2026
+// that was reversed: a TA whose own class covers every lecture of a group is not
+// to be given that group's เช็คชื่อ duty at all.
 //
-// Everything else keeps its previous behaviour. A lab puts the TA in a room with
-// students at a fixed hour and cannot share a slot with anything; grading and
-// other work are left blocking because the change asked for was specifically
-// about lecture periods, and widening it would quietly authorise hours nobody
-// decided to authorise.
-//
-// `other` follows its parent kind: admin work attached to a lecture is exempt
-// with it, admin work attached to a lab is not.
+// The reversal lives HERE rather than in a submit-time check on purpose. Refusing
+// the request outright would make the verdict depend on WHEN the TA filed their
+// timetable — file it first and the submission errors, file it later and the same
+// request is merely trimmed. That order-dependence is a bug this codebase already
+// fixed once (see applyClashOutcome); enforcing through the trim path keeps one
+// answer for one situation.
 func clashBlockingKind(activity string, parentKind *string) bool {
-	if activity == "lecture" {
-		return false
-	}
-	if activity == "other" && parentKind != nil && *parentKind == "lecture" {
-		return false
-	}
 	return true
 }
 
@@ -157,7 +151,10 @@ func clashBlockingKind(activity string, parentKind *string) bool {
 // three courses have a LECTURE period sitting on one of his own classes, and both
 // requests would have been refused outright.
 func BlockingSessionSQL(ssAlias string) string {
-	return ssAlias + ".kind = 'lab'"
+	// Was `kind = 'lab'` while the lecture exemption stood. See
+	// clashBlockingKind for why it no longer does.
+	_ = ssAlias
+	return "TRUE"
 }
 
 // enforceNoOwnClassConflict rejects a work log whose hours collide with the

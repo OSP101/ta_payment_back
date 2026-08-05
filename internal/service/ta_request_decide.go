@@ -66,6 +66,97 @@ func sectionClash(ctx context.Context, q querier, taID, sectionID uuid.UUID) (to
 	return total, clashing, err
 }
 
+// offSlotHours sums the declared duties that are performed OUTSIDE the class
+// session — grading and other work, for both undergrad and grad shapes. A
+// positive result means a fully-clashing section is still worth keeping.
+func offSlotHours(ctx context.Context, q rowQuerier, assignmentID uuid.UUID) (float64, error) {
+	rows, err := q.Query(ctx, `
+		SELECT COALESCE(wf.check_work_hrs,0) + COALESCE(wf.ug_other_hrs,0)
+		     + COALESCE(wf.lab_other_hrs,0)
+		     + COALESCE(wf.grade_hrs,0) + COALESCE(wf.other_hrs,0) + COALESCE(wf.prep_hrs,0)
+		FROM ta_workload_forms wf WHERE wf.assignment_id = $1`, assignmentID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var total float64
+	for rows.Next() {
+		var h float64
+		if err := rows.Scan(&h); err != nil {
+			return 0, err
+		}
+		total += h
+	}
+	return total, rows.Err()
+}
+
+// kindClash is sectionClash split by session kind.
+type kindClash map[string]struct{ Total, Clashing int }
+
+// fullyBlocked reports that EVERY session of this kind collides, which is the
+// only case that costs the TA the matching in-class duty. A partial collision
+// leaves workable sessions behind, and the meeting was explicit that those
+// still count — losing one of three lectures must not cost the whole duty.
+//
+// A kind with no sessions at all is not "blocked": it is simply absent, and the
+// hour caps already refuse hours against it.
+func (k kindClash) fullyBlocked(kind string) bool {
+	c, ok := k[kind]
+	return ok && c.Total > 0 && c.Clashing >= c.Total
+}
+
+// sectionClashByKind is sectionClash grouped by section_schedules.kind, so a
+// caller can tell "the lectures all clash but the labs are fine" from "the
+// whole section is unusable".
+//
+// The distinction is the whole point of the per-kind rule: เช็คชื่อ must happen
+// inside the lecture and สอนปฏิบัติการ inside the lab, but ตรวจงาน and อื่น ๆ
+// are done outside the slot and survive any collision.
+//
+// It deliberately does NOT apply BlockingSessionSQL. That predicate exempts
+// lecture periods — a decision from 31/07/2026 that a TA whose own class sits on
+// a lecture may still take attendance — and it still governs whether an existing
+// duty may be LOGGED. Whether the duty may be DECLARED in the first place is now
+// the opposite call: a section whose every lecture collides cannot carry
+// เช็คชื่อ, per the 05/08/2026 decision that reversed it for declarations.
+//
+// Two rules, two questions. Keeping the exemption inside the logging predicate
+// and out of this one is what lets both answers stay true at once — but they are
+// close enough that changing either without the other will look correct and be
+// wrong, so change them together.
+func sectionClashByKind(ctx context.Context, q rowQuerier, taID, sectionID uuid.UUID) (kindClash, error) {
+	rows, err := q.Query(ctx, `
+		SELECT ss.kind, COUNT(*),
+		       COUNT(*) FILTER (WHERE EXISTS (
+		           SELECT 1 FROM ta_class_schedules cs
+		           WHERE cs.user_id = $1
+		             AND NOT cs.is_wba
+		             AND cs.term_id = (
+		                 SELECT tc.term_id FROM sections sx
+		                 JOIN teaching_courses tc ON tc.id = sx.teaching_course_id
+		                 WHERE sx.id = $2)
+		             AND cs.day_of_week = ss.day_of_week
+		             AND cs.start_time < ss.end_time
+		             AND ss.start_time < cs.end_time))
+		FROM section_schedules ss
+		WHERE ss.section_id = $2
+		GROUP BY ss.kind`, taID, sectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := kindClash{}
+	for rows.Next() {
+		var kind string
+		var total, clashing int
+		if err := rows.Scan(&kind, &total, &clashing); err != nil {
+			return nil, err
+		}
+		out[kind] = struct{ Total, Clashing int }{total, clashing}
+	}
+	return out, rows.Err()
+}
+
 // clashDetail is one collision, named on both sides: the teaching session the
 // TA cannot cover, and the class of their own that takes the slot.
 type clashDetail struct {
@@ -313,18 +404,36 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 		head := fmt.Sprintf("Section %s: ตรงกับตารางเรียนของคุณ %d จาก %d คาบ",
 			a.secNo, clashing, total)
 		reason := strings.Join(append([]string{head}, lines...), "\n")
+
+		left, err := remainingKinds(ctx, tx, a.taID, a.secID)
+		if err != nil {
+			return nil, err
+		}
+		if left != "" {
+			reason += fmt.Sprintf("\nยังลงเวลาในคาบ%sได้ตามปกติ", left)
+		}
+
+		// Every session colliding no longer costs the whole assignment. Grading
+		// and other work happen OUTSIDE the session — that is the entire reason
+		// a TA can support a group they cannot stand in the room for — so the
+		// assignment survives as long as one such duty was declared.
+		//
+		// Dropping it outright was the old behaviour and it took the off-slot
+		// duties down with the in-class ones.
 		if total > 0 && clashing >= total {
-			state = "dropped"
-			reason = strings.Join(append(
-				[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ — คุณจึงไม่ได้เป็นผู้ช่วยสอนกลุ่มนี้", a.secNo)},
-				lines...), "\n")
-		} else {
-			left, err := remainingKinds(ctx, tx, a.taID, a.secID)
+			offSlot, err := offSlotHours(ctx, tx, a.id)
 			if err != nil {
 				return nil, err
 			}
-			if left != "" {
-				reason += fmt.Sprintf("\nยังลงเวลาในคาบ%sได้ตามปกติ", left)
+			if offSlot > 0 {
+				reason = strings.Join(append(
+					[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ — ลงเวลาในคาบไม่ได้ แต่ยังทำงานตรวจ/งานอื่นนอกคาบได้ตามที่อาจารย์ระบุ", a.secNo)},
+					lines...), "\n")
+			} else {
+				state = "dropped"
+				reason = strings.Join(append(
+					[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ และไม่มีงานนอกคาบที่อาจารย์ระบุไว้ — คุณจึงไม่ได้เป็นผู้ช่วยสอนกลุ่มนี้", a.secNo)},
+					lines...), "\n")
 			}
 		}
 		if _, err := tx.Exec(ctx, `
@@ -478,13 +587,15 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 		s.notify.Send(ctx, taID,
 			"ตารางเรียนของคุณทับกับคาบสอน",
 			fmt.Sprintf("วิชา %s\n%s", label, strings.Join(lines, "\n")),
-			"/ta/courses")
+			// /ta/courses is not a route — the TA's course list is the home page.
+			"/ta")
 		summary = append(summary, fmt.Sprintf("%s — %s", s.taName(ctx, taID), strings.Join(lines, "; ")))
 	}
 	s.notify.Send(ctx, lecturerID,
 		"ผู้ช่วยสอนบางคนติดตารางเรียน",
 		fmt.Sprintf("วิชา %s\n%s", label, strings.Join(summary, "\n")),
-		"/lecturer/courses")
+		// Likewise: the lecturer's course list is their home page.
+		"/lecturer")
 }
 
 // SweepPendingRequests finalises any request whose TAs have all filed their

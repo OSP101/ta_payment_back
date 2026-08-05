@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
@@ -35,20 +36,23 @@ func (s *ExportBatchService) Record(ctx context.Context, actor uuid.UUID, in Exp
 	in.ID = uuid.New()
 	in.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
 	in.GeneratedBy = actor
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO export_batches
-		    (id, teaching_course_id, submission_period_id,
-		     file_path, file_name, ta_count, total_baht,
-		     generated_at, generated_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9)`,
-		in.ID, in.TeachingCourseID, in.SubmissionPeriodID,
-		in.FilePath, in.FileName, in.TACount, in.TotalBaht,
-		in.GeneratedAt, in.GeneratedBy)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "export_batch.record",
+			Entity: "teaching_course", EntityID: in.TeachingCourseID.String(), After: in},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO export_batches
+				    (id, teaching_course_id, submission_period_id,
+				     file_path, file_name, ta_count, total_baht,
+				     generated_at, generated_by)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9)`,
+				in.ID, in.TeachingCourseID, in.SubmissionPeriodID,
+				in.FilePath, in.FileName, in.TACount, in.TotalBaht,
+				in.GeneratedAt, in.GeneratedBy)
+			return err
+		}); err != nil {
 		return nil, err
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "export_batch.record",
-		Entity: "teaching_course", EntityID: in.TeachingCourseID.String(), After: in})
 	return &in, nil
 }
 
@@ -121,7 +125,7 @@ type CourseSummary struct {
 
 // DashboardSummary aggregates budget + submission status per teaching_course
 // filtered by term. Heavy query — used by the staff dashboard page only.
-func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, termID uuid.UUID) ([]CourseSummary, error) {
+func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, export *ExportService, termID uuid.UUID) ([]CourseSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT tc.id, tc.code, tc.name_th,
 		       COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', '
@@ -181,6 +185,17 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		out[i].UsedBaht = snap.UsedBaht
 		out[i].RemainingBaht = snap.RemainingBaht
 		out[i].OverBudget = snap.OverBudget
+		// The spend figure comes from the settlement, not from BudgetSnapshot's
+		// own sum: that one prices raw work_logs at face value, with no merged
+		// sittings, no B2 deduction and no คาบ cutoff, so the list quoted a
+		// course at 24,360 while its own preview said 14,860.
+		if export != nil {
+			if st, serr := export.SettleCourse(ctx, out[i].TeachingCourseID); serr == nil {
+				out[i].UsedBaht = st.EarnedBaht()
+				out[i].RemainingBaht = round2(snap.PerCourseMaxBaht - out[i].UsedBaht)
+				out[i].OverBudget = snap.PerCourseMaxBaht > 0 && out[i].UsedBaht > snap.PerCourseMaxBaht+0.01
+			}
+		}
 	}
 	// Pending months: for each course, list periods (of its term) with no batch yet.
 	pendingRows, err := s.pool.Query(ctx, `

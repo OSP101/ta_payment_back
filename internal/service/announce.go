@@ -277,14 +277,16 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 		oldAnnouncedAt = nil
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
+		ActorID: &actor, Action: "announce.upsert", Entity: "announcement",
+		EntityID: in.ID.String(), After: in,
+	}); err != nil {
 		return uuid.Nil, err
 	}
 
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "announce.upsert", Entity: "announcement",
-		EntityID: in.ID.String(), After: in,
-	})
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, err
+	}
 
 	// Fanout only if the row is live *now* and hasn't been announced yet.
 	if oldAnnouncedAt == nil && in.PublishedAt != nil && !in.PublishedAt.After(time.Now()) {
@@ -298,38 +300,45 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 // ============================================================================
 
 func (s *AnnounceService) Delete(ctx context.Context, actor, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM announcements WHERE id=$1`, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "announce.delete", Entity: "announcement", EntityID: id.String(),
-	})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "announce.delete", Entity: "announcement", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `DELETE FROM announcements WHERE id=$1`, id)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		})
 }
 
 // Publish flips a draft/scheduled row to "live now" and fires the fanout.
 // Safe to call repeatedly — a second call just refreshes published_at but
 // the fanout guard (announced_at) prevents re-notifying.
 func (s *AnnounceService) Publish(ctx context.Context, actor, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE announcements
-		   SET published_at = COALESCE(published_at, NOW()),
-		       updated_by = $2, updated_at = NOW()
-		 WHERE id = $1
-	`, id, actor)
-	if err != nil {
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "announce.publish", Entity: "announcement", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE announcements
+				   SET published_at = COALESCE(published_at, NOW()),
+				       updated_by = $2, updated_at = NOW()
+				 WHERE id = $1
+			`, id, actor)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		}); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "announce.publish", Entity: "announcement", EntityID: id.String(),
-	})
+	// After the commit on purpose: the fanout sends mail and notifications, and
+	// those cannot be rolled back if the transaction later fails.
 	s.fanout(ctx, id)
 	return nil
 }
@@ -338,22 +347,23 @@ func (s *AnnounceService) Publish(ctx context.Context, actor, id uuid.UUID) erro
 // already went out are left in place — the recipient's inbox is a log, not
 // a mirror of the current state.
 func (s *AnnounceService) Unpublish(ctx context.Context, actor, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE announcements
-		   SET published_at = NULL, announced_at = NULL,
-		       updated_by = $2, updated_at = NOW()
-		 WHERE id = $1
-	`, id, actor)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	s.aud.Log(ctx, audit.Entry{
-		ActorID: &actor, Action: "announce.unpublish", Entity: "announcement", EntityID: id.String(),
-	})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "announce.unpublish", Entity: "announcement", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `
+				UPDATE announcements
+				   SET published_at = NULL, announced_at = NULL,
+				       updated_by = $2, updated_at = NOW()
+				 WHERE id = $1
+			`, id, actor)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			return nil
+		})
 }
 
 // ============================================================================

@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
+
+	"ta-payment-back/internal/docxgen"
 )
 
 // appointment_round.go turns the คำสั่งแต่งตั้ง into a sequence of rounds.
@@ -168,10 +171,17 @@ func (s *AppointmentOrderService) skippedCourses(ctx context.Context, termID uui
 // recordRound writes the ledger entry for an order that was just produced.
 // Runs in the same call as Build so a generated document is never left
 // unrecorded — an unrecorded round would be reprinted next time.
+// The composed document is frozen in the same transaction as the ledger row:
+// an order recorded without its snapshot could never be re-issued, and one
+// stored without its ledger row would be reprinted in the next round.
 func (s *AppointmentOrderService) recordRound(
 	ctx context.Context, actor uuid.UUID, in AppointmentOrderInput,
-	round int, pairs []AppointmentCandidate,
+	round int, pairs []AppointmentCandidate, doc docxgen.AppointmentOrderData,
 ) error {
+	snapshot, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -194,10 +204,10 @@ func (s *AppointmentOrderService) recordRound(
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO appointment_orders
 		    (id, term_id, round_no, order_no, order_date, effective_date,
-		     signer_officer_id, ta_count, generated_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		     signer_officer_id, ta_count, generated_by, document)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		orderID, in.TermID, round, in.OrderNo, in.OrderDate, in.EffectiveDate,
-		signer, len(pairs), by); err != nil {
+		signer, len(pairs), by, snapshot); err != nil {
 		return err
 	}
 	for _, p := range pairs {
@@ -221,6 +231,10 @@ type AppointmentRound struct {
 	GeneratedAt string    `json:"generated_at"`
 	GeneratedBy string    `json:"generated_by,omitempty"`
 	IsLate      bool      `json:"is_late"`
+	// CanReprint is false for orders issued before the document snapshot column
+	// existed. The button is hidden rather than shown-and-failing, because the
+	// refusal is permanent — nothing will ever make those reprintable.
+	CanReprint bool `json:"can_reprint"`
 }
 
 // ListRounds returns the orders already issued for a term, newest first.
@@ -228,7 +242,8 @@ func (s *AppointmentOrderService) ListRounds(ctx context.Context, termID uuid.UU
 	rows, err := s.pool.Query(ctx, `
 		SELECT o.id, o.round_no, o.order_no, o.order_date, o.ta_count,
 		       TO_CHAR(o.generated_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
-		       COALESCE(u.first_name || ' ' || u.last_name, '')
+		       COALESCE(u.first_name || ' ' || u.last_name, ''),
+		       o.document IS NOT NULL
 		FROM appointment_orders o
 		LEFT JOIN users u ON u.id = o.generated_by
 		WHERE o.term_id = $1
@@ -242,7 +257,7 @@ func (s *AppointmentOrderService) ListRounds(ctx context.Context, termID uuid.UU
 	for rows.Next() {
 		var r AppointmentRound
 		if err := rows.Scan(&r.ID, &r.RoundNo, &r.OrderNo, &r.OrderDate, &r.TACount,
-			&r.GeneratedAt, &r.GeneratedBy); err != nil {
+			&r.GeneratedAt, &r.GeneratedBy, &r.CanReprint); err != nil {
 			return nil, err
 		}
 		r.IsLate = r.RoundNo > 1

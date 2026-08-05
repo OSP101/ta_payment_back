@@ -71,6 +71,11 @@ type WorkloadInput struct {
 	UGOtherHrs    float64 `json:"ug_other_hrs"`
 	UGOtherDesc   string  `json:"ug_other_desc"`
 	LabHrs        float64 `json:"lab_hrs"`
+	// Support for a lab section done OUTSIDE the slot — prep, materials,
+	// marking lab sheets. Mutually exclusive with LabHrs: a TA either runs the
+	// session or supports it, never both for the same group.
+	LabOtherHrs  float64 `json:"lab_other_hrs"`
+	LabOtherDesc string  `json:"lab_other_desc"`
 }
 
 type CreateTARequestInput struct {
@@ -139,15 +144,10 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return nil, errors.New("คุณไม่ได้เป็นผู้สอนของรายวิชานี้")
 	}
 
-	var (
-		termID             uuid.UUID
-		lectureHrs, labHrs float64
-	)
+	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.term_id, COALESCE(tc.lecture_hrs, 0), COALESCE(tc.lab_hrs, 0)
-		FROM teaching_courses tc
-		WHERE tc.id = $1
-	`, in.TeachingCourseID).Scan(&termID, &lectureHrs, &labHrs); err != nil {
+		SELECT tc.term_id FROM teaching_courses tc WHERE tc.id = $1
+	`, in.TeachingCourseID).Scan(&termID); err != nil {
 		return nil, errors.New("ไม่พบรายวิชาที่เลือก")
 	}
 
@@ -257,6 +257,12 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			return nil, err
 		}
 
+		// The ceiling per section comes from the timetable, not the credits.
+		weekly, err := s.sectionWeeklyHours(ctx, a.SectionIDs)
+		if err != nil {
+			return nil, err
+		}
+
 		for _, secID := range a.SectionIDs {
 			w := perSection[i][secID]
 			secNo := s.sectionLabel(ctx, secID)
@@ -266,11 +272,11 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			if err := validateWorkloadFields(w, name); err != nil {
 				return nil, err
 			}
-			// Each group's hours are bounded by the course's weekly contact
-			// hours for that kind — the 3(3-0-6) figures. Undergrad only; grad
-			// hours follow the 10–12 total rule inside autoDecide.
+			// Each group's hours are bounded by how long that group actually
+			// meets. Undergrad only; grad hours follow the 10–12 total rule
+			// inside autoDecide.
 			if level == "undergrad" {
-				if err := validateUndergradSectionCaps(w, name, secNo, lectureHrs, labHrs); err != nil {
+				if err := validateUndergradSectionCaps(w, name, secNo, weekly[secID]); err != nil {
 					return nil, err
 				}
 			}
@@ -345,10 +351,12 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			wl := perSection[i][secID]
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO ta_workload_forms (id, assignment_id, help_teach_hrs, help_teach_desc, prep_hrs, prep_desc,
-					grade_hrs, grade_desc, other_hrs, other_desc, check_work_hrs, attendance_hrs, ug_other_hrs, ug_other_desc, lab_hrs)
-				VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+					grade_hrs, grade_desc, other_hrs, other_desc, check_work_hrs, attendance_hrs, ug_other_hrs, ug_other_desc,
+					lab_hrs, lab_other_hrs, lab_other_desc)
+				VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 				aid, wl.HelpTeachHrs, wl.HelpTeachDesc, wl.PrepHrs, wl.PrepDesc, wl.GradeHrs, wl.GradeDesc,
-				wl.OtherHrs, wl.OtherDesc, wl.CheckWorkHrs, wl.AttendanceHrs, wl.UGOtherHrs, wl.UGOtherDesc, wl.LabHrs); err != nil {
+				wl.OtherHrs, wl.OtherDesc, wl.CheckWorkHrs, wl.AttendanceHrs, wl.UGOtherHrs, wl.UGOtherDesc,
+				wl.LabHrs, wl.LabOtherHrs, wl.LabOtherDesc); err != nil {
 				return nil, err
 			}
 		}
@@ -382,14 +390,16 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			checksJSON, rid); err != nil {
 			return nil, err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return nil, err
-		}
-		s.aud.Log(ctx, audit.Entry{
+		if err := s.aud.LogTx(ctx, tx, audit.Entry{
 			ActorID: &lecturerID, Action: "ta_request.pending_schedule",
 			Entity: "ta_request", EntityID: rid.String(),
 			Note: strings.Join(waiting, ", "), After: in,
-		})
+		}); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
 		return &CreateResult{ID: rid, Status: "submitted", Checks: checks}, nil
 	}
 
@@ -453,18 +463,20 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		WHERE id = $4`, verdict, reason, checksJSON, rid); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-
-	s.aud.Log(ctx, audit.Entry{
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
 		ActorID:  &lecturerID,
 		Action:   "ta_request.auto_decide",
 		Entity:   "ta_request",
 		EntityID: rid.String(),
 		Note:     verdict,
 		After:    in,
-	})
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 	s.notifyClashOutcome(ctx, rid, notices)
 	s.notifyDecision(ctx, rid, verdict, reason)
 	return &CreateResult{ID: rid, Status: verdict, Checks: checks, RejectReason: reason}, nil
@@ -558,7 +570,7 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 func validateWorkloadFields(w WorkloadInput, name string) error {
 	fields := []float64{
 		w.HelpTeachHrs, w.PrepHrs, w.GradeHrs, w.OtherHrs,
-		w.CheckWorkHrs, w.AttendanceHrs, w.UGOtherHrs, w.LabHrs,
+		w.CheckWorkHrs, w.AttendanceHrs, w.UGOtherHrs, w.LabHrs, w.LabOtherHrs,
 	}
 	for _, v := range fields {
 		if v < 0 {
@@ -571,10 +583,62 @@ func validateWorkloadFields(w WorkloadInput, name string) error {
 	return nil
 }
 
+// sectionTotalMultiplier bounds the SUM of one side's declared hours against the
+// group's real teaching time. Attendance happens inside the session; grading and
+// other work happen outside it, so the total legitimately exceeds the class
+// hours — but not without limit.
+const sectionTotalMultiplier = 2
+
+// sectionWeekly is one section's actual weekly contact time, split by kind.
+type sectionWeekly struct{ Lecture, Lab float64 }
+
+// sectionWeeklyHours reads how long each section ACTUALLY meets per week, from
+// the timetable rather than from the credit notation.
+//
+// The two disagree in practice. A course carrying 1 credit-hour of lab can meet
+// for 3 real hours, and the ceiling that matters to a TA is the one they are
+// standing in the room for. Deriving it from teaching_courses.lecture_hrs /
+// lab_hrs — the 3(2-2-5) figures — capped that TA at 1 hour for a 3-hour job.
+//
+// Callers reach here only after the WBA gate above, so every section is
+// guaranteed to have at least one row; a kind with no sessions is legitimately
+// zero and blocks that kind's fields.
+func (s *TARequestService) sectionWeeklyHours(ctx context.Context, sectionIDs []uuid.UUID) (map[uuid.UUID]sectionWeekly, error) {
+	out := map[uuid.UUID]sectionWeekly{}
+	if len(sectionIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT section_id, kind,
+		       SUM(EXTRACT(EPOCH FROM (end_time - start_time)) / 3600)
+		FROM section_schedules
+		WHERE section_id = ANY($1)
+		GROUP BY section_id, kind`, sectionIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var kind string
+		var hrs float64
+		if err := rows.Scan(&id, &kind, &hrs); err != nil {
+			return nil, err
+		}
+		w := out[id]
+		switch kind {
+		case "lecture":
+			w.Lecture = hrs
+		case "lab":
+			w.Lab = hrs
+		}
+		out[id] = w
+	}
+	return out, rows.Err()
+}
+
 // validateUndergradSectionCaps bounds ONE section's declared weekly hours by
-// the course's contact hours for that kind — the figures inside the Thai
-// credit notation, e.g. 3(3-0-6) means 3 lecture hours and 0 lab hours per
-// week, per group.
+// how long that section actually meets each week, per kind.
 //
 // The bound is per section, not per assignment: the lecturers asked to declare
 // hours "ต่อกลุ่มเรียน (section)", and a TA cannot spend more time on a group
@@ -582,29 +646,71 @@ func validateWorkloadFields(w WorkloadInput, name string) error {
 // function multiplied the ceiling by the number of sections, because one
 // figure covered them all; that multiplication is now wrong and gone.
 //
+// A collision with the TA's own class is deliberately NOT judged here. Refusing
+// the submission would make the verdict depend on whether the TA filed their
+// timetable before or after the lecturer pressed Send — the same order-dependence
+// applyClashOutcome was written to remove. The clash is settled there instead, by
+// trimming the sessions the TA cannot cover (or dropping the assignment when
+// nothing off-slot was declared), and the request form disables the affected duty
+// up front using PreviewConflicts.BlockedKinds.
+//
 // secLabel names the group in the error so a lecturer filling several knows
 // which one to fix.
-func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, lectureHrs, labHrs float64) error {
+func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, hrs sectionWeekly) error {
+	// ปฏิบัติการ is either-or: a TA either runs the lab session or supports it
+	// from outside (prep, marking lab sheets). Declaring both would bill the
+	// same lab twice over, and the TA cannot be in two places for one slot.
+	if w.LabHrs > 0.001 && w.LabOtherHrs > 0.001 {
+		return fmt.Errorf(
+			"ภาระงานปฏิบัติการของ %s (Sec %s) เลือกได้อย่างใดอย่างหนึ่ง: 'สอนปฏิบัติการ' หรือ 'อื่น ๆ (ปฏิบัติการ)'",
+			name, secLabel)
+	}
 	checks := []struct {
 		v     float64
 		cap   float64
 		label string
 	}{
-		{w.CheckWorkHrs, lectureHrs, "ช่วยตรวจงาน"},
-		{w.AttendanceHrs, lectureHrs, "เช็คชื่อ/เก็บใบงาน"},
-		{w.UGOtherHrs, lectureHrs, "อื่น ๆ (บรรยาย)"},
-		{w.LabHrs, labHrs, "ปฏิบัติการ"},
+		{w.CheckWorkHrs, hrs.Lecture, "ช่วยตรวจงาน"},
+		{w.AttendanceHrs, hrs.Lecture, "เช็คชื่อ/เก็บใบงาน"},
+		{w.UGOtherHrs, hrs.Lecture, "อื่น ๆ (บรรยาย)"},
+		{w.LabHrs, hrs.Lab, "ปฏิบัติการ"},
+		{w.LabOtherHrs, hrs.Lab, "อื่น ๆ (ปฏิบัติการ)"},
 	}
 	for _, c := range checks {
 		if c.v > c.cap+0.001 {
 			if c.cap == 0 {
 				return fmt.Errorf(
-					"ภาระงาน '%s' ของ %s (Sec %s) กรอกไม่ได้ — วิชานี้ไม่มีชั่วโมงประเภทนี้ในหน่วยกิต",
+					"ภาระงาน '%s' ของ %s (Sec %s) กรอกไม่ได้ — กลุ่มนี้ไม่มีคาบประเภทนี้ในตารางสอน",
 					c.label, name, secLabel)
 			}
 			return fmt.Errorf(
-				"ภาระงาน '%s' ของ %s (Sec %s) เกินชั่วโมงของวิชาต่อสัปดาห์ (%.2f ชม.)",
+				"ภาระงาน '%s' ของ %s (Sec %s) เกินชั่วโมงสอนจริงของกลุ่มนี้ (%.2f ชม./สัปดาห์)",
 				c.label, name, secLabel, c.cap)
+		}
+	}
+	// Each field alone fitting the class hours is not enough: three lecture-side
+	// fields at the ceiling declared three times the group's real teaching time.
+	// The total is bounded at sectionTotalMultiplier × the class hours.
+	//
+	// The multiplier is 2, not 1, because the second hour is real work that
+	// happens outside the room: every approved assignment in service today
+	// declares 2h เช็คชื่อ during a 2h lecture plus 2h ตรวจงาน after it. A ×1
+	// ceiling would describe a practice nobody follows and refuse every request.
+	totals := []struct {
+		v     float64
+		hrs   float64
+		label string
+	}{
+		{w.CheckWorkHrs + w.AttendanceHrs + w.UGOtherHrs, hrs.Lecture, "บรรยาย"},
+		{w.LabHrs + w.LabOtherHrs, hrs.Lab, "ปฏิบัติการ"},
+	}
+	for _, t := range totals {
+		limit := t.hrs * sectionTotalMultiplier
+		if t.hrs > 0 && t.v > limit+0.001 {
+			return fmt.Errorf(
+				"ภาระงาน%sรวมของ %s (Sec %s) = %.2f ชม./สัปดาห์ เกินเพดานรวม %.2f ชม. "+
+					"(%.0f เท่าของชั่วโมงสอนจริง %.2f ชม.)",
+				t.label, name, secLabel, t.v, limit, float64(sectionTotalMultiplier), t.hrs)
 		}
 	}
 	return nil
@@ -713,7 +819,7 @@ func weeklyWorkloadTotal(w WorkloadInput, level string) float64 {
 	if level == "master" || level == "phd" {
 		return w.HelpTeachHrs + w.PrepHrs + w.GradeHrs + w.OtherHrs
 	}
-	return w.CheckWorkHrs + w.AttendanceHrs + w.UGOtherHrs + w.LabHrs
+	return w.CheckWorkHrs + w.AttendanceHrs + w.UGOtherHrs + w.LabHrs + w.LabOtherHrs
 }
 
 var thaiDayNames = [7]string{"อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"}
@@ -738,6 +844,19 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 ) error {
 	if len(sectionIDs) == 0 {
 		return nil
+	}
+	// Without pay_rates there are no caps to enforce, and the query below would
+	// return no rows — indistinguishable from "this course has no timetable".
+	// Silently approving in that state is the wrong way to be wrong: the caps
+	// are the announcement, and a request waved through without them cannot be
+	// unwound once the TA has worked the hours. Refuse and say why.
+	var haveRates bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pay_rates)`).Scan(&haveRates); err != nil {
+		return err
+	}
+	if !haveRates {
+		return Invalid("ยังไม่ได้ตั้งอัตราค่าตอบแทนในระบบ — ตรวจเพดานชั่วโมงตามประกาศไม่ได้ จึงยังส่งคำขอไม่ได้")
 	}
 	isGrad := level == "master" || level == "phd"
 	// Hours per weekday must be the UNION of the occupied time, not the sum of
@@ -878,6 +997,21 @@ func (s *TARequestService) taName(ctx context.Context, taID uuid.UUID) string {
 type SectionConflict struct {
 	SectionID uuid.UUID `json:"section_id"`
 	Messages  []string  `json:"messages"`
+	// BlockedKinds names the session kinds ("lecture" / "lab") whose every
+	// meeting collides with this TA's own timetable. The form disables only the
+	// matching in-class duty — เช็คชื่อ for lecture, สอนปฏิบัติการ for lab —
+	// and leaves grading and other work available, because those are done
+	// outside the session.
+	//
+	// A section may appear in the result with an empty BlockedKinds: a partial
+	// collision is worth warning about but costs the TA nothing.
+	BlockedKinds []string `json:"blocked_kinds"`
+	// CrossConflict marks an overlap with a DIFFERENT course the TA already
+	// assists. Unlike a collision with their own class, this one still blocks
+	// the request: both sides are teaching commitments, so it cannot be
+	// resolved by dropping sessions from this request. The form keeps refusing
+	// to submit on this — and only this.
+	CrossConflict bool `json:"cross_conflict"`
 }
 
 // PreviewConflicts checks the given TA against every section of the given
@@ -918,6 +1052,7 @@ func (s *TARequestService) PreviewConflicts(ctx context.Context, taID, teachingC
 	out := make([]SectionConflict, 0, len(secIDs))
 	for _, sid := range secIDs {
 		var msgs []string
+		var cross bool
 		if err := s.checkOwnClassConflict(ctx, s.pool, taID, sid, name); err != nil {
 			msgs = append(msgs, err.Error())
 		}
@@ -925,9 +1060,22 @@ func (s *TARequestService) PreviewConflicts(ctx context.Context, taID, teachingC
 		// filing a request yet, so no ID to exclude.
 		if err := s.checkCrossRequestConflict(ctx, s.pool, taID, sid, termID, teachingCourseID, uuid.Nil, []string{"approved"}, name); err != nil {
 			msgs = append(msgs, err.Error())
+			cross = true
 		}
-		if len(msgs) > 0 {
-			out = append(out, SectionConflict{SectionID: sid, Messages: msgs})
+		byKind, err := sectionClashByKind(ctx, s.pool, taID, sid)
+		if err != nil {
+			return nil, err
+		}
+		var blocked []string
+		for _, k := range []string{"lecture", "lab"} {
+			if byKind.fullyBlocked(k) {
+				blocked = append(blocked, k)
+			}
+		}
+		if len(msgs) > 0 || len(blocked) > 0 {
+			out = append(out, SectionConflict{
+				SectionID: sid, Messages: msgs, BlockedKinds: blocked, CrossConflict: cross,
+			})
 		}
 	}
 	return out, nil
@@ -1222,6 +1370,7 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		       COALESCE(w.grade_hrs,0),      COALESCE(w.other_hrs,0),
 		       COALESCE(w.check_work_hrs,0), COALESCE(w.attendance_hrs,0),
 		       COALESCE(w.ug_other_hrs,0),   COALESCE(w.lab_hrs,0),
+		       COALESCE(w.lab_other_hrs,0),
 		       COALESCE(a.cotaught_group, 0)
 		FROM ta_request_assignments a
 		JOIN users u ON u.id = a.ta_id
@@ -1238,6 +1387,7 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		if err := arows.Scan(&a.taID, &a.secID, &a.name, &a.level,
 			&a.wl.HelpTeachHrs, &a.wl.PrepHrs, &a.wl.GradeHrs, &a.wl.OtherHrs,
 			&a.wl.CheckWorkHrs, &a.wl.AttendanceHrs, &a.wl.UGOtherHrs, &a.wl.LabHrs,
+			&a.wl.LabOtherHrs,
 			&a.coGroup); err != nil {
 			arows.Close()
 			return nil, false, err
@@ -1371,7 +1521,7 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 				if a.taID != t.id || !countOnce(a) {
 					continue
 				}
-				tot += a.wl.CheckWorkHrs + a.wl.AttendanceHrs + a.wl.UGOtherHrs + a.wl.LabHrs
+				tot += a.wl.CheckWorkHrs + a.wl.AttendanceHrs + a.wl.UGOtherHrs + a.wl.LabHrs + a.wl.LabOtherHrs
 			}
 			totOK = tot > 0
 			if totOK {
@@ -1650,7 +1800,8 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 	arows, err := s.pool.Query(ctx, `
 		SELECT sec.sec_no, a.ta_id, u.first_name || ' ' || u.last_name, u.email, u.student_id, a.level::text,
 		       COALESCE(w.help_teach_hrs,0)+COALESCE(w.prep_hrs,0)+COALESCE(w.grade_hrs,0)+COALESCE(w.other_hrs,0)
-		       +COALESCE(w.check_work_hrs,0)+COALESCE(w.attendance_hrs,0)+COALESCE(w.ug_other_hrs,0)+COALESCE(w.lab_hrs,0),
+		       +COALESCE(w.check_work_hrs,0)+COALESCE(w.attendance_hrs,0)+COALESCE(w.ug_other_hrs,0)+COALESCE(w.lab_hrs,0)
+		       +COALESCE(w.lab_other_hrs,0),
 		       COALESCE(p.status::text, 'pending'),
 		       EXISTS (SELECT 1 FROM ta_class_schedules cs WHERE cs.user_id = a.ta_id AND cs.term_id = $2),
 		       a.section_id, a.state::text, a.state_reason
@@ -1723,24 +1874,27 @@ type Window struct {
 }
 
 func (s *TARequestService) UpsertWindow(ctx context.Context, actor uuid.UUID, in Window) (*Window, error) {
-	if in.ID == uuid.Nil {
+	isNew := in.ID == uuid.Nil
+	if isNew {
 		in.ID = uuid.New()
-		_, err := s.pool.Exec(ctx,
-			`INSERT INTO ta_request_windows (id, term_id, opens_at, closes_at, is_open, note)
-			 VALUES ($1,$2,$3,$4,$5,$6)`,
-			in.ID, in.TermID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		_, err := s.pool.Exec(ctx,
-			`UPDATE ta_request_windows SET opens_at=$2, closes_at=$3, is_open=$4, note=$5 WHERE id=$1`,
-			in.ID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note)
-		if err != nil {
-			return nil, err
-		}
 	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_window.upsert", Entity: "ta_window", EntityID: in.ID.String(), After: in})
+	if err := writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "ta_window.upsert", Entity: "ta_window", EntityID: in.ID.String(), After: in},
+		func(tx pgx.Tx) error {
+			if isNew {
+				_, err := tx.Exec(ctx,
+					`INSERT INTO ta_request_windows (id, term_id, opens_at, closes_at, is_open, note)
+					 VALUES ($1,$2,$3,$4,$5,$6)`,
+					in.ID, in.TermID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note)
+				return err
+			}
+			_, err := tx.Exec(ctx,
+				`UPDATE ta_request_windows SET opens_at=$2, closes_at=$3, is_open=$4, note=$5 WHERE id=$1`,
+				in.ID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note)
+			return err
+		}); err != nil {
+		return nil, err
+	}
 	return &in, nil
 }
 
@@ -1779,13 +1933,16 @@ func (s *TARequestService) DeleteWindow(ctx context.Context, actor, id uuid.UUID
 	if used > 0 {
 		return errors.New("ช่วงเวลานี้ถูกอ้างอิงจากคำขอ TA แล้ว ไม่สามารถลบได้ (แนะนำให้ปิดชั่วคราวแทน)")
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM ta_request_windows WHERE id = $1`, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return errors.New("ไม่พบช่วงเวลารับสมัครนี้")
-	}
-	s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_window.delete", Entity: "ta_window", EntityID: id.String()})
-	return nil
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "ta_window.delete", Entity: "ta_window", EntityID: id.String()},
+		func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `DELETE FROM ta_request_windows WHERE id = $1`, id)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return errors.New("ไม่พบช่วงเวลารับสมัครนี้")
+			}
+			return nil
+		})
 }

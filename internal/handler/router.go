@@ -105,8 +105,14 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Patch("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.UpdateSection)
 	authed.Delete("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.DeleteSection)
 	authed.Put("/teaching-courses/:id/sections/:sectionId/schedules", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.ReplaceSectionSchedules)
-	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddMakeup)
-	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.DeleteMakeup)
+	// Makeups (วันชดเชย) admit TA as well: the TA who works the rescheduled
+	// class may file its date instead of waiting on the lecturer, otherwise the
+	// period stays unresolved and the TA cannot log the hours. taApproved keeps
+	// an unapproved TA profile out (it passes non-TA roles straight through);
+	// service.assertMakeupManager then requires an approved assignment in THIS
+	// course, so the role alone does not open other people's courses.
+	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.AddMakeup)
+	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.DeleteMakeup)
 	authed.Get("/teaching-courses/:id/holiday-impacts", th.HolidayImpacts)
 	authed.Post("/teaching-courses/:id/holiday-impacts/:originalDate/remind", RequireRole(rbac.RoleTA), taApproved, th.RemindLecturerAboutMakeup)
 	authed.Post("/teaching-courses/:id/review-date/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddReviewDate)
@@ -183,6 +189,10 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Delete("/assignments/:id/worklog/:logId", RequireRole(rbac.RoleTA), taApproved, wl.Delete)
 	authed.Post("/assignments/:id/worklog/submit", RequireRole(rbac.RoleTA), taApproved, wl.Submit)
 	authed.Post("/assignments/:id/worklog/approve", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.Approve)
+	// Several assignments, one transaction — a TA on two sections is approved
+	// wholly or not at all. Not under /assignments/:id because the batch is the
+	// unit here, not any one assignment.
+	authed.Post("/worklog/approve-batch", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.ApproveBatch)
 	authed.Post("/assignments/:id/worklog/reject", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.Reject)
 	// TA-owned weekly review pattern — TA self-service, seeds review entries
 	// on auto-generate. Approval gate mirrors the worklog write endpoints so
@@ -242,15 +252,27 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 	// Read-only payout preview — review the numbers before the locking download.
 	authed.Get("/exports/course/:id/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursePreview)
+	// No role guard: the service checks that the caller teaches or assists the
+	// course. A budget that decides a TA's own pay is not a staff secret.
+	authed.Get("/teaching-courses/:tcId/budget-settlement", eh.BudgetSettlement)
 	// Phase 4 exports dashboard.
 	authed.Get("/exports/summary", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursesSummary)
 	authed.Get("/exports/course/:id/history", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseHistory)
 	// Appointment order (คำสั่งแต่งตั้ง) — PDF + DOCX in one ZIP.
 	// Issued in rounds: names already printed are never reprinted, so a late
 	// round carries only the courses that were not ready earlier.
+	// Who signs the ผู้รับรอง block on a term's claim forms. Under /exports
+	// rather than /terms because it is a property of the documents this package
+	// produces, not of the academic calendar.
+	authed.Get("/exports/terms/:id/certifier", adminOrStaff, eh.Certifier)
+	authed.Put("/exports/terms/:id/certifier", adminOrStaff, eh.SetCertifier)
 	authed.Get("/exports/appointment-order/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentPreview)
 	authed.Get("/exports/appointment-order/rounds", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRounds)
 	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentOrder)
+	// Re-issue a copy of an order already printed. Separate from the POST above
+	// because that one CREATES a round; this one only re-renders a stored
+	// snapshot, so it must never be reachable by the same verb and path.
+	authed.Get("/exports/appointment-order/rounds/:id/download", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentReprint)
 
 	// Physical-document progress board — the off-system signature/routing journey.
 	// GET is readable by any authenticated user (shared status); staff/admin update.
