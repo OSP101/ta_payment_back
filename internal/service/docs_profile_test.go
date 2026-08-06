@@ -74,7 +74,7 @@ func TestGetProfile_IgnoresNonFormPrefix(t *testing.T) {
 		t.Fatalf("GetProfile: %v", err)
 	}
 	if p.Prefix != "" {
-		t.Errorf("prefix = %q, want empty — only นาย/นาง/นางสาว may seed it", p.Prefix)
+		t.Errorf("prefix = %q, want empty only นาย/นาง/นางสาว may seed it", p.Prefix)
 	}
 	// The name still seeds the account name, just without a prefix in front.
 	if p.AccountName != "งามนิจ อาจอินทร์" {
@@ -163,7 +163,7 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 		}
 		rows.Close()
 		if len(cols) > 0 {
-			t.Errorf("%s still has PDPA columns %v — ข้อมูลสำคัญต้องไม่ถูกเก็บลงฐานข้อมูล", table, cols)
+			t.Errorf("%s still has PDPA columns %v ข้อมูลสำคัญต้องไม่ถูกเก็บลงฐานข้อมูล", table, cols)
 		}
 	}
 
@@ -174,7 +174,7 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 		t.Fatalf("GetProfile: %v", err)
 	}
 	if p.Status != "submitted" {
-		t.Errorf("status = %q, want submitted — ขั้นที่ 1 ต้องนับว่าเสร็จ", p.Status)
+		t.Errorf("status = %q, want submitted ขั้นที่ 1 ต้องนับว่าเสร็จ", p.Status)
 	}
 	if p.NationalID != "" || p.AccountNo != "" || p.SignatureSVG != "" {
 		t.Errorf("GetProfile leaked sensitive values back: nid=%q acct=%q sig=%q",

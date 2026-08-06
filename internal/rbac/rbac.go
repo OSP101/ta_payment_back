@@ -12,6 +12,12 @@ const (
 	RoleStaff    = "staff"
 	RoleLecturer = "lecturer"
 	RoleTA       = "ta"
+	// RoleExecutive is synthetic: it is users.is_executive surfaced as a role,
+	// not a role_code enum value (ALTER TYPE ... ADD VALUE cannot be used in
+	// the migration transaction that adds it — see migration 0041/0068). The
+	// management team are lecturers whose accounts staff tick the flag on; the
+	// role grants ONLY the read-only budget-analytics endpoints.
+	RoleExecutive = "executive"
 )
 
 type RBAC struct {
@@ -22,7 +28,10 @@ func New(pool *pgxpool.Pool) *RBAC { return &RBAC{pool: pool} }
 
 func (r *RBAC) Roles(ctx context.Context, userID uuid.UUID) ([]string, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT role::text FROM user_roles WHERE user_id = $1 ORDER BY role`, userID)
+		`SELECT role::text FROM user_roles WHERE user_id = $1
+		 UNION ALL
+		 SELECT 'executive' FROM users WHERE id = $1 AND is_executive
+		 ORDER BY 1`, userID)
 	if err != nil {
 		return nil, err
 	}

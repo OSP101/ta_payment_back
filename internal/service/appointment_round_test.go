@@ -213,3 +213,40 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+// The sidebar badge and the page's "จะออกคำสั่งให้ N รายชื่อ" read the same
+// predicate — this pins that the count moves exactly with the preview list:
+// grows when a request is approved, falls to zero once the round is printed,
+// and never counts a request still waiting for a decision.
+func TestAppointmentPendingCountMatchesPreview(t *testing.T) {
+	f := newApptFixture(t)
+	f.addCourseWithTA("CP101", "หนึ่ง", "approved")
+	f.addCourseWithTA("CP202", "สอง", "approved")
+	f.addCourseWithTA("CP303", "สาม", "submitted") // ยังไม่อนุมัติ ต้องไม่ถูกนับ
+
+	p, err := f.svc.Preview(f.ctx, f.term)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	n, err := f.svc.PendingCount(f.ctx, f.term)
+	if err != nil {
+		t.Fatalf("PendingCount: %v", err)
+	}
+	if n != len(p.Include) {
+		t.Fatalf("badge says %d but the page would print %d names", n, len(p.Include))
+	}
+	if n != 2 {
+		t.Fatalf("pending = %d, want 2 (the submitted request is not appointable)", n)
+	}
+
+	if _, _, err := f.svc.Build(f.ctx, uuid.Nil, f.in); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	n, err = f.svc.PendingCount(f.ctx, f.term)
+	if err != nil {
+		t.Fatalf("PendingCount after build: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("badge must clear once the order is printed, got %d", n)
+	}
+}

@@ -78,13 +78,13 @@ func combinedFixture(t *testing.T) (*excelize.File, *combinedBookData, []claiman
 	day := func(n int) time.Time { return time.Date(2026, 6, n, 0, 0, 0, 0, time.UTC) }
 	// Person 1 teaches 5 hours (฿200 at the rate) but the budget funds only
 	// ฿150 — the over-budget case the ขอเบิกจ่ายเพียง line exists for. Person 2
-	// is funded in full.
+	// is funded in full, so their ขอเบิกจ่ายเพียง stays blank.
 	people := []claimant{
-		{Name: "หนึ่ง ทดสอบ", LevelTH: "ป.ตรี", Rate: 40, PaidBaht: 150, Rows: []claimSheetRow{
+		{Name: "หนึ่ง ทดสอบ", LevelTH: "ป.ตรี", Rate: 40, PaidBaht: 150, FullBaht: 200, Rows: []claimSheetRow{
 			{Date: day(1), Group: "ปกติ Sec1", Range: "13.00 - 17.00", Note: "สอนปฏิบัติ"},
 			{Date: day(2), Group: "ปกติ Sec1", Range: "14.00 - 15.00", Note: "เช็คชื่อ"},
 		}},
-		{Name: "สอง ทดสอบ", LevelTH: "ป.ตรี", Rate: 40, PaidBaht: 80, Rows: []claimSheetRow{
+		{Name: "สอง ทดสอบ", LevelTH: "ป.ตรี", Rate: 40, PaidBaht: 80, FullBaht: 80, Rows: []claimSheetRow{
 			{Date: day(3), Group: "ปกติ Sec1", Range: "19.00 - 21.00", Note: "ตรวจงาน"},
 		}},
 	}
@@ -235,14 +235,15 @@ func TestCombinedSheet_CertifierSignsEveryBlock(t *testing.T) {
 }
 
 // Office instruction (ส.ค. 2569): the sheet lists every hour taught and totals
-// it in รวมเป็นเงินทั้งสิ้น; the FUNDED amount prints separately — in each
-// block's ขอเบิกจ่ายเพียง line and in the evidence sheet's รับจริง column —
-// while จำนวนเงิน (D×E) on the evidence sheet stays the full figure.
-func TestCombinedSheet_FundedAmountPrintsSeparately(t *testing.T) {
-	f, _, people := combinedFixture(t)
+// it in รวมเป็นเงินทั้งสิ้น. ขอเบิกจ่ายเพียง (and the evidence sheet's รับจริง)
+// prints the funded amount ONLY when the budget stopped short — a fully funded
+// block leaves the line blank, so a figure there always means "งบไม่พอ".
+func TestCombinedSheet_FundedAmountPrintsOnlyWhenBudgetStopsShort(t *testing.T) {
+	f, _, _ := combinedFixture(t)
 	raw := excelize.Options{RawCellValue: true}
 
-	// Block 1: top=1 → grand total at row 32, ขอเบิกจ่ายเพียง at row 33.
+	// Block 1 (underfunded, 150 of 200): top=1 → grand total row 32,
+	// ขอเบิกจ่ายเพียง row 33.
 	got, err := f.GetCellValue(sheetClaimRegular, "C33", raw)
 	if err != nil {
 		t.Fatal(err)
@@ -254,22 +255,23 @@ func TestCombinedSheet_FundedAmountPrintsSeparately(t *testing.T) {
 	if formula, _ := f.GetCellFormula(sheetClaimRegular, "C32"); formula == "" {
 		t.Error("C32 must keep the full-amount formula — the budget must not touch it")
 	}
-
-	// Evidence sheet: รับจริง carries the funded figure per person.
-	for i, want := range []string{"150", "80"} {
-		got, err := f.GetCellValue(sheetEvidenceRegular, cellAt("G", 10+i), raw)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
-			t.Errorf("evidence รับจริง row %d = %q, want %q", 10+i, got, want)
-		}
+	// Block 2 (funded in full): top=41 → ขอเบิกจ่ายเพียง row 73 stays blank.
+	if got, _ := f.GetCellValue(sheetClaimRegular, "C73", raw); got != "" {
+		t.Errorf("fully funded block prints ขอเบิกจ่ายเพียง %q, want blank", got)
 	}
-	// จำนวนเงิน keeps the full D×E formula.
+
+	// Evidence sheet: รับจริง is a literal only for the underfunded person…
+	if got, _ := f.GetCellValue(sheetEvidenceRegular, "G10", raw); got != "150" {
+		t.Errorf("evidence รับจริง G10 = %q, want the funded 150", got)
+	}
+	// …and stays the =F link for the fully funded one.
+	if formula, _ := f.GetCellFormula(sheetEvidenceRegular, "G11"); formula == "" {
+		t.Error("G11 must keep the =F11 link — funded in full means received = claimed")
+	}
+	// จำนวนเงิน keeps the full D×E formula for everyone.
 	if formula, _ := f.GetCellFormula(sheetEvidenceRegular, "F10"); formula == "" {
 		t.Error("F10 must keep the D×E full-amount formula")
 	}
-	_ = people
 }
 
 // A track nobody worked produces no sheet, rather than a blank one to leaf past.

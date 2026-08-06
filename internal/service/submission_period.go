@@ -175,7 +175,7 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 		return nil, err
 	}
 	if !validYearMonth(in.YearMonth, acadYear) {
-		return nil, Invalid(fmt.Sprintf("รูปแบบเดือนไม่ถูกต้อง — ต้องเป็น %d-MM (เช่น %d-06)", acadYear, acadYear))
+		return nil, Invalid(fmt.Sprintf("รูปแบบเดือนไม่ถูกต้อง ต้องเป็น %d-MM (เช่น %d-06)", acadYear, acadYear))
 	}
 	if in.RemindDaysBefore <= 0 {
 		in.RemindDaysBefore = 3
@@ -224,7 +224,7 @@ func (s *SubmissionPeriodService) Delete(ctx context.Context, actor, id uuid.UUI
 		return err
 	}
 	if lockedCount > 0 {
-		return Conflict("ลบงวดนี้ไม่ได้ — มีเดือนที่ส่งออกไฟล์หรือส่งการเงินไปแล้ว กรุณาตีกลับหรือให้ผู้ดูแลระบบปลดล็อกก่อน")
+		return Conflict("ลบงวดนี้ไม่ได้ มีเดือนที่ส่งออกไฟล์หรือส่งการเงินไปแล้ว กรุณาตีกลับหรือให้ผู้ดูแลระบบปลดล็อกก่อน")
 	}
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "submission_period.delete",
@@ -617,7 +617,7 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 			for _, c := range cells {
 				s.notify.Send(ctx, c.taID,
 					"เจ้าหน้าที่ส่งออกเอกสารเบิกจ่ายแล้ว",
-					"เจ้าหน้าที่ตรวจสอบและส่งออกไฟล์เบิกจ่ายของคุณแล้ว — บันทึกเวลาเดือนดังกล่าวถูกล็อก",
+					"เจ้าหน้าที่ตรวจสอบและส่งออกไฟล์เบิกจ่ายของคุณแล้ว บันทึกเวลาเดือนดังกล่าวถูกล็อก",
 					"/ta/reminders")
 			}
 		}
@@ -660,7 +660,7 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 				return err
 			}
 			if tag.RowsAffected() == 0 {
-				return Invalid("ยังไม่พร้อมส่งการเงิน — ต้องส่งออกไฟล์เบิกจ่ายของเดือนนี้ก่อน")
+				return Invalid("ยังไม่พร้อมส่งการเงิน ต้องส่งออกไฟล์เบิกจ่ายของเดือนนี้ก่อน")
 			}
 			return nil
 		}); err != nil {
@@ -684,16 +684,16 @@ func (s *SubmissionPeriodService) assertPayoutReady(ctx context.Context, taID uu
 		SELECT status::text, COALESCE(national_id,''), COALESCE(account_no,''), COALESCE(bank_name,'')
 		FROM ta_profiles WHERE user_id = $1`, taID).Scan(&status, &nid, &acct, &bank)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Invalid("ส่งการเงินไม่ได้ — TA ยังไม่ได้กรอกข้อมูลโปรไฟล์/บัญชีธนาคาร")
+		return Invalid("ส่งการเงินไม่ได้ TA ยังไม่ได้กรอกข้อมูลโปรไฟล์/บัญชีธนาคาร")
 	}
 	if err != nil {
 		return err
 	}
 	if status != "approved" {
-		return Invalid("ส่งการเงินไม่ได้ — เอกสารโปรไฟล์ของ TA ยังไม่ผ่านการอนุมัติจากเจ้าหน้าที่")
+		return Invalid("ส่งการเงินไม่ได้ เอกสารโปรไฟล์ของ TA ยังไม่ผ่านการอนุมัติจากเจ้าหน้าที่")
 	}
 	if nid == "" || acct == "" || bank == "" {
-		return Invalid("ส่งการเงินไม่ได้ — ข้อมูลเลขบัตรประชาชนหรือบัญชีธนาคารของ TA ไม่ครบถ้วน")
+		return Invalid("ส่งการเงินไม่ได้ ข้อมูลเลขบัตรประชาชนหรือบัญชีธนาคารของ TA ไม่ครบถ้วน")
 	}
 	return nil
 }
@@ -747,7 +747,7 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 		return Invalid("สถานะปัจจุบันไม่รองรับการตีกลับ")
 	}
 	if cur == "finance_sent" {
-		return Conflict("รายการนี้ส่งการเงินแล้ว — ต้องให้ผู้ดูแลระบบปลดล็อกก่อน")
+		return Conflict("รายการนี้ส่งการเงินแล้ว ต้องให้ผู้ดูแลระบบปลดล็อกก่อน")
 	}
 	if toRank >= curRank {
 		return Invalid("สถานะปลายทางต้องอยู่ก่อนสถานะปัจจุบัน")
@@ -1052,7 +1052,7 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 		items = append(items, it)
 	}
 	for _, it := range items {
-		body := fmt.Sprintf("โปรดบันทึกเวลาปฏิบัติงาน %s วิชา %s (%s) ให้ครบและส่งให้อาจารย์อนุมัติ — กำหนดส่งภายในวันที่ %s",
+		body := fmt.Sprintf("โปรดบันทึกเวลาปฏิบัติงาน %s วิชา %s (%s) ให้ครบและส่งให้อาจารย์อนุมัติ กำหนดส่งภายในวันที่ %s",
 			it.label, it.code, it.nm, it.due)
 		s.notify.Send(ctx, it.taID, "แจ้งเตือน: ใกล้ครบกำหนดส่งบันทึกเวลา TA", body, "/ta/reminders")
 		_, _ = s.pool.Exec(ctx, `

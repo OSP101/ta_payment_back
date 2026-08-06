@@ -493,7 +493,7 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		return err
 	}
 	if lastSent != nil && time.Since(*lastSent) < 24*time.Hour {
-		return Invalid("ส่งแจ้งเตือนไปแล้ววันนี้ — จะส่งได้อีกครั้งใน 24 ชั่วโมง")
+		return Invalid("ส่งแจ้งเตือนไปแล้ววันนี้ จะส่งได้อีกครั้งใน 24 ชั่วโมง")
 	}
 
 	// Look up the TA's name + course code for the notification body.
@@ -536,7 +536,7 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		return Invalid("ไม่พบอาจารย์ประจำวิชา")
 	}
 	body := fmt.Sprintf(
-		"%s แจ้งว่ายังไม่ได้กำหนดวันชดเชยของวันที่ %s (%s) วิชา %s — %s",
+		"%s แจ้งว่ายังไม่ได้กำหนดวันชดเชยของวันที่ %s (%s) วิชา %s %s",
 		taName, originalDate, holidayName, courseCode, courseNameTH,
 	)
 	if note != "" {
@@ -734,7 +734,7 @@ func (s *HolidayService) fetchBOTHolidays(ctx context.Context, year int) ([]botH
 	}
 	var bare []botHolidayRow
 	if err := json.Unmarshal(body, &bare); err != nil {
-		return nil, &UserError{Status: 502, Msg: "รูปแบบข้อมูลจาก BOT API เปลี่ยน — โปรดตรวจสอบ"}
+		return nil, &UserError{Status: 502, Msg: "รูปแบบข้อมูลจาก BOT API เปลี่ยน โปรดตรวจสอบ"}
 	}
 	return bare, nil
 }

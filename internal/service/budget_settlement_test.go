@@ -323,7 +323,7 @@ func TestSettleTrack_WastesFarLessThanTheMonthRuleDid(t *testing.T) {
 	})
 	// 400 + 800 + 900×3 = 3,900; the fourth August คาบ needs 4,800.
 	if fine.PaidBaht != 3900 {
-		t.Errorf("paid = %v, want 3900 — the คาบ cutoff should reach far deeper", fine.PaidBaht)
+		t.Errorf("paid = %v, want 3900 the คาบ cutoff should reach far deeper", fine.PaidBaht)
 	}
 	if wasted := 4000 - fine.PaidBaht; wasted >= 900 {
 		t.Errorf("wasted %v, want less than one คาบ", wasted)
@@ -335,7 +335,7 @@ func TestSettleTrack_WastesFarLessThanTheMonthRuleDid(t *testing.T) {
 func TestSettleTrack_DoesNotSkipAheadToASmallerSlot(t *testing.T) {
 	got := settleTrack("regular", 1000, 0, slots(600, 500, 100))
 	if want := []bool{true, false, false}; !equalBools(slotPaidFlags(got), want) {
-		t.Errorf("slot paid = %v, want %v — the 100฿ คาบ would fit, but it is later",
+		t.Errorf("slot paid = %v, want %v the 100฿ คาบ would fit, but it is later",
 			slotPaidFlags(got), want)
 	}
 	if got.PaidBaht != 600 {

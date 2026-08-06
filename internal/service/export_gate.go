@@ -146,5 +146,5 @@ func exportBlockedError(blockers []ExportBlocker) error {
 			lines = append(lines, fmt.Sprintf("%s ยังไม่ได้ตรวจสอบเบิกจ่าย (%s)", b.TAName, months))
 		}
 	}
-	return Invalid("ยังส่งออกไม่ได้ — ต้องผ่านครบทุกขั้นก่อน:\n• " + strings.Join(lines, "\n• "))
+	return Invalid("ยังส่งออกไม่ได้ ต้องผ่านครบทุกขั้นก่อน:\n• " + strings.Join(lines, "\n• "))
 }

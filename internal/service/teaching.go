@@ -81,6 +81,9 @@ type Section struct {
 	Track            string    `json:"track"`
 	Room             *string   `json:"room,omitempty"`
 	NumStudents      int       `json:"num_students"`
+	// Programme group served (CS/IT/GIS/AI/CY, OTHER = another faculty),
+	// derived from the import file's ReservedFor; nil = not yet known.
+	Curriculum *string `json:"curriculum,omitempty"`
 	// Set when a lecturer filled in a missing timetable — they get one such
 	// write per section and the UI uses this to explain why the row is now
 	// read-only to them. See ReplaceSectionSchedules.
@@ -185,7 +188,7 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 		return uuid.Nil, err
 	}
 	if !priv {
-		return uuid.Nil, Forbidden("การเปิดรายวิชาต้องให้เจ้าหน้าที่ดำเนินการ — รายวิชามาจากไฟล์ทะเบียน")
+		return uuid.Nil, Forbidden("การเปิดรายวิชาต้องให้เจ้าหน้าที่ดำเนินการ รายวิชามาจากไฟล์ทะเบียน")
 	}
 	in.Code = strings.ToUpper(strings.Join(strings.Fields(in.Code), ""))
 	in.NameTH = strings.TrimSpace(in.NameTH)
@@ -193,7 +196,7 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 		return uuid.Nil, ErrInvalidInput
 	}
 	if !courseCodeRe.MatchString(in.Code) {
-		return uuid.Nil, Invalid("รูปแบบรหัสวิชาไม่ถูกต้อง — ต้องเป็นตัวเลข 6 หลัก (เช่น 342233) หรือตัวอักษรพิมพ์ใหญ่ 2 ตัวตามด้วยตัวเลข 6 หลัก (เช่น CP353201)")
+		return uuid.Nil, Invalid("รูปแบบรหัสวิชาไม่ถูกต้อง ต้องเป็นตัวเลข 6 หลัก (เช่น 342233) หรือตัวอักษรพิมพ์ใหญ่ 2 ตัวตามด้วยตัวเลข 6 หลัก (เช่น CP353201)")
 	}
 	if in.NameTH == "" {
 		// English-only policy: the display name falls back to the English name,
@@ -355,17 +358,17 @@ func (s *TeachingService) Delete(ctx context.Context, actor, id uuid.UUID) error
 	}
 	switch {
 	case exported:
-		return Conflict("ลบไม่ได้ — วิชานี้ถูกส่งออกเอกสารแล้ว")
+		return Conflict("ลบไม่ได้ วิชานี้ถูกส่งออกเอกสารแล้ว")
 	case hasWL:
-		return Conflict("ลบไม่ได้ — วิชานี้มีบันทึกเวลาแล้ว")
+		return Conflict("ลบไม่ได้ วิชานี้มีบันทึกเวลาแล้ว")
 	case hasStatus:
-		return Conflict("ลบไม่ได้ — วิชานี้มีสถานะการเบิกจ่ายแล้ว")
+		return Conflict("ลบไม่ได้ วิชานี้มีสถานะการเบิกจ่ายแล้ว")
 	case hasAssign:
-		return Conflict("ลบไม่ได้ — วิชานี้มี TA ที่ได้รับมอบหมายแล้ว")
+		return Conflict("ลบไม่ได้ วิชานี้มี TA ที่ได้รับมอบหมายแล้ว")
 	case hasReq, hasCounts:
-		return Conflict("ลบไม่ได้ — วิชานี้มีคำขอ TA อยู่")
+		return Conflict("ลบไม่ได้ วิชานี้มีคำขอ TA อยู่")
 	case hasHoliday:
-		return Conflict("ลบไม่ได้ — วิชานี้มีข้อมูลที่เกี่ยวข้องอยู่")
+		return Conflict("ลบไม่ได้ วิชานี้มีข้อมูลที่เกี่ยวข้องอยู่")
 	}
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "teaching_course.delete",
@@ -388,9 +391,9 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		        TO_CHAR(COALESCE(tc.ends_on,   at.ends_on),   'YYYY-MM-DD'),
 		        tc.num_students, tc.num_students_regular, tc.num_students_special,
 		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
-		        -- คาบที่ตรงวันหยุดและยังไม่กำหนดวันชดเชย — see UnresolvedMakeupsSQL.
+		        -- คาบที่ตรงวันหยุดและยังไม่กำหนดวันชดเชย see UnresolvedMakeupsSQL.
 		        `+UnresolvedMakeupsSQL("tc")+`,
-		        -- ≥1 section ยังไม่มีตารางเรียน (WBA จากทะเบียน) — บล็อกการส่งคำขอ TA.
+		        -- ≥1 section ยังไม่มีตารางเรียน (WBA จากทะเบียน) บล็อกการส่งคำขอ TA.
 		        -- List() คำนวณค่านี้อยู่แล้ว; Get() ไม่เคยส่งมา ทำให้หน้าเดียวเปิดวิชา
 		        -- เดียวกันแล้วเห็นสถานะไม่ตรงกับหน้ารายการ
 		        EXISTS (SELECT 1 FROM sections sx
@@ -409,7 +412,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	}
 	// Sections
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, sec_no, track::text, room, num_students,
+		`SELECT id, sec_no, track::text, room, num_students, curriculum,
 		        TO_CHAR(schedule_set_by_lecturer_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		   FROM sections WHERE teaching_course_id=$1 ORDER BY sec_no`, id)
 	if err != nil {
@@ -418,7 +421,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	for rows.Next() {
 		var sec Section
 		if err := rows.Scan(&sec.ID, &sec.SecNo, &sec.Track, &sec.Room, &sec.NumStudents,
-			&sec.ScheduleSetByLecturerAt); err != nil {
+			&sec.Curriculum, &sec.ScheduleSetByLecturerAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -523,7 +526,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	             COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', ' ORDER BY tl.is_primary DESC, u.first_name)
 	                       FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
 	                       WHERE tl.teaching_course_id = tc.id), '') AS lecturer_names,
-	             -- คาบที่ตรงวันหยุดและยังไม่มีวันชดเชย — see UnresolvedMakeupsSQL.
+	             -- คาบที่ตรงวันหยุดและยังไม่มีวันชดเชย see UnresolvedMakeupsSQL.
 	             -- Previously inlined here with a CURRENT_DATE fallback, which made
 	             -- this list disagree with both Get() and the holidays page.
 	             ` + UnresolvedMakeupsSQL("tc") + ` AS unresolved_makeups
@@ -788,7 +791,7 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 		return err
 	}
 	if !priv {
-		return Forbidden("จำนวนนักศึกษาต้องให้เจ้าหน้าที่กรอก — ข้อมูลมาจากไฟล์ทะเบียน")
+		return Forbidden("จำนวนนักศึกษาต้องให้เจ้าหน้าที่กรอก ข้อมูลมาจากไฟล์ทะเบียน")
 	}
 	// Fetch current values so we can preserve untouched fields.
 	var curTotal, curRegular, curSpecial int
@@ -845,7 +848,7 @@ func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUI
 		return err
 	}
 	if !priv {
-		return Forbidden("ช่วงวันที่ของรายวิชาต้องให้เจ้าหน้าที่กำหนด — อ้างอิงตามภาคการศึกษา")
+		return Forbidden("ช่วงวันที่ของรายวิชาต้องให้เจ้าหน้าที่กำหนด อ้างอิงตามภาคการศึกษา")
 	}
 	sets := []string{}
 	args := []any{}
@@ -934,7 +937,7 @@ type AddSectionInput struct {
 // that list would put the system out of step with the registrar, so the whole
 // of section add/rename/delete is staff-only.
 func errSectionsAreStaffOnly(verb string) error {
-	return Forbidden(verb + " section ต้องให้เจ้าหน้าที่ดำเนินการ — รายชื่อ section มาจากไฟล์ทะเบียน")
+	return Forbidden(verb + " section ต้องให้เจ้าหน้าที่ดำเนินการ รายชื่อ section มาจากไฟล์ทะเบียน")
 }
 
 // AddSection adds a new section to a course. Staff-only: see
@@ -1058,9 +1061,9 @@ func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tc
 		switch {
 		case setAt != nil:
 			return Forbidden("คุณกำหนดตารางเวลาของกลุ่มนี้ไปแล้วเมื่อ " + thaiDate(*setAt) +
-				" — กำหนดได้ครั้งเดียว หากต้องแก้ไขกรุณาแจ้งเจ้าหน้าที่")
+				" กำหนดได้ครั้งเดียว หากต้องแก้ไขกรุณาแจ้งเจ้าหน้าที่")
 		case existing > 0:
-			return Forbidden("ตารางเวลาของกลุ่มนี้มาจากไฟล์ที่เจ้าหน้าที่นำเข้า — แก้ไขได้เฉพาะเจ้าหน้าที่")
+			return Forbidden("ตารางเวลาของกลุ่มนี้มาจากไฟล์ที่เจ้าหน้าที่นำเข้า แก้ไขได้เฉพาะเจ้าหน้าที่")
 		}
 	}
 	if _, err := tx.Exec(ctx,
@@ -1149,15 +1152,15 @@ func validateScheduleKinds(kinds []string, lectureHrs, labHrs int) error {
 		switch k {
 		case "lecture":
 			if lectureHrs <= 0 {
-				return errors.New("รายวิชานี้ไม่มีหน่วยชั่วโมงบรรยาย — เพิ่มตารางบรรยายไม่ได้")
+				return errors.New("รายวิชานี้ไม่มีหน่วยชั่วโมงบรรยาย เพิ่มตารางบรรยายไม่ได้")
 			}
 		case "lab":
 			if labHrs <= 0 {
-				return errors.New("รายวิชานี้ไม่มีหน่วยชั่วโมงปฏิบัติการ — เพิ่มตารางปฏิบัติการไม่ได้")
+				return errors.New("รายวิชานี้ไม่มีหน่วยชั่วโมงปฏิบัติการ เพิ่มตารางปฏิบัติการไม่ได้")
 			}
 		}
 		if seen[k] {
-			return errors.New("มีตารางบรรยาย/ปฏิบัติการซ้ำในกลุ่มเดียวกัน — ระบุได้ประเภทละ 1 รายการต่อกลุ่ม")
+			return errors.New("มีตารางบรรยาย/ปฏิบัติการซ้ำในกลุ่มเดียวกัน ระบุได้ประเภทละ 1 รายการต่อกลุ่ม")
 		}
 		seen[k] = true
 	}
@@ -1221,6 +1224,19 @@ type UpdateSectionInput struct {
 	SecNo       *string `json:"sec_no,omitempty"`
 	Room        *string `json:"room,omitempty"`
 	NumStudents *int    `json:"num_students,omitempty"`
+	// "" clears back to unknown; otherwise one of the CHECK-listed groups.
+	// This is the staff override the import respects (re-import fills only
+	// NULLs), so a wrong registrar value can be corrected once and stay put.
+	Curriculum *string `json:"curriculum,omitempty"`
+}
+
+// validCurriculum mirrors the CHECK constraint on sections.curriculum.
+func validCurriculum(v string) bool {
+	switch v {
+	case "CS", "IT", "GIS", "AI", "CY", "OTHER":
+		return true
+	}
+	return false
 }
 
 // UpdateSection edits sec_no / room / num_students on a single section.
@@ -1236,6 +1252,9 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 	}
 	if in.NumStudents != nil && *in.NumStudents < 0 {
 		return Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
+	}
+	if in.Curriculum != nil && *in.Curriculum != "" && !validCurriculum(*in.Curriculum) {
+		return Invalid("หลักสูตรไม่ถูกต้อง")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1265,6 +1284,15 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 	if in.NumStudents != nil {
 		sets = append(sets, fmt.Sprintf("num_students = $%d", i))
 		args = append(args, *in.NumStudents)
+		i++
+	}
+	if in.Curriculum != nil {
+		sets = append(sets, fmt.Sprintf("curriculum = $%d", i))
+		if *in.Curriculum == "" {
+			args = append(args, nil)
+		} else {
+			args = append(args, *in.Curriculum)
+		}
 		i++
 	}
 	if len(sets) == 0 {
@@ -1418,7 +1446,7 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	ny, nm, _ := now.Date()
 	if my < ny || (my == ny && mm < nm) {
 		return Invalid(fmt.Sprintf(
-			"กำหนดวันชดเชยย้อนหลังไปเดือนที่ผ่านไปแล้วไม่ได้ (%s) — "+
+			"กำหนดวันชดเชยย้อนหลังไปเดือนที่ผ่านไปแล้วไม่ได้ (%s) "+
 				"เดือนนั้นปิดการลงเวลาแล้ว TA จึงลงบันทึกคาบนี้ไม่ได้ กรุณาเลือกวันตั้งแต่เดือนปัจจุบันเป็นต้นไป",
 			m.MakeupDate))
 	}
@@ -1455,7 +1483,7 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 		 LIMIT 1`,
 		m.MakeupDate, m.StartTime, m.EndTime).Scan(&nestedHoliday, &nestedWindow)
 	if err == nil {
-		return Invalid(fmt.Sprintf("วันชดเชย %s ตรงกับวันหยุด (%s · %s) — กรุณาเลือกวันหรือช่วงเวลาอื่น",
+		return Invalid(fmt.Sprintf("วันชดเชย %s ตรงกับวันหยุด (%s · %s) กรุณาเลือกวันหรือช่วงเวลาอื่น",
 			m.MakeupDate, nestedHoliday, nestedWindow))
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return err
@@ -1471,7 +1499,7 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 				// UNIQUE (section_id, original_date, kind) violation — this PERIOD already
 				// has a filed makeup. Names the period, because the other period of the
 				// same day is a separate row the lecturer may still need to file.
-				return Invalid(fmt.Sprintf("คาบ%sของวันที่ %s มีวันชดเชยอยู่แล้ว — กรุณาลบวันเดิมก่อนแล้วเพิ่มใหม่",
+				return Invalid(fmt.Sprintf("คาบ%sของวันที่ %s มีวันชดเชยอยู่แล้ว กรุณาลบวันเดิมก่อนแล้วเพิ่มใหม่",
 					kindLabelTH(m.Kind), m.OriginalDate))
 			}
 			return nil
@@ -1570,7 +1598,7 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 		return err
 	}
 	if s.notify != nil {
-		body := fmt.Sprintf("อาจารย์ยกเลิกวันชดเชย %s — รายการชั่วโมงร่างในวันนั้นถูกลบ", makeupDateStr)
+		body := fmt.Sprintf("อาจารย์ยกเลิกวันชดเชย %s รายการชั่วโมงร่างในวันนั้นถูกลบ", makeupDateStr)
 		for _, taID := range notifyTargets {
 			s.notify.Send(ctx, taID, "อาจารย์ยกเลิกวันชดเชย", body, "/ta")
 		}
@@ -1682,6 +1710,7 @@ type parsedSection struct {
 	track       string
 	room        string
 	numStudents int
+	curriculum  string // "" = ReservedFor carried no programme token
 	schedules   []parsedSchedule
 }
 
@@ -1875,6 +1904,49 @@ func courseLevelFromReserved(reserved string) string {
 	return "undergrad"
 }
 
+// curriculumTokenRE finds programme tokens like "SC-IT", "CP-Cy", "BS-Digi"
+// inside the ReservedFor text. The registrar writes one or more of these per
+// section, optionally with seat counts and year qualifiers around them.
+var curriculumTokenRE = regexp.MustCompile(`([A-Za-z]{2})-([A-Za-z]+)`)
+
+// curriculumFromReserved maps the "ReservedFor" text to a programme group for
+// sections.curriculum. The FIRST token wins: the registrar lists the section's
+// main reserved group first, extra groups are top-ups ("SC-IT ปี 3 (80),
+// CP-Cy ปี 3 (20)" is an IT section that lends 20 seats).
+//
+// SC-/CP- prefixes are the college's own programmes and map by suffix — GIS
+// deliberately collapses SC-GIS and CP-GIS into one group, same programme in
+// two code eras. Any other prefix (BS-*, ...) means another faculty's students
+// enrol here; per the 06/08/2026 decision those group as OTHER (คณะอื่น ๆ),
+// never guessed into a programme. Empty when no token appears — "unknown" and
+// "another faculty" are different answers and the dashboard keeps them apart.
+func curriculumFromReserved(reserved string) string {
+	m := curriculumTokenRE.FindStringSubmatch(reserved)
+	if m == nil {
+		return ""
+	}
+	prefix := strings.ToUpper(m[1])
+	if prefix != "SC" && prefix != "CP" {
+		return "OTHER"
+	}
+	switch strings.ToUpper(m[2]) {
+	case "CS":
+		return "CS"
+	case "IT":
+		return "IT"
+	case "GIS":
+		return "GIS"
+	case "AI":
+		return "AI"
+	case "CY":
+		return "CY"
+	}
+	// An SC/CP token we don't recognise is still a college code — a new
+	// programme would land here. OTHER would silently file it under another
+	// faculty, so unknown is the honest value until the mapping learns it.
+	return ""
+}
+
 // parseNormalizedSheet reads the Excel body and groups its rows into courses.
 // It reports per-row structural warnings via `warnings` — malformed rows are
 // simply skipped so a single bad row cannot lose the entire course.
@@ -1980,7 +2052,8 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 				track = "special"
 			}
 			seats, _ := strconv.Atoi(get(row, "totalseats"))
-			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats}
+			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats,
+				curriculum: curriculumFromReserved(get(row, "reservedfor"))}
 			course.sections[secNo] = sec
 			course.sectionsInOrder = append(course.sectionsInOrder, secNo)
 		}
@@ -2107,7 +2180,8 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 				track = "special"
 			}
 			seats, _ := strconv.Atoi(cell(row, 6))
-			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats}
+			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats,
+				curriculum: curriculumFromReserved(reserved)}
 			cur.sections[secNo] = sec
 			cur.sectionsInOrder = append(cur.sectionsInOrder, secNo)
 		}
@@ -2366,6 +2440,22 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 	err := s.pool.QueryRow(ctx,
 		`SELECT id FROM teaching_courses WHERE term_id = $1 AND code = $2`, termID, c.code).Scan(&existing)
 	if err == nil {
+		// The course itself is untouched, but a re-import is the designated way
+		// to BACKFILL sections.curriculum for terms imported before the column
+		// existed. Only NULLs are filled — a staff override must survive the
+		// registrar file being uploaded again.
+		for _, secNo := range c.sectionsInOrder {
+			sec := c.sections[secNo]
+			if sec.curriculum == "" {
+				continue
+			}
+			if _, err := s.pool.Exec(ctx,
+				`UPDATE sections SET curriculum = $1
+				  WHERE teaching_course_id = $2 AND sec_no = $3 AND curriculum IS NULL`,
+				sec.curriculum, existing, sec.secNo); err != nil {
+				return uuid.Nil, err
+			}
+		}
 		return uuid.Nil, errImportSkipped
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -2423,9 +2513,10 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 			roomPtr = &r
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students)
-			 VALUES ($1,$2,$3,$4::section_track,$5,$6)`,
-			secID, id, sec.secNo, sec.track, roomPtr, sec.numStudents); err != nil {
+			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students, curriculum)
+			 VALUES ($1,$2,$3,$4::section_track,$5,$6,$7)`,
+			secID, id, sec.secNo, sec.track, roomPtr, sec.numStudents,
+			emptyToNil(sec.curriculum)); err != nil {
 			return uuid.Nil, err
 		}
 		if sec.track == "special" {

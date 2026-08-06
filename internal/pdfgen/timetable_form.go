@@ -155,7 +155,7 @@ func BuildTimetableFormPDF(in TimetableFormInput) ([]byte, error) {
 	for _, k := range []string{"own_class", "lecture", "lab", "review"} {
 		st := ttStyles[k]
 		ttFillRect(&pdf, lx, y, lx+9, y+9, st.r, st.g, st.b)
-		label := "งาน TA — " + st.tag
+		label := "งาน TA " + st.tag
 		if k == "own_class" {
 			label = "คาบเรียนของนักศึกษา"
 		}

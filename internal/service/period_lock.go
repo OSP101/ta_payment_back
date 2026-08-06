@@ -87,15 +87,15 @@ func assertWorklogWritable(ctx context.Context, pool *pgxpool.Pool, tcID, taID u
 	}
 	if st.Status == "finance_sent" {
 		return Conflict(fmt.Sprintf(
-			"บันทึกเวลาเดือน %s ถูกส่งการเงินแล้ว — แก้ไขไม่ได้ (ผู้ดูแลระบบปลดล็อกได้เท่านั้น)", st.Label))
+			"บันทึกเวลาเดือน %s ถูกส่งการเงินแล้ว แก้ไขไม่ได้ (ผู้ดูแลระบบปลดล็อกได้เท่านั้น)", st.Label))
 	}
 	if st.Status == "exported" {
 		return Conflict(fmt.Sprintf(
-			"บันทึกเวลาเดือน %s ถูกส่งออกไฟล์เบิกจ่ายแล้ว — แก้ไขไม่ได้ (เจ้าหน้าที่ตีกลับหรือผู้ดูแลระบบปลดล็อกได้)", st.Label))
+			"บันทึกเวลาเดือน %s ถูกส่งออกไฟล์เบิกจ่ายแล้ว แก้ไขไม่ได้ (เจ้าหน้าที่ตีกลับหรือผู้ดูแลระบบปลดล็อกได้)", st.Label))
 	}
 	if st.IsClosed {
 		return Invalid(fmt.Sprintf(
-			"งวดส่งบันทึกเวลาเดือน %s ปิดแล้ว — เพิ่ม/แก้ไข/ส่งย้อนหลังไม่ได้ "+
+			"งวดส่งบันทึกเวลาเดือน %s ปิดแล้ว เพิ่ม/แก้ไข/ส่งย้อนหลังไม่ได้ "+
 				"รายการที่ไม่ได้ส่งภายในกำหนดถือว่าไม่ประสงค์ลงเวลา", st.Label))
 	}
 	return nil
@@ -148,7 +148,7 @@ func assertNoFinanceLockedRows(ctx context.Context, pool *pgxpool.Pool, assignme
 	}
 	if len(months) > 0 {
 		return Conflict(fmt.Sprintf(
-			"ดำเนินการไม่ได้ — มีรายการในเดือนที่ส่งออกไฟล์/ส่งการเงินแล้ว: %s", strings.Join(months, ", ")))
+			"ดำเนินการไม่ได้ มีรายการในเดือนที่ส่งออกไฟล์/ส่งการเงินแล้ว: %s", strings.Join(months, ", ")))
 	}
 	return nil
 }

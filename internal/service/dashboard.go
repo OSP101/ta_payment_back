@@ -43,6 +43,13 @@ type ExecutiveSummary struct {
 	// one number in the unit that screen lists — courses.
 	PayoutCoursesActionable int `json:"payout_courses_actionable"`
 
+	// PendingAppointments counts รายชื่อ (TA × course) approved but not yet on
+	// any appointment order of this term — the next round's print list. A TA
+	// without an order cannot pass payout review, so leaving this invisible
+	// let approved requests pile up until the payout screen mysteriously
+	// stalled. Same unit and predicate as the appointments page's preview.
+	PendingAppointments int `json:"pending_appointments"`
+
 	// Budget covers only the courses that actually asked for a TA. Courses
 	// with no request commit no money, so counting all 127 courses in the term
 	// produced a denominator that could never be approached.
@@ -216,7 +223,7 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 // imported. budget_caps stopped being the source of truth when the ceiling
 // became formula-derived (see BudgetService.Compute), so the dashboard was
 // reporting a figure no other page agreed with.
-func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, budget *BudgetService) (*ExecutiveSummary, error) {
+func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, budget *BudgetService, appointments *AppointmentOrderService) (*ExecutiveSummary, error) {
 	sum := &ExecutiveSummary{}
 
 	// Resolve the term once. Fall back to the newest term so a database with no
@@ -373,6 +380,12 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 		SELECT COUNT(DISTINCT tc_id) FROM months
 		 WHERE (status = 'pending' AND open_rows = 0)
 		    OR status = 'staff_reviewed'`, tid).Scan(&sum.PayoutCoursesActionable)
+
+	if appointments != nil {
+		if n, err := appointments.PendingCount(ctx, tid); err == nil {
+			sum.PendingAppointments = n
+		}
+	}
 
 	// Budget over exactly the courses counted above. Delegating to
 	// BudgetService.Compute rather than re-deriving the formula here is what

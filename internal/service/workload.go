@@ -82,11 +82,11 @@ func classLabelOf(b ClassBlock) string {
 	switch b.Kind {
 	case "lecture":
 		if label != "" {
-			label += " — บรรยาย"
+			label += " บรรยาย"
 		}
 	case "lab":
 		if label != "" {
-			label += " — ปฏิบัติการ"
+			label += " ปฏิบัติการ"
 		}
 	}
 	return label
@@ -151,7 +151,7 @@ func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, term
 		return "", err
 	}
 	if n > 0 {
-		return "เจ้าหน้าที่ส่งออกเอกสารเบิกจ่ายของภาคเรียนนี้แล้ว — ดูได้แต่แก้ไขไม่ได้", nil
+		return "เจ้าหน้าที่ส่งออกเอกสารเบิกจ่ายของภาคเรียนนี้แล้ว ดูได้แต่แก้ไขไม่ได้", nil
 	}
 	return "", nil
 }

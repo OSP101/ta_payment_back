@@ -539,7 +539,7 @@ func (s *ExportService) NotifyBudgetShortfall(ctx context.Context, courseID uuid
 	var code, nameTH string
 	_ = s.pool.QueryRow(ctx,
 		`SELECT code, name_th FROM teaching_courses WHERE id = $1`, courseID).Scan(&code, &nameTH)
-	title := "งบไม่พอ — " + code
+	title := "งบไม่พอ " + code
 	// Two different sentences: a month that lost some คาบ still pays something,
 	// and saying "จะไม่ได้รับค่าตอบแทน" about it would be wrong.
 	var what []string
@@ -550,7 +550,7 @@ func (s *ExportService) NotifyBudgetShortfall(ctx context.Context, courseID uuid
 		what = append(what, "เดือน "+strings.Join(thaiMonthLabels(forecast.UnpaidMonths), ", ")+" ไม่ได้รับค่าตอบแทน")
 	}
 	body := fmt.Sprintf(
-		"%s %s\nงบรายวิชาไม่พอจ่ายทั้งหมด — %s (รวม %.0f บาท)\n"+
+		"%s %s\nงบรายวิชาไม่พอจ่ายทั้งหมด %s (รวม %.0f บาท)\n"+
 			"ชั่วโมงยังถูกบันทึกไว้ครบ และอาจารย์ยังอนุมัติได้ตามปกติ",
 		code, nameTH, strings.Join(what, " และ"), forecast.DroppedBaht)
 

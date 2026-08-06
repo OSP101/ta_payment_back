@@ -114,7 +114,7 @@ func (s *ExportService) SetCertifier(ctx context.Context, actor, termID uuid.UUI
 			return Invalid("ไม่พบรายชื่อผู้รับรองที่เลือก")
 		}
 		if !active {
-			return Invalid("รายชื่อที่เลือกถูกปิดใช้งานแล้ว — เลือกผู้รับรองที่ยังใช้งานอยู่")
+			return Invalid("รายชื่อที่เลือกถูกปิดใช้งานแล้ว เลือกผู้รับรองที่ยังใช้งานอยู่")
 		}
 	}
 	return writeAudited(ctx, s.pool, s.aud,

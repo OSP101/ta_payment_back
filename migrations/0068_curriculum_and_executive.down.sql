@@ -1,0 +1,2 @@
+ALTER TABLE users DROP COLUMN IF EXISTS is_executive;
+ALTER TABLE sections DROP COLUMN IF EXISTS curriculum;

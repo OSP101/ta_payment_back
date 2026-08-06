@@ -38,7 +38,16 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	if !auth.CheckPassword(hash, in.Password) {
 		return fiber.NewError(fiber.StatusUnauthorized, "อีเมลหรือรหัสผ่านไม่ถูกต้อง")
 	}
-	tok, err := h.Tokens.Issue(u.ID, u.Roles, h.Svc.Cfg.JWTLifetime)
+	// The synthetic executive role rides in the TOKEN only, not in u.Roles:
+	// RequireRole reads roles from JWT claims, so leaving it out here made the
+	// analytics endpoints 403 for a flagged lecturer. u.Roles itself stays the
+	// user_roles list — the users screen renders those as role chips and shows
+	// the flag separately.
+	tokenRoles := u.Roles
+	if u.IsExecutive {
+		tokenRoles = append(append([]string{}, u.Roles...), rbac.RoleExecutive)
+	}
+	tok, err := h.Tokens.Issue(u.ID, tokenRoles, h.Svc.Cfg.JWTLifetime)
 	if err != nil {
 		return err
 	}

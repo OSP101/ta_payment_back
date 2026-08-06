@@ -165,7 +165,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return nil, err
 	}
 	if missingSchedule {
-		return nil, Invalid("รายวิชานี้ยังไม่ระบุเวลาเรียน (WBA) — กรุณากรอกตารางเรียนของทุก section ให้ครบก่อน จึงจะส่งคำขอ TA ได้")
+		return nil, Invalid("รายวิชานี้ยังไม่ระบุเวลาเรียน (WBA) กรุณากรอกตารางเรียนของทุก section ให้ครบก่อน จึงจะส่งคำขอ TA ได้")
 	}
 
 	// Capture which window admitted this request so window deletion can honour
@@ -377,7 +377,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			Passed:  false,
 			Warning: true,
 			Message: fmt.Sprintf(
-				"รอตารางเรียนของ %s — ระบบจะตัดสินคำขอนี้ให้อัตโนมัติเมื่อครบทุกคน "+
+				"รอตารางเรียนของ %s ระบบจะตัดสินคำขอนี้ให้อัตโนมัติเมื่อครบทุกคน "+
 					"หากคาบใดตรงกับตารางเรียนของเขา คาบนั้นจะถูกตัดออก",
 				strings.Join(waiting, ", ")),
 		}}
@@ -680,7 +680,7 @@ func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, hrs se
 		if c.v > c.cap+0.001 {
 			if c.cap == 0 {
 				return fmt.Errorf(
-					"ภาระงาน '%s' ของ %s (Sec %s) กรอกไม่ได้ — กลุ่มนี้ไม่มีคาบประเภทนี้ในตารางสอน",
+					"ภาระงาน '%s' ของ %s (Sec %s) กรอกไม่ได้ กลุ่มนี้ไม่มีคาบประเภทนี้ในตารางสอน",
 					c.label, name, secLabel)
 			}
 			return fmt.Errorf(
@@ -708,7 +708,7 @@ func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, hrs se
 		limit := t.hrs * sectionTotalMultiplier
 		if t.hrs > 0 && t.v > limit+0.001 {
 			return fmt.Errorf(
-				"ภาระงาน%sรวมของ %s (Sec %s) = %.2f ชม./สัปดาห์ เกินเพดานรวม %.2f ชม. "+
+				"ภาระงาน%sรวมของ %s (Sec %s) อยู่ที่ %.2f ชม./สัปดาห์ เกินเพดานรวม %.2f ชม. "+
 					"(%.0f เท่าของชั่วโมงสอนจริง %.2f ชม.)",
 				t.label, name, secLabel, t.v, limit, float64(sectionTotalMultiplier), t.hrs)
 		}
@@ -856,7 +856,7 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 		return err
 	}
 	if !haveRates {
-		return Invalid("ยังไม่ได้ตั้งอัตราค่าตอบแทนในระบบ — ตรวจเพดานชั่วโมงตามประกาศไม่ได้ จึงยังส่งคำขอไม่ได้")
+		return Invalid("ยังไม่ได้ตั้งอัตราค่าตอบแทนในระบบ ตรวจเพดานชั่วโมงตามประกาศไม่ได้ จึงยังส่งคำขอไม่ได้")
 	}
 	isGrad := level == "master" || level == "phd"
 	// Hours per weekday must be the UNION of the occupied time, not the sum of
@@ -930,7 +930,7 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 				day = thaiDayNames[dow]
 			}
 			return Invalid(fmt.Sprintf(
-				"%s รับ section ที่เรียนวัน%sรวม %.1f ชม. เกินเพดาน %.1f ชม./วัน ตามประกาศ — "+
+				"%s รับ section ที่เรียนวัน%sรวม %.1f ชม. เกินเพดาน %.1f ชม./วัน ตามประกาศ "+
 					"กรุณาลด section ของวันนั้น มิฉะนั้นบันทึกเวลาจะลงได้ไม่ครบ",
 				name, day, hrs, dayCap))
 		}
@@ -944,7 +944,7 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 	weeklyCap := minCap * workingDaysPerWeek
 	if declaredWeekly > weeklyCap+0.01 {
 		return Invalid(fmt.Sprintf(
-			"ภาระงานของ %s รวม %.2f ชม./สัปดาห์ เกินที่จะลงบันทึกเวลาได้จริง — "+
+			"ภาระงานของ %s รวม %.2f ชม./สัปดาห์ เกินที่จะลงบันทึกเวลาได้จริง "+
 				"เพดาน %.1f ชม./วัน × %d วันทำการ = %.1f ชม./สัปดาห์",
 			name, declaredWeekly, minCap, workingDaysPerWeek, weeklyCap))
 	}
@@ -1586,7 +1586,7 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		}
 		addWarn("intra_conflict", name,
 			fmt.Sprintf("%s section ในคำขอเดียวกันไม่ทับซ้อน", name),
-			fmt.Sprintf("%s คุมหลาย section ที่สอนพร้อมกัน (เวลาทับซ้อน) — อนุญาตสำหรับวิชาที่สอนรวมกัน", name),
+			fmt.Sprintf("%s คุมหลาย section ที่สอนพร้อมกัน (เวลาทับซ้อน) อนุญาตสำหรับวิชาที่สอนรวมกัน", name),
 			clash == 0)
 	}
 
@@ -1851,7 +1851,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 			a.Warnings = append(a.Warnings, "ยังไม่ได้บันทึกตารางเรียนของภาคการศึกษานี้")
 		}
 		if count >= 3 {
-			a.Warnings = append(a.Warnings, "เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว — อนุมัติเพิ่มไม่ได้")
+			a.Warnings = append(a.Warnings, "เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว อนุมัติเพิ่มไม่ได้")
 		}
 		if err := s.checkOwnClassConflict(ctx, s.pool, c.taID, c.secID, a.TAName); err != nil {
 			a.Warnings = append(a.Warnings, "เวลาสอนทับซ้อนกับตารางเรียนของ TA")

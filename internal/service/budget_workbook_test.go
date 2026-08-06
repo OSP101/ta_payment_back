@@ -108,7 +108,7 @@ func TestBudget_WorkloadRateIs300(t *testing.T) {
 	}
 	if rate != 300 {
 		t.Fatalf("ug_workload_rate_regular = %.0f, want 300 "+
-			"(50%%×200 ตรี + 50%%×400 บัณฑิต — see ชีต \"2_59 ป.ตรี\")", rate)
+			"(50%%×200 ตรี + 50%%×400 บัณฑิต see ชีต \"2_59 ป.ตรี\")", rate)
 	}
 }
 

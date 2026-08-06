@@ -297,6 +297,47 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		return id, nil
 	}
 
+	// The template's empty grid carries scars where the college's example
+	// blocks were cleared: stray full boxes and bare cells with no rules at
+	// all, mixed into the hour pattern (rows 6-9, 14-15 and 18 of the shipped
+	// template). Repaint the WHOLE grid to the clean pattern first — top rule
+	// plus hour verticals on each class row, bottom rule plus hour verticals
+	// on each duty row, exactly the pattern the undamaged rows carry — so the
+	// blocks below land on an even canvas whatever state the template is in.
+	gridStyle := func(vertical string, edge string) (int, error) {
+		return f.NewStyle(&excelize.Style{
+			Font: &excelize.Font{Family: "TH Sarabun New", Size: 12},
+			Border: []excelize.Border{
+				{Type: vertical, Style: 1, Color: "000000"},
+				{Type: edge, Style: 1, Color: "000000"},
+			},
+		})
+	}
+	var gridIDs [4]int // [class|duty][hourStart|hourEnd]
+	for i, spec := range [][2]string{
+		{"left", "top"}, {"right", "top"}, {"left", "bottom"}, {"right", "bottom"},
+	} {
+		id, err := gridStyle(spec[0], spec[1])
+		if err != nil {
+			return err
+		}
+		gridIDs[i] = id
+	}
+	const gridFirstCol, gridLastCol = 3, 28 // C (08:00) … AB (20:30)
+	for _, dayRow := range claimDayRow {
+		for col := gridFirstCol; col <= gridLastCol; col++ {
+			i := (col - gridFirstCol) % 2 // 0 = hour start, 1 = hour end
+			classCell, _ := excelize.CoordinatesToCellName(col, dayRow)
+			dutyCell, _ := excelize.CoordinatesToCellName(col, dayRow+1)
+			if err := f.SetCellStyle(tt, classCell, classCell, gridIDs[i]); err != nil {
+				return err
+			}
+			if err := f.SetCellStyle(tt, dutyCell, dutyCell, gridIDs[2+i]); err != nil {
+				return err
+			}
+		}
+	}
+
 	var blocks []gridBlock
 
 	// (a) teaching periods of the TA's courses, merged across co-scheduled

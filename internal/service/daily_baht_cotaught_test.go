@@ -128,7 +128,7 @@ func TestDailyBahtCap_PricesASharedSittingAtTheRegularRate(t *testing.T) {
 	// 4h shared (160฿ at the regular rate) + 3h alone (120฿) = 280฿ ≤ 300฿.
 	if _, err := f.upsert(f.entry(d, "08:00", "11:00", 3)); err != nil {
 		t.Fatalf("the shared sitting must be priced at the regular rate, as export "+
-			"rule B2 pays it — at the special rate this day reads 320฿ and is "+
+			"rule B2 pays it at the special rate this day reads 320฿ and is "+
 			"refused: %v", err)
 	}
 }

@@ -74,7 +74,7 @@ var maxDocMBLabel = strconv.FormatInt(maxDocBytes/(1024*1024), 10)
 
 // errDocTooLarge is the single refusal for an oversized upload.
 func errDocTooLarge() error {
-	return Invalid("ไฟล์ใหญ่เกิน " + maxDocMBLabel + " MB — กรุณาลดขนาดไฟล์แล้วอัปโหลดใหม่")
+	return Invalid("ไฟล์ใหญ่เกิน " + maxDocMBLabel + " MB กรุณาลดขนาดไฟล์แล้วอัปโหลดใหม่")
 }
 
 // acceptedDocMIMEs is the file type NEW uploads may use. PDF only, per the
@@ -395,7 +395,7 @@ func (s *DocsService) scanUpload(ctx context.Context, userID uuid.UUID, kind, fi
 		}
 		return &UserError{
 			Status: 422,
-			Msg:    "ไฟล์นี้ตรวจพบความเสี่ยงด้านความปลอดภัย จึงไม่รับอัปโหลด — กรุณาสแกนไวรัสในเครื่องแล้วสร้างไฟล์ PDF ใหม่",
+			Msg:    "ไฟล์นี้ตรวจพบความเสี่ยงด้านความปลอดภัย จึงไม่รับอัปโหลด กรุณาสแกนไวรัสในเครื่องแล้วสร้างไฟล์ PDF ใหม่",
 		}
 	}
 
@@ -410,7 +410,7 @@ func (s *DocsService) scanUpload(ctx context.Context, userID uuid.UUID, kind, fi
 	}
 	return &UserError{
 		Status: 503,
-		Msg:    "ระบบตรวจไวรัสไม่พร้อมใช้งานชั่วคราว จึงยังไม่รับอัปโหลด — กรุณาลองใหม่อีกครั้ง หากยังไม่ได้โปรดแจ้งผู้ดูแลระบบ",
+		Msg:    "ระบบตรวจไวรัสไม่พร้อมใช้งานชั่วคราว จึงยังไม่รับอัปโหลด กรุณาลองใหม่อีกครั้ง หากยังไม่ได้โปรดแจ้งผู้ดูแลระบบ",
 	}
 }
 
@@ -428,10 +428,10 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 	// Trust MIME when the client sets a known one, else fall back to the
 	// filename extension so browsers that omit type still work.
 	if mime != "" && !acceptedDocMIMEs[mime] {
-		return uuid.Nil, Invalid("รองรับเฉพาะไฟล์ PDF เท่านั้น — หากถ่ายรูปมา กรุณาแปลงเป็น PDF ก่อนอัปโหลด")
+		return uuid.Nil, Invalid("รองรับเฉพาะไฟล์ PDF เท่านั้น หากถ่ายรูปมา กรุณาแปลงเป็น PDF ก่อนอัปโหลด")
 	}
 	if mime == "" && filenameExt(filename) != "pdf" {
-		return uuid.Nil, Invalid("รองรับเฉพาะไฟล์ PDF เท่านั้น — หากถ่ายรูปมา กรุณาแปลงเป็น PDF ก่อนอัปโหลด")
+		return uuid.Nil, Invalid("รองรับเฉพาะไฟล์ PDF เท่านั้น หากถ่ายรูปมา กรุณาแปลงเป็น PDF ก่อนอัปโหลด")
 	}
 
 	// Read the whole file into memory before anything touches storage.
@@ -453,14 +453,14 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 		return uuid.Nil, errDocTooLarge()
 	}
 	if len(buf) == 0 {
-		return uuid.Nil, Invalid("ไฟล์ว่าง — กรุณาเลือกไฟล์ใหม่")
+		return uuid.Nil, Invalid("ไฟล์ว่าง กรุณาเลือกไฟล์ใหม่")
 	}
 
 	// Content sniffing: the MIME/extension checks above are advisory only since
 	// the client controls both. Confirm the file is genuinely a PDF from its
 	// leading bytes.
 	if !sniffAllowedDoc(buf) {
-		return uuid.Nil, Invalid("ไฟล์นี้ไม่ใช่ PDF จริง (ตรวจจากเนื้อไฟล์ ไม่ใช่นามสกุล) — กรุณาแปลงเป็น PDF ก่อนอัปโหลด")
+		return uuid.Nil, Invalid("ไฟล์นี้ไม่ใช่ PDF จริง (ตรวจจากเนื้อไฟล์ ไม่ใช่นามสกุล) กรุณาแปลงเป็น PDF ก่อนอัปโหลด")
 	}
 
 	// Virus scan BEFORE storage, so an infected file never lands on disk at all

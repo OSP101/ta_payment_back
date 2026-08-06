@@ -56,7 +56,7 @@ func TestExecutive_ScopesToTermAndRequestedCourses(t *testing.T) {
 	oldSec := insertDashSection(t, pool, otherTerm)
 	insertDashAssignment(t, pool, oldReq, oldSec, ta, "active")
 
-	sum, err := dash.Executive(ctx, nil, budget)
+	sum, err := dash.Executive(ctx, nil, budget, nil)
 	if err != nil {
 		t.Fatalf("Executive: %v", err)
 	}
@@ -65,19 +65,19 @@ func TestExecutive_ScopesToTermAndRequestedCourses(t *testing.T) {
 		t.Errorf("TermLabel = %q, want \"2569/1\" (ควรเลือกเทอมที่ is_active)", sum.TermLabel)
 	}
 	if sum.TotalCourses != 2 {
-		t.Errorf("TotalCourses = %d, want 2 — วิชาของเทอมเก่าไม่ควรถูกนับ", sum.TotalCourses)
+		t.Errorf("TotalCourses = %d, want 2 วิชาของเทอมเก่าไม่ควรถูกนับ", sum.TotalCourses)
 	}
 	if sum.CoursesWithTA != 1 {
 		t.Errorf("CoursesWithTA = %d, want 1", sum.CoursesWithTA)
 	}
 	if sum.TotalTAs != 1 {
-		t.Errorf("TotalTAs = %d, want 1 — assignment ที่ state='dropped' ไม่ได้ทำงานแล้ว", sum.TotalTAs)
+		t.Errorf("TotalTAs = %d, want 1 assignment ที่ state='dropped' ไม่ได้ทำงานแล้ว", sum.TotalTAs)
 	}
 	if sum.BudgetCourses != 1 {
 		t.Errorf("BudgetCourses = %d, want 1", sum.BudgetCourses)
 	}
 	if sum.MissingStudentCounts != 0 {
-		t.Errorf("MissingStudentCounts = %d, want 0 — ทุกวิชากรอกจำนวน นศ. แล้ว", sum.MissingStudentCounts)
+		t.Errorf("MissingStudentCounts = %d, want 0 ทุกวิชากรอกจำนวน นศ. แล้ว", sum.MissingStudentCounts)
 	}
 	// One requested course only: the un-requested course and the past term's
 	// course must contribute nothing.
@@ -105,12 +105,12 @@ func TestExecutive_CountsSubmittedRequests(t *testing.T) {
 	insertDashRequest(t, pool, pending, lecturer, "submitted")
 	insertDashRequest(t, pool, rejected, lecturer, "rejected")
 
-	sum, err := dash.Executive(ctx, nil, budget)
+	sum, err := dash.Executive(ctx, nil, budget, nil)
 	if err != nil {
 		t.Fatalf("Executive: %v", err)
 	}
 	if sum.CoursesWithTA != 1 {
-		t.Errorf("CoursesWithTA = %d, want 1 — นับ submitted แต่ไม่นับ rejected", sum.CoursesWithTA)
+		t.Errorf("CoursesWithTA = %d, want 1 นับ submitted แต่ไม่นับ rejected", sum.CoursesWithTA)
 	}
 	if sum.BudgetAllocated != 10800 {
 		t.Errorf("BudgetAllocated = %.0f฿, want 10800฿", sum.BudgetAllocated)
@@ -152,15 +152,15 @@ func TestExecutive_StepQueueCounts(t *testing.T) {
 		insertDashPeriod(t, pool, other, "2568-11"), ta,
 		insertDashCourse(t, pool, other, "OLD-EXPORTABLE", 3, 0, 60), "staff_reviewed")
 
-	sum, err := dash.Executive(ctx, nil, budget)
+	sum, err := dash.Executive(ctx, nil, budget, nil)
 	if err != nil {
 		t.Fatalf("Executive: %v", err)
 	}
 	if sum.PendingTARequests != 2 {
-		t.Errorf("PendingTARequests = %d, want 2 — นับเฉพาะ submitted ในเทอมนี้", sum.PendingTARequests)
+		t.Errorf("PendingTARequests = %d, want 2 นับเฉพาะ submitted ในเทอมนี้", sum.PendingTARequests)
 	}
 	if sum.ReadyToExport != 1 {
-		t.Errorf("ReadyToExport = %d, want 1 — นับเฉพาะ staff_reviewed ในเทอมนี้", sum.ReadyToExport)
+		t.Errorf("ReadyToExport = %d, want 1 นับเฉพาะ staff_reviewed ในเทอมนี้", sum.ReadyToExport)
 	}
 }
 
@@ -190,7 +190,7 @@ func TestExecutive_CountsCoursesMissingStudentCounts(t *testing.T) {
 	// this one has none, so it must not be flagged.
 	insertDashSection(t, pool, insertDashCourse(t, pool, term, "REGULAR-ONLY", 3, 0, 60))
 
-	sum, err := dash.Executive(ctx, nil, budget)
+	sum, err := dash.Executive(ctx, nil, budget, nil)
 	if err != nil {
 		t.Fatalf("Executive: %v", err)
 	}

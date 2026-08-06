@@ -296,7 +296,7 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 	}
 	if unapproved > 0 {
 		return Invalid(fmt.Sprintf(
-			"ยังมี %d รายการที่อาจารย์ยังไม่อนุมัติ — ต้องให้ครบก่อน จึงจะตรวจสอบเบิกจ่ายได้", unapproved))
+			"ยังมี %d รายการที่อาจารย์ยังไม่อนุมัติ ต้องให้ครบก่อน จึงจะตรวจสอบเบิกจ่ายได้", unapproved))
 	}
 
 	name := s.userDisplayName(ctx, actor)
@@ -396,7 +396,7 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 		return err
 	}
 	if lastSent != nil && time.Since(*lastSent) < 24*time.Hour {
-		return Invalid("แจ้งเตือนอาจารย์วิชานี้ไปแล้ววันนี้ — ส่งได้อีกครั้งใน 24 ชั่วโมง")
+		return Invalid("แจ้งเตือนอาจารย์วิชานี้ไปแล้ววันนี้ ส่งได้อีกครั้งใน 24 ชั่วโมง")
 	}
 
 	// How much is actually outstanding. Sending "please approve" without the
@@ -439,7 +439,7 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 
 	title := "มีบันทึกเวลา TA รออนุมัติ"
 	body := fmt.Sprintf(
-		"%s %s — มี %d รายการที่ TA ส่งมาแล้วและรอการอนุมัติของอาจารย์ "+
+		"%s %s มี %d รายการที่ TA ส่งมาแล้วและรอการอนุมัติของอาจารย์ "+
 			"เจ้าหน้าที่ยังตรวจเบิกจ่ายเดือนนั้นไม่ได้จนกว่าจะอนุมัติครบ",
 		code, nameTH, openRows)
 	for _, id := range lecturerIDs {
@@ -450,7 +450,7 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 	if err := s.aud.Log(ctx, audit.Entry{
 		ActorID: &actor, Action: "payout.remind_lecturer",
 		Entity: "teaching_course", EntityID: tcID.String(),
-		Note: fmt.Sprintf("%s — %d รายการรออนุมัติ, แจ้ง %d คน", code, openRows, len(lecturerIDs)),
+		Note: fmt.Sprintf("%s %d รายการรออนุมัติ, แจ้ง %d คน", code, openRows, len(lecturerIDs)),
 	}); err != nil {
 		return err
 	}

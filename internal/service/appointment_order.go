@@ -1,13 +1,10 @@
 // appointment_order.go orchestrates the "ใบแต่งตั้งทีเอ (คำสั่ง)" export:
 // staff pick a term + fill in metadata (order number, dates, signer), the
-// service queries every approved TA roster for that term, and returns a zip
-// containing a PDF and a DOCX rendering. Both formats live behind one
-// service so the underlying data query is not duplicated.
+// service queries every approved TA roster for that term, and renders the
+// คำสั่ง as a Word (.docx) file. PDF was dropped 06/08/2026 — see renderBundle.
 package service
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,10 +16,9 @@ import (
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/docxgen"
-	"ta-payment-back/internal/pdfgen"
 )
 
-// AppointmentOrderService produces the คำสั่งแต่งตั้ง PDF+DOCX bundle for a term.
+// AppointmentOrderService produces the คำสั่งแต่งตั้ง .docx for a term.
 type AppointmentOrderService struct {
 	pool    *pgxpool.Pool
 	aud     *audit.Auditor
@@ -38,7 +34,7 @@ type AppointmentOrderInput struct {
 	SignerOfficerID uuid.UUID `json:"signer_officer_id"`
 }
 
-// Build returns a ZIP containing appointment-order.pdf + appointment-order.docx.
+// Build renders the next round as appointment-order-<no>.docx.
 func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in AppointmentOrderInput) ([]byte, string, error) {
 	if in.OrderNo == "" || in.OrderDate == "" || in.EffectiveDate == "" {
 		return nil, "", Invalid("กรุณาระบุคำสั่งที่ / วันที่สั่ง / วันที่ทำการ")
@@ -157,7 +153,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 			JOIN appointment_orders o ON o.id = it.appointment_order_id
 			WHERE o.term_id = $1`, in.TermID).Scan(&issued)
 		if issued > 0 {
-			return nil, "", Invalid("ออกคำสั่งครบทุกคนแล้วสำหรับภาคเรียนนี้ — ไม่มีรายชื่อค้างให้ออกรอบใหม่")
+			return nil, "", Invalid("ออกคำสั่งครบทุกคนแล้วสำหรับภาคเรียนนี้ ไม่มีรายชื่อค้างให้ออกรอบใหม่")
 		}
 		return nil, "", Invalid("ยังไม่มีทีเอที่ได้รับอนุมัติในภาคเรียนนี้")
 	}
@@ -221,7 +217,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		return nil, "", err
 	}
 
-	zipBytes, name, err := s.renderBundle(doc, round)
+	docxBytes, name, err := s.renderBundle(doc, round)
 	if err != nil {
 		return nil, "", err
 	}
@@ -233,72 +229,28 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	}); err != nil {
 		return nil, "", err
 	}
-	return zipBytes, name, nil
+	return docxBytes, name, nil
 }
 
-// renderBundle turns one composed order into the PDF+DOCX zip.
+// renderBundle turns one composed order into the .docx file staff download.
+//
+// It used to package a PDF alongside the DOCX in a zip; dropped 06/08/2026 at
+// the officers' request — the คำสั่ง goes onward as a Word file they finish by
+// hand, and the PDF was an extra step of unzipping for a copy nobody filed.
 //
 // Split out of Build so a reprint can reach it with a document loaded from the
 // ledger instead of one just assembled from live tables — that is the whole
 // mechanism by which a re-issue is a COPY rather than a fresh document. It
 // touches no database: everything it needs is in `d`.
 func (s *AppointmentOrderService) renderBundle(d docxgen.AppointmentOrderData, round int) ([]byte, string, error) {
-	// Mirror the hierarchy for the PDF renderer.
-	pdfLevels := make([]pdfgen.AppointmentLevel, 0, len(d.Levels))
-	for _, lv := range d.Levels {
-		pl := pdfgen.AppointmentLevel{Heading: lv.Heading}
-		for _, c := range lv.Courses {
-			pc := pdfgen.AppointmentCourse{Code: c.Code, Name: c.Name, CreditText: c.CreditText}
-			for _, ap := range c.Appointees {
-				pc.Appointees = append(pc.Appointees, pdfgen.AppointmentAppointee{
-					StudentID: ap.StudentID, FirstName: ap.FirstName, LastName: ap.LastName,
-				})
-			}
-			pl.Courses = append(pl.Courses, pc)
-		}
-		pdfLevels = append(pdfLevels, pl)
-	}
-
-	pdfBytes, err := pdfgen.BuildAppointmentOrderPDF(pdfgen.AppointmentOrderInput{
-		FontDir: s.fontDir,
-		Data: pdfgen.AppointmentOrderData{
-			OrderNo:         d.OrderNo,
-			AcademicYear:    d.AcademicYear,
-			SemesterLabel:   d.SemesterLabel,
-			OrderDate:       d.OrderDate,
-			EffectiveDate:   d.EffectiveDate,
-			SignerName:      d.SignerName,
-			SignerTitle:     d.SignerTitle,
-			SignerActingFor: d.SignerActingFor,
-			Levels:          pdfLevels,
-		},
-	})
-	if err != nil {
-		// PDF failing (usually missing fontDir) should NOT block the DOCX.
-		pdfBytes = nil
-	}
-
 	docxBytes, err := docxgen.BuildAppointmentOrderDOCX(d)
 	if err != nil {
 		return nil, "", err
 	}
-
-	// Package as ZIP. Sanitize OrderNo so "6/2569" doesn't become a subfolder
-	// inside the archive.
-	buf := &bytes.Buffer{}
-	zw := zip.NewWriter(buf)
+	// Sanitize OrderNo so "6/2569" cannot smuggle a path into the filename.
 	safeOrderNo := strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(d.OrderNo)
 	base := fmt.Sprintf("appointment-order-%s%s", safeOrderNo, appointmentRoundSuffix(round))
-	if pdfBytes != nil {
-		w, _ := zw.Create(base + ".pdf")
-		_, _ = w.Write(pdfBytes)
-	}
-	w, _ := zw.Create(base + ".docx")
-	_, _ = w.Write(docxBytes)
-	if err := zw.Close(); err != nil {
-		return nil, "", err
-	}
-	return buf.Bytes(), base + ".zip", nil
+	return docxBytes, base + ".docx", nil
 }
 
 // Reprint hands back a copy of an order that was already issued.
@@ -319,7 +271,7 @@ func (s *AppointmentOrderService) Reprint(ctx context.Context, actor, orderID uu
 		return nil, "", ErrNotFound
 	}
 	if len(raw) == 0 {
-		return nil, "", Invalid("คำสั่งรอบนี้ออกก่อนระบบจะเก็บสำเนาเอกสาร — " +
+		return nil, "", Invalid("คำสั่งรอบนี้ออกก่อนระบบจะเก็บสำเนาเอกสาร " +
 			"ออกซ้ำให้ไม่ได้ เพราะไม่มีหลักฐานว่าฉบับเดิมพิมพ์ข้อความใดไว้")
 	}
 	var d docxgen.AppointmentOrderData
@@ -327,7 +279,7 @@ func (s *AppointmentOrderService) Reprint(ctx context.Context, actor, orderID uu
 		return nil, "", fmt.Errorf("appointment order %s: snapshot unreadable: %w", orderID, err)
 	}
 
-	zipBytes, name, err := s.renderBundle(d, round)
+	docxBytes, name, err := s.renderBundle(d, round)
 	if err != nil {
 		return nil, "", err
 	}
@@ -341,7 +293,7 @@ func (s *AppointmentOrderService) Reprint(ctx context.Context, actor, orderID uu
 	}); err != nil {
 		return nil, "", err
 	}
-	return zipBytes, name, nil
+	return docxBytes, name, nil
 }
 
 // ensureBuddhistEra inserts "พ.ศ." before a trailing 4-digit year when staff

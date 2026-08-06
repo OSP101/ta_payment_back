@@ -402,7 +402,7 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		return nil, "", 0, err
 	}
 	if numStudents <= 0 {
-		return nil, "", 0, Invalid("ยังไม่ได้กรอกจำนวนนักศึกษาของวิชานี้ — กรุณากรอกที่หน้า “วิชาที่เปิดสอน” ก่อนส่งออก (งบเบิกจ่ายคำนวณจากจำนวนนักศึกษา)")
+		return nil, "", 0, Invalid("ยังไม่ได้กรอกจำนวนนักศึกษาของวิชานี้ กรุณากรอกที่หน้า “วิชาที่เปิดสอน” ก่อนส่งออก (งบเบิกจ่ายคำนวณจากจำนวนนักศึกษา)")
 	}
 	// Payout readiness gate: refuse to build reimbursement documents while any
 	// TA in the course has an unapproved or incomplete profile — otherwise the
@@ -561,7 +561,7 @@ func (s *ExportService) validatePayoutReadiness(ctx context.Context, teachingCou
 		return err
 	}
 	if len(offenders) > 0 {
-		return Invalid("ส่งออกไม่ได้ — ข้อมูล TA ไม่ครบหรือยังไม่ผ่านการตรวจ: " + strings.Join(offenders, ", "))
+		return Invalid("ส่งออกไม่ได้ ข้อมูล TA ไม่ครบหรือยังไม่ผ่านการตรวจ: " + strings.Join(offenders, ", "))
 	}
 	return nil
 }

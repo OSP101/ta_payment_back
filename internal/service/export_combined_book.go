@@ -56,12 +56,16 @@ type claimant struct {
 	Rows    []claimSheetRow
 	Rate    float64
 	// PaidBaht is what the payout actually funds for this claimant on this
-	// track. The office's instruction (ส.ค. 2569) is that the sheet lists
-	// EVERY hour taught and totals it in รวมเป็นเงินทั้งสิ้น; the funded
-	// figure prints separately, in ขอเบิกจ่ายเพียง and the evidence sheet's
-	// รับจริง column. Priced by the same source the settlement runs on, so
-	// this figure and the actual transfer cannot disagree.
+	// track; FullBaht is what their whole logged time costs. The office's
+	// instruction (ส.ค. 2569): the sheet lists EVERY hour taught and totals it
+	// in รวมเป็นเงินทั้งสิ้น; only when the budget stops short of the full
+	// figure does ขอเบิกจ่ายเพียง (and the evidence sheet's รับจริง) print the
+	// funded amount, so the gap is legible as "สอนมาเท่านี้ งบจ่ายได้เท่านี้".
+	// A fully funded claimant leaves ขอเบิกจ่ายเพียง blank, as the college's
+	// own files do. Both figures are priced by the same source the settlement
+	// runs on, so they and the actual transfer cannot disagree.
 	PaidBaht float64
+	FullBaht float64
 	// LumpSum marks the grad-special claimant, whose pay is the flat term
 	// lump the staff fill in by hand — no hourly funded figure exists, so
 	// their money cells stay blank exactly as before.
@@ -72,6 +76,11 @@ type claimant struct {
 	nameRow  int
 	hoursRow int
 }
+
+// underfunded reports whether the budget stopped short of this claimant's
+// logged time — the only case ขอเบิกจ่ายเพียง and รับจริง print a figure of
+// their own.
+func (c *claimant) underfunded() bool { return c.PaidBaht+0.005 < c.FullBaht }
 
 // combinedBookData is everything the workbook prints.
 type combinedBookData struct {
@@ -99,7 +108,7 @@ func (s *ExportService) BuildCombinedClaimWorkbook(ctx context.Context, courseID
 		return nil, err
 	}
 	if len(d.Regular) == 0 && len(d.Special) == 0 {
-		return nil, Invalid("ไม่มีบันทึกเวลาที่อนุมัติแล้วในวิชานี้ — ยังสร้างเอกสารเบิกจ่ายไม่ได้")
+		return nil, Invalid("ไม่มีบันทึกเวลาที่อนุมัติแล้วในวิชานี้ ยังสร้างเอกสารเบิกจ่ายไม่ได้")
 	}
 
 	f := excelize.NewFile()
@@ -660,12 +669,13 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	if err := set(at("B", grand+1), "ขอเบิกจ่ายเพียง"); err != nil {
 		return 0, err
 	}
-	// ขอเบิกจ่ายเพียง carries what the payout actually funds. The totals above
-	// cover every hour taught, so when the budget stops short the two figures
-	// differ and finance reads the claimable amount here. A literal, not a
-	// formula: the cutoff is the settlement's decision and cannot be derived
-	// from the sheet. Grad-special lumps stay blank for staff, as before.
-	if moneyRow > 0 && !p.LumpSum {
+	// ขอเบิกจ่ายเพียง prints ONLY when the budget stopped short: the totals
+	// above cover every hour taught, so the two figures differing is exactly
+	// the signal finance needs — "สอนมาเท่านี้ งบจ่ายได้เท่านี้". A fully
+	// funded block leaves the line blank, as the college's own files do. A
+	// literal, not a formula: the cutoff is the settlement's decision and
+	// cannot be derived from the sheet. Grad-special lumps stay blank too.
+	if moneyRow > 0 && !p.LumpSum && p.underfunded() {
 		if err := set(at("C", grand+1), p.PaidBaht); err != nil {
 			return 0, err
 		}
@@ -985,15 +995,15 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		if err := set(at("F", r), fmt.Sprintf("=D%d*E%d", r, r)); err != nil {
 			return err
 		}
-		// รับจริง is the funded amount — a literal, because the budget cutoff
-		// is not derivable in-sheet. จำนวนเงิน (D×E) stays the full figure, so
-		// the two columns diverge exactly when the budget stopped short. The
-		// grad-special lump keeps the =F link; staff fill that case by hand.
-		if p.LumpSum {
-			if err := set(at("G", r), fmt.Sprintf("=F%d", r)); err != nil {
+		// รับจริง follows the same rule as ขอเบิกจ่ายเพียง: normally the =F
+		// link (received = claimed), and a literal funded amount only when the
+		// budget stopped short of this person's logged time — the one case the
+		// two columns should visibly diverge.
+		if !p.LumpSum && p.underfunded() {
+			if err := set(at("G", r), p.PaidBaht); err != nil {
 				return err
 			}
-		} else if err := set(at("G", r), p.PaidBaht); err != nil {
+		} else if err := set(at("G", r), fmt.Sprintf("=F%d", r)); err != nil {
 			return err
 		}
 		if err := set(at("J", r), d.CourseCode); err != nil {
@@ -1142,13 +1152,16 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 		return nil, err
 	}
 	funded := map[taTrackKey]float64{}
+	fullCost := map[taTrackKey]float64{}
 	for _, c := range costs {
 		t := settlement.Regular
 		if c.Track == "special" {
 			t = settlement.Special
 		}
+		k := taTrackKey{c.TA, c.Track}
+		fullCost[k] += c.Baht
 		if !t.unpaidFrom(c.Date, c.StartTime) {
-			funded[taTrackKey{c.TA, c.Track}] += c.Baht
+			funded[k] += c.Baht
 		}
 	}
 
@@ -1235,11 +1248,12 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 			if len(mine) == 0 {
 				continue
 			}
+			k := taTrackKey{p.id, side.track}
 			*side.dst = append(*side.dst, claimant{
 				TAID: p.id, Name: p.name, LevelTH: levelTH,
 				Rows: buildClaimSheetRows(mine, side.word), Rate: side.rate,
-				PaidBaht: round2(funded[taTrackKey{p.id, side.track}]),
-				LumpSum:  p.level != "undergrad" && side.track == "special",
+				PaidBaht: round2(funded[k]), FullBaht: round2(fullCost[k]),
+				LumpSum: p.level != "undergrad" && side.track == "special",
 			})
 		}
 	}

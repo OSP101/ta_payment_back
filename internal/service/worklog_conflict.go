@@ -201,7 +201,7 @@ func (s *WorkLogService) enforceNoOwnClassConflict(ctx context.Context, ac *assi
 		return nil
 	}
 	return Invalid(fmt.Sprintf(
-		"ลงเวลาช่วงนี้ไม่ได้ — ตรงกับตารางเรียนของคุณ: %s "+
+		"ลงเวลาช่วงนี้ไม่ได้ ตรงกับตารางเรียนของคุณ: %s "+
 			"(ตารางเรียนของตัวเองมาก่อนเสมอ ถ้าตารางเรียนนี้ไม่ถูกต้อง ให้แก้ที่หน้า “ตารางเรียนของฉัน”)",
 		clash.describe()))
 }

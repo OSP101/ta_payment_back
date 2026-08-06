@@ -1732,6 +1732,9 @@ func (h *AnnounceHandler) List(c *fiber.Ctx) error {
 	out, err := h.Svc.Announce.List(c.Context(), service.ListFilter{
 		RoleFilter: role,
 		IncludeAll: includeAll,
+		// Targeting is per person, so the feed is filtered by who is asking
+		// rather than by their role alone.
+		ViewerID: UserID(c),
 	})
 	if err != nil {
 		return err
@@ -1754,6 +1757,11 @@ func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
 		return err
 	}
 	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		// The recipient ledger is who-else-was-emailed. That is staff
+		// bookkeeping, not part of the notice, and handing a reader the
+		// address list of everyone it was sent to would leak contact details
+		// they never asked for.
+		a.Recipients = nil
 		if a.Status != "live" {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
@@ -1851,6 +1859,234 @@ const announceImageMaxBytes = 5 * 1024 * 1024
 // UploadImage accepts a cover image, validates MIME + magic bytes + size,
 // and stores it via the shared encrypted-at-rest store. Returns the key so
 // the composer can attach it to the announcement.
+// AudiencePreview — POST /announcements/preview-audience — "who will get this".
+//
+// Answered by the same resolver that will actually deliver it, so the number
+// on screen is the number of people reached, not an estimate.
+func (h *AnnounceHandler) AudiencePreview(c *fiber.Ctx) error {
+	var rule service.AudienceRule
+	if err := c.BodyParser(&rule); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	out, err := h.Svc.Announce.PreviewAudience(c.Context(), rule)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AudienceFilters — GET /announcements/audience-filters — the closed set of
+// narrowing conditions, so the composer cannot offer one the resolver has no
+// query for.
+func (h *AnnounceHandler) AudienceFilters(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{"items": service.AnnounceFilterOptions()})
+}
+
+// PublicGet — GET /public/announcements/:id — no authentication.
+//
+// The service decides what is visible; this handler adds nothing but the HTTP
+// shape, so there is one place to reason about what an anonymous reader can
+// reach. Anything not opted into sharing is reported as missing rather than
+// forbidden: "this exists but you may not see it" is itself information.
+func (h *AnnounceHandler) PublicGet(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+	}
+	a, err := h.Svc.Announce.PublicGet(c.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	return c.JSON(a)
+}
+
+// Resend — POST /announcements/:id/send-email — delivers to everyone on the
+// audience who has not had it yet. Widening the target after publishing is the
+// normal case; this is the button for it.
+func (h *AnnounceHandler) Resend(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	sent, err := h.Svc.Announce.Deliver(c.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"sent": sent})
+}
+
+// announceMediaKinds maps an accepted MIME to (kind, extension). The kind is
+// decided HERE, from the sniffed bytes — never from the filename — because it
+// is what the reader's browser will be told to do with the file.
+var announceMediaKinds = map[string]struct {
+	Kind string
+	Ext  string
+}{
+	"image/jpeg":      {"image", ".jpg"},
+	"image/jpg":       {"image", ".jpg"},
+	"image/png":       {"image", ".png"},
+	"image/webp":      {"image", ".webp"},
+	"image/gif":       {"image", ".gif"},
+	"video/mp4":       {"video", ".mp4"},
+	"video/webm":      {"video", ".webm"},
+	"video/quicktime": {"video", ".mov"},
+	"application/pdf": {"file", ".pdf"},
+}
+
+// Per-kind ceilings. Video is the outlier: a two-minute clip from a phone is
+// tens of megabytes, and refusing it would make the feature useless, while an
+// unbounded upload would let one announcement fill the disk.
+var announceMediaMaxBytes = map[string]int64{
+	"image": 8 * 1024 * 1024,
+	"video": 80 * 1024 * 1024,
+	"file":  20 * 1024 * 1024,
+}
+
+// announceMediaMagic confirms the bytes really are what the MIME claims, for
+// the formats where a wrong guess would be dangerous to serve.
+func announceMediaMagic(head []byte, ext string) bool {
+	switch ext {
+	case ".pdf":
+		return len(head) >= 5 && string(head[:5]) == "%PDF-"
+	case ".mp4", ".mov":
+		// ISO base media: bytes 4..8 are "ftyp".
+		return len(head) >= 12 && string(head[4:8]) == "ftyp"
+	case ".webm":
+		return len(head) >= 4 && head[0] == 0x1A && head[1] == 0x45 && head[2] == 0xDF && head[3] == 0xA3
+	case ".gif":
+		return len(head) >= 6 && string(head[:3]) == "GIF"
+	default:
+		return imageMagicMatches(head, ext)
+	}
+}
+
+// UploadMedia accepts one attachment — image, video or PDF — and returns the
+// key plus the kind the composer should render it as.
+func (h *AnnounceHandler) UploadMedia(c *fiber.Ctx) error {
+	fh, err := c.FormFile("file")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "file required")
+	}
+	mime := strings.ToLower(strings.TrimSpace(strings.Split(fh.Header.Get("Content-Type"), ";")[0]))
+	spec, ok := announceMediaKinds[mime]
+	if !ok {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType,
+			"รองรับเฉพาะรูปภาพ (JPEG/PNG/WebP/GIF), วิดีโอ (MP4/WebM/MOV) และ PDF")
+	}
+	if max := announceMediaMaxBytes[spec.Kind]; fh.Size > max {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge,
+			"ไฟล์ใหญ่เกิน "+strconv.FormatInt(max/(1024*1024), 10)+" MB")
+	}
+	src, err := fh.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	head := make([]byte, 16)
+	n, _ := src.Read(head)
+	if !announceMediaMagic(head[:n], spec.Ext) {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType, "ประเภทไฟล์ไม่ตรงกับเนื้อหา")
+	}
+	if _, err := src.Seek(0, 0); err != nil {
+		return err
+	}
+
+	key, size, err := h.Svc.Storage.Save("announcements", uuid.New().String()+spec.Ext, src)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"kind": spec.Kind, "storage_key": key, "size_bytes": size, "mime": mime,
+		"filename": fh.Filename,
+		"url":      service.AttachmentURL(key),
+	})
+}
+
+// ServeMedia streams an attachment to a signed-in reader.
+func (h *AnnounceHandler) ServeMedia(c *fiber.Ctx) error {
+	return serveAnnounceMedia(c, h.Svc, c.Params("*"), false)
+}
+
+// ServePublicMedia streams an attachment to anyone, but only when the
+// announcement carrying it is publicly shared and live.
+//
+// Without this the public page renders <img> tags at an authenticated URL, so
+// every shared announcement with a picture showed a broken image to exactly
+// the people it was shared with.
+func (h *AnnounceHandler) ServePublicMedia(c *fiber.Ctx) error {
+	key := c.Params("*")
+	ok, err := h.Svc.Announce.MediaIsPublic(c.Context(), key)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// 404, not 403: an anonymous caller must not learn that a key exists.
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบไฟล์")
+	}
+	return serveAnnounceMedia(c, h.Svc, key, true)
+}
+
+// serveAnnounceMedia is the shared streaming half — one place that decides
+// content type and headers, so the public and private routes cannot drift.
+func serveAnnounceMedia(c *fiber.Ctx, svc *service.Container, key string, shortCache bool) error {
+	if key == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "key required")
+	}
+	if strings.Contains(key, "..") || !strings.HasPrefix(key, "announcements/") {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid key")
+	}
+	rc, err := svc.Storage.Open(key)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบไฟล์")
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	k := strings.TrimSuffix(key, ".enc")
+	ct := "application/octet-stream"
+	switch strings.ToLower(k[strings.LastIndex(k, "."):]) {
+	case ".jpg", ".jpeg":
+		ct = "image/jpeg"
+	case ".png":
+		ct = "image/png"
+	case ".webp":
+		ct = "image/webp"
+	case ".gif":
+		ct = "image/gif"
+	case ".mp4":
+		ct = "video/mp4"
+	case ".webm":
+		ct = "video/webm"
+	case ".mov":
+		ct = "video/quicktime"
+	case ".pdf":
+		ct = "application/pdf"
+	}
+	c.Set("Content-Type", ct)
+	// Public files get a short window on purpose. Withdrawing an announcement
+	// has to take its pictures down with it, and an hour-long cache would keep
+	// serving them from the reader's own browser long after — verified on
+	// 06/08/2026, when a withdrawn post's image still loaded from cache.
+	if shortCache {
+		c.Set("Cache-Control", "private, max-age=60, must-revalidate")
+	} else {
+		c.Set("Cache-Control", "private, max-age=3600")
+	}
+	// Stops a browser from re-interpreting a PDF or a clip as something it can
+	// execute in the page's origin.
+	c.Set("X-Content-Type-Options", "nosniff")
+	return c.Send(body)
+}
+
 func (h *AnnounceHandler) UploadImage(c *fiber.Ctx) error {
 	fh, err := c.FormFile("file")
 	if err != nil {
@@ -1965,11 +2201,54 @@ func (h *DashboardHandler) Executive(c *fiber.Ctx) error {
 			termID = &id
 		}
 	}
-	out, err := h.Svc.Dashboard.Executive(c.Context(), termID, h.Svc.Budget)
+	out, err := h.Svc.Dashboard.Executive(c.Context(), termID, h.Svc.Budget, h.Svc.Appointment)
 	if err != nil {
 		return err
 	}
 	return c.JSON(out)
+}
+
+// Analytics — GET /dashboard/analytics — the executive budget view (monthly
+// disbursement, per-curriculum, per-course). Read-only; also served to the
+// synthetic executive role.
+func (h *DashboardHandler) Analytics(c *fiber.Ctx) error {
+	var termID *uuid.UUID
+	if v := c.Query("term_id"); v != "" {
+		if id, err := uuid.Parse(v); err == nil {
+			termID = &id
+		}
+	}
+	out, err := h.Svc.Dashboard.Analytics(c.Context(), termID, h.Svc.Budget, h.Svc.Export)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AnalyticsXLSX — GET /dashboard/analytics.xlsx — the same figures as a
+// three-sheet workbook for further analysis.
+func (h *DashboardHandler) AnalyticsXLSX(c *fiber.Ctx) error {
+	var termID *uuid.UUID
+	if v := c.Query("term_id"); v != "" {
+		if id, err := uuid.Parse(v); err == nil {
+			termID = &id
+		}
+	}
+	a, err := h.Svc.Dashboard.Analytics(c.Context(), termID, h.Svc.Budget, h.Svc.Export)
+	if err != nil {
+		return err
+	}
+	body, err := service.AnalyticsWorkbook(a)
+	if err != nil {
+		return err
+	}
+	name := "ta-budget-analytics.xlsx"
+	if a.TermLabel != "" {
+		name = "ta-budget-" + strings.ReplaceAll(a.TermLabel, "/", "-") + ".xlsx"
+	}
+	c.Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
+	return c.Send(body)
 }
 
 // TaOverview — GET /dashboard/ta/me — TA's per-course status + estimated pay.
@@ -2010,7 +2289,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// a HEAD returned 200 and left a locked course and a history row behind.
 	if c.Method() == fiber.MethodHead {
 		return fiber.NewError(fiber.StatusMethodNotAllowed,
-			"ต้องใช้ GET — การดาวน์โหลดล็อกข้อมูล จึงไม่รองรับ HEAD")
+			"ต้องเรียกด้วย GET เท่านั้น เพราะการดาวน์โหลดมีผลล็อกข้อมูล")
 	}
 	raw := strings.TrimSuffix(c.Params("id"), ".zip")
 	id, err := uuid.Parse(raw)
@@ -2127,7 +2406,6 @@ func (h *ExportHandler) CourseHistory(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-// AppointmentOrder — POST /exports/appointment-order — returns ZIP with PDF+DOCX.
 // AppointmentPreview shows who the next คำสั่งแต่งตั้ง round would contain and
 // which courses it skips, so staff confirm before a document that cannot be
 // recalled gets printed.
@@ -2165,10 +2443,16 @@ func (h *ExportHandler) AppointmentOrder(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	c.Set(fiber.HeaderContentType, "application/zip")
+	c.Set(fiber.HeaderContentType, docxContentType)
 	c.Set(fiber.HeaderContentDisposition, contentDisposition("attachment", name))
 	return c.Send(body)
 }
+
+// docxContentType is what a Word document is served as. Both appointment
+// endpoints hand back a bare .docx since 06/08/2026 (the PDF, and the zip that
+// wrapped the pair, were dropped) — announcing it as application/zip left the
+// browser to guess from the extension alone.
+const docxContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 // Certifier reports who will sign the ผู้รับรอง block on this term's claim
 // forms — the explicit choice if one was made, otherwise the seat holder.
@@ -2227,7 +2511,7 @@ func (h *ExportHandler) AppointmentReprint(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	c.Set(fiber.HeaderContentType, "application/zip")
+	c.Set(fiber.HeaderContentType, docxContentType)
 	c.Set(fiber.HeaderContentDisposition, contentDisposition("attachment", name))
 	return c.Send(body)
 }

@@ -190,7 +190,7 @@ func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uu
 			return Invalid("ยังไม่มีรายวิชาที่มี TA ในเทอมนี้")
 		}
 		if exported < total {
-			return Invalid("ยังส่งออกเอกสารไม่ครบทุกวิชา — ต้องส่งออกให้ครบก่อนจึงจะเริ่มติดตามการเซ็นได้")
+			return Invalid("ยังส่งออกเอกสารไม่ครบทุกวิชา ต้องส่งออกให้ครบก่อนจึงจะเริ่มติดตามการเซ็นได้")
 		}
 	}
 	// Every stage BELOW the requested one must already be complete. The paper
@@ -419,7 +419,7 @@ func stageBlockedMessage(stage int, missing []string) string {
 		extra = fmt.Sprintf(" และอีก %d รายการ", len(shown)-5)
 		shown = shown[:5]
 	}
-	return fmt.Sprintf("ยังข้ามขั้นไม่ได้ — \"%s\" ยังไม่ครบ (เหลือ %d รายการ): %s%s",
+	return fmt.Sprintf("ยังข้ามขั้นไม่ได้ \"%s\" ยังไม่ครบ (เหลือ %d รายการ): %s%s",
 		label, len(missing), strings.Join(shown, " · "), extra)
 }
 

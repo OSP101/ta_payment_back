@@ -69,6 +69,37 @@ func (s *AppointmentOrderService) nextRoundNo(ctx context.Context, termID uuid.U
 	return *maxRound + 1, nil
 }
 
+// appointmentEligibleSQL is the one definition of "this (TA × course) pair
+// still needs an appointment order": approved request, assignment not dropped,
+// never printed on an earlier round of this term. Preview's name list and the
+// dashboard badge both read it, so the two can never show different numbers.
+const appointmentEligibleSQL = `
+	FROM ta_request_assignments a
+	JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
+	JOIN sections sec        ON sec.id = a.section_id
+	JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+	JOIN users u             ON u.id = a.ta_id
+	WHERE tc.term_id = $1
+	  AND a.state <> 'dropped'
+	  AND NOT EXISTS (
+	      SELECT 1
+	      FROM appointment_order_items it
+	      JOIN appointment_orders o ON o.id = it.appointment_order_id
+	      WHERE o.term_id = $1
+	        AND it.teaching_course_id = tc.id
+	        AND it.ta_id = a.ta_id)`
+
+// PendingCount reports how many รายชื่อ (TA × course pairs) the next round
+// would print — the figure behind the sidebar badge. Same unit as the
+// appointments page's "จะออกคำสั่งให้ N รายชื่อ".
+func (s *AppointmentOrderService) PendingCount(ctx context.Context, termID uuid.UUID) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM (SELECT DISTINCT tc.id, u.id `+appointmentEligibleSQL+`) q`,
+		termID).Scan(&n)
+	return n, err
+}
+
 // Preview computes the membership of the next round without issuing anything.
 func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID) (*AppointmentPreview, error) {
 	round, err := s.nextRoundNo(ctx, termID)
@@ -87,20 +118,7 @@ func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID)
 	// on an earlier round of this term.
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT tc.id, tc.code, tc.name_th, u.id, u.first_name || ' ' || u.last_name
-		FROM ta_request_assignments a
-		JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
-		JOIN sections sec        ON sec.id = a.section_id
-		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		JOIN users u             ON u.id = a.ta_id
-		WHERE tc.term_id = $1
-		  AND a.state <> 'dropped'
-		  AND NOT EXISTS (
-		      SELECT 1
-		      FROM appointment_order_items it
-		      JOIN appointment_orders o ON o.id = it.appointment_order_id
-		      WHERE o.term_id = $1
-		        AND it.teaching_course_id = tc.id
-		        AND it.ta_id = a.ta_id)
+		`+appointmentEligibleSQL+`
 		-- SELECT DISTINCT requires every ORDER BY expression to be selected;
 		-- the columns below are already in the list, so order by them by name.
 		ORDER BY tc.code, u.first_name || ' ' || u.last_name`, termID)
@@ -162,7 +180,7 @@ func (s *AppointmentOrderService) skippedCourses(ctx context.Context, termID uui
 		if err := rows.Scan(&c.TeachingCourseID, &c.CourseCode, &c.CourseNameTH, &c.PendingTAs); err != nil {
 			return nil, err
 		}
-		c.Reason = "คำขอ TA ยังไม่ได้รับการตัดสิน — รอตารางเรียนของผู้ช่วยสอน"
+		c.Reason = "คำขอ TA ยังไม่ได้รับการตัดสิน รอตารางเรียนของผู้ช่วยสอน"
 		out = append(out, c)
 	}
 	return out, rows.Err()

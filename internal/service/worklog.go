@@ -361,17 +361,17 @@ func validateWorkLogEntry(
 		dy, dm, _ := d.Date()
 		ty, tm, _ := todayRef.Date()
 		if dy < ty || (dy == ty && dm < tm) {
-			return Invalid("บันทึกย้อนหลังในเดือนที่ผ่านไปแล้วไม่ได้ — ลงเวลาได้ตั้งแต่วันที่ 1 ของเดือนปัจจุบันเป็นต้นไป")
+			return Invalid("บันทึกย้อนหลังในเดือนที่ผ่านไปแล้วไม่ได้ ลงเวลาได้ตั้งแต่วันที่ 1 ของเดือนปัจจุบันเป็นต้นไป")
 		}
 	}
 	// Exam-window blackout — faculty publishes the range on the term. TA
 	// worklog stops accruing pay during exams even if the section still has
 	// scheduled meetings that week.
 	if midterm.contains(d) {
-		return Invalid("วันที่ทำงานตรงกับช่วงสอบกลางภาค — ลงเวลาไม่ได้")
+		return Invalid("วันที่ทำงานตรงกับช่วงสอบกลางภาค ลงเวลาไม่ได้")
 	}
 	if final.contains(d) {
-		return Invalid("วันที่ทำงานตรงกับช่วงสอบปลายภาค — ลงเวลาไม่ได้")
+		return Invalid("วันที่ทำงานตรงกับช่วงสอบปลายภาค ลงเวลาไม่ได้")
 	}
 	// Q&A rule 2: "อื่นๆ" entries must be tagged with the parent session type
 	// so the per-session credit-hour cap can be enforced in Upsert.
@@ -387,19 +387,19 @@ func validateWorkLogEntry(
 	switch w.Activity {
 	case "lecture":
 		if scope == "lab" {
-			return Invalid("คำขอนี้อนุมัติเฉพาะปฏิบัติการ — ลง 'บรรยาย' ไม่ได้")
+			return Invalid("คำขอนี้อนุมัติเฉพาะปฏิบัติการ ลง 'บรรยาย' ไม่ได้")
 		}
 	case "lab":
 		if scope == "lecture" {
-			return Invalid("คำขอนี้อนุมัติเฉพาะบรรยาย — ลง 'ปฏิบัติการ' ไม่ได้")
+			return Invalid("คำขอนี้อนุมัติเฉพาะบรรยาย ลง 'ปฏิบัติการ' ไม่ได้")
 		}
 	case "other":
 		if w.ParentKind != nil {
 			if scope == "lab" && *w.ParentKind == "lecture" {
-				return Invalid("คำขอนี้อนุมัติเฉพาะปฏิบัติการ — ลง 'อื่นๆ (คู่กับบรรยาย)' ไม่ได้")
+				return Invalid("คำขอนี้อนุมัติเฉพาะปฏิบัติการ ลง 'อื่นๆ (คู่กับบรรยาย)' ไม่ได้")
 			}
 			if scope == "lecture" && *w.ParentKind == "lab" {
-				return Invalid("คำขอนี้อนุมัติเฉพาะบรรยาย — ลง 'อื่นๆ (คู่กับปฏิบัติการ)' ไม่ได้")
+				return Invalid("คำขอนี้อนุมัติเฉพาะบรรยาย ลง 'อื่นๆ (คู่กับปฏิบัติการ)' ไม่ได้")
 			}
 		}
 	}
@@ -412,23 +412,23 @@ func validateWorkLogEntry(
 	switch w.Activity {
 	case "lecture":
 		if !gate.AllowLecture {
-			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงเช็คชื่อบรรยายในคำขอ — ลง 'บรรยาย' ไม่ได้")
+			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงเช็คชื่อบรรยายในคำขอ ลง 'บรรยาย' ไม่ได้")
 		}
 	case "lab":
 		if !gate.AllowLab {
-			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงปฏิบัติการในคำขอ — ลง 'ปฏิบัติการ' ไม่ได้")
+			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงปฏิบัติการในคำขอ ลง 'ปฏิบัติการ' ไม่ได้")
 		}
 	case "review":
 		if !gate.AllowReview {
-			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงตรวจงานในคำขอ — ลง 'ตรวจงาน' ไม่ได้")
+			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงตรวจงานในคำขอ ลง 'ตรวจงาน' ไม่ได้")
 		}
 	case "other":
 		if !gate.AllowOther {
-			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงงานอื่นๆ ในคำขอ — ลง 'อื่นๆ' ไม่ได้")
+			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงงานอื่นๆ ในคำขอ ลง 'อื่นๆ' ไม่ได้")
 		}
 	case "makeup":
 		if !gate.AllowLecture && !gate.AllowLab {
-			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงคาบเรียนในคำขอ — ลงชดเชยไม่ได้")
+			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงคาบเรียนในคำขอ ลงชดเชยไม่ได้")
 		}
 	}
 	// Holiday + makeup gate. See plans/1-sharded-hopcroft.md § 2 for the full
@@ -473,19 +473,19 @@ func validateWorkLogEntry(
 		if isHoliday && !isMakeupDay {
 			if holiday.allDay {
 				return Invalid(fmt.Sprintf(
-					"วันที่ %s ตรงกับวันหยุด (%s) — ต้องกำหนดวันชดเชยก่อน จึงจะลงเวลาได้ (ไปที่หน้า “วันหยุดและวันชดเชย”)",
+					"วันที่ %s ตรงกับวันหยุด (%s) ต้องกำหนดวันชดเชยก่อน จึงจะลงเวลาได้ (ไปที่หน้า “วันหยุดและวันชดเชย”)",
 					dkey, holiday.labelTH()))
 			}
 			// Partial closure: the fix may be as small as moving the entry to the
 			// free part of the same day, so say which hours are closed instead of
 			// sending the TA to wait for a makeup they may not need.
 			return Invalid(fmt.Sprintf(
-				"เวลา %s–%s ของวันที่ %s อยู่ในช่วงวันหยุด (%s) — ลงเวลาได้เฉพาะช่วงที่ไม่ตรงกับวันหยุด หรือกำหนดวันชดเชยที่หน้า “วันหยุดและวันชดเชย”",
+				"เวลา %s–%s ของวันที่ %s อยู่ในช่วงวันหยุด (%s) ลงเวลาได้เฉพาะช่วงที่ไม่ตรงกับวันหยุด หรือกำหนดวันชดเชยที่หน้า “วันหยุดและวันชดเชย”",
 				w.StartTime, w.EndTime, dkey, holiday.labelTH()))
 		}
 	case "makeup":
 		if !isMakeupDay {
-			return Invalid("วันที่เลือกยังไม่ได้ถูกกำหนดเป็นวันชดเชย — กรุณาระบุวันชดเชยที่หน้า “วันหยุดและวันชดเชย” ก่อน")
+			return Invalid("วันที่เลือกยังไม่ได้ถูกกำหนดเป็นวันชดเชย กรุณาระบุวันชดเชยที่หน้า “วันหยุดและวันชดเชย” ก่อน")
 		}
 	case "review":
 		// Intentional no-op — reviewing homework can happen on any date.
@@ -494,7 +494,7 @@ func validateWorkLogEntry(
 			// parent_kind is validated non-nil above for activity="other".
 			if w.ParentKind != nil && *w.ParentKind == "lab" {
 				return Invalid(fmt.Sprintf(
-					"วันหยุด (%s) — กิจกรรม 'อื่นๆ' ที่คู่กับปฏิบัติการ ทำได้เฉพาะช่วงเวลาที่มีคาบเรียนจริง",
+					"วันหยุด (%s) กิจกรรม 'อื่นๆ' ที่คู่กับปฏิบัติการ ทำได้เฉพาะช่วงเวลาที่มีคาบเรียนจริง",
 					holiday.labelTH()))
 			}
 			// parent_kind=lecture → admin/prep work is allowed off-campus.
@@ -663,7 +663,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	// COALESCE against but CURRENT_DATE), the caller gets a helpful message
 	// instead of a silent no-op.
 	if !endsOn.After(startsOn) {
-		return nil, Invalid("ยังไม่ได้กำหนดวันเริ่ม/วันสิ้นสุดของเทอมหรือรายวิชา — เจ้าหน้าที่ต้องตั้งช่วงเวลาก่อน จึงจะสร้างรายการอัตโนมัติได้")
+		return nil, Invalid("ยังไม่ได้กำหนดวันเริ่ม/วันสิ้นสุดของเทอมหรือรายวิชา เจ้าหน้าที่ต้องตั้งช่วงเวลาก่อน จึงจะสร้างรายการอัตโนมัติได้")
 	}
 	// Resolve the per-track daily hour cap once (used by both loops below).
 	dailyHourCap := s.dailyHourCapFor(ctx, assignmentID)
@@ -1660,7 +1660,7 @@ func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignment
 			label = kind
 		}
 		return Invalid(fmt.Sprintf(
-			"เวลาตรวจการบ้านชนกับ%s (%s %s %s–%s) — เลือกช่วงเวลาที่ไม่ทับกัน",
+			"เวลาตรวจการบ้านชนกับ%s (%s %s %s–%s) เลือกช่วงเวลาที่ไม่ทับกัน",
 			kind, label, dayTH, st, en))
 	}
 
@@ -1768,7 +1768,7 @@ func (s *WorkLogService) enforceReviewCap(ctx context.Context, assignmentID uuid
 	}
 	if existing+addedHours > capH+0.01 {
 		return Invalid(fmt.Sprintf(
-			"ชั่วโมง '%s' รวมต่อสัปดาห์ (%.1f ชม.) ต้องไม่เกินที่อาจารย์ระบุไว้ (%.1f ชม.) — ปัจจุบันใช้ไปแล้ว %.1f ชม.",
+			"ชั่วโมง '%s' รวมต่อสัปดาห์ (%.1f ชม.) ต้องไม่เกินที่อาจารย์ระบุไว้ (%.1f ชม.) ปัจจุบันใช้ไปแล้ว %.1f ชม.",
 			dutyKindTH(kind), existing+addedHours, capH, existing))
 	}
 	return nil
@@ -2025,7 +2025,7 @@ func (s *WorkLogService) enforceWeeklyActivityCap(ctx context.Context, ac *assig
 	}
 	if weekTotal+w.Hours > cap+0.01 {
 		return Invalid(fmt.Sprintf(
-			"เกินโควตา %s ประจำสัปดาห์ (%.1f ชม./สัปดาห์) — สัปดาห์นี้มี %.2f ชม. อยู่แล้ว",
+			"เกินโควตา %s ประจำสัปดาห์ (%.1f ชม./สัปดาห์) สัปดาห์นี้มี %.2f ชม. อยู่แล้ว",
 			labelTH, cap, weekTotal))
 	}
 	return nil
@@ -2093,7 +2093,7 @@ func (s *WorkLogService) enforceNoOverlap(ctx context.Context, taID uuid.UUID, w
 	if len(en) > 5 {
 		en = en[:5]
 	}
-	return Invalid(fmt.Sprintf("ช่วงเวลาซ้อนกับรายการเดิม (%s %s–%s) — แก้ไขเวลาให้ไม่ทับกัน", code, st, en))
+	return Invalid(fmt.Sprintf("ช่วงเวลาซ้อนกับรายการเดิม (%s %s–%s) แก้ไขเวลาให้ไม่ทับกัน", code, st, en))
 }
 
 // recheckCapsForApproval re-validates the per-day and per-week hour caps over
@@ -2128,7 +2128,7 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 	}
 	if len(badDays) > 0 {
 		return Conflict(fmt.Sprintf(
-			"อนุมัติไม่ได้ — ชั่วโมงรวมต่อวันเกิน %.1f ชม. ในวันที่: %s", dailyCap, strings.Join(badDays, ", ")))
+			"อนุมัติไม่ได้ ชั่วโมงรวมต่อวันเกิน %.1f ชม. ในวันที่: %s", dailyCap, strings.Join(badDays, ", ")))
 	}
 
 	if !ac.HasWorkloadForm {
@@ -2182,7 +2182,7 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 		}
 		if len(badWeeks) > 0 {
 			return Conflict(fmt.Sprintf(
-				"อนุมัติไม่ได้ — เกินโควตา %s ประจำสัปดาห์ (%.1f ชม.) ในสัปดาห์ที่เริ่ม: %s",
+				"อนุมัติไม่ได้ เกินโควตา %s ประจำสัปดาห์ (%.1f ชม.) ในสัปดาห์ที่เริ่ม: %s",
 				b.label, b.cap, strings.Join(badWeeks, ", ")))
 		}
 	}
@@ -2245,7 +2245,7 @@ func (s *WorkLogService) assertOwnClassScheduleFilled(ctx context.Context, taID,
 		return err
 	}
 	if n == 0 {
-		return Invalid("กรุณากรอกตารางเรียนของคุณในเทอมนี้ก่อน จึงจะลงเวลาปฏิบัติงานได้ — " +
+		return Invalid("กรุณากรอกตารางเรียนของคุณในเทอมนี้ก่อน จึงจะลงเวลาปฏิบัติงานได้ " +
 			"ระบบใช้ตารางเรียนเพื่อออกแบบฟอร์มตารางปฏิบัติงาน และตรวจว่างาน TA ไม่ชนกับคาบเรียนของคุณ (เมนู “ตารางเรียนของฉัน”)")
 	}
 	return nil
@@ -2308,7 +2308,7 @@ func (s *WorkLogService) enforceTermHourCeiling(ctx context.Context, ac *assignm
 			remaining = 0
 		}
 		return Invalid(fmt.Sprintf(
-			"เกินเพดานชั่วโมงรวมทั้งเทอมของภาระงานนี้ (%.1f ชม.) — ลงได้อีก %.2f ชม.", ceiling, remaining))
+			"เกินเพดานชั่วโมงรวมทั้งเทอมของภาระงานนี้ (%.1f ชม.) ลงได้อีก %.2f ชม.", ceiling, remaining))
 	}
 	return nil
 }
@@ -2446,7 +2446,7 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 			return uuid.Nil, err
 		}
 		if reviewed > 0 {
-			return uuid.Nil, Invalid("เดือนนี้ส่งอนุมัติหรืออนุมัติไปแล้ว — เพิ่มรายการใหม่ในเดือนนี้ไม่ได้")
+			return uuid.Nil, Invalid("เดือนนี้ส่งอนุมัติหรืออนุมัติไปแล้ว เพิ่มรายการใหม่ในเดือนนี้ไม่ได้")
 		}
 		w.ID = uuid.New()
 		if err := writeAudited(ctx, s.pool, s.aud,
@@ -2516,7 +2516,7 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 			// No back-dated submission (staff decision, 03/08/2026): a month
 			// whose deadline passed unsent is a month the TA did not claim. The
 			// message says so instead of offering an appeal that will be refused.
-			return Invalid("รายการทั้งหมดอยู่ในงวดที่ปิดไปแล้ว — ถือว่าไม่ประสงค์ลงเวลา ส่งย้อนหลังไม่ได้")
+			return Invalid("รายการทั้งหมดอยู่ในงวดที่ปิดไปแล้ว ถือว่าไม่ประสงค์ลงเวลา ส่งย้อนหลังไม่ได้")
 		}
 		return Invalid("ไม่มีรายการที่ส่งอนุมัติได้")
 	}

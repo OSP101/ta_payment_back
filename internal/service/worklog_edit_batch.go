@@ -86,7 +86,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	}
 	if len([]rune(strings.TrimSpace(in.Reason))) < editReasonMinLen {
 		return nil, Invalid(fmt.Sprintf(
-			"ต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร — เหตุผลนี้จะถูกส่งให้อาจารย์และทีเอ", editReasonMinLen))
+			"ต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร เหตุผลนี้จะถูกส่งให้อาจารย์และทีเอ", editReasonMinLen))
 	}
 	if len(in.Evidence) > maxEvidenceFiles {
 		return nil, Invalid(fmt.Sprintf("แนบรูปได้ไม่เกิน %d รูป", maxEvidenceFiles))
@@ -139,7 +139,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	// an arbitrary-row editor that happens to take a course id in its path.
 	for _, c := range in.Changes {
 		if _, ok := before[c.WorkLogID]; !ok {
-			return nil, Invalid("มีรายการที่ไม่ได้อยู่ในเดือน/วิชา/ทีเอนี้ — ยกเลิกทั้งชุด")
+			return nil, Invalid("มีรายการที่ไม่ได้อยู่ในเดือน/วิชา/ทีเอนี้ ยกเลิกทั้งชุด")
 		}
 	}
 
@@ -182,7 +182,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	if res.Applied == 0 {
 		// Nothing changed, so there is nothing to explain and no evidence worth
 		// keeping. Report the refusals instead of writing an empty batch.
-		return nil, Invalid("แก้ไขไม่สำเร็จสักรายการ — " + strings.Join(res.Errors, " · "))
+		return nil, Invalid("แก้ไขไม่สำเร็จสักรายการ " + strings.Join(res.Errors, " · "))
 	}
 
 	changesJSON, err := json.Marshal(applied)
@@ -221,7 +221,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
 		ActorID: &actor, Action: "worklog.staff_edit_batch",
 		Entity: "worklog_edit_batch", EntityID: batchID.String(),
-		Note: fmt.Sprintf("%s — แก้ %d รายการ, แนบ %d รูป: %s",
+		Note: fmt.Sprintf("%s แก้ %d รายการ, แนบ %d รูป: %s",
 			in.YearMonth, res.Applied, len(in.Evidence), strings.TrimSpace(in.Reason)),
 		After: applied,
 	}); err != nil {
@@ -251,7 +251,7 @@ func (s *WorkLogService) notifyEditBatch(ctx context.Context, in EditBatchInput,
 		in.TeachingCourseID).Scan(&code, &nameTH)
 
 	title := "เจ้าหน้าที่แก้ไขบันทึกเวลา " + code
-	body := fmt.Sprintf("%s %s · เดือน %s — แก้ไข %d รายการ\nเหตุผล: %s",
+	body := fmt.Sprintf("%s %s · เดือน %s แก้ไข %d รายการ\nเหตุผล: %s",
 		code, nameTH, in.YearMonth, applied, strings.TrimSpace(in.Reason))
 	if files > 0 {
 		body += fmt.Sprintf("\n(แนบหลักฐาน %d รูป)", files)

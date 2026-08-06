@@ -183,7 +183,7 @@ func TestSettleCourse_CutsInsideAMonthNotAtItsEdge(t *testing.T) {
 		t.Fatal("precondition: the course must be over budget")
 	}
 	if len(out.Regular.Slots) != 4 {
-		t.Fatalf("slots = %d, want 4 — the ledger must be per คาบ", len(out.Regular.Slots))
+		t.Fatalf("slots = %d, want 4 the ledger must be per คาบ", len(out.Regular.Slots))
 	}
 	paid := 0
 	for _, sl := range out.Regular.Slots {
@@ -192,7 +192,7 @@ func TestSettleCourse_CutsInsideAMonthNotAtItsEdge(t *testing.T) {
 		}
 	}
 	if paid != 3 {
-		t.Errorf("paid คาบ = %d, want 3 — the budget affords three of the four", paid)
+		t.Errorf("paid คาบ = %d, want 3 the budget affords three of the four", paid)
 	}
 	// The month is part-paid, so it is NOT in unpaid_months: telling the TA they
 	// get nothing for a month they are partly paid for would be a lie.
@@ -234,8 +234,14 @@ func TestCombinedBook_PrintsAllHoursAndFundsOnlyWhatTheBudgetReached(t *testing.
 	// The funded figure is cut at the settlement's คาบ (6 of 8 hours afford)…
 	pr, _ := (&CourseService{pool: f.Pool}).LatestPayRate(f.ctx)
 	if want := 6 * pr.UndergradRegular; math.Abs(d.Regular[0].PaidBaht-want) > 0.01 {
-		t.Errorf("PaidBaht = %.2f, want %.2f — ขอเบิกจ่ายเพียง must stop where the budget did",
+		t.Errorf("PaidBaht = %.2f, want %.2f ขอเบิกจ่ายเพียง must stop where the budget did",
 			d.Regular[0].PaidBaht, want)
+	}
+	if want := 8 * pr.UndergradRegular; math.Abs(d.Regular[0].FullBaht-want) > 0.01 {
+		t.Errorf("FullBaht = %.2f, want %.2f (all 8 hours)", d.Regular[0].FullBaht, want)
+	}
+	if !d.Regular[0].underfunded() {
+		t.Error("claimant must read as underfunded that is what makes ขอเบิกจ่ายเพียง print")
 	}
 	// …and must equal what the payout actually transfers.
 	comp, err := svc.buildExportRows(f.ctx, f.CourseID)
@@ -243,7 +249,7 @@ func TestCombinedBook_PrintsAllHoursAndFundsOnlyWhatTheBudgetReached(t *testing.
 		t.Fatal(err)
 	}
 	if math.Abs(comp.records[0].actualPaid-d.Regular[0].PaidBaht) > 0.01 {
-		t.Errorf("actual_paid = %.2f but ขอเบิกจ่ายเพียง prints %.2f — document and money disagree",
+		t.Errorf("actual_paid = %.2f but ขอเบิกจ่ายเพียง prints %.2f document and money disagree",
 			comp.records[0].actualPaid, d.Regular[0].PaidBaht)
 	}
 }

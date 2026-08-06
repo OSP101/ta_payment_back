@@ -196,7 +196,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
              WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND u.study_level = 'undergrad')
           +
             -- ป.ตรี ภาคพิเศษ: รายชั่วโมงแต่ไม่เกิน ug_special_monthly_cap ต่อคน/เดือน
-            -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") — คิดทีละเดือนแล้วรวม
+            -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") คิดทีละเดือนแล้วรวม
             (SELECT COALESCE(SUM(LEAST(m.hrs * (SELECT undergrad_special FROM latest),
                                        (SELECT ug_special_monthly_cap FROM latest))), 0)
              FROM (

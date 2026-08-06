@@ -50,6 +50,29 @@ func RequireRole(roles ...string) fiber.Handler {
 	}
 }
 
+// RequireExecutiveView guards the read-only budget-analytics endpoints. The
+// synthetic executive role travels in the JWT (see Login), but the flag is
+// ticked by staff while the lecturer may already hold a 12-hour token — so a
+// claims miss falls back to the live users.is_executive read, and the grant
+// works immediately instead of after the next login. Revocation still waits
+// for token expiry only when the claims carry the role; the fallback path
+// re-reads every request.
+func RequireExecutiveView(pool *pgxpool.Pool) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleExecutive) {
+			return c.Next()
+		}
+		var ok bool
+		_ = pool.QueryRow(c.Context(),
+			`SELECT is_executive FROM users WHERE id = $1 AND deleted_at IS NULL`,
+			UserID(c)).Scan(&ok)
+		if ok {
+			return c.Next()
+		}
+		return fiber.NewError(fiber.StatusForbidden, "forbidden")
+	}
+}
+
 // AccountGuard runs after Authenticated on every protected route. It re-reads
 // the user's live state from the DB so that (a) a deactivated or deleted account
 // loses access immediately instead of when its 12h token expires, and (b) a user

@@ -306,7 +306,7 @@ func TestClaimTemplate_CertifierCellsAreWhereWeWriteThem(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(label, "ผู้รับรอง") {
-		t.Fatalf("H33 = %q, want the ผู้รับรอง block label — the cells below it are "+
+		t.Fatalf("H33 = %q, want the ผู้รับรอง block label the cells below it are "+
 			"the ones the exporter writes, so if this moved the export is now "+
 			"writing into somebody else's signature", label)
 	}

@@ -427,12 +427,12 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 			}
 			if offSlot > 0 {
 				reason = strings.Join(append(
-					[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ — ลงเวลาในคาบไม่ได้ แต่ยังทำงานตรวจ/งานอื่นนอกคาบได้ตามที่อาจารย์ระบุ", a.secNo)},
+					[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ ลงเวลาในคาบไม่ได้ แต่ยังทำงานตรวจ/งานอื่นนอกคาบได้ตามที่อาจารย์ระบุ", a.secNo)},
 					lines...), "\n")
 			} else {
 				state = "dropped"
 				reason = strings.Join(append(
-					[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ และไม่มีงานนอกคาบที่อาจารย์ระบุไว้ — คุณจึงไม่ได้เป็นผู้ช่วยสอนกลุ่มนี้", a.secNo)},
+					[]string{fmt.Sprintf("Section %s: ทุกคาบตรงกับตารางเรียนของคุณ และไม่มีงานนอกคาบที่อาจารย์ระบุไว้ คุณจึงไม่ได้เป็นผู้ช่วยสอนกลุ่มนี้", a.secNo)},
 					lines...), "\n")
 			}
 		}

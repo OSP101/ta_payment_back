@@ -169,3 +169,15 @@ func renderMailHTML(title, body, link string) string {
 </td></tr></table>
 </body></html>`
 }
+
+// SendMailTo delivers a message to a bare email address: no user row, no in-app
+// notification, no delivery record here.
+//
+// The announcement recipient list is the only caller — its addresses may belong
+// to nobody in the system (a guest lecturer, a faculty mailing list), so
+// Send()'s user-id-first shape does not fit. Routing it through NotifyService
+// anyway keeps the mailer owned in one place instead of handing a second
+// service its own copy.
+func (s *NotifyService) SendMailTo(to, subject, html string) error {
+	return s.mailer.Send(to, subject, html)
+}

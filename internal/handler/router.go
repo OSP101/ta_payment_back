@@ -41,6 +41,14 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	api.Post("/auth/login", loginLimiter, authH.Login)
 	api.Post("/auth/sso/callback", authH.SSOCallback) // stub
 	api.Get("/auth/sso/url", authH.SSOURL)
+	// Shared announcements. Anonymous by design — a link posted to Facebook or
+	// LINE is useless if it lands on a login page. The service only answers for
+	// rows staff explicitly opened, and only while they are live.
+	api.Get("/public/announcements/:id", (&AnnounceHandler{Svc: svc}).PublicGet)
+	// Pictures and files belonging to a shared announcement. The handler asks
+	// the service whether this exact key is on a public, live announcement, so
+	// nothing else in the store is reachable.
+	api.Get("/public/announcements/media/*", (&AnnounceHandler{Svc: svc}).ServePublicMedia)
 	api.Post("/auth/logout", authH.Logout)
 
 	// Authenticated. AccountGuard re-checks live account state (active +
@@ -231,17 +239,28 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// declaration order, so /:id would swallow "images/..." if placed above.
 	ah := &AnnounceHandler{Svc: svc}
 	authed.Post("/announcements/upload-image", adminOrStaff, ah.UploadImage)
+	authed.Post("/announcements/upload-media", adminOrStaff, ah.UploadMedia)
+	authed.Get("/announcements/media/*", ah.ServeMedia)
 	authed.Get("/announcements/images/*", ah.ServeImage)
 	authed.Get("/announcements", ah.List)
 	authed.Post("/announcements", adminOrStaff, ah.Upsert)
+	// These two literal paths MUST stay above "/announcements/:id": Fiber
+	// matches in registration order, so ":id" registered first would swallow
+	// them and try to parse "audience-filters" as a UUID.
+	authed.Post("/announcements/preview-audience", adminOrStaff, ah.AudiencePreview)
+	authed.Get("/announcements/audience-filters", adminOrStaff, ah.AudienceFilters)
 	authed.Get("/announcements/:id", ah.Get)
 	authed.Delete("/announcements/:id", adminOrStaff, ah.Delete)
 	authed.Post("/announcements/:id/publish", adminOrStaff, ah.Publish)
 	authed.Post("/announcements/:id/unpublish", adminOrStaff, ah.Unpublish)
+	authed.Post("/announcements/:id/send-email", adminOrStaff, ah.Resend)
 
 	// Dashboard
 	dashH := &DashboardHandler{Svc: svc}
 	authed.Get("/dashboard/executive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), dashH.Executive)
+	// The analytics view is the one thing the executive role can see.
+	authed.Get("/dashboard/analytics", RequireExecutiveView(svc.Pool), dashH.Analytics)
+	authed.Get("/dashboard/analytics.xlsx", RequireExecutiveView(svc.Pool), dashH.AnalyticsXLSX)
 	authed.Get("/dashboard/ta/me", RequireRole(rbac.RoleTA), dashH.TaOverview)
 	authed.Get("/dashboard/lecturer/me", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), dashH.LecturerOverview)
 

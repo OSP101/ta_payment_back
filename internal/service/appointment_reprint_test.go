@@ -26,48 +26,34 @@ func (f *apptFixture) firstOrderID(t *testing.T) uuid.UUID {
 	return id
 }
 
-// docxText pulls word/document.xml out of the returned zip — the only way to
+// docxText pulls word/document.xml out of the returned .docx — the only way to
 // read back what the reprint actually says.
-func docxText(t *testing.T, zipBytes []byte) string {
+//
+// A .docx IS a zip, so this opens exactly one level. Until 06/08/2026 the
+// service handed back a zip WRAPPING the .docx (next to a PDF) and this helper
+// opened two; the PDF was dropped and the wrapper with it.
+func docxText(t *testing.T, docxBytes []byte) string {
 	t.Helper()
-	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	zr, err := zip.NewReader(bytes.NewReader(docxBytes), int64(len(docxBytes)))
 	if err != nil {
-		t.Fatalf("open zip: %v", err)
+		t.Fatalf("open docx: %v", err)
 	}
-	for _, f := range zr.File {
-		if !strings.HasSuffix(f.Name, ".docx") {
+	for _, p := range zr.File {
+		if p.Name != "word/document.xml" {
 			continue
 		}
-		rc, err := f.Open()
+		prc, err := p.Open()
 		if err != nil {
 			t.Fatal(err)
 		}
-		var buf bytes.Buffer
-		if _, err := buf.ReadFrom(rc); err != nil {
+		defer prc.Close()
+		var doc bytes.Buffer
+		if _, err := doc.ReadFrom(prc); err != nil {
 			t.Fatal(err)
 		}
-		rc.Close()
-		inner, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
-		if err != nil {
-			t.Fatalf("open docx: %v", err)
-		}
-		for _, p := range inner.File {
-			if p.Name != "word/document.xml" {
-				continue
-			}
-			prc, err := p.Open()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var doc bytes.Buffer
-			if _, err := doc.ReadFrom(prc); err != nil {
-				t.Fatal(err)
-			}
-			prc.Close()
-			return doc.String()
-		}
+		return doc.String()
 	}
-	t.Fatal("no docx in the bundle")
+	t.Fatal("no word/document.xml — the returned bytes are not a .docx")
 	return ""
 }
 
