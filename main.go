@@ -12,6 +12,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	pdfcpu "github.com/pdfcpu/pdfcpu/pkg/api"
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/auth"
@@ -26,6 +27,26 @@ import (
 )
 
 func main() {
+	// pdfcpu writes a config.yml under os.UserConfigDir() the first time any
+	// call builds a default configuration, and it reports failure to create
+	// that directory by PANICKING (model.NewDefaultConfiguration → fault.Fail),
+	// not by returning an error. In the container the app runs as `nobody`,
+	// whose home is /, so the write landed on /.config and every creditor-form
+	// render died with "pdfcpu: config problem: mkdir /.config: permission
+	// denied" — a stack trace rendered into the page where the PDF should be.
+	//
+	// Nothing here customises pdfcpu, so the config file has no purpose: this
+	// tells pdfcpu to use its compiled-in defaults and never touch the disk.
+	// The one documented side effect is that user fonts become unavailable,
+	// which costs us nothing — the only pdfcpu text is the Helvetica watermark
+	// in internal/watermark, a core font. Thai text is drawn by gopdf with its
+	// own TTF registration and never goes through pdfcpu at all.
+	//
+	// Must run before the first NewDefaultConfiguration call. All three call
+	// sites (pdfgen.normalizedTemplate, service.mergePDFs, watermark.applyPDF)
+	// are inside request handlers, so main() is early enough.
+	pdfcpu.DisableConfigDir()
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config: %v", err)
