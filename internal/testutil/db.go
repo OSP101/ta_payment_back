@@ -29,6 +29,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/db"
 )
 
@@ -36,19 +37,54 @@ import (
 // process may use to CREATE DATABASE. Its own database is never modified.
 const adminURLEnv = "TEST_DATABASE_URL"
 
-// defaultAdminURL matches the docker-compose service shipped with this repo so
-// a developer who ran `docker compose up` needs no extra configuration.
-const defaultAdminURL = "postgres://itii_database_prod:2b15y2d2h6wzgZIksSSIkwR7udsbuCduKkdIrGtsPDhwJZVoVFdqR7m@localhost:5432/postgres?sslmode=disable"
-
 // dbSeq disambiguates databases created within the same process. Combined with
 // the PID it keeps concurrent `go test` invocations from colliding.
 var dbSeq atomic.Int64
 
-func adminURL() string {
+// adminURL resolves the connection string used to CREATE/DROP throwaway test
+// databases. TEST_DATABASE_URL (CI) wins outright; otherwise it is built from
+// DB_HOST/DB_PORT/DB_USER/DB_PASSWORD, loaded from the repo's own .env — the
+// same file `docker compose up` and the running server already use.
+//
+// This used to be a literal connection string with a real password baked into
+// this file. That value sat in git history (and on the private GitHub remote)
+// for weeks before anyone noticed, and every password rotation silently broke
+// it again until someone hardcoded the new one back in. Reading .env instead
+// means there is exactly one place the password lives, and it is the place
+// already excluded from git.
+func adminURL(t *testing.T) string {
+	t.Helper()
 	if v := os.Getenv(adminURLEnv); v != "" {
 		return v
 	}
-	return defaultAdminURL
+	config.LoadDotEnv(filepath.Join(repoRoot(t), ".env"))
+	user, pass, host, port := os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_HOST"), os.Getenv("DB_PORT")
+	if user == "" || host == "" || port == "" {
+		// No .env and no TEST_DATABASE_URL — NewPool's caller skips on the
+		// ensuing connection failure, same as it always has.
+		return ""
+	}
+	// The admin connection targets Postgres's own "postgres" maintenance
+	// database (needed to CREATE DATABASE), never DB_NAME — creating a
+	// sibling database requires connecting to some OTHER database first.
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/postgres?sslmode=disable", user, pass, host, port)
+}
+
+// repoRoot locates the repository root from this source file's own path, the
+// same trick MigrationsDir uses — works regardless of which package's tests
+// are running, since `go test` sets the working directory to the package
+// under test, not the repo root.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve testutil source path")
+	}
+	abs, err := filepath.Abs(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	return abs
 }
 
 // MigrationsDir resolves the repo's migrations directory from this source
@@ -78,7 +114,12 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	admin, err := pgxpool.New(ctx, adminURL())
+	url := adminURL(t)
+	if url == "" {
+		t.Skipf("no test database configured — set %s, or create a .env with "+
+			"DB_HOST/DB_PORT/DB_USER/DB_PASSWORD (see .env.example)", adminURLEnv)
+	}
+	admin, err := pgxpool.New(ctx, url)
 	if err != nil {
 		t.Skipf("no test database configured (%s): %v", adminURLEnv, err)
 	}
@@ -87,7 +128,7 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 	if err := admin.Ping(pingCtx); err != nil {
 		admin.Close()
 		t.Skipf("test database unreachable at %s — start it with `docker compose up -d` "+
-			"or set %s (%v)", redact(adminURL()), adminURLEnv, err)
+			"or set %s (%v)", redact(url), adminURLEnv, err)
 	}
 
 	name := fmt.Sprintf("ta_payment_test_%d_%d", os.Getpid(), dbSeq.Add(1))
@@ -98,7 +139,7 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("create database %s: %v", name, err)
 	}
 
-	pool, err := db.Connect(ctx, replaceDBName(adminURL(), name))
+	pool, err := db.Connect(ctx, replaceDBName(url, name))
 	if err != nil {
 		dropDatabase(admin, name)
 		admin.Close()

@@ -823,4 +823,3 @@ func slotLedger(costs []taSlotCost, track string) []SlotSettlement {
 	})
 	return out
 }
-

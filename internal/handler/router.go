@@ -75,6 +75,11 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/users/:id/reset-password", adminOrStaff, uh.ResetPassword)
 	authed.Post("/users/:id/deactivate", adminOrStaff, uh.Deactivate)
 	authed.Post("/users/:id/activate", adminOrStaff, uh.Activate)
+	// Admin-only, not adminOrStaff: clearing the re-auth lockout REVERSES a
+	// security control, and this codebase keeps reversals with admin while staff
+	// move work forward. Staff are also the people the gate protects against a
+	// stolen session, so they must not be able to clear each other's lockouts.
+	authed.Post("/users/:id/unlock-password-gate", RequireRole(rbac.RoleAdmin), uh.UnlockPasswordGate)
 
 	// Pay-rate & budget-cap settings (admin, staff). The faculty course catalog
 	// was removed — course identity now lives per-term on teaching_courses.

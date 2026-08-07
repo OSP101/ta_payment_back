@@ -9,9 +9,12 @@ import (
 	"time"
 )
 
-// loadDotEnv reads a KEY=VALUE file and populates os.Environ for keys not
-// already set. Silently no-ops if the file doesn't exist.
-func loadDotEnv(path string) {
+// LoadDotEnv reads a KEY=VALUE file and populates os.Environ for keys not
+// already set. Silently no-ops if the file doesn't exist. Exported so tools
+// outside this package (internal/testutil, in particular) can point a test
+// database connection at the same .env a developer already has, instead of
+// keeping a second, easily-stale copy of the same credentials in Go source.
+func LoadDotEnv(path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
@@ -79,9 +82,9 @@ type Config struct {
 func Load() (Config, error) {
 	// Auto-load .env from cwd and from the binary's directory (in that order).
 	// Never overrides existing environment variables.
-	loadDotEnv(".env")
+	LoadDotEnv(".env")
 	if exe, err := os.Executable(); err == nil {
-		loadDotEnv(exe + "/.env")
+		LoadDotEnv(exe + "/.env")
 	}
 
 	c := Config{

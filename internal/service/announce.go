@@ -60,6 +60,12 @@ type Announcement struct {
 	// AudienceCount is how many people the announcement actually reached.
 	// Filled by Get from the materialised ledger; 0 before publishing.
 	AudienceCount int `json:"audience_count"`
+	// Excerpt is the body with its markup taken off, cut to a length that fits
+	// a link-preview card. Filled by PublicGet, because the page that needs it
+	// is rendered for crawlers that cannot run the React renderer. Derived from
+	// Body by the same stripper the mail preview uses, so a shared card and an
+	// email can never describe the announcement differently.
+	Excerpt string `json:"excerpt,omitempty"`
 	// Recipients is the extra-email ledger. Populated by Get only — the feed
 	// has no use for it and it would be the largest field in every list row.
 	Recipients []AnnouncementRecipient `json:"recipients,omitempty"`

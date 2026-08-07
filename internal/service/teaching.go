@@ -2848,3 +2848,21 @@ func nilStr(s *string) any {
 
 // unused import guard
 var _ io.Reader = (io.Reader)(nil)
+
+// LecturerSupervisesTA reports whether the lecturer has this TA assigned in
+// any of their courses (either as the requesting lecturer or as a co-lecturer
+// on the course). Used to scope the timetable form: the form is a personal
+// weekly schedule, so "is a lecturer" alone must not open it.
+func (s *TeachingService) LecturerSupervisesTA(ctx context.Context, lecturerID, taID uuid.UUID) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM ta_request_assignments a
+			JOIN ta_requests r ON r.id = a.request_id
+			LEFT JOIN teaching_lecturers tl ON tl.teaching_course_id = r.teaching_course_id
+			WHERE a.ta_id = $1
+			  AND (r.lecturer_id = $2 OR tl.lecturer_id = $2)
+		)`, taID, lecturerID).Scan(&ok)
+	return ok, err
+}

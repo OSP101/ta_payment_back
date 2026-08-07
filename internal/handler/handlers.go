@@ -135,6 +135,28 @@ func (h *UserHandler) Deactivate(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// UnlockPasswordGate clears the re-authentication lockout on a user who mistyped
+// their password too many times at the document-download or worklog-edit gate.
+//
+// No confirm-email step, unlike Deactivate: this restores access rather than
+// removing it, and the worst case of a misfired click is that someone who was
+// not locked out stays not locked out. was_locked tells the admin which of those
+// just happened.
+func (h *UserHandler) UnlockPasswordGate(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	wasLocked, err := h.Svc.Users.ClearPasswordGateLockout(c.Context(), UserID(c), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "user not found")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true, "was_locked": wasLocked})
+}
+
 func (h *UserHandler) Activate(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -310,15 +332,32 @@ func (h *TeachingHandler) ListMyTACourses(c *fiber.Ctx) error {
 // caller may see it. A TA gets their own; staff, admin and lecturers may name
 // anyone. Shared by the JSON and PDF handlers so the two cannot drift into
 // different permissions for the same document.
-func timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.UUID, yearMonth string, err error) {
+func (h *TeachingHandler) timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.UUID, yearMonth string, err error) {
 	taID = UserID(c)
 	if raw := c.Query("user_id"); raw != "" {
 		id, perr := uuid.Parse(raw)
 		if perr != nil {
 			return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusBadRequest, "invalid user_id")
 		}
-		if id != taID && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer) {
-			return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusForbidden, "forbidden")
+		if id != taID {
+			switch {
+			case rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff):
+				// Staff prints forms for anyone; that is the job.
+			case rbac.Has(Roles(c), rbac.RoleLecturer):
+				// A lecturer prints forms for THEIR TAs. Before this check any
+				// lecturer account could pull any TA's weekly whereabouts by
+				// iterating user ids — a personal timetable is not faculty-wide
+				// data.
+				ok, qerr := h.Svc.Teaching.LecturerSupervisesTA(c.Context(), UserID(c), id)
+				if qerr != nil {
+					return uuid.Nil, uuid.Nil, "", qerr
+				}
+				if !ok {
+					return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusForbidden, "forbidden")
+				}
+			default:
+				return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusForbidden, "forbidden")
+			}
 		}
 		taID = id
 	}
@@ -328,9 +367,8 @@ func timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.UUID, yearMonth string
 	}
 	return taID, termID, c.Query("year_month"), nil
 }
-
 func (h *TeachingHandler) TimetableForm(c *fiber.Ctx) error {
-	taID, termID, yearMonth, err := timetableFormTarget(c)
+	taID, termID, yearMonth, err := h.timetableFormTarget(c)
 	if err != nil {
 		return err
 	}
@@ -344,7 +382,7 @@ func (h *TeachingHandler) TimetableForm(c *fiber.Ctx) error {
 // TimetableFormPDF serves the same document as a real PDF, so it can be filed
 // and signed without a browser in the loop.
 func (h *TeachingHandler) TimetableFormPDF(c *fiber.Ctx) error {
-	taID, termID, yearMonth, err := timetableFormTarget(c)
+	taID, termID, yearMonth, err := h.timetableFormTarget(c)
 	if err != nil {
 		return err
 	}
@@ -1739,7 +1777,25 @@ func (h *AnnounceHandler) List(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	if !isStaff {
+		for i := range out {
+			stripAnnounceTargeting(&out[i])
+		}
+	}
 	return c.JSON(out)
+}
+
+// stripAnnounceTargeting removes the staff-only aim of an announcement before
+// it goes to an ordinary reader. The target lists are the sensitive part: an
+// announcement aimed via "ta_missing_documents" carries, in target_user_ids,
+// the roster of exactly who has not turned their papers in — which is the
+// kind of disclosure the private targeting exists to avoid.
+func stripAnnounceTargeting(a *service.Announcement) {
+	a.TargetUserIDs = nil
+	a.TargetCourseIDs = nil
+	a.TargetFilters = nil
+	a.Recipients = nil
+	a.AudienceCount = 0
 }
 
 // Get returns one announcement. Non-staff callers can only see it if the row
@@ -1757,11 +1813,10 @@ func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
 		return err
 	}
 	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
-		// The recipient ledger is who-else-was-emailed. That is staff
-		// bookkeeping, not part of the notice, and handing a reader the
-		// address list of everyone it was sent to would leak contact details
-		// they never asked for.
-		a.Recipients = nil
+		// Who was aimed at, who was emailed — staff bookkeeping, not part of
+		// the notice. See stripAnnounceTargeting for why the target lists in
+		// particular must never reach a reader.
+		stripAnnounceTargeting(a)
 		if a.Status != "live" {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
@@ -2053,7 +2108,14 @@ func serveAnnounceMedia(c *fiber.Ctx, svc *service.Container, key string, shortC
 	}
 	k := strings.TrimSuffix(key, ".enc")
 	ct := "application/octet-stream"
-	switch strings.ToLower(k[strings.LastIndex(k, "."):]) {
+	// Guard the slice: LastIndex on an extensionless key returns -1 and
+	// k[-1:] panics. Our minted keys always carry an extension, but a served
+	// path must not be one odd row away from a crash.
+	ext := ""
+	if dot := strings.LastIndex(k, "."); dot >= 0 {
+		ext = strings.ToLower(k[dot:])
+	}
+	switch ext {
 	case ".jpg", ".jpeg":
 		ct = "image/jpeg"
 	case ".png":

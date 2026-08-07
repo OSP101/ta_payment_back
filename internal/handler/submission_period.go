@@ -439,7 +439,13 @@ func (h *SubmissionPeriodHandler) ServeEditFile(c *fiber.Ctx) error {
 		return err
 	}
 	k := strings.TrimSuffix(key, ".enc")
-	switch strings.ToLower(k[strings.LastIndex(k, "."):]) {
+	// Guard the slice: LastIndex on an extensionless key returns -1 and
+	// k[-1:] panics.
+	ext := ""
+	if dot := strings.LastIndex(k, "."); dot >= 0 {
+		ext = strings.ToLower(k[dot:])
+	}
+	switch ext {
 	case ".jpg", ".jpeg":
 		c.Set("Content-Type", "image/jpeg")
 	case ".png":

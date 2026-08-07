@@ -32,8 +32,13 @@ type User struct {
 	MustChangePassword bool      `json:"must_change_password"`
 	// IsExecutive grants the read-only budget-analytics dashboard. A flag,
 	// not a role_code value — see rbac.RoleExecutive.
-	IsExecutive bool     `json:"is_executive"`
-	Roles       []string `json:"roles"`
+	IsExecutive bool `json:"is_executive"`
+	// AdminPosition is a free-text administrative role (e.g. "หัวหน้าสาขาวิชา
+	// วิทยาการคอมพิวเตอร์") shown next to the person's role label. Display
+	// only: it does not feed appointment orders or the term certifier, which
+	// draw from the separate admin_officers roster.
+	AdminPosition *string  `json:"admin_position,omitempty"`
+	Roles         []string `json:"roles"`
 	// AvatarURL is derived, never stored: the API path that streams the
 	// picture, with the last-changed timestamp as a cache-buster. Nil when the
 	// user has not set one, which is what tells the UI to draw initials.
@@ -149,9 +154,9 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	var avatarKey *string
 	var avatarAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, is_executive, avatar_key, avatar_updated_at
+		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, is_executive, admin_position, avatar_key, avatar_updated_at
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
-		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &avatarKey, &avatarAt,
+		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -369,7 +374,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 	// over a non-unique sort key lets Postgres return tied rows in a different
 	// order per query — the same person could appear on two pages while someone
 	// else appeared on none.
-	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.is_executive, u.avatar_key, u.avatar_updated_at
+	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.is_executive, u.admin_position, u.avatar_key, u.avatar_updated_at
 	      FROM users u WHERE ` + where + ` ORDER BY ` + f.orderBy() + `, u.id
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)
@@ -383,7 +388,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 		var u User
 		var avatarKey *string
 		var avatarAt *time.Time
-		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &avatarKey, &avatarAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt); err != nil {
 			return nil, 0, err
 		}
 		u.AvatarURL = avatarURL(u.ID, avatarKey, avatarAt)
@@ -467,11 +472,13 @@ type UpdateUserInput struct {
 	// Grants/revokes the read-only executive dashboard. Staff may set this —
 	// the management team are lecturers, and per the 06/08/2026 decision the
 	// officer ticks the flag per person in the users page.
-	IsExecutive *bool   `json:"is_executive,omitempty"`
-	BankName    *string `json:"bank_name,omitempty"`
-	BankBranch  *string `json:"bank_branch,omitempty"`
-	BranchCode  *string `json:"branch_code,omitempty"`
-	AccountNo   *string `json:"account_no,omitempty"`
+	IsExecutive *bool `json:"is_executive,omitempty"`
+	// AdminPosition: pass "" to clear. Staff/admin only — see the handler gate.
+	AdminPosition *string `json:"admin_position,omitempty"`
+	BankName      *string `json:"bank_name,omitempty"`
+	BankBranch    *string `json:"bank_branch,omitempty"`
+	BranchCode    *string `json:"branch_code,omitempty"`
+	AccountNo     *string `json:"account_no,omitempty"`
 }
 
 func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in UpdateUserInput) (*User, error) {
@@ -515,6 +522,13 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 	}
 	if in.IsExecutive != nil {
 		add("is_executive", *in.IsExecutive)
+	}
+	if in.AdminPosition != nil {
+		if strings.TrimSpace(*in.AdminPosition) == "" {
+			sets = append(sets, "admin_position=NULL")
+		} else {
+			add("admin_position", strings.TrimSpace(*in.AdminPosition))
+		}
 	}
 	if in.StudyYear != nil {
 		// 0 is the "clear" sentinel; any other value is validated to 1..8.
