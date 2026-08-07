@@ -3,6 +3,7 @@ package service
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // The plain form is what lands in the bell and in an email client. Whatever it
@@ -41,5 +42,34 @@ func TestAnnounceBodyPlain_LeavesNoMarkers(t *testing.T) {
 		if strings.Contains(got, marker) {
 			t.Errorf("plain text still contains %q: %q", marker, got)
 		}
+	}
+}
+
+// A card description lives in an HTML attribute and is rendered as one line.
+// Line structure that reads fine in an email arrives there as a squashed run.
+func TestAnnounceExcerpt_IsOneLine(t *testing.T) {
+	body := "**หัวข้อ**\n\n- ข้อหนึ่ง\n- ข้อสอง\n\n:::center\nปิดท้าย"
+	got := announceExcerpt(body, 200)
+	if strings.ContainsAny(got, "\n\r\t") {
+		t.Errorf("excerpt still carries line structure: %q", got)
+	}
+	if strings.Contains(got, "  ") {
+		t.Errorf("excerpt has a double space: %q", got)
+	}
+	want := "หัวข้อ - ข้อหนึ่ง - ข้อสอง ปิดท้าย"
+	if got != want {
+		t.Errorf("announceExcerpt()\n got %q\nwant %q", got, want)
+	}
+}
+
+// The cut is by rune. Thai is three bytes per character, so a byte-based cut
+// would slice a character in half and yield invalid UTF-8.
+func TestAnnounceExcerpt_CutsByRune(t *testing.T) {
+	got := announceExcerpt(strings.Repeat("ก", 50), 10)
+	if n := len([]rune(strings.TrimSuffix(got, "…"))); n > 10 {
+		t.Errorf("cut to %d runes, want <= 10 (%q)", n, got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("excerpt is not valid UTF-8: %q", got)
 	}
 }

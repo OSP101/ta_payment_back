@@ -181,7 +181,7 @@ func (s *AnnounceService) PublicGet(ctx context.Context, id uuid.UUID) (*Announc
 	a.Status = "live"
 	// 200 runes: enough for Facebook's description line, short enough that it is
 	// never truncated mid-card by the platform instead.
-	a.Excerpt = truncateRunes(announceBodyPlain(a.Body), 200)
+	a.Excerpt = announceExcerpt(a.Body, 200)
 	if att, err := s.loadAttachments(ctx, id); err == nil {
 		a.Attachments = att
 	}

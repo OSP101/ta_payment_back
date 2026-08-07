@@ -48,3 +48,18 @@ func announceBodyPlain(body string) string {
 	}
 	return strings.TrimSpace(s)
 }
+
+// wsRunRE matches any run of whitespace, newlines included.
+var wsRunRE = regexp.MustCompile(`\s+`)
+
+// announceExcerpt is the body as a link-preview card wants it: no markup, and
+// no line structure either.
+//
+// announceBodyPlain deliberately KEEPS the line breaks and the "- " markers,
+// because a plain-text email is a page and reads as one. A card description is
+// a single line inside an HTML attribute — the newlines survive into the markup
+// and the platform renders them as a squashed run, so here they collapse to
+// ordinary spaces. Same words, same order; only the shape differs.
+func announceExcerpt(body string, maxRunes int) string {
+	return truncateRunes(strings.TrimSpace(wsRunRE.ReplaceAllString(announceBodyPlain(body), " ")), maxRunes)
+}
