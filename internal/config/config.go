@@ -72,6 +72,15 @@ type Config struct {
 	// TADocsEncKey is a 32-byte AES-256 key (base64) used to encrypt TA
 	// documents at rest. Optional — when empty, files are stored unencrypted.
 	TADocsEncKey string
+	// PIIEncKey is a 32-byte XChaCha20-Poly1305 key (base64) used by
+	// internal/pii to encrypt the TA citizen ID (ta_profiles.citizen_id_enc).
+	// Deliberately a SEPARATE secret from TADocsEncKey — one leaking must not
+	// leak the other. Required, unlike TADocsEncKey: that key protects files
+	// that predate encryption and so has an unencrypted fallback for
+	// continuity; this one protects a field being stored for the first time
+	// under an explicit "must be encrypted, no exceptions" requirement, so
+	// there is no unencrypted mode to fall back to.
+	PIIEncKey string
 	// BOT (Bank of Thailand) Open API — Financial Institutions' Holidays.
 	// Used by the "ซิงก์จาก BOT" button on /staff/holidays to seed national
 	// holidays. Empty ClientID → sync endpoint returns 503.
@@ -107,6 +116,7 @@ func Load() (Config, error) {
 		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.pdf"),
 		FontDir:              env("FONT_DIR", "./assets/fonts"),
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
+		PIIEncKey:            env("PII_ENC_KEY", ""),
 		BotAPIBaseURL:        env("BOT_API_BASE_URL", "https://gateway.api.bot.or.th/financial-institutions-holidays"),
 		BotAPIClientID:       env("BOT_API_CLIENT_ID", ""),
 		ClamAVAddr:           env("CLAMAV_ADDR", ""),
@@ -118,6 +128,9 @@ func Load() (Config, error) {
 	c.ClamAVTimeout = envDuration("CLAMAV_TIMEOUT", 30*time.Second)
 	if c.JWTSecret == "" {
 		return c, fmt.Errorf("JWT_SECRET is required")
+	}
+	if c.PIIEncKey == "" {
+		return c, fmt.Errorf("PII_ENC_KEY is required")
 	}
 	return c, nil
 }

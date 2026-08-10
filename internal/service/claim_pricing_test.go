@@ -105,7 +105,7 @@ func TestCollectCombinedBook_SpecialSheetExcludesCoTaughtTime(t *testing.T) {
 	insertLog(f, f.AssignmentID, day(10), "09:00", "11:00", 2)
 	insertLog(f, special, day(10), "09:00", "13:00", 4) // 2 co-taught + 2 own
 
-	d, err := exportSvcFor(f).collectCombinedBook(f.ctx, f.CourseID)
+	d, err := exportSvcFor(f).collectCombinedBook(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestCombinedBook_PrintsAllHoursAndFundsOnlyWhatTheBudgetReached(t *testing.
 	squeezeToSlots(t, f, 6)
 	svc := exportSvcFor(f)
 
-	d, err := svc.collectCombinedBook(f.ctx, f.CourseID)
+	d, err := svc.collectCombinedBook(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestCombinedBook_PrintsAllHoursAndFundsOnlyWhatTheBudgetReached(t *testing.
 		t.Error("claimant must read as underfunded that is what makes ขอเบิกจ่ายเพียง print")
 	}
 	// …and must equal what the payout actually transfers.
-	comp, err := svc.buildExportRows(f.ctx, f.CourseID)
+	comp, err := svc.buildExportRows(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

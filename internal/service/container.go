@@ -8,6 +8,7 @@ import (
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/mail"
+	"ta-payment-back/internal/pii"
 	"ta-payment-back/internal/storage"
 )
 
@@ -39,7 +40,7 @@ type Container struct {
 	DocProgress       *DocumentProgressService
 }
 
-func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config) *Container {
+func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher) *Container {
 	c := &Container{Pool: pool, Storage: store, Mailer: mailer, Auditor: auditor, Cfg: cfg}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
@@ -53,12 +54,12 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	if !av.Enabled() {
 		log.Printf("WARNING: CLAMAV_ADDR is not set — uploaded documents are NOT virus-scanned")
 	}
-	c.Docs = &DocsService{pool: pool, aud: auditor, store: store, av: av}
+	c.Docs = &DocsService{pool: pool, aud: auditor, store: store, av: av, pii: piiCipher}
 	// Workload holds a back-reference to TARequest so saving a TA timetable can
 	// finalise the requests that were waiting for it (deferred-decision model).
 	c.Workload = &WorkloadService{pool: pool, requests: c.TARequest}
 	c.WorkLog = &WorkLogService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
-	c.Export = &ExportService{pool: pool, aud: auditor, notify: c.Notify, store: store, budget: c.Budget, teaching: c.Teaching}
+	c.Export = &ExportService{pool: pool, aud: auditor, notify: c.Notify, store: store, budget: c.Budget, teaching: c.Teaching, users: c.Users, docs: c.Docs}
 	// Back-reference, set after both exist: approving is what moves the budget,
 	// and the settlement that decides the shortfall lives on Export.
 	c.WorkLog.export = c.Export

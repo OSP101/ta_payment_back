@@ -20,6 +20,7 @@ import (
 	"ta-payment-back/internal/db"
 	"ta-payment-back/internal/handler"
 	"ta-payment-back/internal/mail"
+	"ta-payment-back/internal/pii"
 	"ta-payment-back/internal/rbac"
 	"ta-payment-back/internal/scheduler"
 	"ta-payment-back/internal/service"
@@ -83,11 +84,23 @@ func main() {
 		log.Fatalf("storage: %v", err)
 	}
 
+	// PII_ENC_KEY is validated as present by config.Load — parse it the same
+	// way as TA_DOCS_ENC_KEY (32 bytes, hex or base64), but into its own
+	// cipher. See internal/pii for why this is a separate key from encKey.
+	piiKey, err := storage.ParseKeyFromBase64(cfg.PIIEncKey)
+	if err != nil {
+		log.Fatalf("PII_ENC_KEY: %v", err)
+	}
+	piiCipher, err := pii.New(piiKey)
+	if err != nil {
+		log.Fatalf("pii: %v", err)
+	}
+
 	mailer := mail.New(cfg)
 	auditor := audit.New(pool)
 	tokens := auth.NewTokenService(cfg.JWTSecret, cfg.JWTIssuer)
 
-	services := service.NewContainer(pool, store, mailer, auditor, cfg)
+	services := service.NewContainer(pool, store, mailer, auditor, cfg, piiCipher)
 
 	app := fiber.New(fiber.Config{
 		AppName:      "TA Payment API",

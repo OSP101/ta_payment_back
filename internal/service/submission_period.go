@@ -533,7 +533,10 @@ func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taI
 // exported it. Months still being worked on are left untouched (editable), so
 // re-exporting later locks whatever has since become ready. Returns the number
 // of (TA × month) cells newly locked.
-func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor, tcID uuid.UUID) (int, error) {
+//
+// months (Gregorian "YYYY-MM", empty = every month) confines the lock to the
+// fiscal slice actually exported — see the SQL comment below.
+func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor, tcID uuid.UUID, months []string) (int, error) {
 	name := s.userDisplayName(ctx, actor)
 	// This is the freeze point for a course's payout numbers, so the lock rows
 	// and the record of the lock go in together.
@@ -562,13 +565,19 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		  -- lecturer-approved month qualified, which is the gap the meeting
 		  -- closed by making "ตรวจสอบเบิกจ่ายค่าตอบแทน" its own step.
 		  AND COALESCE(st.status,'pending') = 'staff_reviewed'
+		  -- The approved work this period is locked FOR must fall inside the
+		  -- fiscal slice being exported. Without this, issuing มิ.ย.–ก.ย. in
+		  -- September would also freeze ตุลาคม, which is still being taught and
+		  -- belongs to the next budget year's document.
 		  AND EXISTS (
 		        SELECT 1 FROM work_logs wl
 		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		        JOIN sections s2 ON s2.id = a2.section_id
 		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
 		          AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
-		          AND wl.status = 'approved')
+		          AND wl.status = 'approved'
+		          AND (COALESCE(cardinality($4::text[]), 0) = 0
+		               OR to_char(wl.work_date,'YYYY-MM') = ANY($4::text[])))
 		  AND NOT EXISTS (
 		        SELECT 1 FROM work_logs wl
 		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
@@ -583,7 +592,7 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		    exported_by   = EXCLUDED.exported_by,
 		    exported_name = EXCLUDED.exported_name
 		WHERE submission_period_status.status NOT IN ('exported','finance_sent')
-		RETURNING ta_id, submission_period_id`, tcID, actor, name)
+		RETURNING ta_id, submission_period_id`, tcID, actor, name, months)
 	if err != nil {
 		return 0, err
 	}
@@ -676,24 +685,35 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 }
 
 // assertPayoutReady rejects the finance handoff when the TA's profile is
-// missing, not yet approved by staff, or lacks the national ID / bank fields
-// the reimbursement documents need.
+// missing, not yet approved by staff, or lacks an approved creditor-form
+// document. The national ID / bank columns this used to check no longer
+// exist (PDPA, migration 0047) — that data now lives only in the
+// creditor-form PDF, so an approved copy of that document is the readiness
+// signal. Mirrors ExportService.validatePayoutReadiness in export.go, scoped
+// to a single TA.
 func (s *SubmissionPeriodService) assertPayoutReady(ctx context.Context, taID uuid.UUID) error {
-	var status, nid, acct, bank string
+	var hasProfile bool
+	var status string
+	var missingForm bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT status::text, COALESCE(national_id,''), COALESCE(account_no,''), COALESCE(bank_name,'')
-		FROM ta_profiles WHERE user_id = $1`, taID).Scan(&status, &nid, &acct, &bank)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Invalid("ส่งการเงินไม่ได้ TA ยังไม่ได้กรอกข้อมูลโปรไฟล์/บัญชีธนาคาร")
-	}
+		SELECT p.user_id IS NOT NULL, COALESCE(p.status::text, ''),
+		       NOT EXISTS (
+		           SELECT 1 FROM ta_documents d
+		           WHERE d.user_id = $1 AND d.kind = 'creditor_form'
+		             AND d.superseded_at IS NULL AND d.status = 'approved')
+		FROM (SELECT 1) x
+		LEFT JOIN ta_profiles p ON p.user_id = $1`, taID).Scan(&hasProfile, &status, &missingForm)
 	if err != nil {
 		return err
+	}
+	if !hasProfile {
+		return Invalid("ส่งการเงินไม่ได้ TA ยังไม่ได้กรอกข้อมูลโปรไฟล์/บัญชีธนาคาร")
 	}
 	if status != "approved" {
 		return Invalid("ส่งการเงินไม่ได้ เอกสารโปรไฟล์ของ TA ยังไม่ผ่านการอนุมัติจากเจ้าหน้าที่")
 	}
-	if nid == "" || acct == "" || bank == "" {
-		return Invalid("ส่งการเงินไม่ได้ ข้อมูลเลขบัตรประชาชนหรือบัญชีธนาคารของ TA ไม่ครบถ้วน")
+	if missingForm {
+		return Invalid("ส่งการเงินไม่ได้ ยังไม่มีแบบฟอร์มเจ้าหนี้ที่อนุมัติแล้ว")
 	}
 	return nil
 }

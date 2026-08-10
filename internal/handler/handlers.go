@@ -2358,7 +2358,8 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	body, name, taCount, err := h.Svc.Export.BuildCourseZip(c.Context(), id)
+	months := monthsParam(c)
+	body, name, taCount, err := h.Svc.Export.BuildCourseZip(c.Context(), id, months)
 	if err != nil {
 		return err
 	}
@@ -2370,7 +2371,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// underlying worklogs stayed editable (file silently diverges from the DB).
 	// Fail the request instead so staff retries; months still being worked on
 	// stay editable and lock on a later re-export.
-	if _, err := h.Svc.SubmissionPeriods.MarkCourseExported(c.Context(), actor, id); err != nil {
+	if _, err := h.Svc.SubmissionPeriods.MarkCourseExported(c.Context(), actor, id, months); err != nil {
 		return err
 	}
 	// Freeze section edits — this export is now the source of truth for the
@@ -2392,12 +2393,13 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// the recorded figure matches the ZIP the staff hands to finance — the old
 	// Budget.UsedBaht used different math and never reconciled with the file.
 	// Best-effort — a DB write failure must NOT hide the (already-locked) zip.
-	if prev, perr := h.Svc.Export.CoursePreview(c.Context(), id); perr == nil {
+	if prev, perr := h.Svc.Export.CoursePreview(c.Context(), id, months); perr == nil {
 		_, _ = h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
 			TeachingCourseID: id,
 			FilePath:         name, // in-memory zip; we persist just the name for reference
 			FileName:         name,
 			TACount:          taCount,
+			Months:           months,
 			TotalBaht:        prev.TotalActual,
 		})
 	}
@@ -2432,7 +2434,22 @@ func (h *ExportHandler) CoursePreview(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	out, err := h.Svc.Export.CoursePreview(c.Context(), id)
+	out, err := h.Svc.Export.CoursePreview(c.Context(), id, monthsParam(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// CourseExportCoverage — GET /exports/course/:id/coverage — the term's months
+// with Thai labels, which of them this course has already exported, and where
+// the budget year cuts. Drives the month picker on the payout screen.
+func (h *ExportHandler) CourseExportCoverage(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Export.CourseExportCoverage(c.Context(), id)
 	if err != nil {
 		return err
 	}

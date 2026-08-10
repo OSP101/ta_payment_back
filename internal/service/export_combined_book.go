@@ -102,8 +102,8 @@ type combinedBookData struct {
 
 // BuildCombinedClaimWorkbook renders one course's entire payout as a single
 // printable workbook.
-func (s *ExportService) BuildCombinedClaimWorkbook(ctx context.Context, courseID uuid.UUID) ([]byte, error) {
-	d, err := s.collectCombinedBook(ctx, courseID)
+func (s *ExportService) BuildCombinedClaimWorkbook(ctx context.Context, courseID uuid.UUID, months []string) ([]byte, error) {
+	d, err := s.collectCombinedBook(ctx, courseID, months)
 	if err != nil {
 		return nil, err
 	}
@@ -1100,7 +1100,7 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 }
 
 // collectCombinedBook gathers every claimant on a course across the whole term.
-func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.UUID) (*combinedBookData, error) {
+func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.UUID, months []string) (*combinedBookData, error) {
 	d := &combinedBookData{}
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `
@@ -1205,7 +1205,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 
 	var earliest, latest time.Time
 	for _, p := range people {
-		logs, err := s.claimLogsAllMonths(ctx, p.id, courseID)
+		logs, err := s.claimLogsAllMonths(ctx, p.id, courseID, months)
 		if err != nil {
 			return nil, err
 		}
@@ -1291,9 +1291,15 @@ func rateFor(pr PayRate, level, track string) float64 {
 	return pr.GraduateRegularHourly
 }
 
-// claimLogsAllMonths is claimLogs without the month filter: one block now covers
-// the whole term, which is the change this file exists for.
-func (s *ExportService) claimLogsAllMonths(ctx context.Context, taID, courseID uuid.UUID) ([]claimLogRow, error) {
+// claimLogsAllMonths gathers a TA's approved คาบ for the course as ONE block
+// rather than a workbook per month — the change this file exists for.
+//
+// "AllMonths" is now bounded by months (Gregorian "YYYY-MM", empty = the whole
+// term): งบแผ่นดิน closes 30 กันยายน mid-ภาคต้น, so a claim covering มิ.ย.–ต.ค.
+// cannot be filed against one appropriation. Without this filter a second
+// export issued after October repeats มิ.ย.–ก.ย. in full and the finance office
+// is billed for them twice.
+func (s *ExportService) claimLogsAllMonths(ctx context.Context, taID, courseID uuid.UUID, months []string) ([]claimLogRow, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT sec.sec_no, sec.track::text, wl.work_date,
 		       EXTRACT(HOUR FROM wl.start_time)*60 + EXTRACT(MINUTE FROM wl.start_time),
@@ -1304,7 +1310,8 @@ func (s *ExportService) claimLogsAllMonths(ctx context.Context, taID, courseID u
 		JOIN sections sec ON sec.id = a.section_id
 		WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
 		  AND wl.status = 'approved'
-		ORDER BY wl.work_date, wl.start_time`, taID, courseID)
+		  AND `+monthFilterSQL("wl.work_date", "$3")+`
+		ORDER BY wl.work_date, wl.start_time`, taID, courseID, months)
 	if err != nil {
 		return nil, err
 	}

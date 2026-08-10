@@ -138,7 +138,7 @@ func TestBillableHours_SQLAgreesWithTheGoMerger(t *testing.T) {
 			courseID := seedSittingCase(t, pool, ctx, c)
 
 			svc := &ExportService{pool: pool}
-			byTrack, err := svc.billableHoursByTATrack(ctx, courseID)
+			byTrack, err := svc.billableHoursByTATrack(ctx, courseID, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -128,12 +128,15 @@ type taTrackKey struct {
 // The key is deliberately NOT the assignment: a sitting can span two sections,
 // so it belongs to the pair the money is billed at, not to one of the sections
 // that happened to be in it.
-func (s *ExportService) billableHoursByTATrack(ctx context.Context, courseID uuid.UUID) (map[taTrackKey]float64, error) {
+// months (Gregorian "YYYY-MM", empty = the whole term) restricts the count to
+// one fiscal slice — see monthFilterSQL.
+func (s *ExportService) billableHoursByTATrack(ctx context.Context, courseID uuid.UUID, months []string) (map[taTrackKey]float64, error) {
 	rows, err := s.pool.Query(ctx, `WITH`+mergedSittingsCTE+`
 		SELECT ta_id, track, SUM(hours)
 		FROM sittings
 		WHERE teaching_course_id = $1
-		GROUP BY ta_id, track`, courseID)
+		  AND `+monthFilterSQL("work_date", "$2")+`
+		GROUP BY ta_id, track`, courseID, months)
 	if err != nil {
 		return nil, err
 	}

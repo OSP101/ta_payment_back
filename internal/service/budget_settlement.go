@@ -387,9 +387,12 @@ func (c *CourseSettlement) unpaidMonthSet(track string) map[string]bool {
 // the gap between them is precisely the money the cutoff took away. Recomputed
 // per TA from their own สittings rather than scaled from the total, because
 // scaling is the thing this rule exists to avoid.
+// months (Gregorian "YYYY-MM", empty = all) must match the scope the records
+// were built with: a มิ.ย.–ก.ย. document never contained October's คาบ, so
+// deducting October's dropped ones from it would understate the slice.
 func (s *ExportService) dropUnpaidWork(
 	ctx context.Context, courseID uuid.UUID,
-	records []exportRow, settlement *CourseSettlement, pr PayRate,
+	records []exportRow, settlement *CourseSettlement, pr PayRate, months []string,
 ) error {
 	if settlement.Regular.CutoffDate == "" && settlement.Special.CutoffDate == "" {
 		return nil
@@ -401,8 +404,15 @@ func (s *ExportService) dropUnpaidWork(
 	if err != nil {
 		return err
 	}
+	_, inSlice, err := s.courseMonthShare(ctx, courseID, months)
+	if err != nil {
+		return err
+	}
 	lost := map[uuid.UUID]float64{}
 	for _, c := range costs {
+		if !inSlice(c.YearMonth) {
+			continue
+		}
 		t := settlement.Regular
 		if c.Track == "special" {
 			t = settlement.Special

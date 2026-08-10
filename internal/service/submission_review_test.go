@@ -78,7 +78,7 @@ func TestExport_RefusesMonthNotStaffReviewed(t *testing.T) {
 	f, _ := reviewFixture(t)
 	staff := f.insertUser("staff", "officer")
 
-	n, err := f.Periods.MarkCourseExported(f.ctx, staff, f.CourseID)
+	n, err := f.Periods.MarkCourseExported(f.ctx, staff, f.CourseID, nil)
 	if err != nil {
 		t.Fatalf("MarkCourseExported: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestExport_AllowsMonthAfterStaffReview(t *testing.T) {
 		t.Fatalf("status = %q, want %q", got, StatusStaffReviewed)
 	}
 
-	n, err := f.Periods.MarkCourseExported(f.ctx, staff, f.CourseID)
+	n, err := f.Periods.MarkCourseExported(f.ctx, staff, f.CourseID, nil)
 	if err != nil {
 		t.Fatalf("MarkCourseExported: %v", err)
 	}

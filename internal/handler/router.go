@@ -97,6 +97,21 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/terms/:id/usage", adminOrStaff, th.TermUsage)
 	authed.Delete("/terms/:id", adminOrStaff, th.DeleteTerm)
 
+	// Curricula — the sheet identity the two payout documents (สรุปรายวิชาที่
+	// ขอใช้ TA, ปะหน้าจ่ายตรง) print under, plus the course-group review flow
+	// for courses taught under more than one registrar code.
+	authed.Get("/curricula", th.ListCurricula)
+	authed.Patch("/curricula/:code", adminOrStaff, th.UpdateCurriculum)
+	authed.Patch("/sections/:id/curriculum", adminOrStaff, th.UpdateSectionCurriculum)
+	authed.Get("/terms/:id/course-groups/candidates", adminOrStaff, th.CourseGroupCandidates)
+	authed.Post("/terms/:id/course-groups", adminOrStaff, th.ConfirmCourseGroup)
+
+	// สรุปรายวิชาที่ขอใช้ TA — the budget-request workbook staff assembled by
+	// hand at the start of every term.
+	authed.Get("/exports/terms/:id/course-summary/warnings", adminOrStaff, th.CourseSummaryWarnings)
+	authed.Get("/exports/terms/:id/course-summary.xlsx", adminOrStaff, th.CourseSummaryXLSX)
+	authed.Get("/exports/terms/:id/course-summary/preview", adminOrStaff, th.CourseSummaryPreview)
+
 	// Teaching courses
 	authed.Get("/teaching-courses", th.List)
 	// Timetable kinds (บรรยาย/ปฏิบัติการ) for a term — any signed-in user.
@@ -276,6 +291,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 	// Read-only payout preview — review the numbers before the locking download.
 	authed.Get("/exports/course/:id/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursePreview)
+	authed.Get("/exports/course/:id/coverage", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseExportCoverage)
 	// No role guard: the service checks that the caller teaches or assists the
 	// course. A budget that decides a TA's own pay is not a staff secret.
 	authed.Get("/teaching-courses/:tcId/budget-settlement", eh.BudgetSettlement)
@@ -290,6 +306,14 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// produces, not of the academic calendar.
 	authed.Get("/exports/terms/:id/certifier", adminOrStaff, eh.Certifier)
 	authed.Put("/exports/terms/:id/certifier", adminOrStaff, eh.SetCertifier)
+	// ปะหน้าจ่ายตรง (แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร) — gated on every course in
+	// the term reaching finance_sent, unlike the course-summary above.
+	authed.Get("/exports/terms/:id/transfer-cover/blockers", adminOrStaff, eh.TransferCoverBlockers)
+	authed.Get("/exports/terms/:id/transfer-cover.xlsx", adminOrStaff, eh.TransferCoverXLSX)
+	authed.Get("/exports/terms/:id/transfer-cover/preview", adminOrStaff, eh.TransferCoverPreview)
+	authed.Get("/exports/terms/:id/transfer-cover/coverage", adminOrStaff, eh.TransferCoverCoverage)
+	authed.Get("/exports/terms/:id/transfer-cover/history", adminOrStaff, eh.TransferCoverHistory)
+	authed.Get("/exports/transfer-cover/:id/reprint", adminOrStaff, eh.TransferCoverReprint)
 	authed.Get("/exports/appointment-order/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentPreview)
 	authed.Get("/exports/appointment-order/rounds", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRounds)
 	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentOrder)

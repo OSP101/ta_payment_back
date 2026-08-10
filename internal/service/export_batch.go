@@ -29,6 +29,9 @@ type ExportBatch struct {
 	GeneratedAt        string     `json:"generated_at"`
 	GeneratedBy        uuid.UUID  `json:"generated_by"`
 	GeneratedByName    string     `json:"generated_by_name,omitempty"`
+	// Months is the fiscal slice this ZIP covered, Gregorian "YYYY-MM". Empty
+	// for batches recorded before the split existed — those were whole-term.
+	Months []string `json:"months,omitempty"`
 }
 
 // Record persists a batch that has already been written to storage.
@@ -44,11 +47,11 @@ func (s *ExportBatchService) Record(ctx context.Context, actor uuid.UUID, in Exp
 				INSERT INTO export_batches
 				    (id, teaching_course_id, submission_period_id,
 				     file_path, file_name, ta_count, total_baht,
-				     generated_at, generated_by)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9)`,
+				     generated_at, generated_by, months)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9,$10)`,
 				in.ID, in.TeachingCourseID, in.SubmissionPeriodID,
 				in.FilePath, in.FileName, in.TACount, in.TotalBaht,
-				in.GeneratedAt, in.GeneratedBy)
+				in.GeneratedAt, in.GeneratedBy, in.Months)
 			return err
 		}); err != nil {
 		return nil, err
@@ -62,7 +65,8 @@ func (s *ExportBatchService) ListByCourse(ctx context.Context, tcID uuid.UUID) (
 		SELECT b.id, b.teaching_course_id, b.submission_period_id,
 		       b.file_path, b.file_name, b.ta_count, b.total_baht,
 		       TO_CHAR(b.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
-		       b.generated_by, u.first_name||' '||u.last_name
+		       b.generated_by, u.first_name||' '||u.last_name,
+		       COALESCE(b.months, '{}')
 		FROM export_batches b
 		JOIN users u ON u.id = b.generated_by
 		WHERE b.teaching_course_id = $1
@@ -76,7 +80,7 @@ func (s *ExportBatchService) ListByCourse(ctx context.Context, tcID uuid.UUID) (
 		var b ExportBatch
 		if err := rows.Scan(&b.ID, &b.TeachingCourseID, &b.SubmissionPeriodID,
 			&b.FilePath, &b.FileName, &b.TACount, &b.TotalBaht,
-			&b.GeneratedAt, &b.GeneratedBy, &b.GeneratedByName); err != nil {
+			&b.GeneratedAt, &b.GeneratedBy, &b.GeneratedByName, &b.Months); err != nil {
 			return nil, err
 		}
 		out = append(out, b)

@@ -23,7 +23,7 @@ func payoutReady(f *fixture) {
 // blockerKinds is the set of stages a course is currently stuck at.
 func blockerKinds(t *testing.T, f *fixture) map[string]int {
 	t.Helper()
-	bs, err := exportSvcFor(f).CourseExportBlockers(f.ctx, f.CourseID)
+	bs, err := exportSvcFor(f).CourseExportBlockers(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestExportGate_BlocksWhileTheLecturerStillHasRows(t *testing.T) {
 	if got := blockerKinds(t, f)["waiting_lecturer"]; got != 1 {
 		t.Fatalf("waiting_lecturer = %d, want 1", got)
 	}
-	_, _, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID)
+	_, _, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, nil)
 	if err == nil {
 		t.Fatal("BuildCourseZip must refuse while the lecturer has unapproved rows")
 	}
@@ -68,7 +68,7 @@ func TestExportGate_BlocksWhileTheTAStillHasAnOpenDraft(t *testing.T) {
 	if got := blockerKinds(t, f)["waiting_ta"]; got != 1 {
 		t.Fatalf("waiting_ta = %d, want 1", got)
 	}
-	if _, _, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID); err == nil {
+	if _, _, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, nil); err == nil {
 		t.Fatal("BuildCourseZip must refuse while the TA still has a sendable draft")
 	}
 }
@@ -106,7 +106,7 @@ func TestExportGate_BlocksAnApprovedMonthStaffNeverSignedOff(t *testing.T) {
 	if got["unreviewed"] != 1 {
 		t.Fatalf("unreviewed = %d, want 1 — staff have not signed the month off", got["unreviewed"])
 	}
-	_, _, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID)
+	_, _, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, nil)
 	if err == nil {
 		t.Fatal("BuildCourseZip must refuse a month staff never reviewed — " +
 			"MarkCourseExported would skip locking it, leaving the file over editable rows")
@@ -131,7 +131,7 @@ func TestExportGate_ClearsOnceStaffSignOff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bs, err := exportSvcFor(f).CourseExportBlockers(f.ctx, f.CourseID)
+	bs, err := exportSvcFor(f).CourseExportBlockers(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,11 +153,11 @@ func TestCoursePreview_CanExportAgreesWithTheGate(t *testing.T) {
 	}
 	svc := exportSvcFor(f)
 
-	prev, err := svc.CoursePreview(f.ctx, f.CourseID)
+	prev, err := svc.CoursePreview(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, buildErr := svc.BuildCourseZip(f.ctx, f.CourseID)
+	_, _, _, buildErr := svc.BuildCourseZip(f.ctx, f.CourseID, nil)
 	if prev.CanExport != (buildErr == nil) {
 		t.Errorf("can_export = %v but BuildCourseZip error = %v — the button and the server disagree",
 			prev.CanExport, buildErr)
@@ -202,7 +202,7 @@ func TestBuildCourseZip_NamesTheFileByTermAndCourse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, name, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID)
+	_, name, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestBuildCourseZip_NamesTheFileByTermAndCourse(t *testing.T) {
 		t.Errorf("filename = %q, want %q", name, want)
 	}
 	// Two downloads of the same term must land on the same name.
-	_, again, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID)
+	_, again, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -112,7 +112,7 @@ func TestBuildExportRows_DropsTheCutMonthsFromActualPaid(t *testing.T) {
 	f.exec(`UPDATE work_logs SET status='approved' WHERE assignment_id=$1`, f.AssignmentID)
 	squeezeBudget(t, f, 1.4, 2)
 
-	comp, err := exportSvcFor(f).buildExportRows(f.ctx, f.CourseID)
+	comp, err := exportSvcFor(f).buildExportRows(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

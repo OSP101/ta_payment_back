@@ -20,6 +20,7 @@ import (
 	"ta-payment-back/internal/antivirus"
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/pdfgen"
+	"ta-payment-back/internal/pii"
 	"ta-payment-back/internal/storage"
 )
 
@@ -31,6 +32,11 @@ type DocsService struct {
 	// stands in when no clamd address is configured, so the upload path can ask
 	// Enabled() instead of nil-checking.
 	av antivirus.Scanner
+	// pii encrypts the one field migration 0047 now deliberately makes an
+	// exception for — the citizen ID (see citizen_id.go). May be nil in tests
+	// that never call a citizen-ID path; every such path guards against that
+	// explicitly rather than risk a silent no-op.
+	pii *pii.Cipher
 
 	// zipTokens holds one-shot download tokens minted after approve-all so
 	// the client can pull the ZIP without re-triggering the approve tx.
@@ -279,6 +285,12 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 		return err
 	}
 
+	// Encrypted, unlike everything else validateProfileInput checked — see
+	// migration 0076 and internal/pii for why the citizen ID alone is kept.
+	if err := s.storeCitizenID(ctx, tx, userID, in.NationalID); err != nil {
+		return err
+	}
+
 	// Insert (or upsert) the immutable snapshot for this round. The row is
 	// unique by (user_id, round) so re-saving the same round overwrites the
 	// draft snapshot rather than creating dupes.
@@ -321,10 +333,12 @@ func (s *DocsService) GetProfile(ctx context.Context, userID uuid.UUID) (*TAProf
 	p := &TAProfile{}
 	var userTitle, firstName, lastName string
 	err := s.pool.QueryRow(ctx,
-		// Only non-sensitive prefill. The national ID, bank details and
-		// signature are not stored anywhere (migration 0047), so the form comes
-		// back blank for those and the TA re-enters them whenever a new
-		// creditor form has to be produced.
+		// Only non-sensitive prefill. Bank details and the signature are not
+		// stored anywhere (migration 0047), so the form comes back blank for
+		// those and the TA re-enters them whenever a new creditor form has to
+		// be produced. The national ID IS stored now (migration 0076), but
+		// encrypted and deliberately NOT selected here — see citizen_id.go's
+		// RevealCitizenID for the one function allowed to read it back.
 		`SELECT COALESCE(u.student_id,''), COALESCE(p.prefix,''), COALESCE(u.phone,''),
 		        COALESCE(p.status::text, 'pending'), p.reject_reason, COALESCE(p.current_round, 1),
 		        COALESCE(u.title,''), COALESCE(u.first_name,''), COALESCE(u.last_name,'')

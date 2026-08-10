@@ -18,7 +18,7 @@ import (
 func profileSvc(t *testing.T) (*DocsService, func(title, first, last, studentID, phone string) uuid.UUID) {
 	t.Helper()
 	pool := testutil.NewPool(t)
-	svc := &DocsService{pool: pool, aud: audit.New(pool), store: newMemStore()}
+	svc := &DocsService{pool: pool, aud: audit.New(pool), store: newMemStore(), pii: testPIICipher(t)}
 	ctx := context.Background()
 
 	makeUser := func(title, first, last, studentID, phone string) uuid.UUID {
@@ -116,15 +116,19 @@ func TestGetProfile_UnknownUser(t *testing.T) {
 	}
 }
 
-// PDPA (policy 2026-07-29): the national ID, bank details and signature are
-// never written to any table. They arrive in the request, are drawn onto the
-// creditor-form PDF, and are gone.
+// PDPA (policy 2026-07-29, amended 09/08/2026): bank details and the
+// signature are never written to any table — they arrive in the request, are
+// drawn onto the creditor-form PDF, and are gone. The national ID is the ONE
+// deliberate exception (migration 0076): the ปะหน้าจ่ายตรง document needs it,
+// so it is now stored, but only as an XChaCha20-Poly1305 ciphertext plus a
+// last4 plaintext for display — never as the literal 13-digit column
+// (national_id/national_id_provided_at) migration 0047 dropped, and never
+// handed back out of GetProfile.
 //
 // This pins the property directly against the database, because the earlier
 // bug in this area was exactly a mismatch between what the form collected and
 // what a later read expected to find: a submitted profile stored a national ID
-// that a PDPA scrub then removed, and every completeness check broke. Storing
-// nothing removes that class of bug, but only while it stays true.
+// that a PDPA scrub then removed, and every completeness check broke.
 func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 	svc, makeUser := profileSvc(t)
 	ctx := context.Background()
@@ -140,8 +144,9 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 		t.Fatalf("UpsertProfile: %v", err)
 	}
 
-	// The columns must not exist at all — a NULL column would still be a place
-	// for a future writer to put the number back without anyone noticing.
+	// The bank/signature columns — and the OLD plaintext national_id column —
+	// must not exist at all. A NULL column would still be a place for a
+	// future writer to put the number back without anyone noticing.
 	for _, table := range []string{"ta_profiles", "ta_profile_submissions"} {
 		var cols []string
 		rows, err := svc.pool.Query(ctx, `
@@ -167,6 +172,24 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 		}
 	}
 
+	// The national ID DOES get stored now — encrypted. Confirms the exception
+	// actually took effect, not just that the old column stayed gone.
+	var enc []byte
+	var last4 string
+	if err := svc.pool.QueryRow(ctx,
+		`SELECT citizen_id_enc, citizen_id_last4 FROM ta_profiles WHERE user_id=$1`, uid,
+	).Scan(&enc, &last4); err != nil {
+		t.Fatalf("citizen_id columns: %v", err)
+	}
+	if len(enc) == 0 {
+		t.Error("citizen_id_enc was not written")
+	}
+	// NationalID is stripped to digits before storage (see validateProfileInput)
+	// — "1-2345-67890-12-3" becomes "1234567890123", so last4 is "0123".
+	if last4 != "0123" {
+		t.Errorf("citizen_id_last4 = %q, want 0123 (digits-only form of ...12-3)", last4)
+	}
+
 	// The workflow state IS recorded, so the checklist can tell a submitted
 	// profile from an untouched one without reading any of the values.
 	p, err := svc.GetProfile(ctx, uid)
@@ -176,6 +199,8 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 	if p.Status != "submitted" {
 		t.Errorf("status = %q, want submitted ขั้นที่ 1 ต้องนับว่าเสร็จ", p.Status)
 	}
+	// GetProfile must still never hand the national ID (or anything else
+	// sensitive) back out, even though it is now stored somewhere.
 	if p.NationalID != "" || p.AccountNo != "" || p.SignatureSVG != "" {
 		t.Errorf("GetProfile leaked sensitive values back: nid=%q acct=%q sig=%q",
 			p.NationalID, p.AccountNo, p.SignatureSVG)

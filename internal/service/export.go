@@ -26,6 +26,11 @@ type ExportService struct {
 	// teaching renders the weekly timetable form. Held as a dependency rather
 	// than duplicated here so the zip ships the same document the TA prints.
 	teaching *TeachingService
+	// users answers TASeniority for the transfer-cover document (Phase 3).
+	users *UserService
+	// docs holds RevealCitizenID — the only decrypt path for the transfer-cover
+	// document's พร้อมเพย์ column (Phase 3).
+	docs *DocsService
 }
 
 // exportRow is one TA's aggregated numbers used by both the coversheet and
@@ -154,7 +159,15 @@ func (s *ExportService) isReturningTA(ctx context.Context, taID, currentTermID u
 // overlap dedup, grad tiers, two-pool pro-rata budget cap) and returns the
 // priced rows without any side effects or readiness gate. Both the ZIP builder
 // and the read-only preview call this so their numbers can never drift.
-func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uuid.UUID) (*exportComputation, error) {
+// months (Gregorian "YYYY-MM", empty = the whole term) restricts the claim to
+// one fiscal slice — the งบแผ่นดิน year closes 30 กันยายน mid-ภาคต้น, so มิ.ย.–ก.ย.
+// and ตุลาคม are claimed on separate documents against separate appropriations.
+//
+// The SETTLEMENT is deliberately not sliced: the budget stays one pool per
+// course for the whole term, cut chronologically as always, and a slice only
+// filters that one result. Every slice of a term therefore sums back to the
+// undivided figure — no คาบ billed twice, none lost between two documents.
+func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uuid.UUID, months []string) (*exportComputation, error) {
 	var courseCode, courseName string
 	if err := s.pool.QueryRow(ctx, `
 		SELECT tc.code, tc.name_th FROM teaching_courses tc
@@ -190,11 +203,19 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	// across the per-assignment rows below: the whole (TA, track) total is
 	// attributed to the FIRST assignment of that pair and the rest are zeroed,
 	// which leaves the per-TA aggregation underneath exactly as it was.
-	billable, err := s.billableHoursByTATrack(ctx, teachingCourseID)
+	billable, err := s.billableHoursByTATrack(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, err
 	}
 	claimed := map[taTrackKey]bool{}
+
+	// Which of the term's months this document covers, for apportioning the
+	// figures that are flat per TERM and have no คาบ to filter (the
+	// graduate-special lump). 1 when unscoped.
+	monthShare, inSlice, err := s.courseMonthShare(ctx, teachingCourseID, months)
+	if err != nil {
+		return nil, err
+	}
 
 	// Pull per-assignment rows; each is billed at its own track's rate into the
 	// regular or special pool (two-pool cap applied after aggregation).
@@ -309,6 +330,9 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		return nil, err
 	}
 	for _, c := range costs {
+		if !inSlice(c.YearMonth) {
+			continue
+		}
 		agg, ok := byTA[c.TA]
 		if !ok {
 			continue
@@ -326,6 +350,10 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}
+	// Flat per term, so a month filter cannot select it — apportioned by the
+	// share of months this document covers, which keeps the slices summing to
+	// the undivided lump (staff's instruction, 10/08/2026).
+	gradLump *= monthShare
 	for _, taID := range order {
 		agg := byTA[taID]
 		if agg.hasGradSpecial && agg.hoursTotal > 0 {
@@ -376,7 +404,10 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		return nil, serr
 	}
 	if settlement.OverBudget {
-		if err := s.dropUnpaidWork(ctx, teachingCourseID, records, settlement, pr); err != nil {
+		// Same month scope as the money that went in: subtracting October's
+		// dropped คาบ from a มิ.ย.–ก.ย. document would understate a slice that
+		// never contained them.
+		if err := s.dropUnpaidWork(ctx, teachingCourseID, records, settlement, pr, months); err != nil {
 			return nil, err
 		}
 	}
@@ -391,7 +422,7 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 // BuildCourseZip builds the per-TA .xlsx (+ best-effort .pdf) ZIP for a course.
 // It gates on payout readiness, then reuses buildExportRows so the file numbers
 // match the preview exactly. Returns (zip bytes, filename, TA count, error).
-func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID) ([]byte, string, int, error) {
+func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID, months []string) ([]byte, string, int, error) {
 	// Student-count gate: the per-course budget is derived from the enrolled
 	// student count (budget.go). If staff never filled it in, num_students is 0,
 	// the budget cap is 0, and everyone would be pro-rata'd down to ฿0 silently.
@@ -416,7 +447,7 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	// document. This is checked on the way OUT, not just in the UI: downloading
 	// is the freeze point, and a half-finished download freezes the wrong
 	// numbers (see CourseExportBlockers).
-	blockers, err := s.CourseExportBlockers(ctx, teachingCourseID)
+	blockers, err := s.CourseExportBlockers(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -432,7 +463,7 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 		FROM teaching_courses tc JOIN academic_terms t ON t.id = tc.term_id
 		WHERE tc.id = $1`, teachingCourseID).Scan(&termID, &academicYear, &semester)
 
-	comp, err := s.buildExportRows(ctx, teachingCourseID)
+	comp, err := s.buildExportRows(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -463,7 +494,7 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	// The PDF coversheet and the PDF timetable are gone with them: both were
 	// second renderings of what the workbooks already say, and a printed pack
 	// containing two versions of one claim is a pack somebody has to reconcile.
-	book, err := s.BuildCombinedClaimWorkbook(ctx, teachingCourseID)
+	book, err := s.BuildCombinedClaimWorkbook(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, "", 0, err
 	}
@@ -612,8 +643,11 @@ func (s *ExportService) readinessByTA(ctx context.Context, teachingCourseID uuid
 // CoursePreview returns the read-only payout preview for a course: the exact
 // per-TA numbers the ZIP export would contain, plus each TA's profile-readiness
 // so staff can review (and fix) before the locking download. No side effects.
-func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid.UUID) (*ExportPreview, error) {
-	comp, err := s.buildExportRows(ctx, teachingCourseID)
+// months (Gregorian "YYYY-MM", empty = the whole term) previews one fiscal
+// slice, so the figures on screen are the ones the download for those months
+// would carry — the panel and the file must never disagree.
+func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid.UUID, months []string) (*ExportPreview, error) {
+	comp, err := s.buildExportRows(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, err
 	}
@@ -621,7 +655,7 @@ func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid
 	if err != nil {
 		return nil, err
 	}
-	blockers, err := s.CourseExportBlockers(ctx, teachingCourseID)
+	blockers, err := s.CourseExportBlockers(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, err
 	}

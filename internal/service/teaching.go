@@ -1895,9 +1895,23 @@ func parseUnit(s string) (credits, lectureHrs, labHrs, selfHrs int) {
 // courseLevelFromReserved maps the "ReservedFor" text to a course level. The
 // registrar writes "ตรี" / "ตรี โครงการพิเศษ" for undergrad and "บัณฑิต" / "โท" /
 // "เอก" for graduate. Defaults to undergrad.
+//
+// Reads only the label of the FIRST clause ("ตรี : SC-IT ปี 3, โท : CP-DSAI ปี
+// 1" is comma-separated clauses, each "label : detail") — same "first wins"
+// rule curriculumFromReserved already uses for programme tokens. A whole-string
+// substring scan used to answer graduate for that example just because "โท"
+// appears somewhere in it, even though the section's own primary label is
+// "ตรี". A section is one level; the first clause names which one.
 func courseLevelFromReserved(reserved string) string {
+	label := reserved
+	if idx := strings.Index(label, ","); idx >= 0 {
+		label = label[:idx]
+	}
+	if idx := strings.Index(label, ":"); idx >= 0 {
+		label = label[:idx]
+	}
 	for _, kw := range []string{"บัณฑิต", "ปริญญาโท", "ปริญญาเอก", "ป.โท", "ป.เอก", "โท", "เอก"} {
-		if strings.Contains(reserved, kw) {
+		if strings.Contains(label, kw) {
 			return "graduate"
 		}
 	}
