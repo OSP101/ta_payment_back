@@ -162,6 +162,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/ta-requests/candidates", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), rh.Candidates)
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), rh.Detail)
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer), rh.Create)
+	authed.Post("/ta-requests/:id/cancel", RequireRole(rbac.RoleLecturer), rh.Cancel)
 
 	// Docs (TA)
 	dh := &DocsHandler{Svc: svc}

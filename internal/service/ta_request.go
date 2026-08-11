@@ -200,6 +200,36 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		seen[a.TAID] = struct{}{}
 	}
 
+	// Guard against a TA who already has an ACTIVE request on this same course
+	// from an earlier round. autoDecide's own "duplicate" rule (below, inside
+	// the tx) already catches this and auto-rejects the whole request — but
+	// only after every row is written and the transaction runs, so from the
+	// lecturer's side it read as "the system let me send it" followed by a
+	// confusing rejected row cluttering their history (10/08/2026 feedback).
+	// Failing here instead means the attempt is refused immediately, with no
+	// rows ever written — same predicate, faster and clearer. The autoDecide
+	// check stays in place as a safety net for a race between two submissions
+	// that both pass this check before either commits.
+	for _, a := range in.Assignments {
+		var alreadyActive bool
+		if err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM ta_request_assignments a2
+				JOIN ta_requests r2 ON r2.id = a2.request_id
+				WHERE a2.ta_id = $1 AND r2.teaching_course_id = $2
+				  AND r2.status IN ('submitted', 'approved')
+				  AND a2.state <> 'dropped'
+			)`, a.TAID, in.TeachingCourseID).Scan(&alreadyActive); err != nil {
+			return nil, err
+		}
+		if alreadyActive {
+			return nil, fmt.Errorf(
+				"%s มีคำขอ TA ของวิชานี้ที่ยังดำเนินการอยู่แล้ว (จากรอบก่อนหน้า) ไม่สามารถส่งคำขอซ้ำได้ "+
+					"หากต้องการแก้ไข กรุณายกเลิกคำขอเดิมก่อน แล้วจึงส่งคำขอใหม่",
+				s.taName(ctx, a.TAID))
+		}
+	}
+
 	// All referenced sections must belong to this course.
 	sectionIDs := map[uuid.UUID]struct{}{}
 	for _, c := range in.Counts {
@@ -512,6 +542,98 @@ func joinRejectMessages(checks []DecisionCheck) string {
 		joined = joined[:end] + "…"
 	}
 	return joined
+}
+
+// cancellableStatuses is where a lecturer's own request may still be
+// withdrawn from. Not 'rejected' (nothing active to withdraw) and not already
+// 'cancelled' (idempotent refusal reads clearer than a silent no-op).
+var cancellableStatuses = map[string]bool{"submitted": true, "approved": true}
+
+// statusLabelTH names a ta_requests.status value for an error message.
+var statusLabelTH = map[string]string{
+	"draft": "ฉบับร่าง", "submitted": "รอตัดสิน", "approved": "อนุมัติแล้ว",
+	"rejected": "ปฏิเสธ", "cancelled": "ยกเลิกแล้ว",
+}
+
+// Cancel withdraws a lecturer's own request while nothing downstream depends
+// on it yet — the answer to "แก้ไข/ยกเลิกคำขอที่ส่งไปแล้วได้ไหม" (10/08/2026
+// feedback): there is no separate edit path, because editing a request that
+// has already been auto-decided means re-running every rule (docs, schedule,
+// clashes, quota) from scratch, which is exactly what Create already does.
+// Cancel + resubmit reuses that machinery instead of duplicating it.
+//
+// Allowed from 'submitted' (still resting on a missing timetable — nothing
+// has happened yet) or 'approved', but ONLY when no TA has logged any hours
+// against it (draft, submitted, or approved work_logs all count): those rows
+// are real work already performed, and pulling the request out from under
+// them would orphan that record from every downstream query that reads it
+// through r.status = 'approved'. That case needs staff, not a self-service
+// button.
+//
+// Reuses the existing 'cancelled' enum value (present since migration 0001,
+// never reachable until now — see fixture_test.go's own long-standing
+// comment about it) and the decided_at/decided_by/reject_reason columns
+// rather than adding schema. decided_by is set to the lecturer themselves,
+// distinguishing a self-cancel from a NULL (system auto-decide).
+func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UUID) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var owner uuid.UUID
+	var status string
+	if err := tx.QueryRow(ctx,
+		`SELECT lecturer_id, status::text FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID,
+	).Scan(&owner, &status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.New("ไม่พบคำขอนี้")
+		}
+		return err
+	}
+	if owner != lecturerID {
+		return errors.New("คุณไม่ใช่เจ้าของคำขอนี้ จึงยกเลิกไม่ได้")
+	}
+	if !cancellableStatuses[status] {
+		label := statusLabelTH[status]
+		if label == "" {
+			label = status
+		}
+		return fmt.Errorf("ยกเลิกคำขอนี้ไม่ได้ (สถานะปัจจุบัน: %s)", label)
+	}
+
+	var hasWorkLogs bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM work_logs wl
+			JOIN ta_request_assignments a ON a.id = wl.assignment_id
+			WHERE a.request_id = $1
+		)`, reqID).Scan(&hasWorkLogs); err != nil {
+		return err
+	}
+	if hasWorkLogs {
+		return errors.New(
+			"ยกเลิกไม่ได้ เพราะมีการบันทึกเวลาทำงานของ TA ในคำขอนี้แล้ว กรุณาติดต่อเจ้าหน้าที่เพื่อดำเนินการ")
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE ta_requests SET
+		  status        = 'cancelled',
+		  decided_at    = NOW(),
+		  decided_by    = $1,
+		  reject_reason = 'ยกเลิกโดยอาจารย์ผู้สอน',
+		  updated_at    = NOW()
+		WHERE id = $2`, lecturerID, reqID); err != nil {
+		return err
+	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
+		ActorID: &lecturerID, Action: "ta_request.cancel", Entity: "ta_request", EntityID: reqID.String(),
+		Note: "สถานะเดิม: " + status,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // notifyDecision fans out approval / rejection notifications. Best-effort:
@@ -1638,6 +1760,12 @@ type TARequestSummary struct {
 	// green "อนุมัติแล้ว" with no other signal would hide that entirely.
 	TrimmedCount int `json:"trimmed_count"`
 	DroppedCount int `json:"dropped_count"`
+	// CanCancel is the server's own verdict on whether Cancel would currently
+	// succeed for this row — status is submitted/approved AND no work_logs
+	// exist yet. Computed here rather than left for the client to infer, so
+	// the button's enabled state can never drift from what Cancel itself
+	// checks (the same reasoning ExportPreview.CanExport already follows).
+	CanCancel bool `json:"can_cancel"`
 }
 
 const requestSummarySelect = `
@@ -1646,7 +1774,11 @@ const requestSummarySelect = `
 	       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
 	       tc.term_id, at.academic_year, at.semester, r.is_late, r.decision_checks,
 	       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'trimmed'),
-	       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'dropped')
+	       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'dropped'),
+	       r.status::text IN ('submitted','approved') AND NOT EXISTS (
+	           SELECT 1 FROM work_logs wl
+	           JOIN ta_request_assignments a ON a.id = wl.assignment_id
+	           WHERE a.request_id = r.id)
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 	JOIN academic_terms at ON at.id = tc.term_id
@@ -1658,7 +1790,7 @@ func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
 	for rows.Next() {
 		var t TARequestSummary
 		var checksRaw []byte
-		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount); err != nil {
+		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount, &t.CanCancel); err != nil {
 			return nil, err
 		}
 		if len(checksRaw) > 0 {

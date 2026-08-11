@@ -825,6 +825,21 @@ func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(res)
 }
 
+// Cancel — POST /ta-requests/:id/cancel — withdraws the caller's own request.
+// TARequestService.Cancel is the single source of truth for whether this is
+// currently allowed (ownership, status, no work_logs yet); this handler does
+// no additional gating of its own.
+func (h *TARequestHandler) Cancel(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.TARequest.Cancel(c.Context(), UserID(c), id); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // PreviewConflicts previews the schedule-conflict verdict for a TA against
 // every section of a teaching course. Used by the lecturer's request form to
 // flag conflicts inline at TA-picking time (instead of at submit time).
