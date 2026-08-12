@@ -213,18 +213,6 @@ func (s *ExportService) settle(ctx context.Context, courseID uuid.UUID, sittings
 		&pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap, &pr.TermMonths); err != nil {
 		return nil, err
 	}
-	termMonths := pr.TermMonths
-	var perTerm int
-	_ = s.pool.QueryRow(ctx, `
-		SELECT t.months FROM academic_terms t
-		JOIN teaching_courses tc ON tc.term_id = t.id WHERE tc.id = $1`, courseID).Scan(&perTerm)
-	if perTerm > 0 {
-		termMonths = perTerm
-	}
-	if termMonths == 0 {
-		termMonths = 4
-	}
-
 	var capRegular, capSpecial float64
 	if s.budget != nil {
 		if snap, err := s.budget.Compute(ctx, courseID); err == nil {
@@ -246,7 +234,10 @@ func (s *ExportService) settle(ctx context.Context, courseID uuid.UUID, sittings
 
 	// Graduate-special is a flat term lump, not monthly, so it cannot be cut by
 	// month — it is committed off the top of the special pool. A grad-special TA
-	// either holds the appointment or does not.
+	// either holds the appointment or does not — eligibility is just an approved
+	// assignment; grad-special TAs no longer log work_logs at all (the system
+	// computes their pay automatically from the regular track's class schedule),
+	// so there is nothing left to gate on there.
 	var gradSpecialTAs int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT a.ta_id)
@@ -255,13 +246,13 @@ func (s *ExportService) settle(ctx context.Context, courseID uuid.UUID, sittings
 		JOIN sections sec ON sec.id = a.section_id AND sec.track = 'special'
 		JOIN users u ON u.id = a.ta_id
 		WHERE sec.teaching_course_id = $1
-		  AND a.level::text IN ('master','phd')
-		  AND EXISTS (SELECT 1 FROM work_logs wl
-		               WHERE wl.assignment_id = a.id AND wl.status = 'approved')`,
+		  AND a.level::text IN ('master','phd')`,
 		courseID).Scan(&gradSpecialTAs); err != nil {
 		return nil, err
 	}
-	gradLump := pr.GraduateSpecialLumpsum * float64(termMonths)
+	// graduate_special_lumpsum IS the whole-term-per-course figure (2026 meeting
+	// correction), not a monthly rate — do not multiply by termMonths.
+	gradLump := pr.GraduateSpecialLumpsum
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}

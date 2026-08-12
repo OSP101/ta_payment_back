@@ -324,12 +324,18 @@ func TestBuildTransferCoverSheets_UsesSettledCutoffNotRawTotal(t *testing.T) {
 // A graduate TA's special-track pay is a flat term lump (never priced hourly
 // by claimCostByTASlot), so it must still show up on the special sheet even
 // though every hourly คาบ they logged prices at zero.
-func TestBuildTransferCoverSheets_GradSpecialLumpAdded(t *testing.T) {
+// graduate_special_lumpsum is the whole-term-per-course figure (2026 meeting
+// correction) — it must NOT be multiplied by term_months. With the fixture's
+// rate table (lumpsum=1000, cap=12000) the flat amount is just 1000, not
+// 1000×4=4000 the way the old (buggy) formula computed it.
+func TestBuildTransferCoverSheets_GradSpecialLumpIsFlatNotMultipliedByMonths(t *testing.T) {
 	f := newTCFixture(t)
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP888", Curriculum: "CY", LectureHrs: 100})
 
 	ta := f.newTA("นายบัณฑิต เรียนดี", "master")
-	f.assignTA(ta, courseID, specSec, "master", []int{1})
+	// No work_logs at all — grad-special TAs no longer log anything themselves;
+	// eligibility must be the approved assignment alone.
+	f.assignTA(ta, courseID, specSec, "master", nil)
 	f.financeSend(courseID)
 
 	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
@@ -339,9 +345,38 @@ func TestBuildTransferCoverSheets_GradSpecialLumpAdded(t *testing.T) {
 	if len(sheets) != 1 || sheets[0].Track != "special" {
 		t.Fatalf("expected exactly one special sheet, got %+v", sheets)
 	}
-	want := 1000.0 * 4 // graduate_special_lumpsum × term_months, under the 12000 cap
+	want := 1000.0 // graduate_special_lumpsum, flat — not × term_months
 	if sheets[0].Rows[0].Baht != want {
 		t.Errorf("baht = %v, want the flat lump %v", sheets[0].Rows[0].Baht, want)
+	}
+}
+
+// Two special-track courses in the same term must each pay their own flat
+// lump independently — there is no cross-course aggregate cap (a TA on 2
+// courses gets 2×lump, not a shared 12,000 split between them).
+func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *testing.T) {
+	f := newTCFixture(t)
+	c1, _, spec1 := f.insertCourse(tcCourseOpts{Code: "CP888", Curriculum: "CY", LectureHrs: 100})
+	c2, _, spec2 := f.insertCourse(tcCourseOpts{Code: "CP889", Curriculum: "CY", LectureHrs: 100})
+
+	ta := f.newTA("นายบัณฑิต สองวิชา", "master")
+	f.assignTA(ta, c1, spec1, "master", nil)
+	f.assignTA(ta, c2, spec2, "master", nil)
+	f.financeSend(c1)
+	f.financeSend(c2)
+
+	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	if err != nil {
+		t.Fatalf("buildTransferCoverSheets: %v", err)
+	}
+	if len(sheets) != 1 || sheets[0].Track != "special" {
+		t.Fatalf("expected exactly one special sheet, got %+v", sheets)
+	}
+	// One row for the TA, courses joined — but the money must be 2×1000, each
+	// course's own flat lump, not a shared/capped total.
+	want := 2000.0
+	if sheets[0].Rows[0].Baht != want {
+		t.Errorf("baht = %v, want %v (2 independent per-course lumps)", sheets[0].Rows[0].Baht, want)
 	}
 }
 
@@ -524,5 +559,69 @@ func TestBuildTransferCoverSheets_GraduateCourseRoutesToGradSheet(t *testing.T) 
 	}
 	if sheets[0].SheetName != "DS&AI ปกติ" {
 		t.Errorf("sheet name = %q, want %q", sheets[0].SheetName, "DS&AI ปกติ")
+	}
+}
+
+// ป.ตรี and บัณฑิตศึกษา are claimed on SEPARATE documents — the college files
+// two different forms, not one form with a level column (their own
+// docs/15.CP362104.xlsx vs docs/14. CP363761-บัณฑิต.xls). So the combined book
+// carries undergrad TAs and NOBODY else.
+//
+// A graduate TA appearing here is not a cosmetic slip: this book prices its
+// people by the undergrad form's shape, and its หลักฐาน sheet ticks
+// ปริญญาตรี/บัณฑิตศึกษา ONCE for the whole sheet, so a mixed course printed the
+// wrong level over half its rows — while the same TA was also billed on the
+// graduate document, making the course's paperwork claim them twice.
+func TestCollectCombinedBook_ExcludesGraduateTAsEntirely(t *testing.T) {
+	f := newTCFixture(t)
+	courseID, regSec, specSec := f.insertCourse(tcCourseOpts{Code: "CP891", Curriculum: "CY", LectureHrs: 100})
+
+	ug := f.newTA("นายปริญญาตรี ทำงาน", "undergrad")
+	f.assignTA(ug, courseID, regSec, "undergrad", []int{10, 11})
+	// A grad-regular TA with real logged hours, and a grad-special TA with
+	// none at all — neither belongs on the undergrad book.
+	gradReg := f.newTA("นายบัณฑิต ลงเวลา", "phd")
+	f.assignTA(gradReg, courseID, regSec, "phd", []int{12, 13})
+	gradSp := f.newTA("นายบัณฑิต ไม่ลงเวลา", "master")
+	f.assignTA(gradSp, courseID, specSec, "master", nil)
+	f.financeSend(courseID)
+
+	d, err := f.svc.collectCombinedBook(f.ctx, courseID, nil)
+	if err != nil {
+		t.Fatalf("collectCombinedBook: %v", err)
+	}
+	for _, side := range [][]claimant{d.Regular, d.Special} {
+		for _, c := range side {
+			if c.LevelTH != "ป.ตรี" {
+				t.Errorf("graduate claimant %q (%s) is on the undergrad book — "+
+					"บัณฑิตศึกษา is claimed on its own form", c.Name, c.LevelTH)
+			}
+		}
+	}
+	if len(d.Regular) != 1 {
+		t.Fatalf("got %d regular claimants, want the 1 undergrad: %+v", len(d.Regular), d.Regular)
+	}
+	if len(d.Special) != 0 {
+		t.Errorf("got %d special claimants, want 0 — the only special-track TA here is graduate: %+v",
+			len(d.Special), d.Special)
+	}
+}
+
+// The counterweight: a course staffed ONLY by graduate TAs produces no
+// undergrad book at all, and that is not an error — its whole claim lives on
+// the graduate documents.
+func TestBuildCombinedClaimWorkbook_NilForGraduateOnlyCourse(t *testing.T) {
+	f := newTCFixture(t)
+	courseID, regSec, _ := f.insertCourse(tcCourseOpts{Code: "CP892", Curriculum: "CY", LectureHrs: 100})
+	ta := f.newTA("นายบัณฑิต ลงเวลา", "phd")
+	f.assignTA(ta, courseID, regSec, "phd", []int{10, 11})
+	f.financeSend(courseID)
+
+	book, err := f.svc.BuildCombinedClaimWorkbook(f.ctx, courseID, nil)
+	if err != nil {
+		t.Fatalf("a graduate-only course must not error, it must simply have no undergrad book: %v", err)
+	}
+	if book != nil {
+		t.Error("a graduate-only course produced an undergrad claim workbook")
 	}
 }

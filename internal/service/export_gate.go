@@ -73,6 +73,13 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		     AND st.teaching_course_id = tc.id
 		    WHERE tc.id = $1
 		      AND `+monthFilterSQL("wl.work_date", "$2")+`
+		      -- Grad-special (master/phd on a special-track section) no longer
+		      -- logs work_logs at all — pay is computed automatically from the
+		      -- regular track's class schedule. Any work_logs rows left over from
+		      -- before that change can never move again (nobody submits or
+		      -- approves them), so counting them here would block this course's
+		      -- export forever.
+		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		    GROUP BY 1, 2, 3, 4
 		)
 		SELECT ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved
@@ -211,6 +218,10 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		     AND st.teaching_course_id = tc.id
 		    WHERE tc.term_id = $1
 		      AND `+monthFilterSQL("wl.work_date", "$2")+`
+		      -- Grad-special no longer logs work_logs at all (see
+		      -- CourseExportBlockers) — leftover rows from before that change
+		      -- must not permanently block the term-wide finance_sent gate.
+		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		    GROUP BY 1, 2, 3, 4, 5
 		)
 		SELECT course_code, ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved

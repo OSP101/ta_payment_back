@@ -251,6 +251,12 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		  -- short of ReviewComplete forever — a deadlock where the screen asks for
 		  -- a sign-off that no screen offers.
 		  AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		  -- Grad-special no longer logs work_logs at all (see export_gate.go) and
+		  -- is excluded from ListReviewQueue, so staff have no screen to clear
+		  -- this status on. Leftover approved rows from before that change must
+		  -- not count as "unreviewed", or the course would never reach
+		  -- ReviewComplete.
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		ORDER BY sp.due_date`,
 		uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
 	if err == nil {

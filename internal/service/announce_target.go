@@ -113,9 +113,15 @@ var announceFilters = map[string]announceFilter{
 		        SELECT 1
 		          FROM work_logs wl
 		          JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		          JOIN sections sec ON sec.id = a.section_id
 		          JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
 		          JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 		         WHERE wl.status = 'submitted' AND tc.term_id = $1 AND r.lecturer_id = u.id
+		           -- Grad-special no longer logs work_logs and never appears on
+		           -- the lecturer's approval screen (ListPending excludes it) —
+		           -- leftover 'submitted' rows must not tell a lecturer they have
+		           -- something to approve when their own queue shows nothing.
+		           AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		      )`,
 	},
 	"course_missing_schedule": {

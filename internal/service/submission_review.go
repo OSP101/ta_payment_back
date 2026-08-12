@@ -146,6 +146,16 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		      -- work is not yet payable, and signing it off here would release
 		      -- it to an export the finance office cannot accept.
 		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		      -- Grad-special (master/phd on a special-track section) no longer
+		      -- logs work_logs at all — pay is computed automatically from the
+		      -- regular track's class schedule (2026 meeting). Leftover
+		      -- 'submitted' rows from before that change must not surface here:
+		      -- the lecturer's own queue already excludes these assignments
+		      -- (worklog.go ListPending), so a stray row here can never be
+		      -- approved or rejected by anyone — it would sit as "รออาจารย์อนุมัติ"
+		      -- forever and block the whole month/course from ever being signed
+		      -- off or exported.
+		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		    GROUP BY sp.id, a.ta_id, tc.id, RIGHT(sp.year_month, 2)
 		)
 		SELECT sp.id, sp.label, sp.year_month,
@@ -408,7 +418,12 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN work_logs wl  ON wl.assignment_id = a.id AND wl.status = 'submitted'
-		WHERE sec.teaching_course_id = $1`, tcID).Scan(&openRows); err != nil {
+		WHERE sec.teaching_course_id = $1
+		  -- Grad-special no longer logs work_logs and is excluded from
+		  -- ListPending, so a lecturer has no row to approve for them. Leftover
+		  -- 'submitted' rows must not be counted here, or staff would keep
+		  -- reminding a lecturer about hours their own approval screen never shows.
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`, tcID).Scan(&openRows); err != nil {
 		return err
 	}
 	if openRows == 0 {

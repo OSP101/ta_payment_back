@@ -174,6 +174,7 @@ type assignmentContext struct {
 	RequestStatus    string
 	ReimburseScope   string
 	Level            string
+	Track            string
 	AllowLecture     bool
 	AllowLab         bool
 	AllowReview      bool
@@ -209,7 +210,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 	)
 	err := pool.QueryRow(ctx, `
 		SELECT sec.teaching_course_id, sec.id, a.ta_id, r.status::text,
-		       r.reimburse_scope::text, a.level::text,
+		       r.reimburse_scope::text, a.level::text, sec.track::text,
 		       COALESCE(wf.help_teach_hrs, 0),
 		       COALESCE(wf.prep_hrs, 0),
 		       COALESCE(wf.grade_hrs, 0),
@@ -226,7 +227,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		LEFT JOIN ta_workload_forms wf ON wf.assignment_id = a.id
 		WHERE a.id = $1`, assignmentID).Scan(
 		&ac.TeachingCourseID, &ac.SectionID, &ac.TAID, &ac.RequestStatus,
-		&ac.ReimburseScope, &ac.Level,
+		&ac.ReimburseScope, &ac.Level, &ac.Track,
 		&help, &prep, &grade, &other,
 		&attendance, &check, &ugOther, &lab,
 		&labOther,

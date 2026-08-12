@@ -466,6 +466,12 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 
 	// (d) working blocks (row B) from the generated weekly pattern: distinct
 	// non-makeup (course, activity, weekday, window) across the term.
+	//
+	// Grad-special TAs are excluded here and sourced from their section's own
+	// schedule instead (below): they no longer log work_logs at all (2026
+	// meeting — the system computes their pay automatically), so there is
+	// nothing left in work_logs to reconstruct their duty pattern from. Their
+	// duty IS the class's own schedule, so that's what prints.
 	dutyRows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT tc.code, wl.activity, EXTRACT(DOW FROM wl.work_date)::int,
 		       EXTRACT(HOUR FROM wl.start_time)*60+EXTRACT(MINUTE FROM wl.start_time),
@@ -474,10 +480,12 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id=wl.assignment_id
 		JOIN sections sec ON sec.id=a.section_id
+		JOIN users u ON u.id=a.ta_id
 		JOIN teaching_courses tc ON tc.id=sec.teaching_course_id AND tc.term_id=$2
 		WHERE a.ta_id=$1 AND wl.status <> 'rejected'
 		  AND wl.activity IN ('lecture','lab')
-		  AND COALESCE(wl.note,'') NOT LIKE '%ชดเชย%'`, taID, termID)
+		  AND COALESCE(wl.note,'') NOT LIKE '%ชดเชย%'
+		  AND NOT (u.study_level::text IN ('master','phd') AND sec.track = 'special')`, taID, termID)
 	if err != nil {
 		return err
 	}
@@ -504,6 +512,47 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		dutySits[k].tracks[track] = true
 	}
 	dutyRows.Close()
+
+	// grad-special's duty pattern, read straight from the section's own
+	// schedule rather than work_logs — see comment above.
+	gradSpecialDutyRows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tc.code, ss.kind, ss.day_of_week,
+		       EXTRACT(HOUR FROM ss.start_time)*60+EXTRACT(MINUTE FROM ss.start_time),
+		       EXTRACT(HOUR FROM ss.end_time)*60+EXTRACT(MINUTE FROM ss.end_time),
+		       sec.sec_no, sec.track::text
+		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		JOIN sections sec ON sec.id = a.section_id AND sec.track = 'special'
+		JOIN users u ON u.id = a.ta_id
+		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id AND tc.term_id = $2
+		JOIN section_schedules ss ON ss.section_id = sec.id AND ss.kind IN ('lecture','lab')
+		WHERE a.ta_id = $1 AND a.state <> 'dropped'
+		  AND u.study_level::text IN ('master','phd')`, taID, termID)
+	if err != nil {
+		return err
+	}
+	for gradSpecialDutyRows.Next() {
+		var code, act, secNo, track string
+		var day int
+		var sm, em float64
+		if err := gradSpecialDutyRows.Scan(&code, &act, &day, &sm, &em, &secNo, &track); err != nil {
+			gradSpecialDutyRows.Close()
+			return err
+		}
+		k := sitKey{code, act, day, int(sm), int(em)}
+		if dutySits[k] == nil {
+			dutySits[k] = &struct {
+				secs   []string
+				tracks map[string]bool
+			}{tracks: map[string]bool{}}
+		}
+		dutySits[k].secs = append(dutySits[k].secs, secNo)
+		dutySits[k].tracks[track] = true
+	}
+	gradSpecialDutyRows.Close()
+	if err := gradSpecialDutyRows.Err(); err != nil {
+		return err
+	}
 	for k, v := range dutySits {
 		var label string
 		if k.kind == "lecture" {

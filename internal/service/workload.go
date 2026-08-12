@@ -176,10 +176,12 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 		`DELETE FROM ta_class_schedules WHERE user_id=$1 AND term_id=$2`, userID, termID); err != nil {
 		return err
 	}
-	// RULE C5 (WBA / year-4): WBA rows are excluded from conflict checks and
-	// therefore must not be forgeable. Enforce that (a) at most one is_wba row is
-	// submitted, and (b) the acting user is a year-4-or-above undergraduate.
-	// study_year is now authoritative (migration 0013); it must be set by staff.
+	// RULE C5 (WBA / year-4 / grad): WBA rows are excluded from conflict checks
+	// and therefore must not be forgeable. Enforce that (a) at most one is_wba
+	// row is submitted, and (b) the acting user is either a year-4-or-above
+	// undergraduate OR a graduate student (master/phd — they may genuinely have
+	// no class schedule of their own). study_year is authoritative for
+	// undergrads (migration 0013) and is not required for grad students.
 	wbaCount := 0
 	for _, b := range blocks {
 		if b.IsWBA {
@@ -196,14 +198,18 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 			`SELECT study_level::text, study_year FROM users WHERE id=$1`, userID).Scan(&studyLevel, &studyYear); err != nil {
 			return err
 		}
-		if studyLevel != "undergrad" {
-			return Invalid("เฉพาะนักศึกษาระดับปริญญาตรีชั้นปีที่ 4 เท่านั้นที่ใช้โหมด WBA ได้")
-		}
-		if studyYear == nil {
-			return Invalid("ยังไม่ได้บันทึกชั้นปีของคุณในระบบ กรุณาติดต่อเจ้าหน้าที่เพื่อใช้โหมด WBA")
-		}
-		if *studyYear < 4 {
-			return Invalid("เฉพาะนักศึกษาชั้นปีที่ 4 ขึ้นไปเท่านั้นที่ใช้โหมด WBA ได้")
+		switch studyLevel {
+		case "master", "phd":
+			// No year requirement for graduate students.
+		case "undergrad":
+			if studyYear == nil {
+				return Invalid("ยังไม่ได้บันทึกชั้นปีของคุณในระบบ กรุณาติดต่อเจ้าหน้าที่เพื่อใช้โหมด WBA")
+			}
+			if *studyYear < 4 {
+				return Invalid("เฉพาะนักศึกษาชั้นปีที่ 4 ขึ้นไปเท่านั้นที่ใช้โหมด WBA ได้")
+			}
+		default:
+			return Invalid("เฉพาะนักศึกษาระดับปริญญาตรีชั้นปีที่ 4 ขึ้นไป หรือนักศึกษาระดับบัณฑิตศึกษาเท่านั้นที่ใช้โหมดนี้ได้")
 		}
 	}
 	for _, b := range blocks {

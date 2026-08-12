@@ -2313,6 +2313,70 @@ func (s *WorkLogService) enforceTermHourCeiling(ctx context.Context, ac *assignm
 	return nil
 }
 
+// validateGradRegularClassWindow requires a grad-regular (level master/phd,
+// track regular) TA's เช็คชื่อ/สอนปฏิบัติการ entry to fall within that
+// section's real scheduled class period for that weekday — per the 2026
+// staff meeting: attendance hours reference the actual lecture period, and
+// lab-teaching hours reference the actual class schedule, rather than being
+// freely typed the way manual entry allows today. Undergrad and grad-special
+// are untouched; ตรวจงาน (review/other) stays free-form, matching the
+// meeting's own scope ("ตรวจงานวันเวลาไหน" — no schedule tie called for there).
+// A makeup session logs as activity='makeup', not 'lecture'/'lab', so it
+// never reaches this check — its date legitimately differs from the weekly
+// pattern.
+func (s *WorkLogService) validateGradRegularClassWindow(ctx context.Context, ac *assignmentContext, w WorkLog) error {
+	if ac.Level == "undergrad" || ac.Track != "regular" {
+		return nil
+	}
+	if w.Activity != "lecture" && w.Activity != "lab" {
+		return nil
+	}
+	d, err := time.Parse("2006-01-02", w.WorkDate)
+	if err != nil {
+		return nil // date format already validated upstream
+	}
+	sm, sok := parseHM(w.StartTime)
+	em, eok := parseHM(w.EndTime)
+	if !sok || !eok {
+		return nil // time format already validated upstream
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT start_time::text, end_time::text FROM section_schedules
+		WHERE section_id = $1 AND kind = $2 AND day_of_week = $3`,
+		ac.SectionID, w.Activity, int(d.Weekday()))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	label := "เช็คชื่อ (คาบบรรยาย)"
+	if w.Activity == "lab" {
+		label = "สอนปฏิบัติการ"
+	}
+	var windows []string
+	for rows.Next() {
+		var st, et string
+		if err := rows.Scan(&st, &et); err != nil {
+			return err
+		}
+		stm, stok := parseHM(st)
+		etm, etok := parseHM(et)
+		if !stok || !etok {
+			continue
+		}
+		windows = append(windows, fmt.Sprintf("%02d:%02d-%02d:%02d", stm/60, stm%60, etm/60, etm%60))
+		if sm >= stm && em <= etm {
+			return nil // fits within this scheduled period
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(windows) == 0 {
+		return Invalid(fmt.Sprintf("วันนี้ไม่มีคาบ%sตามตารางสอนจริงของกลุ่มนี้", label))
+	}
+	return Invalid(fmt.Sprintf("เวลาที่กรอกต้องอยู่ในคาบ%sจริง (%s)", label, strings.Join(windows, ", ")))
+}
+
 func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog) (uuid.UUID, error) {
 	ac, err := s.assertTAOwnsAssignment(ctx, actor, w.AssignmentID)
 	if err != nil {
@@ -2350,6 +2414,9 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		// server time.Now() still reports yesterday until 07:00 local, which
 		// would reopen a month the back-date rule should already have closed.
 	}, termStart, termEnd, midterm, final, holidays, mk, timeutil.Now()); err != nil {
+		return uuid.Nil, err
+	}
+	if err := s.validateGradRegularClassWindow(ctx, ac, w); err != nil {
 		return uuid.Nil, err
 	}
 	// Month lock: a finance_sent month is frozen for everyone; a closed period
@@ -2784,9 +2851,13 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 // assignment that currently has at least one submitted work-log row awaiting
 // review.
 type PendingReport struct {
-	ID               uuid.UUID `json:"id"`
-	TAID             uuid.UUID `json:"ta_id"`
-	TAName           string    `json:"ta_name"`
+	ID     uuid.UUID `json:"id"`
+	TAID   uuid.UUID `json:"ta_id"`
+	TAName string    `json:"ta_name"`
+	// StudyLevel ("undergrad" | "master" | "phd") lets the reviewer tell a ป.ตรี
+	// claimant from a บัณฑิตศึกษา one at a glance — the two are reviewed under
+	// different rules (per-hour caps vs. the 10–12 ชม./สัปดาห์ regulation).
+	StudyLevel       string    `json:"study_level"`
 	CourseCode       string    `json:"course_code"`
 	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
 	// Which section this row is for. The list is one row PER ASSIGNMENT, and a
@@ -2849,6 +2920,7 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		SELECT a.id,
 		       a.ta_id,
 		       u.first_name || ' ' || u.last_name,
+		       a.level::text,
 		       tc.code,
 		       tc.id,
 		       sec.sec_no,
@@ -2867,11 +2939,20 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		LEFT JOIN grp g ON g.ta_id = a.ta_id
 		                AND g.teaching_course_id = tc.id
 		                AND g.cotaught_group = a.cotaught_group
-		WHERE $1 = TRUE OR EXISTS (
+		-- Grad-special (master/phd on a special-track section) no longer logs
+		-- work_logs at all — the system computes their pay automatically from
+		-- the regular track's class schedule (2026 meeting). Any leftover
+		-- 'submitted' rows from before that change are inert and must not
+		-- surface here: they'd sit forever unapproved and, since the batch
+		-- approve call covers every assignment shown for a TA, one grad-special
+		-- row failing its (now-meaningless) weekly cap check would block
+		-- approving that TA's legitimate grad-regular/undergrad hours too.
+		WHERE (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		  AND ($1 = TRUE OR EXISTS (
 		    SELECT 1 FROM teaching_lecturers tl
 		    WHERE tl.teaching_course_id = tc.id AND tl.lecturer_id = $2
-		)
-		GROUP BY a.id, a.ta_id, u.first_name, u.last_name, tc.code, tc.id,
+		  ))
+		GROUP BY a.id, a.ta_id, u.first_name, u.last_name, a.level, tc.code, tc.id,
 		         sec.sec_no, sec.track, a.cotaught_group
 		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, tc.code, sec.sec_no`,
 		privileged, actor)
@@ -2886,7 +2967,7 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 			minD, maxD  time.Time
 			submittedAt *time.Time
 		)
-		if err := rows.Scan(&p.ID, &p.TAID, &p.TAName, &p.CourseCode, &p.TeachingCourseID,
+		if err := rows.Scan(&p.ID, &p.TAID, &p.TAName, &p.StudyLevel, &p.CourseCode, &p.TeachingCourseID,
 			&p.SecNo, &p.Track, &p.CoTaughtGroup,
 			&p.TotalHours, &p.GroupHours, &minD, &maxD, &submittedAt); err != nil {
 			return nil, err
@@ -3158,6 +3239,9 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		AllowReview:  ac.AllowReview,
 		AllowOther:   ac.AllowOther,
 	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}); err != nil {
+		return uuid.Nil, err
+	}
+	if err := s.validateGradRegularClassWindow(ctx, ac, w); err != nil {
 		return uuid.Nil, err
 	}
 	// Staff get no exemption from the monthly deadline. A closed month is closed

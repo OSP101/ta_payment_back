@@ -87,6 +87,55 @@ func TestListPending_TellsCoTaughtSectionsApart(t *testing.T) {
 	_ = sibling
 }
 
+// Grad-special (master/phd on a special-track section) no longer logs
+// work_logs at all — the system computes their pay automatically from the
+// regular track's class schedule (2026 meeting). Any leftover 'submitted' rows
+// from before that change must not appear in the review queue: they'd sit
+// forever unapproved, and — because the frontend batch-approves every
+// assignment shown for a TA in one call — a stray grad-special row failing
+// its now-meaningless weekly cap would block approving that TA's legitimate
+// grad-regular/undergrad hours too.
+func TestListPending_ExcludesGradSpecial(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Level: "master", Track: "special"})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	f.exec(`UPDATE work_logs SET status='submitted', submitted_at=now() WHERE assignment_id=$1`, f.AssignmentID)
+
+	rows, err := f.Svc.ListPending(f.ctx, f.LecturerID, false)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == f.AssignmentID {
+			t.Fatalf("grad-special assignment %s appeared in the review queue — it should have been excluded", r.ID)
+		}
+	}
+}
+
+// A grad-regular (master/phd, track=regular) assignment must still appear —
+// only grad-special is excluded.
+func TestListPending_StillIncludesGradRegular(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Level: "master", Track: "regular"})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	f.exec(`UPDATE work_logs SET status='submitted', submitted_at=now() WHERE assignment_id=$1`, f.AssignmentID)
+
+	rows, err := f.Svc.ListPending(f.ctx, f.LecturerID, false)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.ID == f.AssignmentID {
+			found = true
+			if r.StudyLevel != "master" {
+				t.Errorf("study_level = %q, want master", r.StudyLevel)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("grad-regular assignment must still appear in the review queue")
+	}
+}
+
 // GroupHours is what the reviewer sees before opening anything, so it has to be
 // the number the payout will settle.
 //

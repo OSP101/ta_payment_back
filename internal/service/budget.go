@@ -174,17 +174,14 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	// Used baht — reflects post-2026 payment model (ประกาศ 731/2565 + 1080/2565):
 	//   Undergrad: SUM(hours × per-track hourly rate) from approved work_logs.
 	//   Grad regular: SUM(hours × graduate_regular_hourly) — now hourly (was lump-sum).
-	//   Grad special: flat 4,000฿/month × term months, capped at grad_special_term_cap
-	//                 (12,000฿/TA/course/term). Counted per assignment.
-	// Months come from academic_terms (per-term); fall back to pay_rates.term_months.
+	//   Grad special: flat term amount per assignment/course — graduate_special_lumpsum
+	//                 IS the whole-term figure (4,000฿/TA/course, per the 2026 meeting
+	//                 correction), NOT a monthly rate multiplied by term months. Capped
+	//                 at grad_special_term_cap as a safety ceiling. Counted per assignment,
+	//                 independently per course — a TA on 3 special-track courses gets up
+	//                 to 3 × 4,000, there is no cross-course aggregate cap.
 	_ = s.pool.QueryRow(ctx, `
-        WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
-             tm AS (
-                SELECT COALESCE(NULLIF(t.months,0), (SELECT term_months FROM latest)) AS months
-                FROM academic_terms t
-                JOIN teaching_courses tc ON tc.term_id = t.id
-                WHERE tc.id = $1
-             )
+        WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
         SELECT COALESCE(
             (SELECT COALESCE(SUM(wl.hours * pr.undergrad_regular), 0)
              FROM work_logs wl
@@ -222,8 +219,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
                AND u.study_level IN ('master','phd') AND sec.track = 'regular')
           +
             (SELECT COALESCE(SUM(
-                LEAST(pr.graduate_special_lumpsum * (SELECT months FROM tm),
-                      pr.grad_special_term_cap)
+                LEAST(pr.graduate_special_lumpsum, pr.grad_special_term_cap)
              ), 0)
              FROM ta_request_assignments a
              JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'

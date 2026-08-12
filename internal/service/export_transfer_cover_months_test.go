@@ -194,13 +194,16 @@ func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
 		t.Fatal(err)
 	}
 	lump := sheetsTotal(whole)
-	// graduate_special_lumpsum 1000 × term_months 4, under the 12000 cap; the
-	// hours themselves price at 0 for grad-special.
-	if lump != 4000 {
-		t.Fatalf("fixture bug: whole-term grad lump = %.2f, want 4000", lump)
+	// graduate_special_lumpsum IS the whole-term-per-course figure (2026
+	// meeting correction) — flat 1000, under the 12000 cap, NOT × term_months.
+	// The hours themselves price at 0 for grad-special.
+	if lump != 1000 {
+		t.Fatalf("fixture bug: whole-term grad lump = %.2f, want 1000", lump)
 	}
 
-	// Five months in the term, so a four-month slice carries 4/5 of the lump.
+	// This course has no regular-track class schedule, so the apportionment
+	// falls back to an even per-calendar-month share: five months in the
+	// term, so a four-month slice carries 4/5 of the lump.
 	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
 		[]string{"2026-06", "2026-07", "2026-08", "2026-09"})
 	if err != nil {
@@ -210,14 +213,54 @@ func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := sheetsTotal(before); got != 3200 {
-		t.Errorf("มิ.ย.–ก.ย. lump = %.2f, want 3200 (4/5 of 4000)", got)
+	if got := sheetsTotal(before); got != 800 {
+		t.Errorf("มิ.ย.–ก.ย. lump = %.2f, want 800 (4/5 of 1000)", got)
 	}
-	if got := sheetsTotal(after); got != 800 {
-		t.Errorf("ต.ค. lump = %.2f, want 800 (1/5 of 4000)", got)
+	if got := sheetsTotal(after); got != 200 {
+		t.Errorf("ต.ค. lump = %.2f, want 200 (1/5 of 1000)", got)
 	}
 	if sum := round2(sheetsTotal(before) + sheetsTotal(after)); sum != lump {
 		t.Errorf("pro-rated lump sums to %.2f, want the undivided %.2f", sum, lump)
+	}
+}
+
+// Same invariant as above, but this time the course DOES have a regular-track
+// class schedule, so the apportionment must follow the real weighted share
+// (2026 meeting correction) instead of falling back to an even per-month
+// split — confirming the fallback and the real path never silently merge.
+func TestTransferCoverMonthSlices_GradLumpFollowsRealScheduleWhenAvailable(t *testing.T) {
+	f := newTCFixture(t)
+	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
+		f.addPeriod(ym)
+	}
+	courseID, regSec, specSec := f.insertCourse(tcCourseOpts{Code: "CP305", Curriculum: "CY", LectureHrs: 100})
+	// A weekly Monday lecture across the whole term. The exact per-month
+	// Monday count isn't hand-verified here (that's grad_special_schedule_test.go's
+	// job) — this test only needs the resulting split to NOT match the
+	// uniform-fallback figures (800/200), proving the real weighting is used
+	// once a schedule exists rather than silently falling back.
+	f.exec(`INSERT INTO section_schedules (id, section_id, kind, day_of_week, start_time, end_time)
+	        VALUES (gen_random_uuid(), $1, 'lecture', 1, '09:00', '11:00')`, regSec)
+	grad := f.newTA("บัณฑิต ตารางจริง", "master")
+	f.assignTAOn(grad, courseID, specSec, "master", []string{"2026-09-14"})
+
+	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
+		[]string{"2026-06", "2026-07", "2026-08", "2026-09"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The uniform fallback would give exactly 800/200 (4/5 vs 1/5 of 1000);
+	// the real schedule-weighted share must differ from that, proving it is
+	// not silently falling back to the uniform split now that a schedule exists.
+	if got := sheetsTotal(before); got == 800 {
+		t.Errorf("มิ.ย.–ก.ย. lump = %.2f, matches the uniform fallback exactly — schedule weighting is not being used", got)
+	}
+	if sum := round2(sheetsTotal(before) + sheetsTotal(after)); sum != 1000 {
+		t.Errorf("weighted lump sums to %.2f, want the undivided 1000", sum)
 	}
 }
 

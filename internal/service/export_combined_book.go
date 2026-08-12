@@ -1,5 +1,11 @@
-// export_combined_book.go builds the ONE workbook a course's whole payout is
-// printed from.
+// export_combined_book.go builds the ONE workbook a course's UNDERGRAD payout
+// is printed from.
+//
+// บัณฑิตศึกษา is NOT in this book. The college files graduate claims on their
+// own forms, which are a different document rather than a variant of this one:
+// hours broken out per month instead of one total, and a เหมาจ่าย sheet with no
+// hour or rate column at all. See export_grad_evidence.go and
+// export_grad_workload_form.go; the two levels never share a sheet.
 //
 // The export used to ship a folder per TA, each holding one claim workbook per
 // month plus a PDF coversheet. Printing a course therefore meant opening five
@@ -100,15 +106,20 @@ type combinedBookData struct {
 	Special         []claimant
 }
 
-// BuildCombinedClaimWorkbook renders one course's entire payout as a single
-// printable workbook.
+// BuildCombinedClaimWorkbook renders one course's UNDERGRAD payout as a single
+// printable workbook, or (nil, nil) when the course has no undergrad claimant.
+//
+// A nil return is not a failure: a course staffed entirely by บัณฑิตศึกษา has
+// its whole claim on the graduate documents instead (export_grad_evidence.go),
+// and the ZIP simply carries no undergrad book. BuildCourseZip is the one that
+// decides whether a pack with nothing in it at all is an error.
 func (s *ExportService) BuildCombinedClaimWorkbook(ctx context.Context, courseID uuid.UUID, months []string) ([]byte, error) {
 	d, err := s.collectCombinedBook(ctx, courseID, months)
 	if err != nil {
 		return nil, err
 	}
 	if len(d.Regular) == 0 && len(d.Special) == 0 {
-		return nil, Invalid("ไม่มีบันทึกเวลาที่อนุมัติแล้วในวิชานี้ ยังสร้างเอกสารเบิกจ่ายไม่ได้")
+		return nil, nil
 	}
 
 	f := excelize.NewFile()
@@ -1132,13 +1143,13 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	var pr PayRate
 	_ = s.pool.QueryRow(ctx, `
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
-		       ug_special_monthly_cap
+		       ug_special_monthly_cap, graduate_special_lumpsum, grad_special_term_cap
 		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
 		// The cap has to come along: this PayRate also prices the คาบ that
 		// decide what the budget reached, and a zero cap there would pick a
 		// different cutoff than the payout used.
-		&pr.UGSpecialMonthlyCap)
+		&pr.UGSpecialMonthlyCap, &pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap)
 	d.RateUGRegular = pr.UndergradRegular
 	d.RateUGSpecial = pr.UndergradSpecial
 	d.RateGradRegular = pr.GraduateRegularHourly
@@ -1165,11 +1176,56 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 		}
 	}
 
-	// Every TA on the course, with the level their assignment was made at.
-	// Names carry the คำนำหน้า (นาย/นาง/นางสาว) the TA declared on their
-	// profile, falling back to users.title — the college's forms print
+	// Grad-special is a flat term lump, priced at 0 by claimCostByTASlot (it
+	// only prices hourly work). These TAs no longer log any work_logs either
+	// (2026 meeting: the system computes their pay automatically from the
+	// regular track's class schedule), so their funded/fullCost figures must
+	// be filled in here rather than left at 0.
+	gradSpecialSet := map[uuid.UUID]bool{}
+	gradSpecialTAs, err := s.gradSpecialTAIDs(ctx, courseID)
+	if err != nil {
+		return nil, err
+	}
+	gradLump := pr.GraduateSpecialLumpsum
+	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
+		gradLump = pr.GradSpecialTermCap
+	}
+	gradShare := 1.0
+	if weights, werr := gradSpecialMonthShares(ctx, s.pool, courseID); werr != nil {
+		return nil, werr
+	} else if weights != nil {
+		if len(months) == 0 {
+			gradShare = 1
+		} else {
+			gradShare = 0
+			for _, ym := range months {
+				gradShare += weights[ym]
+			}
+		}
+	}
+	gradLump = round2(gradLump * gradShare)
+	for _, taID := range gradSpecialTAs {
+		gradSpecialSet[taID] = true
+		k := taTrackKey{taID, "special"}
+		funded[k] += gradLump
+		fullCost[k] += gradLump
+	}
+
+	// Every UNDERGRAD TA on the course, with the level their assignment was
+	// made at. Names carry the คำนำหน้า (นาย/นาง/นางสาว) the TA declared on
+	// their profile, falling back to users.title — the college's forms print
 	// "นายสรวิศ ไผ่พันธ์", never the bare name, and the same composition is
 	// used by the appointment order.
+	//
+	// Graduate TAs are deliberately absent: บัณฑิตศึกษา is claimed on its own
+	// paperwork (export_grad_evidence.go + the ภาระงาน .docx), which has a
+	// different layout — one column per MONTH rather than a single total, and a
+	// เหมาจ่าย sheet with no hours at all. Mixing the two in this book was
+	// wrong in both directions: a graduate TA appeared here priced by the
+	// undergrad form's shape AND again on their own document, and the ระดับ
+	// checkbox on the หลักฐาน sheet is a single tick for the whole sheet, so a
+	// mixed course printed "ปริญญาตรี" over graduate rows or the reverse
+	// depending only on who sorted first.
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT a.ta_id,
 		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
@@ -1180,6 +1236,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 		JOIN users u ON u.id = a.ta_id
 		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		WHERE sec.teaching_course_id = $1 AND a.state <> 'dropped'
+		  AND a.level::text = 'undergrad'
 		ORDER BY 2`, courseID)
 	if err != nil {
 		return nil, err
@@ -1245,7 +1302,11 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 					mine = append(mine, l)
 				}
 			}
-			if len(mine) == 0 {
+			// A grad-special TA never has any work_logs rows to print — their
+			// row is the flat lump, not a session log — so len(mine)==0 must
+			// not skip them the way it correctly does for everyone else.
+			isGradSpecialLump := side.track == "special" && gradSpecialSet[p.id]
+			if len(mine) == 0 && !isGradSpecialLump {
 				continue
 			}
 			k := taTrackKey{p.id, side.track}

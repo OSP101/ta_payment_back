@@ -167,6 +167,35 @@ func TestCoursePreview_CanExportAgreesWithTheGate(t *testing.T) {
 	}
 }
 
+// Grad-special (master/phd, track=special) no longer logs work_logs at all —
+// pay is computed automatically from the regular track's class schedule. A
+// work_logs row left over from before that change can never move again
+// (nobody submits or approves it), so it must not be counted as a blocker —
+// that would wedge the course's export shut forever.
+func TestExportGate_ExcludesGradSpecialLeftoverRows(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Level: "master", Track: "special"})
+	payoutReady(f)
+	f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	f.exec(`UPDATE work_logs SET status='submitted', submitted_at=now() WHERE assignment_id=$1`, f.AssignmentID)
+
+	bs, err := exportSvcFor(f).CourseExportBlockers(f.ctx, f.CourseID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gradSpecialName string
+	if err := f.Pool.QueryRow(f.ctx,
+		`SELECT first_name||' '||last_name FROM users WHERE id=$1`, f.TAID).Scan(&gradSpecialName); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range bs {
+		if b.TAName == gradSpecialName {
+			t.Fatalf("grad-special leftover 'submitted' row still surfaced as a %s blocker — "+
+				"it can never move, so it would wedge this course's export shut forever", b.Kind)
+		}
+	}
+}
+
 // submission_periods.year_month is Buddhist-era already. Reusing the settlement's
 // Gregorian labeller on it printed "สิงหาคม 3112" — 2569 + 543.
 func TestExportBlockers_MonthLabelsStayBuddhistEra(t *testing.T) {

@@ -261,3 +261,52 @@ func TestStatusRank_StaffReviewSitsBeforeExport(t *testing.T) {
 		}
 	}
 }
+
+// Grad-special (master/phd on a special-track section) no longer logs
+// work_logs at all — the system computes their pay automatically from the
+// regular track's class schedule (2026 meeting). Leftover 'submitted' rows
+// from before that change must not appear in the staff review queue: the
+// lecturer's own queue already excludes these assignments (worklog.go
+// ListPending), so a stray row here could never be approved or rejected by
+// anyone and would block the whole month/course from ever being signed off.
+func TestReviewQueue_ExcludesGradSpecial(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Level: "master", Track: "special"})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	f.exec(`UPDATE work_logs SET status='submitted', submitted_at=now() WHERE assignment_id=$1`, f.AssignmentID)
+	f.addSubmissionPeriod(currentMonthMM(), openDueDate(), "", false)
+	f.addAppointmentOrder()
+
+	rows, err := f.Periods.ListReviewQueue(f.ctx, f.TermID)
+	if err != nil {
+		t.Fatalf("ListReviewQueue: %v", err)
+	}
+	for _, r := range rows {
+		if r.TAID == f.TAID {
+			t.Fatalf("grad-special assignment appeared in the staff review queue (row=%+v) — it can never be approved/rejected now, so it must not show up here", r)
+		}
+	}
+}
+
+// A grad-regular (master/phd, track=regular) assignment must still appear —
+// only grad-special is excluded.
+func TestReviewQueue_StillIncludesGradRegular(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Level: "master", Track: "regular"})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	f.exec(`UPDATE work_logs SET status='approved' WHERE assignment_id=$1`, f.AssignmentID)
+	f.addSubmissionPeriod(currentMonthMM(), openDueDate(), "", false)
+	f.addAppointmentOrder()
+
+	rows, err := f.Periods.ListReviewQueue(f.ctx, f.TermID)
+	if err != nil {
+		t.Fatalf("ListReviewQueue: %v", err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.TAID == f.TAID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("grad-regular assignment must still appear in the staff review queue")
+	}
+}

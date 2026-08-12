@@ -344,19 +344,38 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		}
 	}
 
-	// Grad-special lump sum: add once per TA (not per section), and only when the
-	// TA actually has approved work in the course. See the switch above.
-	gradLump := pr.GraduateSpecialLumpsum * float64(termMonths)
+	// Grad-special lump sum: add once per TA (not per section). Eligibility is
+	// just holding an approved grad-special assignment in this course — these
+	// TAs no longer log work_logs at all (2026 meeting: the system computes
+	// their pay automatically), so hoursTotal is expected to be 0 for them and
+	// must NOT gate whether they get paid.
+	// graduate_special_lumpsum IS the whole-term-per-course figure — no month
+	// multiplication.
+	gradLump := pr.GraduateSpecialLumpsum
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}
-	// Flat per term, so a month filter cannot select it — apportioned by the
-	// share of months this document covers, which keeps the slices summing to
-	// the undivided lump (staff's instruction, 10/08/2026).
-	gradLump *= monthShare
+	// Flat per term, so a month filter cannot select it — apportioned by this
+	// course's own regular-track class-schedule share of the selected months
+	// (falls back to an even per-month share if no schedule exists yet), which
+	// keeps the slices summing to the undivided lump.
+	gradShare := monthShare
+	if weights, werr := gradSpecialMonthShares(ctx, s.pool, teachingCourseID); werr != nil {
+		return nil, werr
+	} else if weights != nil {
+		gradShare = 0
+		if len(months) == 0 {
+			gradShare = 1
+		} else {
+			for _, ym := range months {
+				gradShare += weights[ym]
+			}
+		}
+	}
+	gradLump *= gradShare
 	for _, taID := range order {
 		agg := byTA[taID]
-		if agg.hasGradSpecial && agg.hoursTotal > 0 {
+		if agg.hasGradSpecial {
 			agg.paySpecial += gradLump
 		}
 	}
@@ -494,12 +513,57 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	// The PDF coversheet and the PDF timetable are gone with them: both were
 	// second renderings of what the workbooks already say, and a printed pack
 	// containing two versions of one claim is a pack somebody has to reconcile.
+	//
+	// ป.ตรี and บัณฑิตศึกษา are claimed on SEPARATE paperwork — they are two
+	// different forms, not one form with a level column, so each level's book
+	// holds only its own people. A course with no undergrad TA gets no
+	// undergrad book at all (nil, not an error).
 	book, err := s.BuildCombinedClaimWorkbook(ctx, teachingCourseID, months)
 	if err != nil {
 		return nil, "", 0, err
 	}
-	if err := add(fmt.Sprintf("%s-เบิกจ่าย.xlsx", courseCode), book); err != nil {
+	if book != nil {
+		if err := add(fmt.Sprintf("%s-เบิกจ่าย.xlsx", courseCode), book); err != nil {
+			return nil, "", 0, err
+		}
+	}
+
+	// บัณฑิตศึกษา files a DIFFERENT หลักฐานการจ่ายเงิน from ป.ตรี — one column
+	// per month rather than a single total, and a เหมาจ่าย sheet with no hour or
+	// rate columns at all (see export_grad_evidence.go). Its own workbook,
+	// holding only graduate TAs, exactly as the college's own two example files
+	// are filed.
+	//
+	// Nil, not an error, when the course has no graduate TAs: that is most
+	// courses, and it must add nothing to their pack.
+	gradEvidence, err := s.BuildGradEvidenceWorkbook(ctx, teachingCourseID, months)
+	if err != nil {
 		return nil, "", 0, err
+	}
+	if gradEvidence != nil {
+		if err := add(fmt.Sprintf("%s-หลักฐาน-บัณฑิต.xlsx", courseCode), gradEvidence); err != nil {
+			return nil, "", 0, err
+		}
+	}
+	// Neither level produced a claim document: there is nothing to pay, and a
+	// ZIP holding only timetables would look like a payout pack while billing
+	// nobody. Same refusal the combined book used to raise on its own.
+	if book == nil && gradEvidence == nil {
+		return nil, "", 0, Invalid("ไม่มีบันทึกเวลาที่อนุมัติแล้วในวิชานี้ ยังสร้างเอกสารเบิกจ่ายไม่ได้")
+	}
+
+	// แบบแสดงรายละเอียดภาระงานของผู้ช่วยสอน — one .docx per grad-REGULAR TA,
+	// the sheet the lecturer signs to say what those claimed hours were spent
+	// on. Grad-special gets none: their pay is the flat term lump and they log
+	// no hours to break down.
+	forms, err := s.BuildGradWorkloadForms(ctx, teachingCourseID, months)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	for _, form := range forms {
+		if err := add(fmt.Sprintf("%s-ภาระงาน-%s.docx", courseCode, sanitize(form.FullName)), form.Doc); err != nil {
+			return nil, "", 0, err
+		}
 	}
 
 	// ตารางเรียนและตารางปฏิบัติงาน stays per person: it covers EVERY course the

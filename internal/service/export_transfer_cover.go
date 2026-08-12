@@ -126,10 +126,13 @@ func (s *ExportService) taNamesByCourse(ctx context.Context, courseID uuid.UUID)
 }
 
 // gradSpecialTAIDs returns every graduate TA on courseID's special-track
-// section who has at least one approved work log — the holders of the flat
-// term lump (claimCostByTASlot prices grad-special hours at 0; the lump is
-// added separately here, exactly as settle() commits it off the top of the
-// special pool rather than cutting it by คาบ).
+// section — the holders of the flat term lump (claimCostByTASlot prices
+// grad-special hours at 0; the lump is added separately here, exactly as
+// settle() commits it off the top of the special pool rather than cutting it
+// by คาบ). Eligibility is just an approved assignment: grad-special TAs don't
+// log work_logs at all any more (2026 meeting — the system computes their pay
+// automatically from the regular track's class schedule instead), so there is
+// nothing left to gate on there.
 func (s *ExportService) gradSpecialTAIDs(ctx context.Context, courseID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT a.ta_id
@@ -138,9 +141,7 @@ func (s *ExportService) gradSpecialTAIDs(ctx context.Context, courseID uuid.UUID
 		JOIN sections sec  ON sec.id = a.section_id AND sec.track = 'special'
 		JOIN users u       ON u.id = a.ta_id
 		WHERE sec.teaching_course_id = $1
-		  AND u.study_level::text IN ('master','phd')
-		  AND EXISTS (SELECT 1 FROM work_logs wl
-		               WHERE wl.assignment_id = a.id AND wl.status = 'approved')`, courseID)
+		  AND u.study_level::text IN ('master','phd')`, courseID)
 	if err != nil {
 		return nil, err
 	}
@@ -186,12 +187,13 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 		return nil, nil, err
 	}
 	inSlice := func(string) bool { return true }
-	// monthShare apportions figures that are flat for the whole term (the
-	// graduate-special lump) across the slices, by how many of the term's
-	// months this document covers. 1 when unscoped.
-	monthShare := 1.0
+	// uniformMonthShare is the fallback apportionment (equal weight per
+	// calendar month) used only when a course has no regular-track schedule
+	// to weight the grad-special lump by. 1 when unscoped.
+	uniformMonthShare := 1.0
+	var selected map[string]bool
 	if len(months) > 0 {
-		selected := map[string]bool{}
+		selected = map[string]bool{}
 		for _, m := range months {
 			selected[m] = true
 		}
@@ -207,8 +209,34 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 					hit++
 				}
 			}
-			monthShare = float64(hit) / float64(n)
+			uniformMonthShare = float64(hit) / float64(n)
 		}
+	}
+	// gradLumpShare apportions the flat graduate-special term lump (no คาบ
+	// behind it) across a month-scoped document, weighted by that COURSE's own
+	// regular-track class-schedule hours per month (2026 meeting: grad-special
+	// TAs no longer log anything themselves, so their monthly split is
+	// estimated from the regular track's teaching pattern instead). Falls back
+	// to an even per-calendar-month share if the course has no regular-track
+	// schedule yet to weight by.
+	gradLumpShare := func(courseID uuid.UUID) (float64, error) {
+		if selected == nil {
+			return 1.0, nil
+		}
+		weights, err := gradSpecialMonthShares(ctx, s.pool, courseID)
+		if err != nil {
+			return 0, err
+		}
+		if weights == nil {
+			return uniformMonthShare, nil
+		}
+		var share float64
+		for ym, w := range weights {
+			if selected[ym] {
+				share += w
+			}
+		}
+		return share, nil
 	}
 
 	var pr PayRate
@@ -234,19 +262,9 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 
 	for courseID, cur := range printCurricula {
 		var courseCode string
-		var perTermMonths int
 		if err := s.pool.QueryRow(ctx, `
-			SELECT tc.code, COALESCE(t.months, 0)
-			FROM teaching_courses tc JOIN academic_terms t ON t.id = tc.term_id
-			WHERE tc.id = $1`, courseID).Scan(&courseCode, &perTermMonths); err != nil {
+			SELECT tc.code FROM teaching_courses tc WHERE tc.id = $1`, courseID).Scan(&courseCode); err != nil {
 			return nil, nil, err
-		}
-		termMonths := pr.TermMonths
-		if perTermMonths > 0 {
-			termMonths = perTermMonths
-		}
-		if termMonths == 0 {
-			termMonths = 4
 		}
 
 		settlement, err := s.SettleCourse(ctx, courseID)
@@ -281,17 +299,23 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 		if err != nil {
 			return nil, nil, err
 		}
-		gradLump := pr.GraduateSpecialLumpsum * float64(termMonths)
+		// graduate_special_lumpsum IS the whole-term-per-course figure (2026
+		// meeting correction) — no month multiplication.
+		gradLump := pr.GraduateSpecialLumpsum
 		if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 			gradLump = pr.GradSpecialTermCap
 		}
 		// The graduate-special lump is a flat TERM figure with no คาบ behind it,
 		// so slicing by month cannot filter it — it is apportioned instead, by
-		// the share of the term's months this document covers (staff's own
-		// instruction, 10/08/2026). Pro-rating rather than assigning it whole to
-		// the first slice keeps the slice-sum equal to the undivided total and
-		// stops a TA's October document reading 0.00 for work they did do.
-		gradLump *= monthShare
+		// this course's own regular-track class-schedule share of the selected
+		// months. Pro-rating rather than assigning it whole to the first slice
+		// keeps the slice-sum equal to the undivided total and stops a TA's
+		// October document reading 0.00 for work done that month.
+		share, err := gradLumpShare(courseID)
+		if err != nil {
+			return nil, nil, err
+		}
+		gradLump *= share
 		for _, taID := range gradTAs {
 			a := get(cur, "special", taID, names[taID])
 			a.courses[courseCode] = true

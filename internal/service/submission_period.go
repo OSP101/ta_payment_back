@@ -360,51 +360,67 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
 		       -- Worklog readiness for the month. MM is taken from the period's
-		       -- year_month and matched against work_date.
-		       (SELECT COUNT(*) FROM work_logs wl2
-		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
-		          JOIN sections s2 ON s2.id = a2.section_id
-		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
-		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)),
+		       -- year_month and matched against work_date. Grad-special
+		       -- (master/phd, track=special) is excluded throughout: those TAs
+		       -- no longer log work_logs at all, so a leftover 'submitted' row
+		       -- on a dead grad-special assignment must not show up as pending
+		       -- work on a TA's OWN reminders screen either — the same rule
+		       -- ListPending/ListReviewQueue already apply on the staff side.
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')),
+		       (SELECT COUNT(*) FROM work_logs wl2
+		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
+		          JOIN sections s2 ON s2.id = a2.section_id
+		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
+		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl2.status IN ('draft','submitted','rejected')),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl2.status IN ('draft','rejected')),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl2.status = 'submitted'),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl2.status = 'rejected'),
 		       COALESCE((SELECT SUM(wl2.hours) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl2.status = 'approved'), 0)
 		FROM submission_periods sp
-		JOIN teaching_courses tc ON tc.term_id = sp.term_id		JOIN ta_request_assignments a ON a.section_id IN
-		    (SELECT id FROM sections WHERE teaching_course_id = tc.id)
+		JOIN teaching_courses tc ON tc.term_id = sp.term_id
+		JOIN sections sec ON sec.teaching_course_id = tc.id
+		JOIN ta_request_assignments a ON a.section_id = sec.id
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		LEFT JOIN submission_period_status st
 		    ON st.submission_period_id = sp.id
 		   AND st.ta_id = a.ta_id
 		   AND st.teaching_course_id = tc.id
 		WHERE a.ta_id = $1
+		  -- A TA whose ONLY assignment on this course is grad-special must not
+		  -- see the course at all here: there is nothing left for them to send
+		  -- or wait on.
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		GROUP BY sp.id, sp.label, sp.year_month, sp.starts_on, sp.due_date, sp.is_closed,
 		         tc.id, tc.code, tc.name_th, st.status
 		ORDER BY sp.due_date, tc.code`, taID)
@@ -521,7 +537,16 @@ func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taI
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
 		WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
-		  AND to_char(wl.work_date,'MM') = $3`, taID, tcID, mm).Scan(&total, &unapproved)
+		  AND to_char(wl.work_date,'MM') = $3
+		  -- Grad-special no longer logs work_logs at all — pay is computed
+		  -- automatically from the regular track's class schedule. A TA who
+		  -- also holds a real (grad-regular or undergrad) assignment on this
+		  -- course must not have their readiness blocked by leftover
+		  -- 'submitted' rows on a dead grad-special assignment: nobody can
+		  -- ever move those rows forward, so counting them here would refuse
+		  -- MarkStaffReviewed on the TA's real hours forever.
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`,
+		taID, tcID, mm).Scan(&total, &unapproved)
 	return
 }
 
@@ -584,7 +609,12 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		        JOIN sections s2 ON s2.id = a2.section_id
 		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
 		          AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
-		          AND wl.status IN ('draft','submitted','rejected'))
+		          AND wl.status IN ('draft','submitted','rejected')
+		          -- Same grad-special exclusion as monthWorklogReadiness: a
+		          -- leftover 'submitted' row on a dead grad-special assignment
+		          -- must not block locking the TA's real (regular-track or
+		          -- undergrad) hours once staff have signed those off.
+		          AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special'))
 		GROUP BY sp.id, a.ta_id, tc.id
 		ON CONFLICT (submission_period_id, ta_id, teaching_course_id) DO UPDATE
 		SET status        = 'exported',
@@ -892,16 +922,22 @@ func (s *SubmissionPeriodService) GetTimeline(ctx context.Context, actor, period
 		       u.id, u.first_name || ' ' || u.last_name,
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
-		       (SELECT COUNT(*) FROM work_logs wl
-		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
-		          JOIN sections s2 ON s2.id = a2.section_id
-		         WHERE a2.ta_id = $2 AND s2.teaching_course_id = tc.id
-		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)),
+		       -- Grad-special (master/phd, track=special) is excluded: those TAs
+		       -- log no work_logs at all, so a leftover 'submitted' row on a
+		       -- dead grad-special assignment must not show as "unapproved"
+		       -- work on a timeline that is otherwise fully done.
 		       (SELECT COUNT(*) FROM work_logs wl
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $2 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')),
+		       (SELECT COUNT(*) FROM work_logs wl
+		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+		          JOIN sections s2 ON s2.id = a2.section_id
+		         WHERE a2.ta_id = $2 AND s2.teaching_course_id = tc.id
+		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl.status IN ('draft','submitted','rejected')),
 		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.exported_by::text,
@@ -962,16 +998,19 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		       u.id, u.first_name || ' ' || u.last_name,
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
-		       (SELECT COUNT(*) FROM work_logs wl
-		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
-		          JOIN sections s2 ON s2.id = a2.section_id
-		         WHERE a2.ta_id = u.id AND s2.teaching_course_id = tc.id
-		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)),
+		       -- Same grad-special exclusion as GetTimeline above.
 		       (SELECT COUNT(*) FROM work_logs wl
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = u.id AND s2.teaching_course_id = tc.id
 		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')),
+		       (SELECT COUNT(*) FROM work_logs wl
+		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+		          JOIN sections s2 ON s2.id = a2.section_id
+		         WHERE a2.ta_id = u.id AND s2.teaching_course_id = tc.id
+		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl.status IN ('draft','submitted','rejected')),
 		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       st.exported_by::text,
@@ -1039,8 +1078,8 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 			                a.ta_id, tc.id AS tc_id, tc.code, tc.name_th
 			FROM submission_periods sp
 			JOIN teaching_courses tc ON tc.term_id = sp.term_id
-			JOIN ta_request_assignments a
-			    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
+			JOIN sections sec ON sec.teaching_course_id = tc.id
+			JOIN ta_request_assignments a ON a.section_id = sec.id
 			JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 			LEFT JOIN submission_period_status st
 			    ON st.submission_period_id = sp.id
@@ -1051,6 +1090,11 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 			  AND CURRENT_DATE <= sp.due_date
 			  AND (st.status IS NULL OR st.status = 'pending')
 			  AND (st.last_reminded_at IS NULL OR st.last_reminded_at < now() - INTERVAL '24 hours')
+			  -- Grad-special no longer logs work_logs at all — reminding them to
+			  -- "บันทึกเวลาปฏิบัติงาน...ให้ครบ" is both wrong (they log nothing)
+			  -- and would fire every 24h forever since st.status never leaves
+			  -- 'pending' for a TA who never submits.
+			  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		)
 		SELECT period_id, label, TO_CHAR(due_date,'YYYY-MM-DD'), ta_id, tc_id, code, name_th
 		FROM pending`)

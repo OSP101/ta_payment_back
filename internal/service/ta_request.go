@@ -316,11 +316,20 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		// กระจายลงบันทึกเวลาจริงได้โดยไม่ชนเพดานรายวัน (ไม่งั้น auto-generate
 		// จะข้ามคาบเงียบ ๆ และ TA เสียชั่วโมงที่ควรได้). Co-taught sections are
 		// worked in a single sitting, so their hours count once here too.
-		if err := s.enforceDailyHourFeasibility(
-			ctx, a.SectionIDs, level, name,
-			billableWeeklyTotal(a.SectionIDs, perSection[i], coGroup[i], level),
-		); err != nil {
-			return nil, err
+		//
+		// Undergrad only (2026 meeting correction): the request-submission gate
+		// used to also refuse a grad TA whose sections' real timetable exceeded
+		// grad_regular_daily_hour_cap (6 ชม./วัน), but graduate students are
+		// bound only by the 10–12 ชม./สัปดาห์ total (checked in autoDecide) —
+		// the daily-hour cap belongs to the WORKLOG entry point instead
+		// (worklog.go's validateGradRegularClassWindow), not request submission.
+		if level == "undergrad" {
+			if err := s.enforceDailyHourFeasibility(
+				ctx, a.SectionIDs, level, name,
+				billableWeeklyTotal(a.SectionIDs, perSection[i], coGroup[i], level),
+			); err != nil {
+				return nil, err
+			}
 		}
 	}
 

@@ -337,6 +337,10 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 		      -- counts work the page it links to refuses to show, and the officer
 		      -- clicks a badge saying 12 to land on an empty queue.
 		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		      -- Grad-special no longer logs work_logs and is excluded from
+		      -- ListReviewQueue — leftover approved rows from before that change
+		      -- must not inflate this badge with work no queue will ever show.
+		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		    GROUP BY sp.id, a.ta_id, tc.id
 		) q`, tid).Scan(&sum.PendingPayoutReviews)
 
@@ -375,6 +379,10 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 		          AND st.teaching_course_id = tc.id
 		    WHERE tc.term_id = $1
 		      AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		      -- Same grad-special exclusion as above: leftover rows from before
+		      -- TAs stopped logging must not make a course look actionable when
+		      -- the review queue behind the badge would show nothing for it.
+		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		    GROUP BY tc.id, sp.id, a.ta_id, COALESCE(st.status, 'pending')
 		)
 		SELECT COUNT(DISTINCT tc_id) FROM months
