@@ -25,6 +25,27 @@ func monthsParam(c *fiber.Ctx) []string {
 	return out
 }
 
+// levelParam reads and validates the ?level= selection every transfer-cover
+// endpoint has needed since the level split (12/08/2026): the document is two
+// separate files now (ป.ตรี ทำเบิกไม่เหมือนบัณฑิต), so unlike months there is
+// no "give me everything" default to fall back to — a caller must say which
+// file it wants.
+func levelParam(c *fiber.Ctx) (string, error) {
+	level := c.Query("level")
+	if level != "undergrad" && level != "graduate" {
+		return "", fiber.NewError(fiber.StatusBadRequest, "level must be 'undergrad' or 'graduate'")
+	}
+	return level, nil
+}
+
+// levelLabelTH names the file for a Content-Disposition filename.
+func levelLabelTH(level string) string {
+	if level == "graduate" {
+		return "บัณฑิต"
+	}
+	return "ปตรี"
+}
+
 // TransferCoverXLSX — GET /exports/terms/:id/transfer-cover.xlsx — the
 // "ปะหน้าจ่ายตรง" (แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร) document. Refuses outright
 // (400, not a 200 with a warnings list) if any course in the term has not
@@ -34,28 +55,66 @@ func (h *ExportHandler) TransferCoverXLSX(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	months := monthsParam(c)
-	body, _, err := h.Svc.Export.BuildTransferCoverWorkbook(c.Context(), UserID(c), termID, months)
+	level, err := levelParam(c)
 	if err != nil {
 		return err
 	}
-	name := "transfer-cover.xlsx"
+	months := monthsParam(c)
+	body, _, err := h.Svc.Export.BuildTransferCoverWorkbook(c.Context(), UserID(c), termID, months, level)
+	if err != nil {
+		return err
+	}
+	name := "transfer-cover-" + levelLabelTH(level)
 	var year, sem string
 	if err := h.Svc.Pool.QueryRow(c.Context(),
 		`SELECT academic_year::text, semester::text FROM academic_terms WHERE id = $1`, termID,
 	).Scan(&year, &sem); err == nil {
-		name = "transfer-cover-" + year + "-" + sem + ".xlsx"
+		name += "-" + year + "-" + sem
 	}
 	// Name the slice in the filename — two files for one term that differ only
 	// by month must not arrive in a downloads folder under the same name.
 	if len(months) > 0 {
-		name = strings.TrimSuffix(name, ".xlsx") + "-" + months[0]
+		name += "-" + months[0]
 		if len(months) > 1 {
 			name += "_" + months[len(months)-1]
 		}
-		name += ".xlsx"
 	}
+	name += ".xlsx"
 	c.Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
+	return c.Send(body)
+}
+
+// TransferCoverBundleZIP — GET /exports/terms/:id/transfer-cover-bundle.zip —
+// one click, one zip, both level files inside (whichever are ready). Staff
+// asked for a single download button instead of two separate ones crowding
+// the header (12/08/2026) — the two documents are still built, gated, and
+// ledgered independently exactly as before; only the button is merged.
+func (h *ExportHandler) TransferCoverBundleZIP(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	months := monthsParam(c)
+	body, _, err := h.Svc.Export.BuildTransferCoverBundle(c.Context(), UserID(c), termID, months)
+	if err != nil {
+		return err
+	}
+	name := "transfer-cover"
+	var year, sem string
+	if err := h.Svc.Pool.QueryRow(c.Context(),
+		`SELECT academic_year::text, semester::text FROM academic_terms WHERE id = $1`, termID,
+	).Scan(&year, &sem); err == nil {
+		name += "-" + year + "-" + sem
+	}
+	if len(months) > 0 {
+		name += "-" + months[0]
+		if len(months) > 1 {
+			name += "_" + months[len(months)-1]
+		}
+	}
+	name += ".zip"
+	c.Set("Content-Type", "application/zip")
 	c.Set("Content-Disposition", contentDisposition("attachment", name))
 	return c.Send(body)
 }
@@ -68,7 +127,11 @@ func (h *ExportHandler) TransferCoverBlockers(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	blockers, err := h.Svc.Export.TermExportBlockers(c.Context(), termID, monthsParam(c))
+	level, err := levelParam(c)
+	if err != nil {
+		return err
+	}
+	blockers, err := h.Svc.Export.TermExportBlockers(c.Context(), termID, monthsParam(c), level)
 	if err != nil {
 		return err
 	}
@@ -84,7 +147,11 @@ func (h *ExportHandler) TransferCoverCoverage(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	out, err := h.Svc.Export.TransferCoverCoverage(c.Context(), termID)
+	level, err := levelParam(c)
+	if err != nil {
+		return err
+	}
+	out, err := h.Svc.Export.TransferCoverCoverage(c.Context(), termID, level)
 	if err != nil {
 		return err
 	}
@@ -98,7 +165,14 @@ func (h *ExportHandler) TransferCoverHistory(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	out, err := h.Svc.Export.ListTransferCoverExports(c.Context(), termID)
+	// level is optional here (unlike the other endpoints) — "" lists every
+	// generation regardless of level, for a caller that wants the combined
+	// history rather than one file's.
+	level := c.Query("level")
+	if level != "" && level != "undergrad" && level != "graduate" {
+		return fiber.NewError(fiber.StatusBadRequest, "level must be 'undergrad' or 'graduate'")
+	}
+	out, err := h.Svc.Export.ListTransferCoverExports(c.Context(), termID, level)
 	if err != nil {
 		return err
 	}
@@ -131,7 +205,11 @@ func (h *ExportHandler) TransferCoverPreview(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	sheets, warnings, err := h.Svc.Export.TransferCoverPreview(c.Context(), termID, monthsParam(c))
+	level, err := levelParam(c)
+	if err != nil {
+		return err
+	}
+	sheets, warnings, err := h.Svc.Export.TransferCoverPreview(c.Context(), termID, monthsParam(c), level)
 	if err != nil {
 		return err
 	}

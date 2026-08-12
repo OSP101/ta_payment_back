@@ -27,7 +27,7 @@ func TestSetStage_RefusesToSkipPastUnsignedTAs(t *testing.T) {
 	exportedTerm(f)
 	svc := progressSvc(f)
 
-	err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, "")
+	err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, "", 1)
 	if err == nil {
 		t.Fatal("stage 2 must be refused while the TA has not signed")
 	}
@@ -47,25 +47,25 @@ func TestSetStage_AllowsTheNextStageOnceEverySignatureIsIn(t *testing.T) {
 
 	// Pressing "TA เซ็นครบ" IS the claim that they all signed, so it needs their
 	// signatures — being exported is not enough.
-	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 1, ""); err == nil {
+	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 1, "", 1); err == nil {
 		t.Fatal("stage 1 must be refused while a TA has not signed")
 	}
 	ta := f.TAID
-	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "ta", &ta, true); err != nil {
+	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "ta", &ta, true, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 1, ""); err != nil {
+	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 1, "", 1); err != nil {
 		t.Fatalf("stage 1 must be allowed once every TA signed: %v", err)
 	}
 	// Stage 2 now needs the lecturer's tick on top.
-	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, ""); err == nil {
+	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, "", 1); err == nil {
 		t.Fatal("stage 2 must be refused — the lecturer has not signed")
 	}
 	lect := f.LecturerID
-	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "lecturer", &lect, true); err != nil {
+	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "lecturer", &lect, true, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, ""); err != nil {
+	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, "", 1); err != nil {
 		t.Errorf("stage 2 must be allowed once the lecturer signed: %v", err)
 	}
 }
@@ -76,21 +76,21 @@ func TestSetStage_BackwardsIsAlwaysAllowed(t *testing.T) {
 	exportedTerm(f)
 	svc := progressSvc(f)
 	ta, lect := f.TAID, f.LecturerID
-	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "ta", &ta, true); err != nil {
+	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "ta", &ta, true, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "lecturer", &lect, true); err != nil {
+	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "lecturer", &lect, true, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, ""); err != nil {
+	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 2, "", 1); err != nil {
 		t.Fatal(err)
 	}
 	// Un-tick the TA, then reverse — the correction must not be blocked by the
 	// very signature the officer is correcting.
-	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "ta", &ta, false); err != nil {
+	if err := svc.ToggleSignature(f.ctx, f.StaffID, f.CourseID, "ta", &ta, false, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 1, ""); err != nil {
+	if err := svc.SetStage(f.ctx, f.StaffID, f.TermID, 1, "", 1); err != nil {
 		t.Errorf("stepping back must always work: %v", err)
 	}
 }
@@ -104,7 +104,7 @@ func TestListChecklist_OneRowPerPerson(t *testing.T) {
 	f.exec(`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
 	        VALUES (gen_random_uuid(), $1, $2, $3, 'undergrad')`, reqID, f.SectionID, second)
 
-	items, err := progressSvc(f).ListChecklist(f.ctx, f.TermID)
+	items, err := progressSvc(f).ListChecklist(f.ctx, f.TermID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestListChecklist_LecturerIsTheSubmitterNotEveryCoTeacher(t *testing.T) {
 	f.exec(`INSERT INTO teaching_lecturers (teaching_course_id, lecturer_id, is_primary)
 	        VALUES ($1, $2, false)`, f.CourseID, other)
 
-	items, err := progressSvc(f).ListChecklist(f.ctx, f.TermID)
+	items, err := progressSvc(f).ListChecklist(f.ctx, f.TermID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +175,11 @@ func TestRemindUnsigned_TargetsTheSameLecturersTheChecklistDoes(t *testing.T) {
 	svc := progressSvc(f)
 	svc.notify = f.Svc.notify
 
-	n, err := svc.RemindUnsigned(f.ctx, f.StaffID, f.TermID)
+	n, err := svc.RemindUnsigned(f.ctx, f.StaffID, f.TermID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	items, err := svc.ListChecklist(f.ctx, f.TermID)
+	items, err := svc.ListChecklist(f.ctx, f.TermID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

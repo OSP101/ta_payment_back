@@ -125,6 +125,17 @@ type CourseSummary struct {
 	// the lecturer — not the TAs, whose names were taking the space and telling
 	// nobody anything they could act on.
 	LecturerNames string `json:"lecturer_names"`
+
+	// RoundTwoOutstanding (12/08/2026) is true when this course's term crosses
+	// the 30 กันยายน budget year, the course has real billable work AFTER that
+	// boundary, and no export_batches slice has covered it yet. A course can
+	// read "ส่งออกแล้ว" (LastExportAt set) from round 1 alone while round 2
+	// still owes a second, separate document against next year's budget — this
+	// is the signal the list uses to say so, rather than a course looking
+	// finished when a second file is still due. Same predicate the
+	// document-progress board uses (round2BillableSQL/round2ExportedSQL),
+	// kept in sync deliberately.
+	RoundTwoOutstanding bool `json:"round_two_outstanding,omitempty"`
 }
 
 // DashboardSummary aggregates budget + submission status per teaching_course
@@ -283,6 +294,37 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		out[i].ReviewComplete = anySignedOff[out[i].TeachingCourseID] &&
 			len(out[i].UnreviewedMonths) == 0
 		out[i].ExportEligible = out[i].HasAppointmentOrder && out[i].ReviewComplete
+	}
+
+	// Round-2 outstanding: only worth a query when the TERM actually crosses
+	// the budget-year boundary — the ordinary (non-crossing) case pays nothing
+	// extra. termID can be uuid.Nil ("every term"), which has no single fiscal
+	// split to compute against, so it is skipped there too.
+	if export != nil && termID != uuid.Nil {
+		if all, merr := export.TermMonths(ctx, termID); merr == nil {
+			if split, serr := fiscalSplit(all); serr == nil && split.Crosses && len(split.After) > 0 {
+				r2Rows, r2err := s.pool.Query(ctx, `
+					SELECT tc.id
+					FROM teaching_courses tc
+					WHERE tc.term_id = $1
+					  AND `+round2BillableSQL("$2")+`
+					  AND NOT `+round2ExportedSQL("$2")+`
+					`, termID, split.After)
+				if r2err == nil {
+					outstanding := map[uuid.UUID]bool{}
+					for r2Rows.Next() {
+						var id uuid.UUID
+						if r2Rows.Scan(&id) == nil {
+							outstanding[id] = true
+						}
+					}
+					r2Rows.Close()
+					for i := range out {
+						out[i].RoundTwoOutstanding = outstanding[out[i].TeachingCourseID]
+					}
+				}
+			}
+		}
 	}
 	return out, nil
 }

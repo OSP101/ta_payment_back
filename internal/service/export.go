@@ -588,12 +588,23 @@ func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uui
 	// ปีการศึกษา_เทอม_รหัสวิชา — the way the finance office files these. It used
 	// to carry a download timestamp, which made every re-download a differently
 	// named copy of the same pack and left staff guessing which was current.
-	// A term is exported once, so the term itself is the identity.
-	name := fmt.Sprintf("%d_%d_%s.zip", academicYear, semester, courseCode)
+	// A term is exported once, so the term itself is the identity — EXCEPT once
+	// the fiscal-year split (10/08/2026) means a term can be exported TWICE
+	// (มิ.ย.–ก.ย. then ตุลาคม on a separate document): without the slice in the
+	// name, both downloads land in a finance officer's folder under the exact
+	// same filename, and the second silently overwrites the first.
+	name := fmt.Sprintf("%d_%d_%s", academicYear, semester, courseCode)
 	if academicYear == 0 {
 		// No term on the course — fall back rather than ship "0_0_CODE.zip".
-		name = courseCode + ".zip"
+		name = courseCode
 	}
+	if len(months) > 0 {
+		name += "_" + months[0]
+		if len(months) > 1 {
+			name += "_" + months[len(months)-1]
+		}
+	}
+	name += ".zip"
 	return buf.Bytes(), name, len(records), nil
 }
 

@@ -190,10 +190,22 @@ func exportBlockedError(blockers []ExportBlocker) error {
 // finance_sent. A term-wide gate makes that document unobtainable until after
 // the budget year it belongs to has already closed.
 //
+// level ("undergrad" | "graduate", 12/08/2026) narrows the gate to the FILE
+// being issued: ปะหน้าจ่ายตรง is now two separate documents, and a graduate
+// course still mid-review must not hold the undergrad file's export shut, nor
+// the reverse. Note this means a term whose graduate TAs are ALL grad-special
+// (no work_logs at all — see gradSpecialTAIDs) reports zero blockers for
+// level="graduate" from the very first day of the term: there is nothing
+// left to review before the lump is transferable. That is intentional, not a
+// gap — see the warning BuildTransferCoverWorkbook attaches in that case.
+//
 // Filtered on work_date's own Gregorian month, not on sp.year_month, which
 // carries a BUDDHIST academic year ("2569-06") and cannot be compared with a
 // caller's Gregorian selection — see term_months.go.
-func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID, months []string) ([]ExportBlocker, error) {
+func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID, months []string, level string) ([]ExportBlocker, error) {
+	if level != "undergrad" && level != "graduate" {
+		return nil, fmt.Errorf("TermExportBlockers: invalid level %q", level)
+	}
 	rows, err := s.pool.Query(ctx, `
 		WITH months AS (
 		    SELECT tc.code AS course_code,
@@ -222,13 +234,15 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		      -- CourseExportBlockers) — leftover rows from before that change
 		      -- must not permanently block the term-wide finance_sent gate.
 		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		      AND CASE WHEN $3 = 'graduate' THEN a.level::text IN ('master','phd')
+		               ELSE a.level::text = 'undergrad' END
 		    GROUP BY 1, 2, 3, 4, 5
 		)
 		SELECT course_code, ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
 		   OR (approved > 0 AND staff_status <> 'finance_sent')
-		ORDER BY course_code, ta_name, year_month`, termID, months)
+		ORDER BY course_code, ta_name, year_month`, termID, months, level)
 	if err != nil {
 		return nil, err
 	}

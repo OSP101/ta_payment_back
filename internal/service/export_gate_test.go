@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"ta-payment-back/internal/timeutil"
 )
 
 // Downloading the ZIP is the freeze point: it becomes the claim document AND
@@ -248,5 +250,40 @@ func TestBuildCourseZip_NamesTheFileByTermAndCourse(t *testing.T) {
 	}
 	if again != name {
 		t.Errorf("re-download named %q, first was %q — the name must not drift", again, name)
+	}
+}
+
+// A term now exported TWICE (the fiscal-year split, 10/08/2026) must not
+// produce the same filename twice — otherwise the second download silently
+// overwrites the first in whatever folder finance keeps these in.
+func TestBuildCourseZip_MonthSliceIsNamedDifferentlyFromTheWholeTerm(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	payoutReady(f)
+	pid := f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Svc.Approve(f.ctx, f.LecturerID, f.AssignmentID, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Periods.MarkStaffReviewed(f.ctx, f.StaffID, pid, f.TAID, f.CourseID, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	ym := timeutil.Now().Format("2006-01")
+	_, whole, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sliced, _, err := exportSvcFor(f).BuildCourseZip(f.ctx, f.CourseID, []string{ym})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sliced == whole {
+		t.Fatalf("month-sliced export named %q, identical to the whole-term name — a second export would overwrite the first", sliced)
+	}
+	if !strings.Contains(sliced, ym) {
+		t.Errorf("month-sliced filename %q must name the month it covers (%s)", sliced, ym)
 	}
 }

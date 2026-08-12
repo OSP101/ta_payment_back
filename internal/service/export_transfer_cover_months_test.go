@@ -112,16 +112,16 @@ func TestTransferCoverMonthSlices_SumToTheWholeTerm(t *testing.T) {
 	f.assignTAOn(ta, courseID, regSec, "undergrad",
 		[]string{"2026-08-10", "2026-09-14", "2026-09-21", "2026-10-05", "2026-10-12"})
 
-	whole, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	whole, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("whole term: %v", err)
 	}
 	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
-		[]string{"2026-06", "2026-07", "2026-08", "2026-09"})
+		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}, "undergrad")
 	if err != nil {
 		t.Fatalf("มิ.ย.–ก.ย.: %v", err)
 	}
-	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"})
+	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"}, "undergrad")
 	if err != nil {
 		t.Fatalf("ต.ค.: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestTermExportBlockers_ScopedToSelectedMonths(t *testing.T) {
 	// กันยายน is settled with finance; ตุลาคม is still in progress.
 	f.financeSendPeriod(courseID, "2569-09")
 
-	scoped, err := f.svc.TermExportBlockers(f.ctx, f.termID, []string{"2026-09"})
+	scoped, err := f.svc.TermExportBlockers(f.ctx, f.termID, []string{"2026-09"}, "undergrad")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestTermExportBlockers_ScopedToSelectedMonths(t *testing.T) {
 		t.Errorf("กันยายน is finance_sent, so its document must be issuable; got blockers: %+v", scoped)
 	}
 
-	wholeTerm, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil)
+	wholeTerm, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
 	grad := f.newTA("บัณฑิต เหมาจ่าย", "master")
 	f.assignTAOn(grad, courseID, specSec, "master", []string{"2026-09-14"})
 
-	whole, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	whole, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "graduate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,11 +205,11 @@ func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
 	// falls back to an even per-calendar-month share: five months in the
 	// term, so a four-month slice carries 4/5 of the lump.
 	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
-		[]string{"2026-06", "2026-07", "2026-08", "2026-09"})
+		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}, "graduate")
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"})
+	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"}, "graduate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,11 +245,11 @@ func TestTransferCoverMonthSlices_GradLumpFollowsRealScheduleWhenAvailable(t *te
 	f.assignTAOn(grad, courseID, specSec, "master", []string{"2026-09-14"})
 
 	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
-		[]string{"2026-06", "2026-07", "2026-08", "2026-09"})
+		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}, "graduate")
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"})
+	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"}, "graduate")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestTransferCoverCoverage_TracksIssuedMonths(t *testing.T) {
 	f.financeSendPeriod(courseID, "2569-09")
 	f.financeSendPeriod(courseID, "2569-10")
 
-	cov, err := f.svc.TransferCoverCoverage(f.ctx, f.termID)
+	cov, err := f.svc.TransferCoverCoverage(f.ctx, f.termID, "undergrad")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,10 +297,10 @@ func TestTransferCoverCoverage_TracksIssuedMonths(t *testing.T) {
 
 	// Issue มิ.ย.–ก.ย. only.
 	if _, _, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID,
-		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}); err != nil {
+		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}, "undergrad"); err != nil {
 		t.Fatalf("issue มิ.ย.–ก.ย.: %v", err)
 	}
-	cov, err = f.svc.TransferCoverCoverage(f.ctx, f.termID)
+	cov, err = f.svc.TransferCoverCoverage(f.ctx, f.termID, "undergrad")
 	if err != nil {
 		t.Fatal(err)
 	}

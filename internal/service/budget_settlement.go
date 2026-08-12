@@ -713,7 +713,18 @@ type taSlotCost struct {
 	EndTime   string // "17:00"
 	YearMonth string // "2026-10"
 	Track     string
-	Baht      float64
+	// Level is the TA's assignment level on this คาบ: "undergrad", "master",
+	// or "phd" — the raw ta_request_assignments.level value, not the
+	// two-value printed grouping (see gradLevel below).
+	Level string
+	Baht  float64
+}
+
+// gradLevel is true for any taSlotCost row belonging to a graduate (master or
+// phd) assignment — the two-value split every document that separates
+// undergrad from graduate money reads instead of comparing Level directly.
+func (c taSlotCost) gradLevel() bool {
+	return c.Level == "master" || c.Level == "phd"
 }
 
 // claimCostByTASlot prices every (TA, คาบ, track) of a course exactly as the
@@ -763,7 +774,7 @@ func (s *ExportService) claimCostByTASlot(
 	    LEFT JOIN b2_overlap o
 	           ON o.ta_id = sit.ta_id AND o.ym = sit.ym AND sit.track = 'special'
 	)
-	SELECT p.ta_id, p.d, p.st, p.et, p.ym, p.track,
+	SELECT p.ta_id, p.d, p.st, p.et, p.ym, p.track, p.level,
 	       CASE
 	           WHEN $5::float8 > 0 AND p.level = 'undergrad' AND p.track = 'special'
 	                AND tot.month_baht > $5
@@ -785,7 +796,7 @@ func (s *ExportService) claimCostByTASlot(
 	var out []taSlotCost
 	for rows.Next() {
 		var c taSlotCost
-		if err := rows.Scan(&c.TA, &c.Date, &c.StartTime, &c.EndTime, &c.YearMonth, &c.Track, &c.Baht); err != nil {
+		if err := rows.Scan(&c.TA, &c.Date, &c.StartTime, &c.EndTime, &c.YearMonth, &c.Track, &c.Level, &c.Baht); err != nil {
 			return nil, err
 		}
 		out = append(out, c)

@@ -252,7 +252,7 @@ func TestBuildTransferCoverSheets_DualTrackSplitsAcrossSheets(t *testing.T) {
 	f.financeSend(courseA)
 	f.financeSend(courseB)
 
-	sheets, warnings, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	sheets, warnings, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("buildTransferCoverSheets: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestBuildTransferCoverSheets_UsesSettledCutoffNotRawTotal(t *testing.T) {
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1, 2, 3})
 	f.financeSend(courseA)
 
-	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("buildTransferCoverSheets: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsFlatNotMultipliedByMonths(t *
 	f.assignTA(ta, courseID, specSec, "master", nil)
 	f.financeSend(courseID)
 
-	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "graduate")
 	if err != nil {
 		t.Fatalf("buildTransferCoverSheets: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *tes
 	f.financeSend(c1)
 	f.financeSend(c2)
 
-	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "graduate")
 	if err != nil {
 		t.Fatalf("buildTransferCoverSheets: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestBuildTransferCoverSheets_ZeroNetRowExcluded(t *testing.T) {
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
 	f.financeSend(courseA)
 
-	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("buildTransferCoverSheets: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestBuildTransferCoverWorkbook_TotalIsARealFormula(t *testing.T) {
 	f.storeCitizenID(ta1, "1234567890123")
 
 	actor := f.actor()
-	body, warnings, err := f.svc.BuildTransferCoverWorkbook(f.ctx, actor, f.termID, nil)
+	body, warnings, err := f.svc.BuildTransferCoverWorkbook(f.ctx, actor, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("BuildTransferCoverWorkbook: %v\nwarnings: %v", err, warnings)
 	}
@@ -464,7 +464,7 @@ func TestBuildTransferCoverWorkbook_SeniorityColumnPopulated(t *testing.T) {
 	f.assignTA(oldTA, courseA, regA, "undergrad", []int{2})
 	f.financeSend(courseA)
 
-	body, warnings, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil)
+	body, warnings, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("BuildTransferCoverWorkbook: %v\nwarnings: %v", err, warnings)
 	}
@@ -494,7 +494,7 @@ func TestTermExportBlockers_RejectsWhenOneMonthNotFinanceSent(t *testing.T) {
 	// was never advanced to finance_sent — the case that must still block.
 	f.ensurePeriod()
 
-	blockers, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil)
+	blockers, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("TermExportBlockers: %v", err)
 	}
@@ -511,7 +511,7 @@ func TestTermExportBlockers_RejectsWhenOneMonthNotFinanceSent(t *testing.T) {
 		t.Errorf("blockers = %+v, want a not_finance_sent entry tagged CP111", blockers)
 	}
 
-	if _, _, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil); err == nil {
+	if _, _, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil, "undergrad"); err == nil {
 		t.Error("BuildTransferCoverWorkbook must refuse while the gate is open")
 	}
 }
@@ -525,7 +525,7 @@ func TestTermExportBlockers_ClearsOnceFinanceSent(t *testing.T) {
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
 	f.financeSend(courseA)
 
-	blockers, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil)
+	blockers, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
 		t.Fatalf("TermExportBlockers: %v", err)
 	}
@@ -547,7 +547,7 @@ func TestBuildTransferCoverSheets_GraduateCourseRoutesToGradSheet(t *testing.T) 
 	f.assignTA(ta, courseA, regA, "master", []int{1})
 	f.financeSend(courseA)
 
-	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil)
+	sheets, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "graduate")
 	if err != nil {
 		t.Fatalf("buildTransferCoverSheets: %v", err)
 	}

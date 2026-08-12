@@ -311,6 +311,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// the term reaching finance_sent, unlike the course-summary above.
 	authed.Get("/exports/terms/:id/transfer-cover/blockers", adminOrStaff, eh.TransferCoverBlockers)
 	authed.Get("/exports/terms/:id/transfer-cover.xlsx", adminOrStaff, eh.TransferCoverXLSX)
+	authed.Get("/exports/terms/:id/transfer-cover-bundle.zip", adminOrStaff, eh.TransferCoverBundleZIP)
 	authed.Get("/exports/terms/:id/transfer-cover/preview", adminOrStaff, eh.TransferCoverPreview)
 	authed.Get("/exports/terms/:id/transfer-cover/coverage", adminOrStaff, eh.TransferCoverCoverage)
 	authed.Get("/exports/terms/:id/transfer-cover/history", adminOrStaff, eh.TransferCoverHistory)

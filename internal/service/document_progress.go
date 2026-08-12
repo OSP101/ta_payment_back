@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -14,29 +15,52 @@ import (
 )
 
 // DocumentProgressService tracks the off-system physical document journey for a
-// whole TERM (one batch): the signature round + routing to finance/treasury.
-// The board only becomes actionable once every course in the term is exported.
+// term's payout documents: the signature round + routing to finance/treasury.
+// The board only becomes actionable once every course in the ROUND is exported.
 // See migration 0031 for the stage meanings.
+//
+// A term that crosses the 30 กันยายน budget-year boundary (see term_months.go's
+// FiscalSplit) now has TWO independent journeys — fiscal_round 1 for the
+// closing budget year's document, 2 for the new one (12/08/2026, migration
+// 0082) — because the two are separate physical folders that get signed and
+// routed on their own schedule; a term whose ปะหน้าจ่ายตรง never crosses that
+// boundary has exactly one, and every existing row is that round automatically
+// (DEFAULT 1). Round 2 is surfaced ONLY when it actually has payable content —
+// see resolveFiscalRounds — so a term that crosses the boundary but has
+// nothing left to claim in October never shows "รอบ" language at all.
 type DocumentProgressService struct {
 	pool   *pgxpool.Pool
 	aud    *audit.Auditor
 	notify *NotifyService
-	// export resolves the term's certifier — the one signer on the checklist who
-	// is an admin_officers row rather than a system user.
+	// export resolves the term's certifier and its month calendar (TermMonths,
+	// for the fiscal-round split) — the one signer on the checklist who is an
+	// admin_officers row rather than a system user, plus the one place the
+	// budget-year boundary is computed from.
 	export *ExportService
 }
 
-// CourseRef names an un-exported course still blocking the term.
+// CourseRef names an un-exported course still blocking the round.
 type CourseRef struct {
 	Code   string `json:"code"`
 	NameTH string `json:"name_th"`
 }
 
-// TermProgress is the single per-term progress record + export readiness.
+// TermProgress is one ROUND's progress record + export readiness. A
+// non-crossing term (or a crossing one whose round 2 has no content) has
+// exactly one of these; a crossing term with round-2 content has two,
+// advancing independently of each other.
 type TermProgress struct {
 	TermID uuid.UUID `json:"term_id"`
-	// Export readiness — signing can only start once ALL courses that have TAs
-	// are exported. TotalCourses counts courses with >=1 approved TA assignment.
+	// Round is 1 or 2 — see the package doc comment. RoundLabel is "" for a
+	// single-round term (no fiscal split to name) and something like
+	// "รอบ 1 · งบ 2569 (มิ.ย.–ก.ย.)" once a term has two.
+	Round      int    `json:"round"`
+	RoundLabel string `json:"round_label,omitempty"`
+
+	// Export readiness — signing can only start once ALL courses that have
+	// billable work THIS ROUND are exported. TotalCourses counts courses with
+	// >=1 approved TA assignment (round 1) or with demonstrable round-2
+	// billable content (round 2) — see exportReadiness.
 	TotalCourses      int         `json:"total_courses"`
 	ExportedCourses   int         `json:"exported_courses"`
 	AllExported       bool        `json:"all_exported"`
@@ -66,33 +90,136 @@ type TermProgress struct {
 	CurrentRole string `json:"current_role,omitempty"`
 }
 
-// courseHasTA is the shared predicate for "this course has documents to sign".
+// TermProgressOverview is what the board actually asks for: every round this
+// term has. len(Rounds) is 1 for the ordinary case and 2 once a crossing
+// term's second budget year has something to claim — the frontend renders
+// tabs only when there is more than one, so a single-round term's screen is
+// pixel-identical to before this feature existed.
+type TermProgressOverview struct {
+	TermID uuid.UUID      `json:"term_id"`
+	Rounds []TermProgress `json:"rounds"`
+}
+
+// courseHasTA is the shared predicate for "this course has documents to sign"
+// — round 1's course filter, unchanged since before the fiscal-round split.
 const courseHasTA = `EXISTS (
 	SELECT 1 FROM ta_request_assignments a
 	JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 	JOIN sections s ON s.id = a.section_id
 	WHERE s.teaching_course_id = tc.id)`
 
-// exportReadiness returns (total courses-with-TAs, exported count, unexported list).
-func (s *DocumentProgressService) exportReadiness(ctx context.Context, termID uuid.UUID) (total, exported int, unexported []CourseRef, err error) {
+// round2BillableSQL is round 2's course filter: courseHasTA alone would catch
+// every course in the term (the roster is fixed at appointment, independent
+// of any month), so round 2 additionally requires DEMONSTRABLE billable
+// content in round 2's own months — otherwise every course with an ordinary
+// full appointment would appear to owe a round-2 signature it has no document
+// for. param must be round 2's Gregorian "YYYY-MM" months as a text[] arg.
+//
+// grad-special (เหมาจ่าย) has no work_logs at all — its lump is apportioned by
+// schedule share across whichever months are printed (gradLumpShare) — so any
+// grad-special assignment counts as round-2 content once round 2 exists at
+// all; there is no คาบ to check a month against.
+func round2BillableSQL(param string) string {
+	return `(
+		EXISTS (
+		    SELECT 1 FROM work_logs wl
+		    JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+		    JOIN sections sec2 ON sec2.id = a2.section_id
+		    WHERE sec2.teaching_course_id = tc.id AND wl.status = 'approved'
+		      AND to_char(wl.work_date,'YYYY-MM') = ANY(` + param + `::text[])
+		)
+		OR EXISTS (
+		    SELECT 1 FROM ta_request_assignments a3
+		    JOIN ta_requests r3 ON r3.id = a3.request_id AND r3.status = 'approved'
+		    JOIN sections sec3 ON sec3.id = a3.section_id AND sec3.track = 'special'
+		    JOIN users u3 ON u3.id = a3.ta_id
+		    WHERE sec3.teaching_course_id = tc.id AND u3.study_level::text IN ('master','phd')
+		)
+	)`
+}
+
+// round2ExportedSQL is round 2's "has this course's document actually been
+// issued" predicate — unlike round 1, which uses the one-shot
+// teaching_courses.exported_at flag (see MarkExported), round 2 has no
+// equivalent flag: exported_at fires on the FIRST ZIP a course ever gets,
+// which for a crossing term is always round 1's. Instead this reads the
+// export_batches ledger directly for a batch whose recorded months overlap
+// round 2's — the same row export.go's BuildCourseZip already writes.
+// param must be round 2's Gregorian "YYYY-MM" months as a text[] arg.
+func round2ExportedSQL(param string) string {
+	return `EXISTS (
+		SELECT 1 FROM export_batches eb
+		WHERE eb.teaching_course_id = tc.id AND eb.months && ` + param + `::text[]
+	)`
+}
+
+// exportReadiness returns (total courses-with-round-content, exported count,
+// unexported list) for ONE round. Round 1 is byte-for-byte the original
+// whole-term query (courseHasTA + tc.exported_at) — a non-crossing term's
+// only round behaves exactly as this board always has. Round 2 uses the
+// round2* predicates above and needs gregMonths (round 2's Gregorian months).
+func (s *DocumentProgressService) exportReadiness(
+	ctx context.Context, termID uuid.UUID, round int, gregMonths []string,
+) (total, exported int, unexported []CourseRef, err error) {
+	if round == 1 {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FILTER (WHERE has_ta),
+			       COUNT(*) FILTER (WHERE has_ta AND tc.exported_at IS NOT NULL)
+			FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+			WHERE tc.term_id = $1`, termID).Scan(&total, &exported)
+		if err != nil {
+			return
+		}
+		rows, rErr := s.pool.Query(ctx, `
+			SELECT tc.code, tc.name_th
+			FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+			WHERE tc.term_id = $1 AND x.has_ta AND tc.exported_at IS NULL
+			ORDER BY tc.code`, termID)
+		if rErr != nil {
+			err = rErr
+			return
+		}
+		defer rows.Close()
+		unexported = []CourseRef{}
+		for rows.Next() {
+			var c CourseRef
+			if err = rows.Scan(&c.Code, &c.NameTH); err != nil {
+				return
+			}
+			unexported = append(unexported, c)
+		}
+		err = rows.Err()
+		return
+	}
+
+	unexported = []CourseRef{}
+	if len(gregMonths) == 0 {
+		return 0, 0, unexported, nil
+	}
 	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FILTER (WHERE has_ta),
-		       COUNT(*) FILTER (WHERE has_ta AND tc.exported_at IS NOT NULL)
-		FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
-		WHERE tc.term_id = $1`, termID).Scan(&total, &exported)
+		SELECT COUNT(*) FILTER (WHERE has_ta AND billable),
+		       COUNT(*) FILTER (WHERE has_ta AND billable AND exported)
+		FROM teaching_courses tc,
+		     LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
+		     LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y,
+		     LATERAL (SELECT `+round2ExportedSQL("$2")+` AS exported) z
+		WHERE tc.term_id = $1`, termID, gregMonths).Scan(&total, &exported)
 	if err != nil {
 		return
 	}
-	rows, err := s.pool.Query(ctx, `
+	rows, rErr := s.pool.Query(ctx, `
 		SELECT tc.code, tc.name_th
-		FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
-		WHERE tc.term_id = $1 AND x.has_ta AND tc.exported_at IS NULL
-		ORDER BY tc.code`, termID)
-	if err != nil {
+		FROM teaching_courses tc,
+		     LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
+		     LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y,
+		     LATERAL (SELECT `+round2ExportedSQL("$2")+` AS exported) z
+		WHERE tc.term_id = $1 AND has_ta AND billable AND NOT exported
+		ORDER BY tc.code`, termID, gregMonths)
+	if rErr != nil {
+		err = rErr
 		return
 	}
 	defer rows.Close()
-	unexported = []CourseRef{}
 	for rows.Next() {
 		var c CourseRef
 		if err = rows.Scan(&c.Code, &c.NameTH); err != nil {
@@ -104,15 +231,184 @@ func (s *DocumentProgressService) exportReadiness(ctx context.Context, termID uu
 	return
 }
 
-// GetByTerm returns the term's document progress + export readiness. Readable by
-// any authenticated user (the shared "where are the documents" board).
-func (s *DocumentProgressService) GetByTerm(ctx context.Context, termID uuid.UUID) (*TermProgress, error) {
-	total, exported, unexported, err := s.exportReadiness(ctx, termID)
+/* -------------------------------------------------------------------------- */
+/* Fiscal round resolution                                                    */
+/* -------------------------------------------------------------------------- */
+
+var fiscalRoundMonthAbbrev = [...]string{
+	"ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+	"ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
+}
+
+// fiscalRoundLabel renders "รอบ 1 · งบ 2569 (มิ.ย.–ก.ย.)" from a round number
+// and its Gregorian "YYYY-MM" months (already in calendar order).
+func fiscalRoundLabel(round int, months []string) (string, error) {
+	if len(months) == 0 {
+		return fmt.Sprintf("รอบ %d", round), nil
+	}
+	fy, err := fiscalYearOf(months[0])
+	if err != nil {
+		return "", err
+	}
+	monthNum := func(ym string) (int, error) {
+		_, m, ok := strings.Cut(ym, "-")
+		if !ok {
+			return 0, fmt.Errorf("year_month %q: want <year>-<MM>", ym)
+		}
+		return strconv.Atoi(m)
+	}
+	first, err := monthNum(months[0])
+	if err != nil {
+		return "", err
+	}
+	last, err := monthNum(months[len(months)-1])
+	if err != nil {
+		return "", err
+	}
+	rangeLabel := fiscalRoundMonthAbbrev[first-1]
+	if last != first {
+		rangeLabel += "–" + fiscalRoundMonthAbbrev[last-1]
+	}
+	return fmt.Sprintf("รอบ %d · งบ %d (%s)", round, fy+543, rangeLabel), nil
+}
+
+// termFiscalSplit is the one place this service reads the term's month
+// calendar — everything below builds on it.
+func (s *DocumentProgressService) termFiscalSplit(ctx context.Context, termID uuid.UUID) (FiscalSplit, error) {
+	if s.export == nil {
+		return FiscalSplit{}, nil
+	}
+	all, err := s.export.TermMonths(ctx, termID)
+	if err != nil {
+		return FiscalSplit{}, err
+	}
+	return fiscalSplit(all)
+}
+
+// roundMonths resolves round 2's Gregorian months, and whether that round
+// exists AT ALL for this term (the fiscal split crosses the budget year).
+// Round 1 always returns (nil, true, nil) — nil is the sentinel exportReadiness
+// and the round-1 checklist read as "unscoped", exactly the pre-round
+// behaviour.
+func (s *DocumentProgressService) roundMonths(ctx context.Context, termID uuid.UUID, round int) (greg []string, exists bool, err error) {
+	if round == 1 {
+		return nil, true, nil
+	}
+	split, err := s.termFiscalSplit(ctx, termID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !split.Crosses {
+		return nil, false, nil
+	}
+	return split.After, true, nil
+}
+
+// fiscalRounds is what GetOverview needs to build every round's progress in
+// one pass, without re-deriving the term's month calendar per round.
+type fiscalRounds struct {
+	// twoRounds is true only once the term BOTH crosses the budget-year
+	// boundary AND round 2 has something payable — a term that crosses but
+	// whose October has no work at all stays a single, unlabeled round (see
+	// the package doc comment).
+	twoRounds                bool
+	round1Label, round2Label string
+	round2Greg               []string
+}
+
+func (s *DocumentProgressService) resolveFiscalRounds(ctx context.Context, termID uuid.UUID) (*fiscalRounds, error) {
+	split, err := s.termFiscalSplit(ctx, termID)
 	if err != nil {
 		return nil, err
 	}
+	fr := &fiscalRounds{}
+	if !split.Crosses {
+		return fr, nil
+	}
+	total, _, _, err := s.exportReadiness(ctx, termID, 2, split.After)
+	if err != nil {
+		return nil, err
+	}
+	if total == 0 {
+		// Crosses the boundary, but nothing in October (or whichever months
+		// fall after it) has any billable work yet — no round 2 to show.
+		return fr, nil
+	}
+	r1Label, err := fiscalRoundLabel(1, split.Before)
+	if err != nil {
+		return nil, err
+	}
+	r2Label, err := fiscalRoundLabel(2, split.After)
+	if err != nil {
+		return nil, err
+	}
+	fr.twoRounds = true
+	fr.round1Label, fr.round2Label, fr.round2Greg = r1Label, r2Label, split.After
+	return fr, nil
+}
+
+/* -------------------------------------------------------------------------- */
+/* Board reads                                                                */
+/* -------------------------------------------------------------------------- */
+
+// GetOverview returns every round of progress this term has — one for the
+// ordinary case, two for a crossing term whose second budget year has
+// payable content. Readable by any authenticated user (the shared "where are
+// the documents" board).
+func (s *DocumentProgressService) GetOverview(ctx context.Context, termID uuid.UUID) (*TermProgressOverview, error) {
+	fr, err := s.resolveFiscalRounds(ctx, termID)
+	if err != nil {
+		return nil, err
+	}
+	r1, err := s.getRoundProgress(ctx, termID, 1, fr)
+	if err != nil {
+		return nil, err
+	}
+	out := &TermProgressOverview{TermID: termID, Rounds: []TermProgress{*r1}}
+	if fr.twoRounds {
+		r2, err := s.getRoundProgress(ctx, termID, 2, fr)
+		if err != nil {
+			return nil, err
+		}
+		out.Rounds = append(out.Rounds, *r2)
+	}
+	return out, nil
+}
+
+// GetRound returns ONE round's progress directly — used by callers (and
+// tests) that already know which round they want without paying for the
+// other round's readiness query.
+func (s *DocumentProgressService) GetRound(ctx context.Context, termID uuid.UUID, round int) (*TermProgress, error) {
+	if round != 1 && round != 2 {
+		return nil, Invalid("รอบไม่ถูกต้อง")
+	}
+	fr, err := s.resolveFiscalRounds(ctx, termID)
+	if err != nil {
+		return nil, err
+	}
+	if round == 2 && !fr.twoRounds {
+		return nil, Invalid("เทอมนี้ไม่มีรอบ 2")
+	}
+	return s.getRoundProgress(ctx, termID, round, fr)
+}
+
+func (s *DocumentProgressService) getRoundProgress(ctx context.Context, termID uuid.UUID, round int, fr *fiscalRounds) (*TermProgress, error) {
+	var gregMonths []string
+	if round == 2 {
+		gregMonths = fr.round2Greg
+	}
+	total, exported, unexported, err := s.exportReadiness(ctx, termID, round, gregMonths)
+	if err != nil {
+		return nil, err
+	}
+	label := fr.round1Label
+	if round == 2 {
+		label = fr.round2Label
+	}
 	p := &TermProgress{
 		TermID:            termID,
+		Round:             round,
+		RoundLabel:        label,
 		TotalCourses:      total,
 		ExportedCourses:   exported,
 		AllExported:       total > 0 && exported == total,
@@ -128,7 +424,7 @@ func (s *DocumentProgressService) GetByTerm(ctx context.Context, termID uuid.UUI
 		       TO_CHAR(sent_treasury_at,    'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       note, updated_by_name,
 		       TO_CHAR(updated_at,          'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
-		FROM document_progress WHERE term_id = $1`, termID).Scan(
+		FROM document_progress WHERE term_id = $1 AND fiscal_round = $2`, termID, round).Scan(
 		&p.Stage, &p.TASignedAt, &p.LecturerSignedAt, &p.CertifierSignedAt,
 		&p.SentFinanceAt, &p.SentTreasuryAt, &p.Note, &p.UpdatedByName, &p.UpdatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -158,7 +454,7 @@ func (s *DocumentProgressService) fillAdvance(ctx context.Context, p *TermProgre
 	// Advancing to stage N needs stage N-1's signatures. Stage 1 needs none of
 	// its own — it IS the TA signing — so what gates it is the export, already
 	// checked above.
-	ok, missing, err := s.stageComplete(ctx, p.TermID, p.Stage+1)
+	ok, missing, err := s.stageComplete(ctx, p.TermID, p.Stage+1, p.Round)
 	if err != nil {
 		return err
 	}
@@ -167,10 +463,14 @@ func (s *DocumentProgressService) fillAdvance(ctx context.Context, p *TermProgre
 	return nil
 }
 
-// SetStage moves the term's document progress to `stage` (0..5). Staff/admin
-// only, and only once EVERY course with TAs in the term has been exported
-// (moving back to 0 is always allowed as a correction).
-func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uuid.UUID, stage int, note string) error {
+// SetStage moves the term's document progress for ONE ROUND to `stage`
+// (0..5). Staff/admin only, and only once every course with round-relevant
+// content has been exported (moving back to 0 is always allowed as a
+// correction).
+func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uuid.UUID, stage int, note string, round int) error {
+	if round != 1 && round != 2 {
+		return Invalid("รอบไม่ถูกต้อง")
+	}
 	if stage < 0 || stage > 5 {
 		return Invalid("ขั้นความคืบหน้าไม่ถูกต้อง")
 	}
@@ -181,16 +481,23 @@ func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uu
 	if !priv {
 		return ErrForbidden
 	}
+	gregMonths, exists, err := s.roundMonths(ctx, termID, round)
+	if err != nil {
+		return err
+	}
+	if round == 2 && !exists {
+		return Invalid("เทอมนี้ไม่มีรอบ 2")
+	}
 	if stage > 0 {
-		total, exported, _, rErr := s.exportReadiness(ctx, termID)
+		total, exported, _, rErr := s.exportReadiness(ctx, termID, round, gregMonths)
 		if rErr != nil {
 			return rErr
 		}
 		if total == 0 {
-			return Invalid("ยังไม่มีรายวิชาที่มี TA ในเทอมนี้")
+			return Invalid("ยังไม่มีรายวิชาที่มีเอกสารต้องเดินในรอบนี้")
 		}
 		if exported < total {
-			return Invalid("ยังส่งออกเอกสารไม่ครบทุกวิชา ต้องส่งออกให้ครบก่อนจึงจะเริ่มติดตามการเซ็นได้")
+			return Invalid("ยังส่งออกเอกสารไม่ครบทุกวิชาของรอบนี้ ต้องส่งออกให้ครบก่อนจึงจะเริ่มติดตามการเซ็นได้")
 		}
 	}
 	// Every stage BELOW the requested one must already be complete. The paper
@@ -199,14 +506,14 @@ func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uu
 	// physical folder cannot have reached. Going backwards is always allowed:
 	// that is how staff correct a mistake.
 	var current int
-	_ = s.pool.QueryRow(ctx, `SELECT stage FROM document_progress WHERE term_id = $1`, termID).Scan(&current)
+	_ = s.pool.QueryRow(ctx, `SELECT stage FROM document_progress WHERE term_id = $1 AND fiscal_round = $2`, termID, round).Scan(&current)
 	if stage > current {
 		// Up to AND INCLUDING the stage being set: pressing "TA เซ็นครบ" is the
 		// claim that they all signed, so it needs their signatures — not just
 		// the ones before it. Stages 4-5 have nobody to sign and pass trivially.
 		// One checklist read for the whole loop: stageComplete would re-run the
 		// same query per stage, so setting stage 5 cost five identical scans.
-		items, lErr := s.ListChecklist(ctx, termID)
+		items, lErr := s.ListChecklist(ctx, termID, round)
 		if lErr != nil {
 			return lErr
 		}
@@ -220,30 +527,30 @@ func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uu
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "document_progress.set_stage",
 			Entity: "academic_term", EntityID: termID.String(),
-			After: map[string]int{"stage": stage}},
+			After: map[string]any{"stage": stage, "round": round}},
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
 		INSERT INTO document_progress
-		    (term_id, stage, note, updated_by, updated_by_name, updated_at,
+		    (term_id, fiscal_round, stage, note, updated_by, updated_by_name, updated_at,
 		     ta_signed_at, lecturer_signed_at, certifier_signed_at, sent_finance_at, sent_treasury_at)
-		VALUES ($1, $2, NULLIF($3,''), $4, $5, now(),
-		     CASE WHEN $2>=1 THEN now() END,
-		     CASE WHEN $2>=2 THEN now() END,
-		     CASE WHEN $2>=3 THEN now() END,
-		     CASE WHEN $2>=4 THEN now() END,
-		     CASE WHEN $2>=5 THEN now() END)
-		ON CONFLICT (term_id) DO UPDATE SET
-		     stage           = $2,
-		     note            = NULLIF($3,''),
-		     updated_by      = $4,
-		     updated_by_name = $5,
+		VALUES ($1, $2, $3, NULLIF($4,''), $5, $6, now(),
+		     CASE WHEN $3>=1 THEN now() END,
+		     CASE WHEN $3>=2 THEN now() END,
+		     CASE WHEN $3>=3 THEN now() END,
+		     CASE WHEN $3>=4 THEN now() END,
+		     CASE WHEN $3>=5 THEN now() END)
+		ON CONFLICT (term_id, fiscal_round) DO UPDATE SET
+		     stage           = $3,
+		     note            = NULLIF($4,''),
+		     updated_by      = $5,
+		     updated_by_name = $6,
 		     updated_at      = now(),
-		     ta_signed_at        = CASE WHEN $2>=1 THEN COALESCE(document_progress.ta_signed_at, now())        ELSE NULL END,
-		     lecturer_signed_at  = CASE WHEN $2>=2 THEN COALESCE(document_progress.lecturer_signed_at, now())  ELSE NULL END,
-		     certifier_signed_at = CASE WHEN $2>=3 THEN COALESCE(document_progress.certifier_signed_at, now()) ELSE NULL END,
-		     sent_finance_at     = CASE WHEN $2>=4 THEN COALESCE(document_progress.sent_finance_at, now())     ELSE NULL END,
-		     sent_treasury_at    = CASE WHEN $2>=5 THEN COALESCE(document_progress.sent_treasury_at, now())    ELSE NULL END`,
-				termID, stage, note, actor, name)
+		     ta_signed_at        = CASE WHEN $3>=1 THEN COALESCE(document_progress.ta_signed_at, now())        ELSE NULL END,
+		     lecturer_signed_at  = CASE WHEN $3>=2 THEN COALESCE(document_progress.lecturer_signed_at, now())  ELSE NULL END,
+		     certifier_signed_at = CASE WHEN $3>=3 THEN COALESCE(document_progress.certifier_signed_at, now()) ELSE NULL END,
+		     sent_finance_at     = CASE WHEN $3>=4 THEN COALESCE(document_progress.sent_finance_at, now())     ELSE NULL END,
+		     sent_treasury_at    = CASE WHEN $3>=5 THEN COALESCE(document_progress.sent_treasury_at, now())    ELSE NULL END`,
+				termID, round, stage, note, actor, name)
 			return err
 		})
 }
@@ -266,12 +573,13 @@ func userDisplayName(ctx context.Context, pool *pgxpool.Pool, uid uuid.UUID) str
 }
 
 /* -------------------------------------------------------------------------- */
-/* Per-course signature checklist (migration 0037)                            */
+/* Per-course signature checklist (migration 0037, per-round since 0082)      */
 /* -------------------------------------------------------------------------- */
 
 // SignatureItem is one (course × signing-role) checklist row: who is
 // responsible and whether they have signed yet.
-// SignatureItem is ONE PERSON's signature on one course's document.
+// SignatureItem is ONE PERSON's signature on one course's document, for one
+// fiscal round.
 //
 // It used to be one row per course-role, with the "ta" row standing for every TA
 // at once, so the board could only say "all of them signed" and the officer had
@@ -314,54 +622,105 @@ func roleForStage(stage int) string {
 }
 
 // ListChecklist returns one row per PERSON who has to sign each course's
-// document, for every course in the term that has approved TAs.
+// document IN THIS ROUND. Round 1 is the original query, unchanged (every
+// course with an approved TA assignment, independent of any month — the
+// roster is fixed at appointment) plus a fiscal_round=1 filter on the ticks so
+// a round-2 signature can never read back as round 1's. Round 2 additionally
+// requires round2BillableSQL — only courses that actually have round-2
+// content get a round-2 document to sign at all.
 //
 // The people are derived live rather than read from signature_checklist, so a
 // TA added after the first export still appears — the checklist table only ever
 // holds the ticks. Readable by any authenticated user.
-func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid.UUID) ([]SignatureItem, error) {
-	rows, err := s.pool.Query(ctx, `
-		WITH courses AS (
-		    SELECT tc.id, tc.code, tc.name_th, (tc.exported_at IS NOT NULL) AS exported
-		    FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
-		    WHERE tc.term_id = $1 AND x.has_ta
-		),
-		people AS (
-		    -- Every TA who actually holds an assignment on the course. One row
-		    -- each: the document is signed one hand at a time.
-		    SELECT DISTINCT c.id AS tc_id, 'ta' AS role, u.id AS signer_id,
-		           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'') AS signer_name
-		    FROM courses c
-		    JOIN sections s               ON s.teaching_course_id = c.id
-		    JOIN ta_request_assignments a ON a.section_id = s.id AND a.state <> 'dropped'
-		    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
-		    JOIN users u                  ON u.id = a.ta_id
-		  UNION ALL
-		    -- The lecturer stage belongs to whoever SUBMITTED the request. A
-		    -- co-teacher listed on teaching_lecturers who filed nothing has
-		    -- nothing to sign, and naming them sent the officer after the wrong
-		    -- person.
-		    SELECT DISTINCT c.id, 'lecturer', u.id,
-		           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')
-		    FROM courses c
-		    JOIN ta_requests r ON r.teaching_course_id = c.id AND r.status = 'approved'
-		    JOIN users u       ON u.id = r.lecturer_id
-		  UNION ALL
-		    -- One certifier per course, and not a system user — signer_id stays
-		    -- NULL and the name is resolved from the term's officer.
-		    SELECT c.id, 'certifier', NULL::uuid, NULL::text FROM courses c
-		)
-		SELECT c.id, c.code, c.name_th, c.exported,
-		       p.role, p.signer_id, COALESCE(p.signer_name, ''),
-		       TO_CHAR(sc.signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
-		FROM courses c
-		JOIN people p ON p.tc_id = c.id
-		LEFT JOIN signature_checklist sc
-		       ON sc.teaching_course_id = c.id
-		      AND sc.role = p.role
-		      AND sc.signer_id IS NOT DISTINCT FROM p.signer_id
-		ORDER BY c.code, CASE p.role WHEN 'ta' THEN 1 WHEN 'lecturer' THEN 2 ELSE 3 END,
-		         COALESCE(p.signer_name, '')`, termID)
+func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid.UUID, round int) ([]SignatureItem, error) {
+	var rows pgx.Rows
+	var err error
+	switch round {
+	case 1:
+		rows, err = s.pool.Query(ctx, `
+			WITH courses AS (
+			    SELECT tc.id, tc.code, tc.name_th, (tc.exported_at IS NOT NULL) AS exported
+			    FROM teaching_courses tc, LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+			    WHERE tc.term_id = $1 AND x.has_ta
+			),
+			people AS (
+			    SELECT DISTINCT c.id AS tc_id, 'ta' AS role, u.id AS signer_id,
+			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'') AS signer_name
+			    FROM courses c
+			    JOIN sections s               ON s.teaching_course_id = c.id
+			    JOIN ta_request_assignments a ON a.section_id = s.id AND a.state <> 'dropped'
+			    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
+			    JOIN users u                  ON u.id = a.ta_id
+			  UNION ALL
+			    SELECT DISTINCT c.id, 'lecturer', u.id,
+			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')
+			    FROM courses c
+			    JOIN ta_requests r ON r.teaching_course_id = c.id AND r.status = 'approved'
+			    JOIN users u       ON u.id = r.lecturer_id
+			  UNION ALL
+			    SELECT c.id, 'certifier', NULL::uuid, NULL::text FROM courses c
+			)
+			SELECT c.id, c.code, c.name_th, c.exported,
+			       p.role, p.signer_id, COALESCE(p.signer_name, ''),
+			       TO_CHAR(sc.signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
+			FROM courses c
+			JOIN people p ON p.tc_id = c.id
+			LEFT JOIN signature_checklist sc
+			       ON sc.teaching_course_id = c.id
+			      AND sc.role = p.role
+			      AND sc.signer_id IS NOT DISTINCT FROM p.signer_id
+			      AND sc.fiscal_round = 1
+			ORDER BY c.code, CASE p.role WHEN 'ta' THEN 1 WHEN 'lecturer' THEN 2 ELSE 3 END,
+			         COALESCE(p.signer_name, '')`, termID)
+	case 2:
+		gregMonths, exists, rErr := s.roundMonths(ctx, termID, 2)
+		if rErr != nil {
+			return nil, rErr
+		}
+		if !exists {
+			return []SignatureItem{}, nil
+		}
+		rows, err = s.pool.Query(ctx, `
+			WITH courses AS (
+			    SELECT tc.id, tc.code, tc.name_th,
+			           `+round2ExportedSQL("$2")+` AS exported
+			    FROM teaching_courses tc,
+			         LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
+			         LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y
+			    WHERE tc.term_id = $1 AND x.has_ta AND y.billable
+			),
+			people AS (
+			    SELECT DISTINCT c.id AS tc_id, 'ta' AS role, u.id AS signer_id,
+			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'') AS signer_name
+			    FROM courses c
+			    JOIN sections s               ON s.teaching_course_id = c.id
+			    JOIN ta_request_assignments a ON a.section_id = s.id AND a.state <> 'dropped'
+			    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
+			    JOIN users u                  ON u.id = a.ta_id
+			  UNION ALL
+			    SELECT DISTINCT c.id, 'lecturer', u.id,
+			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')
+			    FROM courses c
+			    JOIN ta_requests r ON r.teaching_course_id = c.id AND r.status = 'approved'
+			    JOIN users u       ON u.id = r.lecturer_id
+			  UNION ALL
+			    SELECT c.id, 'certifier', NULL::uuid, NULL::text FROM courses c
+			)
+			SELECT c.id, c.code, c.name_th, c.exported,
+			       p.role, p.signer_id, COALESCE(p.signer_name, ''),
+			       TO_CHAR(sc.signed_at, 'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
+			FROM courses c
+			JOIN people p ON p.tc_id = c.id
+			LEFT JOIN signature_checklist sc
+			       ON sc.teaching_course_id = c.id
+			      AND sc.role = p.role
+			      AND sc.signer_id IS NOT DISTINCT FROM p.signer_id
+			      AND sc.fiscal_round = 2
+			ORDER BY c.code, CASE p.role WHEN 'ta' THEN 1 WHEN 'lecturer' THEN 2 ELSE 3 END,
+			         COALESCE(p.signer_name, '')`, termID, gregMonths)
+	default:
+		return nil, Invalid("รอบไม่ถูกต้อง")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -423,14 +782,14 @@ func stageBlockedMessage(stage int, missing []string) string {
 		label, len(missing), strings.Join(shown, " · "), extra)
 }
 
-// stageComplete reports whether every signature the stage needs is in place,
-// and names who is still missing.
+// stageComplete reports whether every signature the stage needs is in place
+// for the given round, and names who is still missing.
 //
 // This is what makes the board a sequence instead of five free buttons: the
 // officer may not record "อาจารย์เซ็นครบ" while a TA has not signed, because the
 // physical document cannot have reached the lecturer yet.
-func (s *DocumentProgressService) stageComplete(ctx context.Context, termID uuid.UUID, stage int) (bool, []string, error) {
-	items, err := s.ListChecklist(ctx, termID)
+func (s *DocumentProgressService) stageComplete(ctx context.Context, termID uuid.UUID, stage int, round int) (bool, []string, error) {
+	items, err := s.ListChecklist(ctx, termID, round)
 	if err != nil {
 		return false, nil, err
 	}
@@ -454,12 +813,13 @@ func stageCompleteIn(items []SignatureItem, stage int) (bool, []string) {
 	return len(missing) == 0, missing
 }
 
-// ToggleSignature marks (or clears) ONE PERSON's signature on one course.
+// ToggleSignature marks (or clears) ONE PERSON's signature on one course, for
+// ONE fiscal round.
 //
 // signerID is the TA or lecturer who signed; nil for the certifier, who is a
 // single admin_officers row rather than a user. Staff/admin only.
 func (s *DocumentProgressService) ToggleSignature(
-	ctx context.Context, actor, tcID uuid.UUID, role string, signerID *uuid.UUID, signed bool,
+	ctx context.Context, actor, tcID uuid.UUID, role string, signerID *uuid.UUID, signed bool, round int,
 ) error {
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
@@ -467,6 +827,9 @@ func (s *DocumentProgressService) ToggleSignature(
 	}
 	if !priv {
 		return ErrForbidden
+	}
+	if round != 1 && round != 2 {
+		return Invalid("รอบไม่ถูกต้อง")
 	}
 	if role != "ta" && role != "lecturer" && role != "certifier" {
 		return Invalid("บทบาทไม่ถูกต้อง")
@@ -497,34 +860,34 @@ func (s *DocumentProgressService) ToggleSignature(
 		signedExpr = "now()"
 	}
 	// Two upserts because the uniqueness is split in two partial indexes: a
-	// person row keys on (course, role, signer), the certifier row on
-	// (course, role) alone. ON CONFLICT has to name the matching one.
-	conflict := "(teaching_course_id, role, signer_id) WHERE signer_id IS NOT NULL"
+	// person row keys on (course, role, signer, round), the certifier row on
+	// (course, role, round) alone. ON CONFLICT has to name the matching one.
+	conflict := "(teaching_course_id, role, signer_id, fiscal_round) WHERE signer_id IS NOT NULL"
 	if signerID == nil {
-		conflict = "(teaching_course_id, role) WHERE signer_id IS NULL"
+		conflict = "(teaching_course_id, role, fiscal_round) WHERE signer_id IS NULL"
 	}
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "signature_checklist.toggle",
 			Entity: "teaching_course", EntityID: tcID.String(),
-			After: map[string]any{"role": role, "signer_id": signerID, "signed": signed}},
+			After: map[string]any{"role": role, "signer_id": signerID, "signed": signed, "round": round}},
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
 				INSERT INTO signature_checklist
-				    (term_id, teaching_course_id, role, signer_id, signer_name,
+				    (term_id, teaching_course_id, role, signer_id, signer_name, fiscal_round,
 				     signed_at, updated_by, updated_by_name, updated_at)
-				VALUES ($1, $2, $3, $4, NULLIF($5,''), `+signedExpr+`, $6, $7, now())
+				VALUES ($1, $2, $3, $4, NULLIF($5,''), $8, `+signedExpr+`, $6, $7, now())
 				ON CONFLICT `+conflict+` DO UPDATE SET
 				  signed_at = `+signedExpr+`, signer_name = EXCLUDED.signer_name,
 				  updated_by = $6, updated_by_name = $7, updated_at = now()`,
-				termID, tcID, role, signerID, signerName, actor, name)
+				termID, tcID, role, signerID, signerName, actor, name, round)
 			return err
 		})
 }
 
 // RemindUnsigned emails+notifies every lecturer whose course still lacks the
-// lecturer signature, one message per lecturer listing their pending courses.
-// Returns how many people were notified. Staff/admin only.
-func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, termID uuid.UUID) (int, error) {
+// lecturer signature FOR THIS ROUND, one message per lecturer listing their
+// pending courses. Returns how many people were notified. Staff/admin only.
+func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, termID uuid.UUID, round int) (int, error) {
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
 		return 0, err
@@ -532,25 +895,52 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if !priv {
 		return 0, ErrForbidden
 	}
+	if round != 1 && round != 2 {
+		return 0, Invalid("รอบไม่ถูกต้อง")
+	}
 	if s.notify == nil {
 		return 0, nil
 	}
-	// The submitter, not every co-teacher. This used to join teaching_lecturers,
-	// so a lecturer who merely appears on the course roster — and therefore has
-	// nothing on the claim to sign — got chased for a signature that was never
-	// theirs. It has to agree with ListChecklist, which shows exactly these
-	// people, or the button nags somebody the board never asked for.
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT r.lecturer_id, tc.code
-		FROM teaching_courses tc
-		JOIN ta_requests r ON r.teaching_course_id = tc.id AND r.status = 'approved'
-		LEFT JOIN signature_checklist sc
-		       ON sc.teaching_course_id = tc.id
-		      AND sc.role = 'lecturer'
-		      AND sc.signer_id = r.lecturer_id
-		CROSS JOIN LATERAL (SELECT `+courseHasTA+` AS has_ta) x
-		WHERE tc.term_id = $1 AND x.has_ta AND sc.signed_at IS NULL
-		ORDER BY tc.code`, termID)
+	var rows pgx.Rows
+	switch round {
+	case 1:
+		// The submitter, not every co-teacher — see ListChecklist's own note.
+		rows, err = s.pool.Query(ctx, `
+			SELECT DISTINCT r.lecturer_id, tc.code
+			FROM teaching_courses tc
+			JOIN ta_requests r ON r.teaching_course_id = tc.id AND r.status = 'approved'
+			LEFT JOIN signature_checklist sc
+			       ON sc.teaching_course_id = tc.id
+			      AND sc.role = 'lecturer'
+			      AND sc.signer_id = r.lecturer_id
+			      AND sc.fiscal_round = 1
+			CROSS JOIN LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+			WHERE tc.term_id = $1 AND x.has_ta AND sc.signed_at IS NULL
+			ORDER BY tc.code`, termID)
+	case 2:
+		var gregMonths []string
+		var exists bool
+		gregMonths, exists, err = s.roundMonths(ctx, termID, 2)
+		if err != nil {
+			return 0, err
+		}
+		if !exists {
+			return 0, nil
+		}
+		rows, err = s.pool.Query(ctx, `
+			SELECT DISTINCT r.lecturer_id, tc.code
+			FROM teaching_courses tc
+			JOIN ta_requests r ON r.teaching_course_id = tc.id AND r.status = 'approved'
+			LEFT JOIN signature_checklist sc
+			       ON sc.teaching_course_id = tc.id
+			      AND sc.role = 'lecturer'
+			      AND sc.signer_id = r.lecturer_id
+			      AND sc.fiscal_round = 2
+			CROSS JOIN LATERAL (SELECT `+courseHasTA+` AS has_ta) x
+			CROSS JOIN LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y
+			WHERE tc.term_id = $1 AND x.has_ta AND y.billable AND sc.signed_at IS NULL
+			ORDER BY tc.code`, termID, gregMonths)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -571,15 +961,19 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
+	roundNote := ""
+	if round == 2 {
+		roundNote = " (รอบ 2 — งบประมาณปีใหม่)"
+	}
 	for _, uid := range order {
 		body := "มีเอกสารเบิกจ่าย TA ที่รอลายเซ็นของท่านในรายวิชา: " +
-			strings.Join(byUser[uid], ", ") +
+			strings.Join(byUser[uid], ", ") + roundNote +
 			"\nกรุณาลงนามเพื่อให้เอกสารเดินทางต่อได้"
 		s.notify.Send(ctx, uid, "แจ้งเตือน: เอกสาร TA รอลายเซ็น", body, "/document-progress")
 	}
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind",
 		Entity: "academic_term", EntityID: termID.String(),
-		After: map[string]int{"notified": len(order)}}); err != nil {
+		After: map[string]any{"notified": len(order), "round": round}}); err != nil {
 		return 0, err
 	}
 	return len(order), nil

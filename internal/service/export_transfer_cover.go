@@ -19,6 +19,7 @@
 package service
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -181,7 +182,18 @@ type transferCoverKey struct {
 // part of that one result. So every month slice of a term sums back to the
 // undivided figure — no คาบ can be paid twice and none can fall between two
 // documents. Empty means the whole term.
-func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uuid.UUID, months []string) ([]transferCoverSheet, []string, error) {
+//
+// level ("undergrad" | "graduate", 12/08/2026) is the OTHER split this
+// document now has: TA level and month are independent axes, so a course can
+// contribute rows to both files in the same run. The sheet a row lands ON
+// (curriculum × track) is still keyed by the COURSE's own curriculum, never
+// the TA's — a graduate TA helping an undergrad course prints on that
+// course's own sheet, just inside the graduate FILE, exactly as staff asked:
+// "หลักสูตรของรายวิชา" decides the sheet, level decides the file.
+func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uuid.UUID, months []string, level string) ([]transferCoverSheet, []string, error) {
+	if level != "undergrad" && level != "graduate" {
+		return nil, nil, fmt.Errorf("buildTransferCoverSheets: invalid level %q", level)
+	}
 	printCurricula, warnings, err := s.transferCoverPrintCurricula(ctx, termID)
 	if err != nil {
 		return nil, nil, err
@@ -284,6 +296,13 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 			if !inSlice(c.YearMonth) {
 				continue
 			}
+			rowLevel := "undergrad"
+			if c.gradLevel() {
+				rowLevel = "graduate"
+			}
+			if rowLevel != level {
+				continue
+			}
 			a := get(cur, c.Track, c.TA, names[c.TA])
 			a.courses[courseCode] = true
 			trackSettle := settlement.Regular
@@ -293,6 +312,12 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 			if !trackSettle.unpaidFrom(c.Date, c.StartTime) {
 				a.baht += c.Baht
 			}
+		}
+
+		// The เหมาจ่าย lump belongs to graduate TAs only — never printed on the
+		// undergrad file.
+		if level != "graduate" {
+			continue
 		}
 
 		gradTAs, err := s.gradSpecialTAIDs(ctx, courseID)
@@ -689,8 +714,13 @@ type transferCoverSnapshot struct {
 // unrecorded generation can never happen; see ReprintTransferCover for how it
 // is read back.
 // months (Gregorian "YYYY-MM", empty = whole term) issues one fiscal slice of
-// the term; both the gate and the money are narrowed to it.
-func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, termID uuid.UUID, months []string) ([]byte, []string, error) {
+// the term; both the gate and the money are narrowed to it. level
+// ("undergrad" | "graduate", 12/08/2026) issues one of the two separate files
+// staff now need — see buildTransferCoverSheets.
+func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, termID uuid.UUID, months []string, level string) ([]byte, []string, error) {
+	if level != "undergrad" && level != "graduate" {
+		return nil, nil, Invalid("level ต้องเป็น undergrad หรือ graduate")
+	}
 	all, err := s.TermMonths(ctx, termID)
 	if err != nil {
 		return nil, nil, err
@@ -700,7 +730,7 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 		return nil, nil, Invalid(err.Error())
 	}
 
-	blockers, err := s.TermExportBlockers(ctx, termID, months)
+	blockers, err := s.TermExportBlockers(ctx, termID, months, level)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -708,9 +738,22 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 		return nil, nil, exportBlockedError(blockers)
 	}
 
-	sheets, warnings, err := s.buildTransferCoverSheets(ctx, termID, months)
+	sheets, warnings, err := s.buildTransferCoverSheets(ctx, termID, months, level)
 	if err != nil {
 		return nil, nil, err
+	}
+	if level == "graduate" {
+		// TA เหมาจ่าย (track "special") ไม่มี work_logs ให้ตรวจเลย จึงไม่มีขั้นตอน
+		// ใดมาบล็อกยอดของพวกเขาได้ตั้งแต่ต้นเทอม — เตือนไว้เฉย ๆ ไม่บล็อก เพราะนี่
+		// คือพฤติกรรมที่ถูกต้องสำหรับ TA เหมาจ่าย แต่ยังคุ้มที่จะเตือนเจ้าหน้าที่ให้
+		// ตรวจยอดเองก่อนส่ง. ไม่แตะ track "regular" เพราะกลุ่มนั้นผ่านการตรวจสอบ
+		// worklog ตามปกติอยู่แล้ว.
+		for _, sh := range sheets {
+			if sh.Track == "special" && len(sh.Rows) > 0 {
+				warnings = append(warnings, "ไฟล์บัณฑิตศึกษามี TA เหมาจ่ายที่ไม่มีขั้นตอนตรวจสอบก่อนส่งออก (ไม่ต้องลงเวลา) กรุณาตรวจยอดเงินก่อนส่งการเงิน")
+				break
+			}
+		}
 	}
 	warnings = append(warnings, s.fillPromptPay(ctx, actor, sheets)...)
 
@@ -728,7 +771,7 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 	for _, sh := range sheets {
 		totalBaht += sh.TotalBaht
 	}
-	if err := s.recordTransferCoverExport(ctx, actor, termID, months, sheets, headers, totalBaht); err != nil {
+	if err := s.recordTransferCoverExport(ctx, actor, termID, months, level, sheets, headers, totalBaht); err != nil {
 		return nil, nil, err
 	}
 	// The file carries decrypted citizen ID numbers — audit who pulled it,
@@ -736,7 +779,7 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 	// best-effort: a disclosure with no trail is worse than a retry.
 	if err := s.aud.Log(ctx, audit.Entry{
 		ActorID: &actor, Action: "export.transfer_cover", Entity: "academic_term", EntityID: termID.String(),
-		After: map[string]any{"sheet_count": len(sheets), "total_baht": round2(totalBaht), "months": months},
+		After: map[string]any{"sheet_count": len(sheets), "total_baht": round2(totalBaht), "months": months, "level": level},
 	}); err != nil {
 		return nil, nil, err
 	}
@@ -747,7 +790,7 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 // back — an unrecorded generation cannot be reprinted, distinguished from a
 // staff member who simply never downloaded it.
 func (s *ExportService) recordTransferCoverExport(
-	ctx context.Context, actor, termID uuid.UUID, months []string,
+	ctx context.Context, actor, termID uuid.UUID, months []string, level string,
 	sheets []transferCoverSheet, headers map[string]transferCoverHeader, totalBaht float64,
 ) error {
 	raw, err := json.Marshal(transferCoverSnapshot{Sheets: sheets, Headers: headers})
@@ -759,9 +802,9 @@ func (s *ExportService) recordTransferCoverExport(
 		by = &actor
 	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO transfer_cover_exports (id, term_id, generated_by, total_baht, sheet_count, document, months)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)`,
-		termID, by, round2(totalBaht), len(sheets), raw, months)
+		INSERT INTO transfer_cover_exports (id, term_id, generated_by, total_baht, sheet_count, document, months, level)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)`,
+		termID, by, round2(totalBaht), len(sheets), raw, months, level)
 	return err
 }
 
@@ -808,19 +851,31 @@ type TransferCoverExportSummary struct {
 	// Empty for rows generated before the split existed — those covered the
 	// whole term, and the screen says so rather than showing a blank range.
 	Months []string `json:"months,omitempty"`
+	// Level is which file this generation was: "undergrad" | "graduate" | ""
+	// for rows predating the level split (12/08/2026), which covered both in
+	// one file — the screen says so rather than mislabeling it either way.
+	Level string `json:"level,omitempty"`
 }
 
 // ListTransferCoverExports returns the generation history for a term, newest
-// first.
-func (s *ExportService) ListTransferCoverExports(ctx context.Context, termID uuid.UUID) ([]TransferCoverExportSummary, error) {
+// first, scoped to one file's history. level="" (predating the split, kept
+// for the CourseExportBlockers-style low-level callers and tests) lists every
+// generation regardless of level.
+//
+// A pre-split row (level NULL — it covered BOTH files at once, back when
+// there was only one) is included in EVERY level's history, the same way a
+// pre-split months=NULL row counted as covering every month: it genuinely
+// did cover this level, it just wasn't recorded as a level-scoped file yet.
+func (s *ExportService) ListTransferCoverExports(ctx context.Context, termID uuid.UUID, level string) ([]TransferCoverExportSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT e.id, e.term_id, TO_CHAR(e.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       COALESCE(u.first_name || ' ' || u.last_name, ''), e.total_baht, e.sheet_count,
-		       COALESCE(e.months, '{}')
+		       COALESCE(e.months, '{}'), COALESCE(e.level, '')
 		FROM transfer_cover_exports e
 		LEFT JOIN users u ON u.id = e.generated_by
 		WHERE e.term_id = $1
-		ORDER BY e.generated_at DESC`, termID)
+		  AND ($2 = '' OR e.level IS NULL OR e.level = $2)
+		ORDER BY e.generated_at DESC`, termID, level)
 	if err != nil {
 		return nil, err
 	}
@@ -828,7 +883,7 @@ func (s *ExportService) ListTransferCoverExports(ctx context.Context, termID uui
 	out := []TransferCoverExportSummary{}
 	for rows.Next() {
 		var r TransferCoverExportSummary
-		if err := rows.Scan(&r.ID, &r.TermID, &r.GeneratedAt, &r.GeneratedBy, &r.TotalBaht, &r.SheetCount, &r.Months); err != nil {
+		if err := rows.Scan(&r.ID, &r.TermID, &r.GeneratedAt, &r.GeneratedBy, &r.TotalBaht, &r.SheetCount, &r.Months, &r.Level); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -853,12 +908,19 @@ type TransferCoverMonthStatus struct {
 	Issued bool `json:"issued"`
 }
 
-func (s *ExportService) TransferCoverCoverage(ctx context.Context, termID uuid.UUID) (*TransferCoverCoverage, error) {
+// level ("undergrad" | "graduate") scopes coverage to one file: issuing the
+// undergrad file must not make the graduate screen believe those same months
+// are already covered, and vice versa — the two files are on independent
+// schedules.
+func (s *ExportService) TransferCoverCoverage(ctx context.Context, termID uuid.UUID, level string) (*TransferCoverCoverage, error) {
+	if level != "undergrad" && level != "graduate" {
+		return nil, Invalid("level ต้องเป็น undergrad หรือ graduate")
+	}
 	all, err := s.TermMonths(ctx, termID)
 	if err != nil {
 		return nil, err
 	}
-	history, err := s.ListTransferCoverExports(ctx, termID)
+	history, err := s.ListTransferCoverExports(ctx, termID, level)
 	if err != nil {
 		return nil, err
 	}
@@ -916,7 +978,10 @@ type TransferCoverPreviewSheet struct {
 // point in the pipeline; the gate exists to stop the FILE (an auditable
 // financial instrument someone might act on) from leaving the server early,
 // not to hide the underlying numbers from staff checking progress.
-func (s *ExportService) TransferCoverPreview(ctx context.Context, termID uuid.UUID, months []string) ([]TransferCoverPreviewSheet, []string, error) {
+func (s *ExportService) TransferCoverPreview(ctx context.Context, termID uuid.UUID, months []string, level string) ([]TransferCoverPreviewSheet, []string, error) {
+	if level != "undergrad" && level != "graduate" {
+		return nil, nil, Invalid("level ต้องเป็น undergrad หรือ graduate")
+	}
 	all, err := s.TermMonths(ctx, termID)
 	if err != nil {
 		return nil, nil, err
@@ -925,7 +990,7 @@ func (s *ExportService) TransferCoverPreview(ctx context.Context, termID uuid.UU
 	if err != nil {
 		return nil, nil, Invalid(err.Error())
 	}
-	sheets, warnings, err := s.buildTransferCoverSheets(ctx, termID, months)
+	sheets, warnings, err := s.buildTransferCoverSheets(ctx, termID, months, level)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -943,4 +1008,77 @@ func (s *ExportService) TransferCoverPreview(ctx context.Context, termID uuid.UU
 		})
 	}
 	return out, warnings, nil
+}
+
+/* -------------------------------------------------------------------------- */
+/* Combined download (12/08/2026)                                             */
+/* -------------------------------------------------------------------------- */
+
+// BuildTransferCoverBundle issues ปะหน้าจ่ายตรง as ONE zip download containing
+// whichever of the two level files (ป.ตรี, บัณฑิตศึกษา) is ready. Staff asked
+// for a single button instead of two separate downloads crowding the header —
+// the two documents are still built, gated, and ledgered completely
+// independently, exactly as BuildTransferCoverWorkbook always has; only the
+// DOWNLOAD ACTION is merged.
+//
+// A level that is not yet ready (TermExportBlockers) is SKIPPED with a warning
+// rather than blocking the other level's file — collapsing the two gates back
+// into one would recreate the exact problem the level split fixed: a graduate
+// course still mid-review holding the undergrad document (or the reverse)
+// hostage. The zip only fails outright if BOTH levels are blocked, since there
+// would then be nothing to hand back.
+func (s *ExportService) BuildTransferCoverBundle(ctx context.Context, actor, termID uuid.UUID, months []string) ([]byte, []string, error) {
+	type builtFile struct {
+		level string
+		body  []byte
+	}
+	var files []builtFile
+	var warnings []string
+	var blockedMsgs []string
+	for _, level := range []string{"undergrad", "graduate"} {
+		body, warn, err := s.BuildTransferCoverWorkbook(ctx, actor, termID, months, level)
+		if err != nil {
+			var ue *UserError
+			if errors.As(err, &ue) {
+				// Expected: this level just isn't ready yet. Note it and move on
+				// to the other level rather than failing the whole bundle.
+				blockedMsgs = append(blockedMsgs, fmt.Sprintf("ไฟล์%s: %s", transferCoverLevelLabelTH(level), ue.Msg))
+				continue
+			}
+			return nil, nil, err
+		}
+		warnings = append(warnings, warn...)
+		files = append(files, builtFile{level: level, body: body})
+	}
+	if len(files) == 0 {
+		return nil, nil, Invalid("ยังสร้างไฟล์ไม่ได้ทั้งสองระดับ:\n• " + strings.Join(blockedMsgs, "\n• "))
+	}
+	warnings = append(warnings, blockedMsgs...)
+
+	buf := &bytes.Buffer{}
+	zw := zip.NewWriter(buf)
+	for _, f := range files {
+		w, err := zw.Create(fmt.Sprintf("ปะหน้าจ่ายตรง-%s.xlsx", transferCoverLevelLabelTH(f.level)))
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := w.Write(f.body); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, nil, err
+	}
+	return buf.Bytes(), warnings, nil
+}
+
+// transferCoverLevelLabelTH names a level for a bundle entry's filename/
+// warning — short forms ("ปตรี"/"บัณฑิต") distinct from levelLabelTH's own
+// full academic-degree labels ("ปริญญาตรี"/"ปริญญาโท"/"ปริญญาเอก") used
+// elsewhere, since a zip entry name reads better short.
+func transferCoverLevelLabelTH(level string) string {
+	if level == "graduate" {
+		return "บัณฑิต"
+	}
+	return "ปตรี"
 }
