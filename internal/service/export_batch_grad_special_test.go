@@ -27,7 +27,7 @@ func TestExportBatchDashboard_ExcludesGradSpecialLeftoverRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range out {
+	for _, c := range out.Courses {
 		if c.TeachingCourseID == f.CourseID && len(c.UnreviewedMonths) != 0 {
 			t.Fatalf("grad-special leftover approved row counted as unreviewed: %+v", c.UnreviewedMonths)
 		}

@@ -29,15 +29,17 @@ import (
 // AudienceRule is the composer's targeting choice.
 type AudienceRule struct {
 	// Roles is the coarse group. Empty AND no courses AND no people means
-	// "everyone with an account".
-	Roles []string `json:"roles"`
+	// "everyone with an account" (see IsEveryone), so this is not required —
+	// only non-empty values are constrained to the four known roles.
+	Roles []string `json:"roles" validate:"omitempty,dive,oneof=admin staff lecturer ta"`
 	// CourseIDs pulls in everyone attached to a teaching course: its lecturers
 	// and the TAs appointed to it.
 	CourseIDs []uuid.UUID `json:"course_ids"`
 	// UserIDs are named people, for an announcement aimed at one person.
 	UserIDs []uuid.UUID `json:"user_ids"`
-	// Filters narrow whatever the above selected. Closed set — see announceFilters.
-	Filters []string `json:"filters"`
+	// Filters narrow whatever the above selected. Closed set — see
+	// announceFilters and validateRule below, which this tag mirrors.
+	Filters []string `json:"filters" validate:"omitempty,dive,oneof=ta_missing_documents ta_missing_schedule ta_no_assignment lecturer_no_request lecturer_pending_worklog course_missing_schedule"`
 	// TermID scopes course and condition filters. nil = the active term.
 	TermID *uuid.UUID `json:"term_id"`
 }

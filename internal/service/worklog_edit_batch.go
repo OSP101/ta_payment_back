@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"ta-payment-back/internal/audit"
 )
@@ -356,4 +357,26 @@ func (s *WorkLogService) ListEditBatches(
 		frows.Close()
 	}
 	return out, nil
+}
+
+// EditFileCourse resolves which teaching course an evidence file belongs to,
+// so ServeEditFile (handler) can check the caller — a lecturer, under
+// staffOrLecturer — actually teaches that course before streaming it. The
+// storage key alone (a random UUID) carries no course information, and this
+// store also holds TA national-ID scans, so "the key is unguessable" is not
+// an acceptable substitute for an actual ownership check.
+func (s *WorkLogService) EditFileCourse(ctx context.Context, storageKey string) (uuid.UUID, error) {
+	var tcID uuid.UUID
+	err := s.pool.QueryRow(ctx, `
+		SELECT b.teaching_course_id
+		FROM worklog_edit_files f
+		JOIN worklog_edit_batches b ON b.id = f.batch_id
+		WHERE f.storage_key = $1`, storageKey).Scan(&tcID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrNotFound
+	}
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return tcID, nil
 }

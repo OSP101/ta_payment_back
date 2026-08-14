@@ -108,18 +108,22 @@ const courseHasTA = `EXISTS (
 	JOIN sections s ON s.id = a.section_id
 	WHERE s.teaching_course_id = tc.id)`
 
-// round2BillableSQL is round 2's course filter: courseHasTA alone would catch
+// roundBillableSQL is a round's course filter: courseHasTA alone would catch
 // every course in the term (the roster is fixed at appointment, independent
-// of any month), so round 2 additionally requires DEMONSTRABLE billable
-// content in round 2's own months — otherwise every course with an ordinary
-// full appointment would appear to owe a round-2 signature it has no document
-// for. param must be round 2's Gregorian "YYYY-MM" months as a text[] arg.
+// of any month), so a round additionally requires DEMONSTRABLE billable
+// content in that round's own months — otherwise every course with an ordinary
+// full appointment would appear to owe a signature it has no document for.
+// param must be the round's Gregorian "YYYY-MM" months as a text[] arg.
+//
+// Written for round 2 and named for it; generalised (13/08/2026) when the
+// payouts list needed the same question asked of round 1, to show both halves
+// of a crossing term side by side. Nothing in the body was round-specific.
 //
 // grad-special (เหมาจ่าย) has no work_logs at all — its lump is apportioned by
 // schedule share across whichever months are printed (gradLumpShare) — so any
-// grad-special assignment counts as round-2 content once round 2 exists at
-// all; there is no คาบ to check a month against.
-func round2BillableSQL(param string) string {
+// grad-special assignment counts as content for whichever round is asked about;
+// there is no คาบ to check a month against.
+func roundBillableSQL(param string) string {
 	return `(
 		EXISTS (
 		    SELECT 1 FROM work_logs wl
@@ -138,15 +142,19 @@ func round2BillableSQL(param string) string {
 	)`
 }
 
-// round2ExportedSQL is round 2's "has this course's document actually been
-// issued" predicate — unlike round 1, which uses the one-shot
-// teaching_courses.exported_at flag (see MarkExported), round 2 has no
-// equivalent flag: exported_at fires on the FIRST ZIP a course ever gets,
-// which for a crossing term is always round 1's. Instead this reads the
-// export_batches ledger directly for a batch whose recorded months overlap
-// round 2's — the same row export.go's BuildCourseZip already writes.
-// param must be round 2's Gregorian "YYYY-MM" months as a text[] arg.
-func round2ExportedSQL(param string) string {
+// roundExportedSQL is "has this course's document for these months actually
+// been issued" — read from the export_batches ledger rather than from the
+// one-shot teaching_courses.exported_at flag, which fires on the FIRST ZIP a
+// course ever gets and so cannot tell one round from another.
+// param must be the round's Gregorian "YYYY-MM" months as a text[] arg.
+//
+// `months && $1` is NULL, not false, for a row whose months is NULL — which
+// used to be every whole-term export, because the ZIP handler stored the
+// absent ?months= parameter verbatim. Migration 0083 backfilled those rows and
+// the handler now resolves the selection first (ResolveCourseMonths), so a
+// surviving NULL means only "this term has no submission periods to
+// enumerate", for which false is the right answer.
+func roundExportedSQL(param string) string {
 	return `EXISTS (
 		SELECT 1 FROM export_batches eb
 		WHERE eb.teaching_course_id = tc.id AND eb.months && ` + param + `::text[]
@@ -201,8 +209,8 @@ func (s *DocumentProgressService) exportReadiness(
 		       COUNT(*) FILTER (WHERE has_ta AND billable AND exported)
 		FROM teaching_courses tc,
 		     LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
-		     LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y,
-		     LATERAL (SELECT `+round2ExportedSQL("$2")+` AS exported) z
+		     LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y,
+		     LATERAL (SELECT `+roundExportedSQL("$2")+` AS exported) z
 		WHERE tc.term_id = $1`, termID, gregMonths).Scan(&total, &exported)
 	if err != nil {
 		return
@@ -211,8 +219,8 @@ func (s *DocumentProgressService) exportReadiness(
 		SELECT tc.code, tc.name_th
 		FROM teaching_courses tc,
 		     LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
-		     LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y,
-		     LATERAL (SELECT `+round2ExportedSQL("$2")+` AS exported) z
+		     LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y,
+		     LATERAL (SELECT `+roundExportedSQL("$2")+` AS exported) z
 		WHERE tc.term_id = $1 AND has_ta AND billable AND NOT exported
 		ORDER BY tc.code`, termID, gregMonths)
 	if rErr != nil {
@@ -626,8 +634,13 @@ func roleForStage(stage int) string {
 // course with an approved TA assignment, independent of any month — the
 // roster is fixed at appointment) plus a fiscal_round=1 filter on the ticks so
 // a round-2 signature can never read back as round 1's. Round 2 additionally
-// requires round2BillableSQL — only courses that actually have round-2
+// requires roundBillableSQL — only courses that actually have round-2
 // content get a round-2 document to sign at all.
+//
+// Names carry the คำนำหน้า the same way the export files do (ta_profiles.prefix
+// first, users.title as the fallback) — the screen this feeds asks a TA to
+// recognise the lecturer who is holding their paperwork, and a bare
+// "วรัญญา วรรณศรี" is not how anybody here refers to them.
 //
 // The people are derived live rather than read from signature_checklist, so a
 // TA added after the first export still appears — the checklist table only ever
@@ -645,14 +658,17 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 			),
 			people AS (
 			    SELECT DISTINCT c.id AS tc_id, 'ta' AS role, u.id AS signer_id,
+			           COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '') ||
 			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'') AS signer_name
 			    FROM courses c
 			    JOIN sections s               ON s.teaching_course_id = c.id
 			    JOIN ta_request_assignments a ON a.section_id = s.id AND a.state <> 'dropped'
 			    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
 			    JOIN users u                  ON u.id = a.ta_id
+			    LEFT JOIN ta_profiles tp      ON tp.user_id = u.id
 			  UNION ALL
 			    SELECT DISTINCT c.id, 'lecturer', u.id,
+			           COALESCE(NULLIF(u.title,''), '') ||
 			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')
 			    FROM courses c
 			    JOIN ta_requests r ON r.teaching_course_id = c.id AND r.status = 'approved'
@@ -683,22 +699,25 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 		rows, err = s.pool.Query(ctx, `
 			WITH courses AS (
 			    SELECT tc.id, tc.code, tc.name_th,
-			           `+round2ExportedSQL("$2")+` AS exported
+			           `+roundExportedSQL("$2")+` AS exported
 			    FROM teaching_courses tc,
 			         LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
-			         LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y
+			         LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y
 			    WHERE tc.term_id = $1 AND x.has_ta AND y.billable
 			),
 			people AS (
 			    SELECT DISTINCT c.id AS tc_id, 'ta' AS role, u.id AS signer_id,
+			           COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '') ||
 			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'') AS signer_name
 			    FROM courses c
 			    JOIN sections s               ON s.teaching_course_id = c.id
 			    JOIN ta_request_assignments a ON a.section_id = s.id AND a.state <> 'dropped'
 			    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
 			    JOIN users u                  ON u.id = a.ta_id
+			    LEFT JOIN ta_profiles tp      ON tp.user_id = u.id
 			  UNION ALL
 			    SELECT DISTINCT c.id, 'lecturer', u.id,
+			           COALESCE(NULLIF(u.title,''), '') ||
 			           COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')
 			    FROM courses c
 			    JOIN ta_requests r ON r.teaching_course_id = c.id AND r.status = 'approved'
@@ -937,7 +956,7 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 			      AND sc.signer_id = r.lecturer_id
 			      AND sc.fiscal_round = 2
 			CROSS JOIN LATERAL (SELECT `+courseHasTA+` AS has_ta) x
-			CROSS JOIN LATERAL (SELECT `+round2BillableSQL("$2")+` AS billable) y
+			CROSS JOIN LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y
 			WHERE tc.term_id = $1 AND x.has_ta AND y.billable AND sc.signed_at IS NULL
 			ORDER BY tc.code`, termID, gregMonths)
 	}

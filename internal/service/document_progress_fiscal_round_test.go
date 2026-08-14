@@ -21,7 +21,7 @@ func progressSvcTC(f *tcFixture) *DocumentProgressService {
 }
 
 // recordExportBatch simulates BuildCourseZip's side effect on export_batches
-// — the ledger round2ExportedSQL actually reads — without needing the full
+// — the ledger roundExportedSQL actually reads — without needing the full
 // ZIP-building machinery (docs, storage, PII) a real export goes through.
 func (f *tcFixture) recordExportBatch(courseID, generatedBy uuid.UUID, months []string) {
 	f.t.Helper()

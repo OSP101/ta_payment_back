@@ -25,14 +25,17 @@ type SubmissionPeriodService struct {
 }
 
 type SubmissionPeriod struct {
-	ID               uuid.UUID `json:"id"`
-	TermID           uuid.UUID `json:"term_id"`
-	YearMonth        string    `json:"year_month"` // "2569-06"
-	StartsOn         string    `json:"starts_on"`  // "2569-06-01" — window opens
-	DueDate          string    `json:"due_date"`   // "2569-07-31" — window closes
-	Label            string    `json:"label"`      // "มิถุนายน 2569"
-	RemindDaysBefore int       `json:"remind_days_before"`
-	IsClosed         bool      `json:"is_closed"`
+	ID     uuid.UUID `json:"id"`
+	TermID uuid.UUID `json:"term_id" validate:"required"`
+	// YearMonth is CHAR(7) in the DB ("2569-06") — len matches that column
+	// exactly; the "<academic_year>-MM" shape itself is still checked by
+	// Upsert against the term's academic_year, which a struct tag can't know.
+	YearMonth        string `json:"year_month" validate:"required,len=7"`
+	StartsOn         string `json:"starts_on" validate:"required"`     // "2569-06-01" — window opens
+	DueDate          string `json:"due_date" validate:"required"`      // "2569-07-31" — window closes
+	Label            string `json:"label" validate:"required,max=200"` // "มิถุนายน 2569"
+	RemindDaysBefore int    `json:"remind_days_before"`                // <=0 defaults to 3 in Upsert — not required
+	IsClosed         bool   `json:"is_closed"`
 }
 
 // SubmissionPeriodStatus is one (TA, teaching_course, period) row from the

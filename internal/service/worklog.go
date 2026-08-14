@@ -533,20 +533,52 @@ func (s *WorkLogService) warnBudgetAfterApproval(ctx context.Context, courseIDs 
 }
 
 type WorkLog struct {
+	// ID and AssignmentID are never trusted from a request body as-is: the
+	// handler always overwrites AssignmentID from the URL param, and ID's own
+	// type (uuid.UUID) already rejects a malformed value at BodyParser time —
+	// no validate tag adds anything here.
 	ID           uuid.UUID `json:"id"`
 	AssignmentID uuid.UUID `json:"assignment_id"`
-	WorkDate     string    `json:"work_date"`
-	StartTime    string    `json:"start_time"`
-	EndTime      string    `json:"end_time"`
-	Hours        float64   `json:"hours"`
-	Activity     string    `json:"activity"`
+	// WorkDate/StartTime/EndTime are only checked for presence here.
+	// validateWorkLogEntry (worklog.go) already does the real format parsing
+	// (time.Parse "2006-01-02", parseHM for HH:MM) plus the term-range,
+	// back-dating, exam-window, holiday/makeup and scope-gate rules — a
+	// stricter format tag here (e.g. datetime="15:04") would risk rejecting
+	// inputs parseHM's looser Sscanf-based parser still accepts (e.g. "9:5"),
+	// which would be a real behaviour change, not just an earlier version of
+	// the same check.
+	WorkDate  string `json:"work_date" validate:"required"`
+	StartTime string `json:"start_time" validate:"required"`
+	EndTime   string `json:"end_time" validate:"required"`
+	// Hours gets a first-line "not negative" check even though
+	// validateWorkLogEntry fully re-validates it (> 0, <= maxRowHours, and
+	// must equal the start/end span) — gte=0 can never conflict with those
+	// tighter rules, it just turns an obviously-bad payload (negative hours)
+	// into a 400 before any of that other work runs.
+	Hours float64 `json:"hours" validate:"gte=0"`
+	// Activity's allowed values are the same set the DB comment on
+	// work_logs.activity documents and validateWorkLogEntry's scope/gate
+	// switches branch on; migration 0018 additionally CHECKs that
+	// activity='other' implies parent_kind is set (still service-only, tags
+	// can't express a cross-field rule).
+	Activity string `json:"activity" validate:"required,oneof=lecture lab review makeup other"`
 	// ParentKind ties an activity='other' row to the session type it belongs to
 	// (lecture|lab) so the per-session credit-hour cap can be enforced.
-	// NULL for lecture/lab/review/makeup rows.
-	ParentKind *string `json:"parent_kind,omitempty"`
-	Room       *string `json:"room,omitempty"`
-	Note       *string `json:"note,omitempty"`
-	Status     string  `json:"status"`
+	// NULL for lecture/lab/review/makeup rows. oneof mirrors migration 0018's
+	// CHECK (parent_kind IS NULL OR parent_kind IN ('lecture','lab')); the
+	// "required when activity='other'" half of that rule stays in
+	// validateWorkLogEntry, which is the only place that can see both fields.
+	ParentKind *string `json:"parent_kind,omitempty" validate:"omitempty,oneof=lecture lab"`
+	// Room/Note are free text with no DB length limit (work_logs.room/note are
+	// plain TEXT); 500 is a sane cap against an abusive payload, not a
+	// documented business limit.
+	Room *string `json:"room,omitempty" validate:"omitempty,max=500"`
+	Note *string `json:"note,omitempty" validate:"omitempty,max=500"`
+	// Status, RejectReason and Source below are never read from the request
+	// body by Upsert/StaffUpsert — both hardcode status='draft' on write, leave
+	// source at its DB default, and only Reject() ever sets reject_reason. A
+	// validate tag on them would police a value the service silently discards.
+	Status string `json:"status"`
 	// RejectReason is populated when the lecturer sends the batch back to the
 	// TA. Reject() stamps every submitted row in the assignment with the same
 	// reason so the TA-facing UI can surface the message on entry — otherwise
@@ -1307,12 +1339,23 @@ type TAReviewSchedule struct {
 }
 
 type TAReviewScheduleInput struct {
-	Kind      string `json:"kind"`
-	DayOfWeek int    `json:"day_of_week"`
-	StartTime string `json:"start_time"`
-	EndTime   string `json:"end_time"`
-	Room      string `json:"room"`
-	Note      string `json:"note"`
+	// Kind mirrors migration 0067's CHECK (kind IN ('review','other_lecture',
+	// 'other_lab')) / validDutyKind below.
+	Kind string `json:"kind" validate:"required,oneof=review other_lecture other_lab"`
+	// DayOfWeek mirrors migration 0025's CHECK (day_of_week BETWEEN 0 AND 6);
+	// validateReviewInput below re-checks it anyway (own Thai message), so
+	// this is a redundant but non-conflicting first-line check.
+	DayOfWeek int `json:"day_of_week" validate:"gte=0,lte=6"`
+	// StartTime/EndTime: presence only. validateReviewInput does the real
+	// parseHM format check plus end>start; parseHM is more lenient than a
+	// strict "15:04" tag (e.g. accepts "9:5"), so a format tag here could
+	// reject input the service would otherwise accept.
+	StartTime string `json:"start_time" validate:"required"`
+	EndTime   string `json:"end_time" validate:"required"`
+	// Room/Note are free text with no DB length limit (ta_review_schedules.room
+	// / .note are plain TEXT); 500 is a defensive cap, not a documented limit.
+	Room string `json:"room" validate:"omitempty,max=500"`
+	Note string `json:"note" validate:"omitempty,max=500"`
 }
 
 func validateReviewInput(in TAReviewScheduleInput) error {

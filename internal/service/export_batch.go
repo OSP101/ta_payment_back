@@ -126,21 +126,51 @@ type CourseSummary struct {
 	// nobody anything they could act on.
 	LecturerNames string `json:"lecturer_names"`
 
-	// RoundTwoOutstanding (12/08/2026) is true when this course's term crosses
-	// the 30 กันยายน budget year, the course has real billable work AFTER that
-	// boundary, and no export_batches slice has covered it yet. A course can
-	// read "ส่งออกแล้ว" (LastExportAt set) from round 1 alone while round 2
-	// still owes a second, separate document against next year's budget — this
-	// is the signal the list uses to say so, rather than a course looking
-	// finished when a second file is still due. Same predicate the
-	// document-progress board uses (round2BillableSQL/round2ExportedSQL),
-	// kept in sync deliberately.
-	RoundTwoOutstanding bool `json:"round_two_outstanding,omitempty"`
+	// Rounds is this course's standing in EACH half of a term that crosses the
+	// 30 กันยายน budget year, in round order. Empty for a term that does not
+	// cross — there is only one document, and LastExportAt already describes it.
+	//
+	// (13/08/2026) This replaced a single RoundTwoOutstanding boolean, which
+	// collapsed three states the payouts screen has to tell apart: round 2
+	// exported, round 2 still owed, and no round-2 work in this course at all.
+	// The last two both read false, so a course that was genuinely finished and
+	// one still owing a second document against next year's appropriation were
+	// indistinguishable — which is exactly the confusion the flag was added to
+	// resolve.
+	Rounds []CourseRoundStatus `json:"rounds,omitempty"`
+}
+
+// CourseRoundStatus is one course's standing in one fiscal round: whether the
+// round has anything to claim for this course, and whether that claim has been
+// issued. Both are needed — "not exported" means nothing without "has work",
+// since every course in a crossing term exists in both rounds' month ranges
+// whether or not anyone taught in them.
+type CourseRoundStatus struct {
+	Round int `json:"round"` // 1 = closes 30 ก.ย., 2 = opens 1 ต.ค.
+	// Billable is whether this course has demonstrable work in the round's
+	// months (roundBillableSQL). False means there is no document to owe.
+	Billable bool `json:"billable"`
+	// Exported is whether an export_batches row covers any of the round's
+	// months (roundExportedSQL).
+	Exported bool `json:"exported"`
+}
+
+// PayoutDashboard is the exports dashboard's whole payload: the course rows
+// plus where the budget year cuts this term.
+//
+// The split used to be computed inside DashboardSummary and thrown away, and
+// the screen received only per-course booleans. That left it unable to tell a
+// term that never crosses the boundary from one that crosses but has no
+// round-2 work — both produced identical rows — so it could not decide whether
+// to speak about "รอบ" at all. Sending the split says which of the two it is.
+type PayoutDashboard struct {
+	Courses []CourseSummary `json:"courses"`
+	Split   FiscalSplit     `json:"fiscal_split"`
 }
 
 // DashboardSummary aggregates budget + submission status per teaching_course
 // filtered by term. Heavy query — used by the staff dashboard page only.
-func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, export *ExportService, termID uuid.UUID) ([]CourseSummary, error) {
+func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, export *ExportService, termID uuid.UUID) (*PayoutDashboard, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT tc.id, tc.code, tc.name_th,
 		       COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', '
@@ -296,35 +326,69 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		out[i].ExportEligible = out[i].HasAppointmentOrder && out[i].ReviewComplete
 	}
 
-	// Round-2 outstanding: only worth a query when the TERM actually crosses
-	// the budget-year boundary — the ordinary (non-crossing) case pays nothing
-	// extra. termID can be uuid.Nil ("every term"), which has no single fiscal
-	// split to compute against, so it is skipped there too.
+	// Per-round standing: only worth querying when the TERM actually crosses the
+	// budget-year boundary — the ordinary case has one document and pays nothing
+	// extra here. termID can be uuid.Nil ("every term"), which has no single
+	// fiscal split to compute against, so it is skipped there too.
+	var split FiscalSplit
 	if export != nil && termID != uuid.Nil {
 		if all, merr := export.TermMonths(ctx, termID); merr == nil {
-			if split, serr := fiscalSplit(all); serr == nil && split.Crosses && len(split.After) > 0 {
-				r2Rows, r2err := s.pool.Query(ctx, `
-					SELECT tc.id
-					FROM teaching_courses tc
-					WHERE tc.term_id = $1
-					  AND `+round2BillableSQL("$2")+`
-					  AND NOT `+round2ExportedSQL("$2")+`
-					`, termID, split.After)
-				if r2err == nil {
-					outstanding := map[uuid.UUID]bool{}
-					for r2Rows.Next() {
-						var id uuid.UUID
-						if r2Rows.Scan(&id) == nil {
-							outstanding[id] = true
-						}
-					}
-					r2Rows.Close()
-					for i := range out {
-						out[i].RoundTwoOutstanding = outstanding[out[i].TeachingCourseID]
-					}
-				}
+			if sp, serr := fiscalSplit(all); serr == nil {
+				split = sp
 			}
 		}
 	}
-	return out, nil
+	if split.Crosses && len(split.After) > 0 {
+		for _, r := range []struct {
+			num    int
+			months []string
+		}{{1, split.Before}, {2, split.After}} {
+			if len(r.months) == 0 {
+				continue
+			}
+			st, err := s.roundStanding(ctx, termID, r.num, r.months)
+			if err != nil {
+				return nil, err
+			}
+			for i := range out {
+				// Default rather than the map's zero value: a course the round
+				// query did not return would otherwise get Round: 0, which the
+				// screen would render as an unlabelled slot.
+				got, ok := st[out[i].TeachingCourseID]
+				if !ok {
+					got = CourseRoundStatus{Round: r.num}
+				}
+				out[i].Rounds = append(out[i].Rounds, got)
+			}
+		}
+	}
+	return &PayoutDashboard{Courses: out, Split: split}, nil
+}
+
+// roundStanding answers billable/exported for every course in the term for ONE
+// round, keyed by course. Asked per round rather than per course so a term of
+// 127 courses costs two queries rather than 254.
+func (s *ExportBatchService) roundStanding(
+	ctx context.Context, termID uuid.UUID, round int, months []string,
+) (map[uuid.UUID]CourseRoundStatus, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT tc.id, y.billable, z.exported
+		FROM teaching_courses tc,
+		     LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y,
+		     LATERAL (SELECT `+roundExportedSQL("$2")+` AS exported) z
+		WHERE tc.term_id = $1`, termID, months)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[uuid.UUID]CourseRoundStatus{}
+	for rows.Next() {
+		var id uuid.UUID
+		st := CourseRoundStatus{Round: round}
+		if err := rows.Scan(&id, &st.Billable, &st.Exported); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
 }

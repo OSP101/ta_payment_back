@@ -103,7 +103,7 @@ func TestExportSummary_EligibilityNeedsOrderAndCompletedReview(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DashboardSummary: %v", err)
 		}
-		for _, s := range all {
+		for _, s := range all.Courses {
 			if s.TeachingCourseID == f.CourseID {
 				return s
 			}
@@ -162,7 +162,7 @@ func TestExportSummary_NoWorkIsNotReviewComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range all {
+	for _, s := range all.Courses {
 		if s.TeachingCourseID != f.CourseID {
 			continue
 		}
@@ -197,7 +197,7 @@ func TestExportSummary_UnappointedWorkDoesNotBlockExportForever(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range all {
+	for _, s := range all.Courses {
 		if s.TeachingCourseID != f.CourseID {
 			continue
 		}

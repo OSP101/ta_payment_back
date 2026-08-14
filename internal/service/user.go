@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,15 +52,19 @@ type UserService struct {
 }
 
 type CreateUserInput struct {
-	Email      string   `json:"email"`
+	Email      string   `json:"email" validate:"required,email"`
 	Title      *string  `json:"title,omitempty"`
-	FirstName  string   `json:"first_name"`
-	LastName   string   `json:"last_name"`
-	Phone      *string  `json:"phone,omitempty"`
-	Roles      []string `json:"roles"`
+	FirstName  string   `json:"first_name" validate:"required,max=100"`
+	LastName   string   `json:"last_name" validate:"required,max=100"`
+	Phone      *string  `json:"phone,omitempty" validate:"omitempty,max=20"`
+	Roles      []string `json:"roles" validate:"required,min=1,dive,oneof=admin staff lecturer ta"`
 	StudyLevel *string  `json:"study_level,omitempty"`
-	StudyYear  *int     `json:"study_year,omitempty"`
-	Password   *string  `json:"password,omitempty"`
+	StudyYear  *int     `json:"study_year,omitempty" validate:"omitempty,gte=1,lte=8"`
+	// Password is intentionally untagged: Create's own logic (user.go) treats
+	// it as optional (nil/"" → a generated temp password) with a conditional
+	// length check only when it IS supplied — a blanket validate tag can't
+	// express "required only if present at all, and only when non-empty".
+	Password *string `json:"password,omitempty"`
 }
 
 type CreateUserResult struct {
@@ -270,6 +275,48 @@ func (s *UserService) ClearAvatar(ctx context.Context, id uuid.UUID) (string, er
 	return *old, nil
 }
 
+// Authenticate resolves an email + password to a User for the login route.
+// It owns the whole login business rule rather than just the credential
+// check, so AuthHandler.Login does not have to reimplement any of it:
+//
+//   - user-enumeration-safe timing — auth.DummyCompare spends the same time a
+//     real bcrypt compare would when the account doesn't exist or has no
+//     password, so a missing account is indistinguishable from a wrong one.
+//   - the per-account lockout in login_gate.go, layered under the route's
+//     own per-IP limiter (see handler.Mount's loginLimiter).
+//   - an audit entry for every outcome — success, wrong password, or locked
+//     — so "why does this account keep getting locked out" has an answer.
+//     Best-effort like the login success entry always was: a failed audit
+//     write must not itself turn into "you cannot log in".
+func (s *UserService) Authenticate(ctx context.Context, email, password, ip, userAgent string) (*User, error) {
+	u, hash, err := s.FindByEmail(ctx, email)
+	if err != nil || u == nil || hash == "" {
+		auth.DummyCompare(password)
+		return nil, &UserError{Status: 401, Msg: "อีเมลหรือรหัสผ่านไม่ถูกต้อง"}
+	}
+	if err := loginGateCheck(u.ID); err != nil {
+		_ = s.aud.Log(ctx, audit.Entry{
+			ActorID: &u.ID, Action: "auth.login_locked", Entity: "user",
+			EntityID: u.ID.String(), IP: ip, UserAgent: userAgent,
+		})
+		return nil, err
+	}
+	if !auth.CheckPassword(hash, password) {
+		loginGateFail(u.ID)
+		_ = s.aud.Log(ctx, audit.Entry{
+			ActorID: &u.ID, Action: "auth.login_failed", Entity: "user",
+			EntityID: u.ID.String(), IP: ip, UserAgent: userAgent,
+		})
+		return nil, &UserError{Status: 401, Msg: "อีเมลหรือรหัสผ่านไม่ถูกต้อง"}
+	}
+	loginGateSucceed(u.ID)
+	_ = s.aud.Log(ctx, audit.Entry{
+		ActorID: &u.ID, Action: "auth.login", Entity: "user",
+		EntityID: u.ID.String(), IP: ip, UserAgent: userAgent,
+	})
+	return u, nil
+}
+
 func (s *UserService) FindByEmail(ctx context.Context, email string) (*User, string, error) {
 	var id uuid.UUID
 	var pwHash *string
@@ -461,24 +508,27 @@ func applyDerivedStudyYear(u *User, curYearBE int) {
 
 // UpdateInput is a partial patch — only non-nil fields are applied.
 type UpdateUserInput struct {
-	Email      *string   `json:"email,omitempty"`
-	Title      *string   `json:"title,omitempty"`
-	FirstName  *string   `json:"first_name,omitempty"`
-	LastName   *string   `json:"last_name,omitempty"`
-	Phone      *string   `json:"phone,omitempty"`
-	StudyLevel *string   `json:"study_level,omitempty"`
-	StudyYear  *int      `json:"study_year,omitempty"`
-	Roles      *[]string `json:"roles,omitempty"`
+	Email      *string   `json:"email,omitempty" validate:"omitempty,email"`
+	Title      *string   `json:"title,omitempty" validate:"omitempty,max=50"`
+	FirstName  *string   `json:"first_name,omitempty" validate:"omitempty,min=1,max=100"`
+	LastName   *string   `json:"last_name,omitempty" validate:"omitempty,min=1,max=100"`
+	Phone      *string   `json:"phone,omitempty" validate:"omitempty,max=20"`
+	StudyLevel *string   `json:"study_level,omitempty" validate:"omitempty,oneof=undergrad master phd"`
+	StudyYear  *int      `json:"study_year,omitempty" validate:"omitempty,gte=1,lte=8"`
+	Roles      *[]string `json:"roles,omitempty" validate:"omitempty,min=1,dive,oneof=admin staff lecturer ta"`
 	// Grants/revokes the read-only executive dashboard. Staff may set this —
 	// the management team are lecturers, and per the 06/08/2026 decision the
 	// officer ticks the flag per person in the users page.
 	IsExecutive *bool `json:"is_executive,omitempty"`
 	// AdminPosition: pass "" to clear. Staff/admin only — see the handler gate.
-	AdminPosition *string `json:"admin_position,omitempty"`
-	BankName      *string `json:"bank_name,omitempty"`
-	BankBranch    *string `json:"bank_branch,omitempty"`
-	BranchCode    *string `json:"branch_code,omitempty"`
-	AccountNo     *string `json:"account_no,omitempty"`
+	AdminPosition *string `json:"admin_position,omitempty" validate:"omitempty,max=200"`
+	// Bank* fields are accepted and ignored (see migration 0047 and Update's
+	// own comment below) — never reach the DB or any business logic, so a
+	// validate tag here would constrain input that is immediately discarded.
+	BankName   *string `json:"bank_name,omitempty"`
+	BankBranch *string `json:"bank_branch,omitempty"`
+	BranchCode *string `json:"branch_code,omitempty"`
+	AccountNo  *string `json:"account_no,omitempty"`
 }
 
 func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in UpdateUserInput) (*User, error) {
@@ -640,7 +690,33 @@ func (s *UserService) GetEmail(ctx context.Context, id uuid.UUID) (string, error
 	return e, err
 }
 
+// passwordRe matches ValidatePassword's letter+digit requirement.
+var (
+	passwordHasLetter = regexp.MustCompile(`[A-Za-z]`)
+	passwordHasDigit  = regexp.MustCompile(`[0-9]`)
+)
+
+// ValidatePassword enforces the same rule the change-password page already
+// shows as live checklist items (ta_payment_front/app/change-password/page.tsx)
+// — length + a letter + a digit — so a caller that reaches this endpoint
+// directly (skipping the UI) cannot set something weaker than what the UI
+// would have accepted. Kept in sync with that page on purpose: the backend
+// being STRICTER than what the UI promises would reject input the user was
+// told was fine.
+func ValidatePassword(pw string) error {
+	if len(pw) < 8 {
+		return Invalid("รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร")
+	}
+	if !passwordHasLetter.MatchString(pw) || !passwordHasDigit.MatchString(pw) {
+		return Invalid("รหัสผ่านต้องมีทั้งตัวอักษรและตัวเลข")
+	}
+	return nil
+}
+
 func (s *UserService) UpdatePassword(ctx context.Context, id uuid.UUID, newPassword string) error {
+	if err := ValidatePassword(newPassword); err != nil {
+		return err
+	}
 	h, err := auth.HashPassword(newPassword)
 	if err != nil {
 		return err
@@ -752,8 +828,10 @@ func generateTempPassword(n int) string {
 }
 
 func itoa(i int) string {
-	// tiny helper to avoid strconv import churn
-	return uintToString(uint64(i))
+	// tiny helper to avoid strconv import churn. i is always a small positional
+	// SQL placeholder index (1, 2, 3, ...) from a bounded loop over a struct's
+	// own fields, never user input — the uint64 conversion cannot overflow.
+	return uintToString(uint64(i)) // #nosec G115 -- i is a small bounded counter, not attacker-controlled
 }
 func uintToString(n uint64) string {
 	if n == 0 {

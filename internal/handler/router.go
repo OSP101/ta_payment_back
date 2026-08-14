@@ -23,9 +23,39 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 
 	api := app.Group("/api/v1")
 
+	// Baseline per-IP ceiling across EVERY /api/v1 endpoint, public and
+	// authenticated alike — a broad backstop against scripted flooding,
+	// layered UNDER the tighter route-specific limiters below (loginLimiter,
+	// heavyLimiter). Generous on purpose: normal multi-tab use, plus
+	// SessionActivityGuard's heartbeat (at most 1/min) and the review
+	// workspace's 20s poll, sit nowhere near this — it should only ever fire
+	// on genuine abuse.
+	//
+	// Keyed by IP, which inherits the same caveat loginLimiter always had:
+	// see config.TrustedProxyIPs. Until that is set in production, every
+	// request arrives looking like it came from the Next.js hop, and this
+	// budget is shared across the whole user base rather than enforced per
+	// visitor.
+	api.Use(limiter.New(limiter.Config{
+		Max:        600,
+		Expiration: time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP()
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "ทำรายการบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่",
+			})
+		},
+	}))
+
 	// Public
 	authH := &AuthHandler{Svc: svc, Tokens: tokens, RBAC: r, Aud: aud}
-	// Rate-limit login attempts per IP to blunt brute-force / credential stuffing.
+	// Rate-limit login attempts per IP to blunt brute-force / credential
+	// stuffing. Layered with the per-ACCOUNT lockout in
+	// UserService.Authenticate (login_gate.go): this stops the system being
+	// hammered, that stops any one account being brute-forced from many IPs
+	// at once — the two close different gaps in each other.
 	loginLimiter := limiter.New(limiter.Config{
 		Max:        10,
 		Expiration: time.Minute,
@@ -49,13 +79,45 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// the service whether this exact key is on a public, live announcement, so
 	// nothing else in the store is reachable.
 	api.Get("/public/announcements/media/*", (&AnnounceHandler{Svc: svc}).ServePublicMedia)
+	// Document-progress share links — a staff-issued, per-term link (see
+	// migration 0084). Anonymous by the same design as public announcements:
+	// only a live link's own id answers; anything else, and a revoked one, is
+	// reported as plain "not found".
+	publicDPH := &DocProgressHandler{Svc: svc}
+	api.Get("/public/document-progress/:linkId", publicDPH.PublicGet)
+	api.Get("/public/document-progress/:linkId/checklist", publicDPH.PublicListChecklist)
 	api.Post("/auth/logout", authH.Logout)
 
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
-	authed := api.Group("", Authenticated(tokens), AccountGuard(svc.Pool))
+	authed := api.Group("", Authenticated(tokens), AccountGuard(svc))
+
+	// Applied below to routes that generate a PDF/XLSX/ZIP or accept an
+	// upload — every one of those costs real CPU, memory, or (for uploads)
+	// an antivirus scan, unlike a plain JSON GET, so the 600/min baseline
+	// above is far too loose to stop someone scripting repeated hits at one
+	// of these from tying up the process. Keyed by user id rather than IP:
+	// every route it guards is already authenticated, so — unlike
+	// loginLimiter — this one has a real per-visitor identity to key on and
+	// does not inherit the trusted-proxy caveat at all.
+	heavyLimiter := limiter.New(limiter.Config{
+		Max:        15,
+		Expiration: time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return UserID(c).String()
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "ทำรายการนี้บ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่",
+			})
+		},
+	})
+
 	authed.Get("/me", authH.Me)
 	authed.Post("/me/password", authH.ChangePassword)
+	// Touched by AccountGuard itself (any POST does) — see AuthHandler.Heartbeat
+	// and SessionActivityGuard on the frontend.
+	authed.Post("/auth/heartbeat", authH.Heartbeat)
 
 	// Users (admin, staff)
 	adminOrStaff := RequireRole(rbac.RoleAdmin, rbac.RoleStaff)
@@ -65,7 +127,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// handler reads the id from the session), so no role gate belongs here —
 	// every signed-in user owns their own face. Reading is open to any signed-in
 	// user so rosters and review queues can render.
-	authed.Post("/me/avatar", uh.UploadAvatar)
+	authed.Post("/me/avatar", heavyLimiter, uh.UploadAvatar)
 	authed.Delete("/me/avatar", uh.DeleteAvatar)
 	authed.Get("/users/:id/avatar", uh.ServeAvatar)
 	authed.Get("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.List)
@@ -109,7 +171,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// สรุปรายวิชาที่ขอใช้ TA — the budget-request workbook staff assembled by
 	// hand at the start of every term.
 	authed.Get("/exports/terms/:id/course-summary/warnings", adminOrStaff, th.CourseSummaryWarnings)
-	authed.Get("/exports/terms/:id/course-summary.xlsx", adminOrStaff, th.CourseSummaryXLSX)
+	authed.Get("/exports/terms/:id/course-summary.xlsx", adminOrStaff, heavyLimiter, th.CourseSummaryXLSX)
 	authed.Get("/exports/terms/:id/course-summary/preview", adminOrStaff, th.CourseSummaryPreview)
 
 	// Teaching courses
@@ -169,11 +231,11 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/me/profile", RequireRole(rbac.RoleTA), dh.GetProfile)
 	authed.Put("/me/profile", RequireRole(rbac.RoleTA), dh.UpsertProfile)
 	authed.Get("/me/documents", RequireRole(rbac.RoleTA), dh.ListDocs)
-	authed.Post("/me/documents", RequireRole(rbac.RoleTA), dh.UploadDoc)
+	authed.Post("/me/documents", RequireRole(rbac.RoleTA), heavyLimiter, dh.UploadDoc)
 	authed.Get("/me/history", RequireRole(rbac.RoleTA), dh.SelfHistory)
-	authed.Post("/me/creditor-form/preview.pdf", RequireRole(rbac.RoleTA, rbac.RoleAdmin, rbac.RoleStaff), dh.CreditorFormPDF)
+	authed.Post("/me/creditor-form/preview.pdf", RequireRole(rbac.RoleTA, rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, dh.CreditorFormPDF)
 	authed.Post("/me/creditor-form/confirm", RequireRole(rbac.RoleTA), dh.ConfirmCreditorForm)
-	authed.Get("/creditor-form/blank.pdf", dh.BlankCreditorForm)
+	authed.Get("/creditor-form/blank.pdf", heavyLimiter, dh.BlankCreditorForm)
 	authed.Get("/documents/:id/download", dh.Download)
 	authed.Get("/ta-review", adminOrStaff, dh.ListPending)
 	authed.Get("/ta-review/:userId/docs", adminOrStaff, dh.ListDocsForUser)
@@ -189,8 +251,8 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// segments, so these never collide with the three-segment ":userId" routes
 	// above — no ordering dependency to get wrong later.
 	authed.Post("/ta-review/download-all-token", adminOrStaff, dh.MintAllApprovedZipToken)
-	authed.Get("/ta-review/download-all.zip", adminOrStaff, dh.DownloadAllZip)
-	authed.Get("/ta-review/:userId/download.zip", adminOrStaff, dh.DownloadZip)
+	authed.Get("/ta-review/download-all.zip", adminOrStaff, heavyLimiter, dh.DownloadAllZip)
+	authed.Get("/ta-review/:userId/download.zip", adminOrStaff, heavyLimiter, dh.DownloadZip)
 	authed.Get("/ta-review/:userId/docs/:docId/preview", adminOrStaff, dh.PreviewWatermarked)
 
 	// TA: my assigned courses (year+term filter on FE).
@@ -199,7 +261,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// banner tells them why nothing can be edited yet.
 	authed.Get("/me/ta-courses", RequireRole(rbac.RoleTA), th.ListMyTACourses)
 	authed.Get("/timetable-form", th.TimetableForm)
-	authed.Get("/timetable-form.pdf", th.TimetableFormPDF)
+	authed.Get("/timetable-form.pdf", heavyLimiter, th.TimetableFormPDF)
 	authed.Get("/me/assignments", RequireRole(rbac.RoleTA), th.ListMyAssignments)
 
 	// Workload / TA class schedule
@@ -259,8 +321,8 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// Register the more specific image routes first: Fiber matches in
 	// declaration order, so /:id would swallow "images/..." if placed above.
 	ah := &AnnounceHandler{Svc: svc}
-	authed.Post("/announcements/upload-image", adminOrStaff, ah.UploadImage)
-	authed.Post("/announcements/upload-media", adminOrStaff, ah.UploadMedia)
+	authed.Post("/announcements/upload-image", adminOrStaff, heavyLimiter, ah.UploadImage)
+	authed.Post("/announcements/upload-media", adminOrStaff, heavyLimiter, ah.UploadMedia)
 	authed.Get("/announcements/media/*", ah.ServeMedia)
 	authed.Get("/announcements/images/*", ah.ServeImage)
 	authed.Get("/announcements", ah.List)
@@ -281,13 +343,13 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/dashboard/executive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), dashH.Executive)
 	// The analytics view is the one thing the executive role can see.
 	authed.Get("/dashboard/analytics", RequireExecutiveView(svc.Pool), dashH.Analytics)
-	authed.Get("/dashboard/analytics.xlsx", RequireExecutiveView(svc.Pool), dashH.AnalyticsXLSX)
+	authed.Get("/dashboard/analytics.xlsx", RequireExecutiveView(svc.Pool), heavyLimiter, dashH.AnalyticsXLSX)
 	authed.Get("/dashboard/ta/me", RequireRole(rbac.RoleTA), dashH.TaOverview)
 	authed.Get("/dashboard/lecturer/me", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), dashH.LecturerOverview)
 
 	// Export
 	eh := &ExportHandler{Svc: svc}
-	authed.Get("/exports/course/:id.zip", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseZip)
+	authed.Get("/exports/course/:id.zip", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.CourseZip)
 	// Admin-only escape hatch to undo an accidental export lock.
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 	// Read-only payout preview — review the numbers before the locking download.
@@ -310,19 +372,19 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// ปะหน้าจ่ายตรง (แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร) — gated on every course in
 	// the term reaching finance_sent, unlike the course-summary above.
 	authed.Get("/exports/terms/:id/transfer-cover/blockers", adminOrStaff, eh.TransferCoverBlockers)
-	authed.Get("/exports/terms/:id/transfer-cover.xlsx", adminOrStaff, eh.TransferCoverXLSX)
-	authed.Get("/exports/terms/:id/transfer-cover-bundle.zip", adminOrStaff, eh.TransferCoverBundleZIP)
+	authed.Get("/exports/terms/:id/transfer-cover.xlsx", adminOrStaff, heavyLimiter, eh.TransferCoverXLSX)
+	authed.Get("/exports/terms/:id/transfer-cover-bundle.zip", adminOrStaff, heavyLimiter, eh.TransferCoverBundleZIP)
 	authed.Get("/exports/terms/:id/transfer-cover/preview", adminOrStaff, eh.TransferCoverPreview)
 	authed.Get("/exports/terms/:id/transfer-cover/coverage", adminOrStaff, eh.TransferCoverCoverage)
 	authed.Get("/exports/terms/:id/transfer-cover/history", adminOrStaff, eh.TransferCoverHistory)
-	authed.Get("/exports/transfer-cover/:id/reprint", adminOrStaff, eh.TransferCoverReprint)
+	authed.Get("/exports/transfer-cover/:id/reprint", adminOrStaff, heavyLimiter, eh.TransferCoverReprint)
 	authed.Get("/exports/appointment-order/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentPreview)
 	authed.Get("/exports/appointment-order/rounds", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRounds)
-	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentOrder)
+	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.AppointmentOrder)
 	// Re-issue a copy of an order already printed. Separate from the POST above
 	// because that one CREATES a round; this one only re-renders a stored
 	// snapshot, so it must never be reachable by the same verb and path.
-	authed.Get("/exports/appointment-order/rounds/:id/download", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentReprint)
+	authed.Get("/exports/appointment-order/rounds/:id/download", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.AppointmentReprint)
 
 	// Physical-document progress board — the off-system signature/routing journey.
 	// GET is readable by any authenticated user (shared status); staff/admin update.
@@ -334,6 +396,11 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	authed.Get("/document-progress/checklist", dpH.ListChecklist)
 	authed.Post("/document-progress/checklist/:tcId", adminOrStaff, dpH.ToggleSignature)
 	authed.Post("/document-progress/:termId/remind", adminOrStaff, dpH.RemindUnsigned)
+	// Public share link — staff/admin issue, view, and revoke it; the link
+	// itself is served below, outside the authed group.
+	authed.Get("/document-progress/:termId/share-link", adminOrStaff, dpH.GetShareLink)
+	authed.Post("/document-progress/:termId/share-link", adminOrStaff, dpH.CreateShareLink)
+	authed.Delete("/document-progress/:termId/share-link", adminOrStaff, dpH.RevokeShareLink)
 
 	// Admin officers (executive roster used on generated official docs).
 	// GET is open to any authenticated user so document templates can render

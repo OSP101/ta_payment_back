@@ -114,25 +114,30 @@ type ExamSchedule struct {
 
 type MakeupSchedule struct {
 	ID           uuid.UUID `json:"id"`
-	OriginalDate string    `json:"original_date"`
-	MakeupDate   string    `json:"makeup_date"`
+	OriginalDate string    `json:"original_date" validate:"required"`
+	MakeupDate   string    `json:"makeup_date" validate:"required"`
 	// Kind is the period this makeup replaces: "lecture" or "lab". Required —
 	// a section that teaches both on the cancelled day needs two independent
 	// makeups, at different times, and a day-level makeup could express only one
 	// of them while silently claiming to cover the other.
-	Kind      string  `json:"kind"`
+	Kind string `json:"kind" validate:"oneof=lecture lab"`
+	// StartTime/EndTime are left untagged: format ("HH:MM") and start<end are
+	// checked by parseHM in AddMakeup, which also has to allow both nil
+	// (whole-day makeup).
 	StartTime *string `json:"start_time,omitempty"`
 	EndTime   *string `json:"end_time,omitempty"`
-	Note      *string `json:"note,omitempty"`
+	Note      *string `json:"note,omitempty" validate:"omitempty,max=200"`
 }
 
 type LectureReview struct {
 	ID         uuid.UUID `json:"id"`
-	ReviewDate string    `json:"review_date"`
-	StartTime  *string   `json:"start_time,omitempty"`
-	EndTime    *string   `json:"end_time,omitempty"`
-	Hours      float64   `json:"hours"`
-	Note       *string   `json:"note,omitempty"`
+	ReviewDate string    `json:"review_date" validate:"required"`
+	// StartTime/EndTime are left untagged: format ("HH:MM") and start<end are
+	// checked by parseHM in AddReviewDate, which also has to allow both nil.
+	StartTime *string `json:"start_time,omitempty"`
+	EndTime   *string `json:"end_time,omitempty"`
+	Hours     float64 `json:"hours" validate:"gt=0,lte=12"`
+	Note      *string `json:"note,omitempty" validate:"omitempty,max=200"`
 }
 
 type TeachingService struct {
@@ -148,18 +153,22 @@ type TeachingService struct {
 // Course identity is supplied inline (no central catalog): the manual
 // "add course" form and the Excel import both carry it.
 type CreateTeachingCourseInput struct {
-	TermID      uuid.UUID   `json:"term_id"`
-	Code        string      `json:"code"`
+	TermID uuid.UUID `json:"term_id" validate:"required"`
+	// Code and NameTH are NOT marked required: Create's own logic (teaching.go)
+	// rejects an empty Code outright but fills a blank NameTH in from NameEN or
+	// Code itself — a struct tag can't express "required unless X", so that
+	// fallback stays exactly where it is.
+	Code        string      `json:"code" validate:"required"`
 	NameTH      string      `json:"name_th"`
 	NameEN      *string     `json:"name_en,omitempty"`
-	Level       string      `json:"level"`
-	Credits     int         `json:"credits"`
-	LectureHrs  int         `json:"lecture_hrs"`
-	LabHrs      int         `json:"lab_hrs"`
-	SelfHrs     int         `json:"self_hrs"`
+	Level       string      `json:"level" validate:"omitempty,oneof=undergrad graduate"`
+	Credits     int         `json:"credits" validate:"gte=0"`
+	LectureHrs  int         `json:"lecture_hrs" validate:"gte=0"`
+	LabHrs      int         `json:"lab_hrs" validate:"gte=0"`
+	SelfHrs     int         `json:"self_hrs" validate:"gte=0"`
 	StartsOn    *string     `json:"starts_on,omitempty"`
 	EndsOn      *string     `json:"ends_on,omitempty"`
-	NumStudents int         `json:"num_students"`
+	NumStudents int         `json:"num_students" validate:"gte=0"`
 	LecturerIDs []uuid.UUID `json:"lecturer_ids"`
 	Sections    []struct {
 		SecNo       string            `json:"sec_no"`
@@ -924,11 +933,14 @@ func (s *TeachingService) recomputeAggregate(ctx context.Context, tx pgx.Tx, tcI
 }
 
 type AddSectionInput struct {
-	SecNo       string            `json:"sec_no"`
-	Track       string            `json:"track"`
-	Room        *string           `json:"room,omitempty"`
-	NumStudents int               `json:"num_students"`
-	Schedules   []SectionSchedule `json:"schedules,omitempty"`
+	SecNo       string  `json:"sec_no" validate:"required"`
+	Track       string  `json:"track" validate:"oneof=regular special"`
+	Room        *string `json:"room,omitempty" validate:"omitempty,max=200"`
+	NumStudents int     `json:"num_students" validate:"gte=0"`
+	// Schedules is checked by validateSectionSchedules (kind/day/time-range/
+	// overlap/credit-hour gating) — a dive tag can't express those, so this
+	// stays untagged and the dedicated function remains the real check.
+	Schedules []SectionSchedule `json:"schedules,omitempty"`
 }
 
 // errSectionsAreStaffOnly explains the roster half of the lecturer rules: which
@@ -1221,12 +1233,17 @@ func isHHMM(v string) bool {
 }
 
 type UpdateSectionInput struct {
-	SecNo       *string `json:"sec_no,omitempty"`
-	Room        *string `json:"room,omitempty"`
-	NumStudents *int    `json:"num_students,omitempty"`
+	SecNo       *string `json:"sec_no,omitempty" validate:"omitempty,max=200"`
+	Room        *string `json:"room,omitempty" validate:"omitempty,max=200"`
+	NumStudents *int    `json:"num_students,omitempty" validate:"omitempty,gte=0"`
 	// "" clears back to unknown; otherwise one of the CHECK-listed groups.
 	// This is the staff override the import respects (re-import fills only
 	// NULLs), so a wrong registrar value can be corrected once and stay put.
+	//
+	// Deliberately untagged: validator's omitempty does not treat a non-nil
+	// pointer-to-"" as empty (only a nil pointer skips the check), so a
+	// oneof tag here would reject the "clear back to unknown" sentinel this
+	// field relies on. validCurriculum() in UpdateSection is the real check.
 	Curriculum *string `json:"curriculum,omitempty"`
 }
 
@@ -2589,8 +2606,8 @@ func (s *TeachingService) ImportScheduleExcel(ctx context.Context, actor uuid.UU
 // Terms
 type Term struct {
 	ID           uuid.UUID `json:"id"`
-	AcademicYear int       `json:"academic_year"`
-	Semester     int       `json:"semester"`
+	AcademicYear int       `json:"academic_year" validate:"gte=2500,lte=2700"`
+	Semester     int       `json:"semester" validate:"gte=1,lte=3"`
 	StartsOn     *string   `json:"starts_on,omitempty"`
 	EndsOn       *string   `json:"ends_on,omitempty"`
 	// Faculty-published exam windows. Worklog entries falling inside either
@@ -2600,8 +2617,11 @@ type Term struct {
 	MidtermEndsOn   *string `json:"midterm_ends_on,omitempty"`
 	FinalStartsOn   *string `json:"final_starts_on,omitempty"`
 	FinalEndsOn     *string `json:"final_ends_on,omitempty"`
-	Months          int     `json:"months"`
-	IsActive        bool    `json:"is_active"`
+	// Months: 0 is a valid input (UpsertTerm defaults it to 4) — omitempty
+	// skips the bound below for that case, same as UpsertTerm's own
+	// `if in.Months == 0 { in.Months = 4 }` before it checks 1..12.
+	Months   int  `json:"months" validate:"omitempty,gte=1,lte=12"`
+	IsActive bool `json:"is_active"`
 }
 
 // TermFilter narrows a ListTerms query. All fields optional; nil means no

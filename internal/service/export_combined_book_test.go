@@ -204,10 +204,24 @@ func TestCombinedSheet_BillsLabAndLectureIntoSeparateColumns(t *testing.T) {
 	// Fixture row 1 of block 1 is a 4-hour สอนปฏิบัติ, row 2 a 1-hour เช็คชื่อ.
 	// Values read back formatted: the hours columns wear the college's comma
 	// format, so 4 displays as "4.00".
-	lab, _ := f.GetCellValue(sheetClaimRegular, "I9")
-	labWrong, _ := f.GetCellValue(sheetClaimRegular, "H9")
-	lect, _ := f.GetCellValue(sheetClaimRegular, "H10")
-	lectWrong, _ := f.GetCellValue(sheetClaimRegular, "I10")
+	// TrimSpace: the college's accounting number format (fmtComma00, see
+	// export_combined_book.go) reserves alignment padding via "_-" — Excel
+	// itself renders that as blank space regardless, but excelize's own
+	// GetCellValue started including that literal padding in the returned
+	// string as of v2.9 or so. The generated .xlsx is unaffected either way
+	// (nothing in this codebase re-reads its own output — GetCellValue is
+	// test-only); trimming here keeps the assertion about the actual
+	// business rule (which COLUMN the hour landed in), not excelize's
+	// internal rendering choice for a library version this test doesn't
+	// otherwise care about.
+	labRaw, _ := f.GetCellValue(sheetClaimRegular, "I9")
+	labWrongRaw, _ := f.GetCellValue(sheetClaimRegular, "H9")
+	lectRaw, _ := f.GetCellValue(sheetClaimRegular, "H10")
+	lectWrongRaw, _ := f.GetCellValue(sheetClaimRegular, "I10")
+	lab := strings.TrimSpace(labRaw)
+	labWrong := strings.TrimSpace(labWrongRaw)
+	lect := strings.TrimSpace(lectRaw)
+	lectWrong := strings.TrimSpace(lectWrongRaw)
 	if lab != "4.00" || labWrong != "" {
 		t.Errorf("lab hour: I9=%q H9=%q, want 4.00 in ปฏิบัติการ only", lab, labWrong)
 	}

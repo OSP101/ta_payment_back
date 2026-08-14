@@ -46,9 +46,9 @@ func (s *TeachingService) ListCurricula(ctx context.Context) ([]Curriculum, erro
 // table points at, and level decides which of the two payout documents' rules
 // apply, neither of which a rename should be able to move.
 type UpdateCurriculumInput struct {
-	SheetName  string `json:"sheet_name"`
-	FullNameTH string `json:"full_name_th"`
-	SortOrder  int    `json:"sort_order"`
+	SheetName  string `json:"sheet_name" validate:"required,max=200"`
+	FullNameTH string `json:"full_name_th" validate:"required,max=200"`
+	SortOrder  int    `json:"sort_order" validate:"gte=0"`
 }
 
 func (s *TeachingService) UpdateCurriculum(ctx context.Context, actor uuid.UUID, code string, in UpdateCurriculumInput) error {

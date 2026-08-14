@@ -10,6 +10,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/helmet"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	pdfcpu "github.com/pdfcpu/pdfcpu/pkg/api"
@@ -102,21 +103,70 @@ func main() {
 
 	services := service.NewContainer(pool, store, mailer, auditor, cfg, piiCipher)
 
+	if cfg.AppEnv == "production" && len(cfg.TrustedProxyIPs) == 0 {
+		// Not fatal — the app still runs correctly for cookie security (that's
+		// derived from AppBaseURL, not this). But every caller's c.IP() will
+		// collapse to the Next.js hop's address, silently defeating the per-IP
+		// login rate limiter (router.go) and mislabeling every audit log IP.
+		log.Printf("WARN: APP_ENV=production but TRUSTED_PROXY_IPS is empty — " +
+			"c.IP() will return the Next.js proxy's address for every request, " +
+			"not the real client. Set TRUSTED_PROXY_IPS to the Next.js server's " +
+			"IP/CIDR to fix per-IP rate limiting and audit-log IPs.")
+	}
+
 	app := fiber.New(fiber.Config{
 		AppName:      "TA Payment API",
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		BodyLimit:    32 * 1024 * 1024,
 		ErrorHandler: handler.ErrorHandler,
+		// See config.TrustedProxyIPs: only a listed peer's X-Forwarded-For is
+		// honoured, so c.IP() resolves to the real browser IP instead of the
+		// Next.js hop's — everyone else's copy of the header is ignored.
+		EnableTrustedProxyCheck: len(cfg.TrustedProxyIPs) > 0,
+		TrustedProxies:          cfg.TrustedProxyIPs,
+		ProxyHeader:             fiber.HeaderXForwardedFor,
 	})
 	app.Use(recover.New())
 	app.Use(logger.New())
+	app.Use(helmet.New(helmet.Config{
+		ContentTypeNosniff: "nosniff",
+		XFrameOptions:      "SAMEORIGIN",
+		ReferrerPolicy:     "strict-origin-when-cross-origin",
+		// HSTS is deliberately NOT set here. This process is two hops behind
+		// the browser (browser → TLS-terminating reverse proxy → Next.js →
+		// here), so it never reliably knows whether the original connection
+		// was HTTPS — see config.TrustedProxyIPs for the same problem applied
+		// to the cookie Secure flag. Set HSTS at the reverse proxy (closest to
+		// the browser) or in ta_payment_front/next.config.ts (see headers()).
+		//
+		// CrossOriginResourcePolicy is overridden from fiber's default
+		// ("same-origin") to "cross-origin": same-origin is enforced by the
+		// browser independently of CORS and would silently break the
+		// documented cross-origin upload path (UPLOAD_ORIGIN in
+		// ta_payment_front/app/lib/api.ts) whenever NEXT_PUBLIC_API_ORIGIN is
+		// configured.
+		//
+		// Cross-Origin-Embedder-Policy/Opener-Policy are left at fiber's
+		// defaults (require-corp / same-origin) rather than fought — the
+		// helmet middleware has no "off" value for them, only "unset field
+		// falls back to the default". Both only matter for a response the
+		// browser treats as a navigable top-level document; nothing here
+		// currently opens this API as one (no window.open()+postMessage flow
+		// against it, no page embeds its JSON/PDF/ZIP responses as a
+		// document), so they're inert today. Revisit if that changes.
+		CrossOriginResourcePolicy: "cross-origin",
+	}))
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.CORSOrigins,
 		AllowCredentials: true,
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 	}))
+	// Second layer of CSRF defence, under the cookie's own SameSite=Lax — see
+	// handler.OriginCheck's doc comment for why this reuses CORS_ORIGINS and
+	// why it cannot reject requests with no Origin/Referer at all.
+	app.Use(handler.OriginCheck(cfg.CORSOrigins))
 
 	handler.Mount(app, services, tokens, rbac.New(pool), auditor)
 

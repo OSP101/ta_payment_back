@@ -154,21 +154,37 @@ func filenameExt(name string) string {
 	return strings.ToLower(name[i+1:])
 }
 
+// TAProfile is bound from the client on three routes (UpsertProfile,
+// CreditorFormPDF preview, ConfirmCreditorForm) and all three funnel through
+// validateProfileInput below before anything is written or rendered — that
+// function normalises (strips dashes/spaces) THEN checks exact length/format,
+// so the validate tags here deliberately stay looser than the service check:
+// they exist to reject an obviously-missing field before the DB/PDF work,
+// not to re-derive the normalized format rule (which would risk rejecting a
+// validly-formatted-but-not-yet-stripped value, e.g. a dashed national ID,
+// before the service gets a chance to normalise it). This is doubly true for
+// NationalID: see internal/service/citizen_id.go and internal/pii — it is
+// PII that gets encrypted downstream, so the tag here is intentionally just
+// "present", not a checksum/format re-implementation.
 type TAProfile struct {
-	StudentID string `json:"student_id"`
-	Prefix    string `json:"prefix"`
-	Phone     string `json:"phone"`
+	// StudentID/Phone are TrimSpace'd/digit-stripped then pattern-checked by
+	// validateProfileInput; required here only guards "missing entirely".
+	StudentID string `json:"student_id" validate:"required"`
+	Prefix    string `json:"prefix" validate:"required,oneof=นาย นาง นางสาว"`
+	Phone     string `json:"phone" validate:"required"`
 	// Sensitive inputs. These arrive in the request, are rendered onto the
 	// creditor-form PDF, and are never written to any table (migration 0047).
 	// GetProfile always returns them empty.
-	NationalID      string  `json:"national_id"`
-	BankName        string  `json:"bank_name"`
-	BankBranch      string  `json:"bank_branch"`
-	BranchCode      string  `json:"branch_code"`
-	AccountNo       string  `json:"account_no"`
-	AccountName     string  `json:"account_name"`
-	SignatureSVG    string  `json:"signature_svg"`
-	SignaturePNGB64 string  `json:"signature_png_b64"`
+	NationalID string `json:"national_id" validate:"required"`
+	BankName   string `json:"bank_name" validate:"required,max=200"`
+	BankBranch string `json:"bank_branch" validate:"omitempty,max=200"`
+	BranchCode string `json:"branch_code" validate:"omitempty,max=50"`
+	// AccountNo is digit-stripped then length-checked against the selected
+	// bank by validateBank; required here only guards "missing entirely".
+	AccountNo       string  `json:"account_no" validate:"required"`
+	AccountName     string  `json:"account_name" validate:"required,max=200"`
+	SignatureSVG    string  `json:"signature_svg" validate:"required,max=300000"`
+	SignaturePNGB64 string  `json:"signature_png_b64" validate:"omitempty,max=300000"`
 	Status          string  `json:"status"`
 	CurrentRound    int     `json:"current_round"`
 	RejectReason    *string `json:"reject_reason,omitempty"`

@@ -79,7 +79,7 @@ func NewLocal(root string) (*Local, error) {
 }
 
 func NewLocalWithKey(root string, key []byte) (*Local, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, err
 	}
 	l := &Local{root: root}
@@ -111,7 +111,7 @@ func (l *Local) Save(kind, filename string, r io.Reader) (string, int64, error) 
 	}
 	day := time.Now().Format("2006/01/02")
 	dir := filepath.Join(l.root, kind, day)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", 0, err
 	}
 	// Encrypted files carry a .enc suffix so operators can tell at a glance.
@@ -146,7 +146,7 @@ func (l *Local) Save(kind, filename string, r io.Reader) (string, int64, error) 
 	if _, err := rand.Read(nonce); err != nil {
 		return "", 0, err
 	}
-	ct := l.aead.Seal(nil, nonce, plaintext, nil)
+	ct := l.aead.Seal(nil, nonce, plaintext, nil) // #nosec G407 -- nonce is crypto/rand.Read output, not a hardcoded value; gosec can't see past the make() it's stored in
 
 	if err := writeFile600(full, nonce, ct); err != nil {
 		return "", 0, err

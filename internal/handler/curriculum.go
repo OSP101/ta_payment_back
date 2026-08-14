@@ -17,8 +17,8 @@ func (h *TeachingHandler) ListCurricula(c *fiber.Ctx) error {
 
 func (h *TeachingHandler) UpdateCurriculum(c *fiber.Ctx) error {
 	var in service.UpdateCurriculumInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.UpdateCurriculum(c.Context(), UserID(c), c.Params("code"), in); err != nil {
 		return err
@@ -32,10 +32,13 @@ func (h *TeachingHandler) UpdateSectionCurriculum(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		Curriculum string `json:"curriculum"`
+		// Mirrors validSectionCurricula (service/curriculum.go) — the CHECK
+		// constraint's actual value set, kept here as a first-line 400 instead
+		// of a round trip to the service's own Invalid() check.
+		Curriculum string `json:"curriculum" validate:"required,oneof=CS IT GIS AI CY OTHER KKBS"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.UpdateSectionCurriculum(c.Context(), UserID(c), id, body.Curriculum); err != nil {
 		return err
@@ -61,12 +64,12 @@ func (h *TeachingHandler) ConfirmCourseGroup(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		CourseIDs       []uuid.UUID `json:"course_ids"`
-		PrimaryCourseID uuid.UUID   `json:"primary_course_id"`
-		CurriculumCode  string      `json:"curriculum_code"`
+		CourseIDs       []uuid.UUID `json:"course_ids" validate:"required,min=2"`
+		PrimaryCourseID uuid.UUID   `json:"primary_course_id" validate:"required"`
+		CurriculumCode  string      `json:"curriculum_code" validate:"required"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	groupID, err := h.Svc.Teaching.ConfirmCourseGroup(
 		c.Context(), UserID(c), termID, body.PrimaryCourseID, body.CourseIDs, body.CurriculumCode)

@@ -87,9 +87,17 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 	n, err := s.svc.SubmissionPeriods.AutoCloseExpired(ctx)
 	if err != nil {
 		log.Printf("scheduler: auto_close err=%v", err)
-		return
-	}
-	if n > 0 {
+	} else if n > 0 {
 		log.Printf("scheduler: auto-closed %d expired periods", n)
+	}
+
+	// Session rows are cheap individually but unbounded over time (every
+	// login writes one) — see SessionService.Cleanup. Daily cadence is fine:
+	// nothing reads a session after it is a week past revoked/expired, so
+	// there is no freshness requirement pushing this onto the hourly tick.
+	if n, err := s.svc.Sessions.Cleanup(ctx); err != nil {
+		log.Printf("scheduler: session_cleanup err=%v", err)
+	} else if n > 0 {
+		log.Printf("scheduler: cleaned up %d expired session(s)", n)
 	}
 }

@@ -33,10 +33,12 @@ var requiredDocKinds = []string{"national_id", "bank_book", "creditor_form"}
 const zipTokenTTL = 60 * time.Second
 
 // RejectItem is a single (doc, reason) entry the officer submits in a batch
-// rejection. Reason must be non-empty after trim.
+// rejection. Reason must be non-empty after trim (RejectBatch below rejects
+// an empty one unconditionally, unlike Review/ReviewProfile's reason which is
+// only required when rejecting — every RejectBatch item IS a rejection).
 type RejectItem struct {
-	DocID  uuid.UUID `json:"doc_id"`
-	Reason string    `json:"reason"`
+	DocID  uuid.UUID `json:"doc_id" validate:"required"`
+	Reason string    `json:"reason" validate:"required,max=500"`
 }
 
 // ApproveAllResult carries what the FE needs to trigger the auto-download:

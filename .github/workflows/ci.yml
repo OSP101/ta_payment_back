@@ -57,6 +57,33 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Checks the module graph against the Go vulnerability database and
+      # reports only vulnerabilities actually REACHABLE from this code (not
+      # every CVE in every transitive dependency) — see
+      # https://go.dev/blog/vuln. @latest is deliberate here, unlike every
+      # other pinned tool below: the value of this check is comparing
+      # against today's database, not a frozen one.
+      - name: Vulnerability scan (govulncheck)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # Static analysis for common Go security bugs (SQL/command injection
+      # shapes, weak crypto, unsafe file handling, ...). G104 (unhandled
+      # error) and G304 (file path from a variable) are excluded — not
+      # because they never matter, but because in THIS codebase G104 fires
+      # on ~30 deliberate best-effort cleanup calls (see e.g.
+      # cmd/rotate-docs-key), and every real G304 call site already carries
+      # its own explicit "reject .. and require the expected prefix" guard
+      # one layer up, at the handler where the path first arrives from a
+      # request (see internal/handler/handlers.go's ServeImage,
+      # serveAnnounceMedia, ServeEditFile — Storage.Open itself is a generic
+      # primitive that intentionally trusts its caller). Findings that
+      # needed a closer look instead of a blanket exclusion (G115, G407)
+      # were fixed or given an inline `#nosec` with a one-line reason —
+      # search the repo for `#nosec` to see all of them; there should never
+      # be many.
+      - name: Static security scan (gosec)
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -exclude=G104,G304 ./...
+
       - name: Build
         run: go build ./...
 

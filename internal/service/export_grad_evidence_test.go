@@ -85,12 +85,19 @@ func TestBuildGradEvidenceWorkbook_RegularSplitsHoursByMonth(t *testing.T) {
 	// Row 10 holds this TA's hours in the month they were worked. 6 in June and
 	// 4+2 in July: a single 12-hour total column would lose exactly this. The
 	// values read back through the sheet's one-decimal hour format.
+	// TrimSpace: the sheet's one-decimal hour format reserves alignment
+	// padding that newer excelize versions include in GetCellValue's
+	// returned string (Excel itself renders it as blank space regardless —
+	// see export_combined_book_test.go's BillsLabAndLectureIntoSeparateColumns
+	// for the same thing on a different sheet). Not a data bug, just this
+	// test asserting the actual number instead of a formatting library's
+	// internal rendering choice.
 	for cell, want := range map[string]string{"E10": "6.0", "F10": "6.0"} {
 		got, err := x.GetCellValue(sheet, cell)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != want {
+		if strings.TrimSpace(got) != want {
 			t.Errorf("%s = %q, want %q hours", cell, got, want)
 		}
 	}
@@ -99,7 +106,7 @@ func TestBuildGradEvidenceWorkbook_RegularSplitsHoursByMonth(t *testing.T) {
 	if got, _ := x.GetCellFormula(sheet, "G10"); got != "SUM(E10:F10)" {
 		t.Errorf("total-hours formula = %q, want SUM(E10:F10)", got)
 	}
-	if got, _ := x.GetCellValue(sheet, "H10"); got != "50" {
+	if got, _ := x.GetCellValue(sheet, "H10"); strings.TrimSpace(got) != "50" {
 		t.Errorf("rate = %q, want 50 (graduate_regular_hourly)", got)
 	}
 	if got, _ := x.GetCellFormula(sheet, "I10"); got != "G10*H10" {
@@ -289,10 +296,10 @@ func TestBuildGradEvidenceWorkbook_TAOnBothTracksAppearsOnBothSheets(t *testing.
 		t.Fatal("the ปกติ sheet is missing — this TA's regular-track hours were dropped " +
 			"because they also hold a special-track assignment")
 	}
-	if got, _ := x.GetCellValue(sheetGradEvidenceRegular, "E10"); got != "6.0" {
+	if got, _ := x.GetCellValue(sheetGradEvidenceRegular, "E10"); strings.TrimSpace(got) != "6.0" {
 		t.Errorf("June hours = %q, want 6.0", got)
 	}
-	if got, _ := x.GetCellValue(sheetGradEvidenceRegular, "F10"); got != "8.0" {
+	if got, _ := x.GetCellValue(sheetGradEvidenceRegular, "F10"); strings.TrimSpace(got) != "8.0" {
 		t.Errorf("July hours = %q, want 8.0", got)
 	}
 	// The เหมาจ่าย row is still theirs too — the two claims coexist.
@@ -336,7 +343,7 @@ func TestBuildGradEvidenceWorkbook_HoursMatchTheSettlementNotRawLogs(t *testing.
 	}
 	x := openWorkbookBytes(t, book)
 	got, _ := x.GetCellValue(sheetGradEvidenceRegular, "E10")
-	if got != "4.0" {
+	if strings.TrimSpace(got) != "4.0" {
 		t.Errorf("June hours = %q, want 4.0 — one sitting taught once is paid once. "+
 			"8.0 means the two co-taught sections were added together, billing the "+
 			"finance office for hours the payout will not transfer", got)
@@ -398,7 +405,7 @@ func TestBuildGradEvidenceWorkbook_ExcludesUndergradOnAMixedCourse(t *testing.T)
 		t.Errorf("a second claimant %q appeared on the graduate book — "+
 			"the undergrad TA belongs on the undergrad form only", got)
 	}
-	if got, _ := x.GetCellValue(sheet, "E10"); got != "6.0" {
+	if got, _ := x.GetCellValue(sheet, "E10"); strings.TrimSpace(got) != "6.0" {
 		t.Errorf("graduate hours = %q, want 6.0 (not merged with the undergrad's 9)", got)
 	}
 }
@@ -481,7 +488,7 @@ func TestBuildGradEvidenceWorkbook_HonoursTheMonthSelection(t *testing.T) {
 	if got, _ := x.GetCellFormula(sheet, "F10"); got != "SUM(E10:E10)" {
 		t.Errorf("total-hours formula = %q, want SUM(E10:E10)", got)
 	}
-	if got, _ := x.GetCellValue(sheet, "E10"); got != "5.0" {
+	if got, _ := x.GetCellValue(sheet, "E10"); strings.TrimSpace(got) != "5.0" {
 		t.Errorf("September hours = %q, want 5.0 — October's 7 must not be folded in", got)
 	}
 }

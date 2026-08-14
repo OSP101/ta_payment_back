@@ -3,7 +3,9 @@ package handler
 import (
 	"errors"
 	"log"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -19,11 +21,16 @@ import (
 type ctxKey string
 
 const (
-	CtxUserID ctxKey = "user_id"
-	CtxRoles  ctxKey = "roles"
+	CtxUserID    ctxKey = "user_id"
+	CtxRoles     ctxKey = "roles"
+	CtxSessionID ctxKey = "session_id"
 )
 
-// Authenticated attaches user id and roles from JWT (cookie or Authorization header).
+// Authenticated attaches user id, roles and session id from JWT (cookie or
+// Authorization header). It does not itself check whether the session is
+// still valid — that needs a DB round trip and is AccountGuard's job, so a
+// route with Authenticated but no AccountGuard (there are none today, but
+// nothing stops one being added) would only get identity, not liveness.
 func Authenticated(tokens *auth.TokenService) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		raw := extractToken(c)
@@ -36,6 +43,12 @@ func Authenticated(tokens *auth.TokenService) fiber.Handler {
 		}
 		c.Locals(string(CtxUserID), claims.UserID)
 		c.Locals(string(CtxRoles), claims.Roles)
+		// A token issued before migration 0085 (or otherwise missing its jti)
+		// parses to uuid.Nil here rather than failing the request — AccountGuard
+		// then finds no matching session row and rejects it as session_revoked,
+		// the same clean "please log in again" as any other revoked session.
+		sid, _ := claims.SessionID()
+		c.Locals(string(CtxSessionID), sid)
 		return c.Next()
 	}
 }
@@ -74,18 +87,47 @@ func RequireExecutiveView(pool *pgxpool.Pool) fiber.Handler {
 }
 
 // AccountGuard runs after Authenticated on every protected route. It re-reads
-// the user's live state from the DB so that (a) a deactivated or deleted account
-// loses access immediately instead of when its 12h token expires, and (b) a user
-// with a pending forced password change cannot use feature endpoints until they
-// change it. The /me and /me/password endpoints stay reachable so the change
-// flow itself can complete.
-func AccountGuard(pool *pgxpool.Pool) fiber.Handler {
+// the user's live state from the DB so that (a) a deactivated or deleted
+// account loses access immediately instead of when its 12h token expires, and
+// (b) a user with a pending forced password change cannot use feature
+// endpoints until they change it. The /me and /me/password endpoints stay
+// reachable so the change flow itself can complete.
+//
+// It also enforces single-device login and the 15-minute idle timeout (see
+// migration 0085 and SessionService): one SELECT joins users to this
+// request's session row (by the JWT's jti — see Authenticated) so both
+// checks cost one round trip on the common path. A session that is revoked
+// (superseded by another login, or by a password change / deactivation /
+// role edit — see handlers) or has gone idle past SessionService.IdleTimeout
+// fails the request with a distinct error code so the frontend can show the
+// right message instead of a generic "log in again":
+//
+//	session_superseded — signed in elsewhere; this device lost the race
+//	session_idle        — no activity for 15 minutes
+//	session_revoked      — anything else (logout, password change, …)
+//
+// A request that IS allowed through still needs a write sometimes: mutating
+// requests (and POST /auth/heartbeat, which is a POST) touch
+// last_activity_at so the session's idle clock resets. GET requests do not —
+// a tab left open on a read-only page, or background polling, must not by
+// itself keep a dead session alive.
+func AccountGuard(svc *service.Container) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		p := c.Path()
+		uid := UserID(c)
+		sid := SessionID(c)
+
 		var isActive, mustChange bool
-		err := pool.QueryRow(c.Context(),
-			`SELECT is_active, must_change_password FROM users WHERE id=$1 AND deleted_at IS NULL`,
-			UserID(c)).Scan(&isActive, &mustChange)
+		var sessRevokedAt *time.Time
+		var sessRevokeReason *string
+		var sessLastActivity *time.Time
+		err := svc.Pool.QueryRow(c.Context(),
+			`SELECT u.is_active, u.must_change_password,
+			        s.revoked_at, s.revoke_reason, s.last_activity_at
+			 FROM users u
+			 LEFT JOIN sessions s ON s.id = $2
+			 WHERE u.id = $1 AND u.deleted_at IS NULL`,
+			uid, sid).Scan(&isActive, &mustChange, &sessRevokedAt, &sessRevokeReason, &sessLastActivity)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "บัญชีนี้ไม่สามารถใช้งานได้"})
 		}
@@ -95,13 +137,44 @@ func AccountGuard(pool *pgxpool.Pool) fiber.Handler {
 		if !isActive {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "บัญชีนี้ถูกปิดการใช้งาน"})
 		}
+
+		switch {
+		case sessLastActivity == nil:
+			// No matching session row at all — deleted, or a pre-migration/
+			// jti-less token (see Authenticated). Same outcome either way.
+			return sessionRejected(c, "session_revoked")
+		case sessRevokedAt != nil && sessRevokeReason != nil && *sessRevokeReason == "superseded":
+			return sessionRejected(c, "session_superseded")
+		case sessRevokedAt != nil:
+			return sessionRejected(c, "session_revoked")
+		case time.Since(*sessLastActivity) > service.IdleTimeout:
+			_ = svc.Sessions.MarkIdle(c.Context(), sid)
+			return sessionRejected(c, "session_idle")
+		}
+
 		if mustChange &&
 			!strings.HasSuffix(p, "/me") &&
-			!strings.HasSuffix(p, "/me/password") {
+			!strings.HasSuffix(p, "/me/password") &&
+			!strings.HasSuffix(p, "/auth/heartbeat") {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "password_change_required"})
+		}
+
+		if c.Method() != fiber.MethodGet && c.Method() != fiber.MethodHead {
+			if err := svc.Sessions.Touch(c.Context(), sid); err != nil {
+				return err
+			}
 		}
 		return c.Next()
 	}
+}
+
+// sessionRejected responds with the machine-readable code in the `error`
+// field — same convention as RequireApprovedTAProfile's ta_profile_not_approved
+// and AccountGuard's own password_change_required below: the frontend's
+// CODE_MESSAGES table (app/lib/api.ts) turns the code into the Thai message the
+// user sees, rather than the backend hardcoding English or Thai text here.
+func sessionRejected(c *fiber.Ctx, code string) error {
+	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": code})
 }
 
 func UserID(c *fiber.Ctx) uuid.UUID {
@@ -111,6 +184,14 @@ func UserID(c *fiber.Ctx) uuid.UUID {
 
 func Roles(c *fiber.Ctx) []string {
 	v, _ := c.Locals(string(CtxRoles)).([]string)
+	return v
+}
+
+// SessionID returns the sessions.id (JWT jti) this request authenticated
+// with — uuid.Nil for a token issued before migration 0085 or otherwise
+// missing one (see Authenticated).
+func SessionID(c *fiber.Ctx) uuid.UUID {
+	v, _ := c.Locals(string(CtxSessionID)).(uuid.UUID)
 	return v
 }
 
@@ -215,4 +296,56 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 	// (services raise these via errors.New/fmt.Errorf with Thai text). These are
 	// never database errors — those are handled above — so it is safe to show.
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+}
+
+// OriginCheck is defense-in-depth against cross-site request forgery,
+// layered UNDER the cookie's own SameSite=Lax (see setAuthCookie) rather
+// than replacing it — SameSite=Lax already blocks the classic cross-site
+// <form> POST, since a Lax cookie is only sent on top-level GET navigations.
+// This exists for the cases that guarantee does not cover: a future
+// subdomain relationship that changes what counts as "the same site", or the
+// documented cross-origin upload path (UPLOAD_ORIGIN in
+// ta_payment_front/app/lib/api.ts) being pointed somewhere it shouldn't.
+//
+// allowedOrigins is CORS_ORIGINS (comma-separated) — the same list already
+// governing what fetch() from a browser may read a response from, reused
+// here as the answer to "who is allowed to submit a mutating request" too.
+//
+// Only mutating methods are checked; GET/HEAD/OPTIONS carry no state-changing
+// risk. And only when the browser actually sent an Origin or Referer header:
+// on the NORMAL path here — browser → Next.js → this process — Next.js's own
+// server-side fetch proxying that rewrite typically carries neither header at
+// all, since it is not a browser-originated cross-origin request. Rejecting
+// on absence would break that path; SameSite=Lax is the primary defense for
+// exactly the traffic this cannot see into.
+func OriginCheck(allowedOrigins string) fiber.Handler {
+	allowed := map[string]bool{}
+	for _, o := range strings.Split(allowedOrigins, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowed[o] = true
+		}
+	}
+	return func(c *fiber.Ctx) error {
+		switch c.Method() {
+		case fiber.MethodGet, fiber.MethodHead, fiber.MethodOptions:
+			return c.Next()
+		}
+		origin := c.Get(fiber.HeaderOrigin)
+		if origin == "" {
+			// Some clients send Referer but not Origin; take its origin as a
+			// fallback rather than leaving this unchecked.
+			if ref := c.Get(fiber.HeaderReferer); ref != "" {
+				if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
+					origin = u.Scheme + "://" + u.Host
+				}
+			}
+		}
+		if origin == "" {
+			return c.Next()
+		}
+		if !allowed[origin] {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "คำขอถูกปฏิเสธ (แหล่งที่มาไม่ได้รับอนุญาต)"})
+		}
+		return c.Next()
+	}
 }

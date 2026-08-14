@@ -20,38 +20,44 @@ type CourseService struct {
 
 // Settings
 
+// Every numeric field below carries validate:"gte=0" as a first-line mirror
+// of UpsertPayRate's own blanket "no negatives" check — that function still
+// owns the sharper rules (some fields treat 0 as "use default", actual pay
+// rates must be > 0, TermMonths has an upper bound too), which a struct tag
+// cannot express without duplicating business logic, so those stay exactly
+// where they are.
 type PayRate struct {
 	ID               uuid.UUID `json:"id"`
-	EffectiveFrom    string    `json:"effective_from"`
-	UndergradRegular float64   `json:"undergrad_regular"` // hourly, ประกาศ 731/2565 = 40 ฿/hr
-	UndergradSpecial float64   `json:"undergrad_special"` // hourly, ประกาศ 1080/2565 = 50 ฿/hr
+	EffectiveFrom    string    `json:"effective_from" validate:"required"`
+	UndergradRegular float64   `json:"undergrad_regular" validate:"gte=0"` // hourly, ประกาศ 731/2565 = 40 ฿/hr
+	UndergradSpecial float64   `json:"undergrad_special" validate:"gte=0"` // hourly, ประกาศ 1080/2565 = 50 ฿/hr
 	// Deprecated: kept for rollback safety. Payment/budget now read GraduateRegularHourly.
-	GraduateRegular        float64 `json:"graduate_regular"`
-	GraduateSpecialLumpsum float64 `json:"graduate_special_lumpsum"` // monthly lump-sum, ประกาศ = 4,000 ฿/เดือน
+	GraduateRegular        float64 `json:"graduate_regular" validate:"gte=0"`
+	GraduateSpecialLumpsum float64 `json:"graduate_special_lumpsum" validate:"gte=0"` // monthly lump-sum, ประกาศ = 4,000 ฿/เดือน
 	// Undergrad budget formula constants (from historical Excel workbook):
-	UGLectureHoursPerCredit float64 `json:"ug_lecture_hours_per_credit"`
-	UGLabHoursPerCredit     float64 `json:"ug_lab_hours_per_credit"`
-	BaselineStudentsLecture int     `json:"baseline_students_lecture"`
-	BaselineStudentsLab     int     `json:"baseline_students_lab"`
+	UGLectureHoursPerCredit float64 `json:"ug_lecture_hours_per_credit" validate:"gte=0"`
+	UGLabHoursPerCredit     float64 `json:"ug_lab_hours_per_credit" validate:"gte=0"`
+	BaselineStudentsLecture int     `json:"baseline_students_lecture" validate:"gte=0"`
+	BaselineStudentsLab     int     `json:"baseline_students_lab" validate:"gte=0"`
 	// Effective monthly budget rate per weekly-workload-hour.
 	// Per Excel formula: default 300 = 50% × 200 (ตรี TA) + 50% × 400 (บัณฑิต TA).
 	// Applied to BOTH regular and special sections — tracks differ only in student count.
-	UGWorkloadRateRegular float64 `json:"ug_workload_rate_regular"`
-	TermMonths            int     `json:"term_months"`
+	UGWorkloadRateRegular float64 `json:"ug_workload_rate_regular" validate:"gte=0"`
+	TermMonths            int     `json:"term_months" validate:"gte=0"`
 	// Policy limits (advisory) — from the official regulation notes.
-	UGMaxHoursPerDay     int `json:"ug_max_hours_per_day"`    // undergrad regular: max hrs/day (7)
-	MaxCoursesPerStudent int `json:"max_courses_per_student"` // any student: max concurrent TA courses (3)
+	UGMaxHoursPerDay     int `json:"ug_max_hours_per_day" validate:"gte=0"`    // undergrad regular: max hrs/day (7)
+	MaxCoursesPerStudent int `json:"max_courses_per_student" validate:"gte=0"` // any student: max concurrent TA courses (3)
 	// New (migration 0018) — per-track daily caps + graduate hourly rate + term/day money caps.
-	GraduateRegularHourly   float64 `json:"graduate_regular_hourly"`     // hourly rate for บัณฑิต regular (50 ฿/hr per ประกาศ)
-	GradSpecialTermCap      float64 `json:"grad_special_term_cap"`       // per TA × course × term cap for บัณฑิต special (12,000 ฿)
-	DailyPayCapBaht         float64 `json:"daily_pay_cap_baht"`          // อัตราค่าตอบแทน hourly ≤ 300 ฿/วัน
-	UGRegularDailyHourCap   float64 `json:"ug_regular_daily_hour_cap"`   // ป.ตรี ปกติ ≤ 7 hrs/วัน
-	UGSpecialDailyHourCap   float64 `json:"ug_special_daily_hour_cap"`   // ป.ตรี พิเศษ ≤ 6 hrs/วัน
-	GradRegularDailyHourCap float64 `json:"grad_regular_daily_hour_cap"` // บัณฑิต ปกติ ≤ 6 hrs/วัน
+	GraduateRegularHourly   float64 `json:"graduate_regular_hourly" validate:"gte=0"`     // hourly rate for บัณฑิต regular (50 ฿/hr per ประกาศ)
+	GradSpecialTermCap      float64 `json:"grad_special_term_cap" validate:"gte=0"`       // per TA × course × term cap for บัณฑิต special (12,000 ฿)
+	DailyPayCapBaht         float64 `json:"daily_pay_cap_baht" validate:"gte=0"`          // อัตราค่าตอบแทน hourly ≤ 300 ฿/วัน
+	UGRegularDailyHourCap   float64 `json:"ug_regular_daily_hour_cap" validate:"gte=0"`   // ป.ตรี ปกติ ≤ 7 hrs/วัน
+	UGSpecialDailyHourCap   float64 `json:"ug_special_daily_hour_cap" validate:"gte=0"`   // ป.ตรี พิเศษ ≤ 6 hrs/วัน
+	GradRegularDailyHourCap float64 `json:"grad_regular_daily_hour_cap" validate:"gte=0"` // บัณฑิต ปกติ ≤ 6 hrs/วัน
 	// New (migration 0040) — ประกาศระบุ ป.ตรี ภาคพิเศษ "50 ฿/ชม. หรือ 2,000 ฿/เดือน":
 	// จ่ายรายชั่วโมงตามจริง แต่ไม่เกินเพดานนี้ต่อเดือน/คน/วิชา.
-	UGSpecialMonthlyCap float64 `json:"ug_special_monthly_cap"`
-	Note                *string `json:"note,omitempty"`
+	UGSpecialMonthlyCap float64 `json:"ug_special_monthly_cap" validate:"gte=0"`
+	Note                *string `json:"note,omitempty" validate:"omitempty,max=500"`
 }
 
 func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
@@ -189,9 +195,9 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 
 type BudgetCap struct {
 	ID            uuid.UUID `json:"id"`
-	EffectiveFrom string    `json:"effective_from"`
-	PerCourseMax  float64   `json:"per_course_max"`
-	Note          *string   `json:"note,omitempty"`
+	EffectiveFrom string    `json:"effective_from" validate:"required"`
+	PerCourseMax  float64   `json:"per_course_max" validate:"gte=0"`
+	Note          *string   `json:"note,omitempty" validate:"omitempty,max=500"`
 }
 
 func (s *CourseService) LatestBudgetCap(ctx context.Context) (*BudgetCap, error) {

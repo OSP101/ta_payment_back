@@ -14,10 +14,11 @@ import (
 // AdminOfficer is one entry in the executive/administrative roster that feeds
 // generated official documents. Staff CRUD these via /settings/admin-officers.
 type AdminOfficer struct {
+	// ID is empty on a create; Upsert treats uuid.Nil as "assign a new one".
 	ID             uuid.UUID `json:"id"`
-	AcademicPrefix string    `json:"academic_prefix"`
-	FullName       string    `json:"full_name"`
-	Title          string    `json:"title"`
+	AcademicPrefix string    `json:"academic_prefix" validate:"omitempty,max=200"`
+	FullName       string    `json:"full_name" validate:"required,max=200"`
+	Title          string    `json:"title" validate:"required,max=200"`
 	IsActive       bool      `json:"is_active"`
 	// IsDean is derived from Title, never stored. Sent to the client so the
 	// appointment screen can warn that a deputy will sign as acting without

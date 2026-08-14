@@ -2,12 +2,14 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
+	"ta-payment-back/internal/rbac"
 	"ta-payment-back/internal/service"
 )
 
@@ -37,8 +39,8 @@ func (h *SubmissionPeriodHandler) List(c *fiber.Ctx) error {
 // Upsert creates or updates one period. Body follows the SubmissionPeriod struct.
 func (h *SubmissionPeriodHandler) Upsert(c *fiber.Ctx) error {
 	var in service.SubmissionPeriod
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	out, err := h.Svc.SubmissionPeriods.Upsert(c.Context(), UserID(c), in)
 	if err != nil {
@@ -86,7 +88,7 @@ func (h *SubmissionPeriodHandler) MePending(c *fiber.Ctx) error {
 // commentBody is the shared payload for the finance-send endpoint so staff can
 // attach a note that renders next to the signer in the UI.
 type commentBody struct {
-	Comment string `json:"comment"`
+	Comment string `json:"comment" validate:"max=500"`
 }
 
 // FinanceSend is the last step — staff records the exported batch has been
@@ -105,7 +107,9 @@ func (h *SubmissionPeriodHandler) FinanceSend(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
 	}
 	var body commentBody
-	_ = c.BodyParser(&body)
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
 	if err := h.Svc.SubmissionPeriods.MarkFinanceSent(c.Context(), UserID(c), pid, taID, tcID, body.Comment); err != nil {
 		return err
 	}
@@ -149,7 +153,9 @@ func (h *SubmissionPeriodHandler) StaffReview(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
 	}
 	var body commentBody
-	_ = c.BodyParser(&body)
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
 	if err := h.Svc.SubmissionPeriods.MarkStaffReviewed(c.Context(), UserID(c), pid, taID, tcID, body.Comment); err != nil {
 		return err
 	}
@@ -173,10 +179,16 @@ func (h *SubmissionPeriodHandler) SendBack(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
 	}
 	var body struct {
-		ToStatus string `json:"to_status"`
-		Reason   string `json:"reason"`
+		// ToStatus defaults to "pending" when empty (MarkSentBack), so it is
+		// not required — but when present it must be a real backward target;
+		// "finance_sent" is excluded there, not here, since the service also
+		// needs to reject it against the row's CURRENT status.
+		ToStatus string `json:"to_status" validate:"omitempty,oneof=pending staff_reviewed exported"`
+		Reason   string `json:"reason" validate:"required,max=500"`
 	}
-	_ = c.BodyParser(&body)
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
 	// Sending back after the period closed is allowed on purpose — that's when
 	// corrections surface. The TA can no longer edit a closed month themself,
 	// so the actual fix flows through the staff worklog editor.
@@ -202,9 +214,11 @@ func (h *SubmissionPeriodHandler) FinanceRevert(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
 	}
 	var body struct {
-		Reason string `json:"reason"`
+		Reason string `json:"reason" validate:"required,max=500"`
 	}
-	_ = c.BodyParser(&body)
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
 	if err := h.Svc.SubmissionPeriods.RevertFinanceSent(c.Context(), UserID(c), pid, taID, tcID, body.Reason); err != nil {
 		return err
 	}
@@ -411,6 +425,19 @@ func (h *SubmissionPeriodHandler) StaffEditHistory(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid taId")
 	}
+	// Route is staffOrLecturer (router.go), and ListEditBatches itself takes
+	// no actor — a lecturer may only read their own course's correction
+	// history (reason text, before/after hours, evidence file URLs);
+	// staff/admin see all.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
 	out, err := h.Svc.WorkLog.ListEditBatches(c.Context(), tcID, taID, c.Query("year_month"))
 	if err != nil {
 		return err
@@ -424,10 +451,34 @@ func (h *SubmissionPeriodHandler) StaffEditHistory(c *fiber.Ctx) error {
 // The prefix check is the security boundary, not a tidiness rule: without it the
 // key parameter is a read primitive over the whole object store, which also
 // holds TA national-ID scans.
+//
+// The key itself is an unguessable random UUID, but "unguessable" is not the
+// same as "authorized" — route is staffOrLecturer (router.go), so a lecturer
+// still must be checked against the SPECIFIC course this file's batch
+// belongs to, the same as StaffEditHistory above. Without this, a lecturer
+// who obtained another course's file key (e.g. from a leaked link, or by
+// widening StaffEditHistory's own scope) could fetch the underlying image —
+// evidence photos can include TA-identifying material.
 func (h *SubmissionPeriodHandler) ServeEditFile(c *fiber.Ctx) error {
 	key := c.Params("*")
 	if key == "" || strings.Contains(key, "..") || !strings.HasPrefix(key, "worklog-edits/") {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid key")
+	}
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		tcID, err := h.Svc.WorkLog.EditFileCourse(c.Context(), key)
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบรูปภาพ")
+		}
+		if err != nil {
+			return err
+		}
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
 	}
 	rc, err := h.Svc.Storage.Open(key)
 	if err != nil {

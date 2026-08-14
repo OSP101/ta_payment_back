@@ -226,13 +226,19 @@ func (s *AnnounceService) Get(ctx context.Context, id uuid.UUID) (*Announcement,
 // updates in place. The service enforces category, audience, and scheduling
 // invariants (expires_at > published_at, etc.) so a broken row can't land.
 type UpsertInput struct {
-	ID            uuid.UUID  `json:"id"`
-	Title         string     `json:"title"`
-	Body          string     `json:"body"`
-	Category      string     `json:"category"`
-	Audience      []string   `json:"audience"`
+	ID uuid.UUID `json:"id"`
+	// Title/Body limits mirror the rune-count checks Upsert applies below
+	// (200 / 8000) — the tag rejects an obviously-oversized payload before a
+	// round trip; Upsert's own trimmed check still runs and stays authoritative.
+	Title    string `json:"title" validate:"required,max=200"`
+	Body     string `json:"body" validate:"required,max=8000"`
+	Category string `json:"category" validate:"omitempty,oneof=info news warning urgent event"`
+	// Empty audience deliberately means "everyone" (see normalizeAudience),
+	// so this is not required — only non-empty values are constrained to the
+	// four known roles.
+	Audience      []string   `json:"audience" validate:"omitempty,dive,oneof=admin staff lecturer ta"`
 	Pinned        bool       `json:"pinned"`
-	CoverImageKey *string    `json:"cover_image_key"`
+	CoverImageKey *string    `json:"cover_image_key" validate:"omitempty,startswith=announcements/"`
 	PublishedAt   *time.Time `json:"published_at"`
 	ExpiresAt     *time.Time `json:"expires_at"`
 	// Pointers because this endpoint is a full-document upsert and several
@@ -246,11 +252,14 @@ type UpsertInput struct {
 	// system notice, and a stranger's inbox is not somewhere it belongs.
 	TargetCourseIDs *[]uuid.UUID `json:"target_course_ids"`
 	TargetUserIDs   *[]uuid.UUID `json:"target_user_ids"`
-	TargetFilters   *[]string    `json:"target_filters"`
-	TargetTermID    *uuid.UUID   `json:"target_term_id"`
+	// TargetFilters is the same closed set validateRule checks (announce_target.go);
+	// tagged here too so a bad filter name is rejected before Upsert runs.
+	TargetFilters *[]string  `json:"target_filters" validate:"omitempty,dive,oneof=ta_missing_documents ta_missing_schedule ta_no_assignment lecturer_no_request lecturer_pending_worklog course_missing_schedule"`
+	TargetTermID  *uuid.UUID `json:"target_term_id"`
 	// Attachments replace the whole list when present; absent leaves it alone,
-	// so a payload rebuilt from a list row cannot wipe the gallery.
-	Attachments *[]AttachmentInput `json:"attachments"`
+	// so a payload rebuilt from a list row cannot wipe the gallery. max=20
+	// mirrors maxAttachments in announce_media.go.
+	Attachments *[]AttachmentInput `json:"attachments" validate:"omitempty,max=20,dive"`
 }
 
 func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in UpsertInput) (uuid.UUID, error) {

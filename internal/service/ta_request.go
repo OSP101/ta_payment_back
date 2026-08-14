@@ -57,36 +57,45 @@ type CreateResult struct {
 	RejectReason string          `json:"reject_reason,omitempty"`
 }
 
+// WorkloadInput's Hrs fields carry validate:"gte=0,lte=99" mirroring
+// validateWorkloadFields below — each is stored as NUMERIC(4,2), so >99 is
+// already rejected there; the tag just catches it before the DB round trip.
+// Desc fields have no DB length limit (TEXT columns) but are free text a TA
+// types, so max=500 bounds them to something sane.
 type WorkloadInput struct {
-	HelpTeachHrs  float64 `json:"help_teach_hrs"`
-	HelpTeachDesc string  `json:"help_teach_desc"`
-	PrepHrs       float64 `json:"prep_hrs"`
-	PrepDesc      string  `json:"prep_desc"`
-	GradeHrs      float64 `json:"grade_hrs"`
-	GradeDesc     string  `json:"grade_desc"`
-	OtherHrs      float64 `json:"other_hrs"`
-	OtherDesc     string  `json:"other_desc"`
-	CheckWorkHrs  float64 `json:"check_work_hrs"`
-	AttendanceHrs float64 `json:"attendance_hrs"`
-	UGOtherHrs    float64 `json:"ug_other_hrs"`
-	UGOtherDesc   string  `json:"ug_other_desc"`
-	LabHrs        float64 `json:"lab_hrs"`
+	HelpTeachHrs  float64 `json:"help_teach_hrs" validate:"gte=0,lte=99"`
+	HelpTeachDesc string  `json:"help_teach_desc" validate:"omitempty,max=500"`
+	PrepHrs       float64 `json:"prep_hrs" validate:"gte=0,lte=99"`
+	PrepDesc      string  `json:"prep_desc" validate:"omitempty,max=500"`
+	GradeHrs      float64 `json:"grade_hrs" validate:"gte=0,lte=99"`
+	GradeDesc     string  `json:"grade_desc" validate:"omitempty,max=500"`
+	OtherHrs      float64 `json:"other_hrs" validate:"gte=0,lte=99"`
+	OtherDesc     string  `json:"other_desc" validate:"omitempty,max=500"`
+	CheckWorkHrs  float64 `json:"check_work_hrs" validate:"gte=0,lte=99"`
+	AttendanceHrs float64 `json:"attendance_hrs" validate:"gte=0,lte=99"`
+	UGOtherHrs    float64 `json:"ug_other_hrs" validate:"gte=0,lte=99"`
+	UGOtherDesc   string  `json:"ug_other_desc" validate:"omitempty,max=500"`
+	LabHrs        float64 `json:"lab_hrs" validate:"gte=0,lte=99"`
 	// Support for a lab section done OUTSIDE the slot — prep, materials,
 	// marking lab sheets. Mutually exclusive with LabHrs: a TA either runs the
 	// session or supports it, never both for the same group.
-	LabOtherHrs  float64 `json:"lab_other_hrs"`
-	LabOtherDesc string  `json:"lab_other_desc"`
+	LabOtherHrs  float64 `json:"lab_other_hrs" validate:"gte=0,lte=99"`
+	LabOtherDesc string  `json:"lab_other_desc" validate:"omitempty,max=500"`
 }
 
 type CreateTARequestInput struct {
-	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
-	ReimburseScope   string    `json:"reimburse_scope"`
-	Counts           []struct {
-		SectionID      uuid.UUID `json:"section_id"`
-		UndergradCount int       `json:"undergrad_count"`
-		GraduateCount  int       `json:"graduate_count"`
-	} `json:"counts"`
-	Assignments []AssignmentInput `json:"assignments"`
+	TeachingCourseID uuid.UUID `json:"teaching_course_id" validate:"required"`
+	// oneof mirrors the exact check in Create below (lecture/lab/both).
+	ReimburseScope string `json:"reimburse_scope" validate:"required,oneof=lecture lab both"`
+	// Counts has no length floor in Create — a request can reference sections
+	// purely through Assignments — so only its elements are validated (dive).
+	Counts []struct {
+		SectionID      uuid.UUID `json:"section_id" validate:"required"`
+		UndergradCount int       `json:"undergrad_count" validate:"gte=0"`
+		GraduateCount  int       `json:"graduate_count" validate:"gte=0"`
+	} `json:"counts" validate:"omitempty,dive"`
+	// required: Create rejects an empty Assignments list outright.
+	Assignments []AssignmentInput `json:"assignments" validate:"required,dive"`
 }
 
 // AssignmentInput is one TA's placement within a request. Named rather than
@@ -97,22 +106,28 @@ type AssignmentInput struct {
 	// SectionIDs lists every section this TA is assigned to within the
 	// request. Each becomes its own ta_request_assignments row so worklog can
 	// attribute time to the specific section taught.
-	SectionIDs []uuid.UUID `json:"section_ids"`
-	TAID       uuid.UUID   `json:"ta_id"`
-	Level      string      `json:"level"`
+	SectionIDs []uuid.UUID `json:"section_ids" validate:"required,dive,required"`
+	TAID       uuid.UUID   `json:"ta_id" validate:"required"`
+	// Level is only a fallback: validateTA prefers the TA's own on-file study
+	// level and only falls back to this value when the DB has none. Left
+	// omittable for that reason; when present it must still be one of the
+	// three levels the resolved value is checked against.
+	Level string `json:"level" validate:"omitempty,oneof=undergrad master phd"`
 	// Workload is the fallback declaration applied to every section that has
 	// no entry in SectionWorkloads. Kept so a client that declares one figure
 	// for the whole assignment keeps working.
 	Workload WorkloadInput `json:"workload"`
 	// SectionWorkloads carries the per-section hours the lecturers asked for:
 	// each group gets its own figure, bounded by the course's weekly contact
-	// hours for that kind — the numbers in the 3(3-0-6) notation.
-	SectionWorkloads []SectionWorkload `json:"section_workloads"`
+	// hours for that kind — the numbers in the 3(3-0-6) notation. Optional:
+	// resolveSectionWorkloads falls back to Workload above for any section
+	// missing here.
+	SectionWorkloads []SectionWorkload `json:"section_workloads" validate:"omitempty,dive"`
 }
 
 // SectionWorkload is one section's slice of a TA's declared weekly workload.
 type SectionWorkload struct {
-	SectionID uuid.UUID     `json:"section_id"`
+	SectionID uuid.UUID     `json:"section_id" validate:"required"`
 	Workload  WorkloadInput `json:"workload"`
 }
 
@@ -2006,12 +2021,16 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 
 // Windows
 type Window struct {
-	ID       uuid.UUID `json:"id"`
-	TermID   uuid.UUID `json:"term_id"`
-	OpensAt  time.Time `json:"opens_at"`
-	ClosesAt time.Time `json:"closes_at"`
+	// ID is intentionally untagged: UpsertWindow treats uuid.Nil as "create
+	// new" (isNew := in.ID == uuid.Nil), so a missing/zero id is the normal
+	// shape for a create call, not an error.
+	ID uuid.UUID `json:"id"`
+	// TermID/OpensAt/ClosesAt are all NOT NULL columns (migration 0001).
+	TermID   uuid.UUID `json:"term_id" validate:"required"`
+	OpensAt  time.Time `json:"opens_at" validate:"required"`
+	ClosesAt time.Time `json:"closes_at" validate:"required"`
 	IsOpen   bool      `json:"is_open"`
-	Note     *string   `json:"note,omitempty"`
+	Note     *string   `json:"note,omitempty" validate:"omitempty,max=500"`
 }
 
 func (s *TARequestService) UpsertWindow(ctx context.Context, actor uuid.UUID, in Window) (*Window, error) {

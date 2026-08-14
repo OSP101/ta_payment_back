@@ -47,8 +47,8 @@ func (h *UserHandler) List(c *fiber.Ctx) error {
 
 func (h *UserHandler) Create(c *fiber.Ctx) error {
 	var in service.CreateUserInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	// Lecturers may only create TA accounts
 	if rbac.Has(Roles(c), rbac.RoleLecturer) && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
@@ -84,12 +84,22 @@ func (h *UserHandler) Update(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var in service.UpdateUserInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	u, err := h.Svc.Users.Update(c.Context(), UserID(c), id, in)
 	if err != nil {
 		return err
+	}
+	// A role edit changes what the target's EXISTING token is allowed to do —
+	// roles ride in the JWT claims (see Login), so the already-issued token
+	// keeps the old roles until it expires unless the session behind it is
+	// revoked. Only when roles were actually part of this request: this
+	// handler also carries profile-field edits that have no such stake.
+	if in.Roles != nil {
+		if err := h.Svc.Sessions.RevokeAllForUser(c.Context(), id, "roles_changed"); err != nil {
+			return err
+		}
 	}
 	return c.JSON(u)
 }
@@ -103,6 +113,12 @@ func (h *UserHandler) ResetPassword(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// The old password's session(s) must not survive a reset — otherwise
+	// whoever was already signed in keeps working under the OLD password's
+	// session while the new temp password sits unused.
+	if err := h.Svc.Sessions.RevokeAllForUser(c.Context(), id, "password_reset"); err != nil {
+		return err
+	}
 	return c.JSON(fiber.Map{"temp_password": pw})
 }
 
@@ -113,9 +129,11 @@ func (h *UserHandler) Deactivate(c *fiber.Ctx) error {
 	}
 	// Require the caller to re-type the target user's email to confirm.
 	var body struct {
-		ConfirmEmail string `json:"confirm_email"`
+		ConfirmEmail string `json:"confirm_email" validate:"required"`
 	}
-	_ = c.BodyParser(&body)
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
 	if strings.TrimSpace(body.ConfirmEmail) == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "confirm_email required")
 	}
@@ -130,6 +148,14 @@ func (h *UserHandler) Deactivate(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "confirmation email does not match")
 	}
 	if err := h.Svc.Users.Deactivate(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	// AccountGuard's live is_active read already blocks a deactivated user's
+	// next request regardless of this — see middleware.go — but revoking here
+	// too means the session row itself shows WHY (revoke_reason
+	// "account_deactivated") instead of leaving that only inferable from the
+	// users table's audit log.
+	if err := h.Svc.Sessions.RevokeAllForUser(c.Context(), id, "account_deactivated"); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -182,8 +208,8 @@ func (h *CourseHandler) PayRate(c *fiber.Ctx) error {
 
 func (h *CourseHandler) CreatePayRate(c *fiber.Ctx) error {
 	var in service.PayRate
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	out, err := h.Svc.Courses.UpsertPayRate(c.Context(), UserID(c), in)
 	if err != nil {
@@ -202,8 +228,8 @@ func (h *CourseHandler) BudgetCap(c *fiber.Ctx) error {
 
 func (h *CourseHandler) UpsertBudgetCap(c *fiber.Ctx) error {
 	var in service.BudgetCap
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	out, err := h.Svc.Courses.UpsertBudgetCap(c.Context(), UserID(c), in)
 	if err != nil {
@@ -250,8 +276,8 @@ func (h *TeachingHandler) TermYearsCount(c *fiber.Ctx) error {
 
 func (h *TeachingHandler) UpsertTerm(c *fiber.Ctx) error {
 	var in service.Term
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	out, err := h.Svc.Teaching.UpsertTerm(c.Context(), UserID(c), in)
 	if err != nil {
@@ -458,8 +484,8 @@ func (h *TeachingHandler) List(c *fiber.Ctx) error {
 
 func (h *TeachingHandler) Create(c *fiber.Ctx) error {
 	var in service.CreateTeachingCourseInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	id, err := h.Svc.Teaching.Create(c.Context(), UserID(c), in)
 	if err != nil {
@@ -499,14 +525,15 @@ func (h *TeachingHandler) SetNumStudents(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	// Accept either legacy `num_students` (aggregate) or per-track split.
-	// -1 means "no change" so callers can update one track without touching the other.
+	// -1 means "no change" so callers can update one track without touching the other,
+	// so the floor is -1 (the sentinel), not 0.
 	body := struct {
-		NumStudents        int `json:"num_students"`
-		NumStudentsRegular int `json:"num_students_regular"`
-		NumStudentsSpecial int `json:"num_students_special"`
+		NumStudents        int `json:"num_students" validate:"gte=-1"`
+		NumStudentsRegular int `json:"num_students_regular" validate:"gte=-1"`
+		NumStudentsSpecial int `json:"num_students_special" validate:"gte=-1"`
 	}{NumStudents: -1, NumStudentsRegular: -1, NumStudentsSpecial: -1}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.SetNumStudents(c.Context(), UserID(c), id,
 		body.NumStudents, body.NumStudentsRegular, body.NumStudentsSpecial); err != nil {
@@ -521,8 +548,8 @@ func (h *TeachingHandler) UpdateSettings(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var in service.UpdateSettingsInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.UpdateSettings(c.Context(), UserID(c), id, in); err != nil {
 		return err
@@ -538,8 +565,8 @@ func (h *TeachingHandler) AddSection(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var in service.AddSectionInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	id, err := h.Svc.Teaching.AddSection(c.Context(), UserID(c), tcID, in)
 	if err != nil {
@@ -561,8 +588,8 @@ func (h *TeachingHandler) UpdateSection(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
 	}
 	var in service.UpdateSectionInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.UpdateSection(c.Context(), UserID(c), tcID, sectionID, in); err != nil {
 		if errors.Is(err, service.ErrCourseLocked) {
@@ -606,8 +633,8 @@ func (h *TeachingHandler) ReplaceSectionSchedules(c *fiber.Ctx) error {
 	var body struct {
 		Schedules []service.SectionSchedule `json:"schedules"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.ReplaceSectionSchedules(c.Context(), UserID(c), tcID, sectionID, body.Schedules); err != nil {
 		if errors.Is(err, service.ErrCourseLocked) {
@@ -627,8 +654,8 @@ func (h *TeachingHandler) AddMakeup(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
 	}
 	var m service.MakeupSchedule
-	if err := c.BodyParser(&m); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &m); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.AddMakeup(c.Context(), UserID(c), sectionID, m); err != nil {
 		return err
@@ -696,8 +723,8 @@ func (h *TeachingHandler) AddReviewDate(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
 	}
 	var r service.LectureReview
-	if err := c.BodyParser(&r); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &r); err != nil {
+		return err
 	}
 	if err := h.Svc.Teaching.AddReviewDate(c.Context(), UserID(c), sectionID, r); err != nil {
 		return err
@@ -755,6 +782,20 @@ func (h *TeachingHandler) Budget(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	// A lecturer may only read their own course's budget; staff/admin see
+	// all. BudgetService.Compute itself takes no actor — it is also called
+	// from several admin/staff-only aggregate views (dashboards, exports)
+	// that legitimately span every course, so the ownership check belongs
+	// here, at this specific lecturer-reachable route, not inside Compute.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), id)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
 	}
 	snap, err := h.Svc.Budget.Compute(c.Context(), id)
 	if err != nil {
@@ -815,8 +856,8 @@ func (h *TARequestHandler) Detail(c *fiber.Ctx) error {
 
 func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 	var in service.CreateTARequestInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	res, err := h.Svc.TARequest.Create(c.Context(), UserID(c), in)
 	if err != nil {
@@ -852,6 +893,18 @@ func (h *TARequestHandler) PreviewConflicts(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid teaching_course_id")
 	}
+	// This route is lecturer-only (router.go), and PreviewConflicts itself
+	// takes no actor — without this, any lecturer could probe another
+	// course's schedule-conflict data for an arbitrary TA by teaching_course_id.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
 	out, err := h.Svc.TARequest.PreviewConflicts(c.Context(), taID, tcID)
 	if err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
@@ -865,6 +918,18 @@ func (h *TARequestHandler) Candidates(c *fiber.Ctx) error {
 	tcID, err := uuid.Parse(c.Query("teaching_course_id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid teaching_course_id")
+	}
+	// A lecturer may only browse candidates for their own course (names,
+	// emails, approved-course counts) — staff/admin see all. Candidates
+	// itself takes no actor, same reasoning as PreviewConflicts above.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		owns, err := h.Svc.Teaching.LecturerOwnsCourse(c.Context(), UserID(c), tcID)
+		if err != nil {
+			return err
+		}
+		if !owns {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
 	}
 	out, err := h.Svc.TARequest.Candidates(c.Context(), tcID)
 	if err != nil {
@@ -889,8 +954,8 @@ func (h *TARequestHandler) ListWindows(c *fiber.Ctx) error {
 
 func (h *TARequestHandler) UpsertWindow(c *fiber.Ctx) error {
 	var w service.Window
-	if err := c.BodyParser(&w); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &w); err != nil {
+		return err
 	}
 	out, err := h.Svc.TARequest.UpsertWindow(c.Context(), UserID(c), w)
 	if err != nil {
@@ -924,8 +989,8 @@ func (h *DocsHandler) GetProfile(c *fiber.Ctx) error {
 
 func (h *DocsHandler) UpsertProfile(c *fiber.Ctx) error {
 	var p service.TAProfile
-	if err := c.BodyParser(&p); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &p); err != nil {
+		return err
 	}
 	if err := h.Svc.Docs.UpsertProfile(c.Context(), UserID(c), p); err != nil {
 		return err
@@ -976,8 +1041,8 @@ func (h *DocsHandler) UploadDoc(c *fiber.Ctx) error {
 // over data the caller just submitted, so it leaks nothing.
 func (h *DocsHandler) CreditorFormPDF(c *fiber.Ctx) error {
 	var in service.TAProfile
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	grid := c.Query("grid") == "1"
 	body, name, err := h.Svc.Docs.BuildCreditorFormPDF(c.Context(), UserID(c), in,
@@ -998,8 +1063,8 @@ func (h *DocsHandler) CreditorFormPDF(c *fiber.Ctx) error {
 // review pipeline treats it identically to a manually-uploaded file.
 func (h *DocsHandler) ConfirmCreditorForm(c *fiber.Ctx) error {
 	var in service.TAProfile
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	id, err := h.Svc.Docs.AttachGeneratedCreditorForm(c.Context(), UserID(c), in,
 		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir)
@@ -1044,6 +1109,18 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	caller := UserID(c)
 	if caller != ownerID && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
 		return fiber.NewError(fiber.StatusForbidden, "forbidden")
+	}
+	// Audited only when someone OTHER than the document's own owner reads
+	// it — an officer pulling up a TA's ID-card photo is exactly the "PII
+	// read back out" event citizen_id.go's RevealCitizenID already treats as
+	// worth a trail; a TA opening their own upload is not.
+	if caller != ownerID {
+		if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{
+			ActorID: &caller, Action: "ta_doc.view", Entity: "ta_document", EntityID: id.String(),
+			IP: c.IP(), UserAgent: c.Get("User-Agent"),
+		}); err != nil {
+			return err
+		}
 	}
 
 	body, err := io.ReadAll(rc)
@@ -1114,10 +1191,10 @@ func (h *DocsHandler) ReviewProfile(c *fiber.Ctx) error {
 	}
 	var body struct {
 		Approve bool   `json:"approve"`
-		Reason  string `json:"reason"`
+		Reason  string `json:"reason" validate:"omitempty,max=500"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Docs.ReviewProfile(c.Context(), UserID(c), uid, body.Approve, body.Reason); err != nil {
 		return err
@@ -1132,10 +1209,10 @@ func (h *DocsHandler) ReviewDoc(c *fiber.Ctx) error {
 	}
 	var body struct {
 		Approve bool   `json:"approve"`
-		Reason  string `json:"reason"`
+		Reason  string `json:"reason" validate:"omitempty,max=500"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Docs.Review(c.Context(), UserID(c), id, body.Approve, body.Reason); err != nil {
 		return err
@@ -1171,10 +1248,10 @@ func (h *DocsHandler) RejectBatch(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		Items []service.RejectItem `json:"items"`
+		Items []service.RejectItem `json:"items" validate:"required,dive"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Docs.RejectBatch(c.Context(), UserID(c), uid, body.Items); err != nil {
 		return err
@@ -1195,11 +1272,11 @@ func (h *DocsHandler) RejectBatch(c *fiber.Ctx) error {
 // them. See MintAllApprovedZipToken for why there is no "everyone" default.
 func (h *DocsHandler) MintAllApprovedZipToken(c *fiber.Ctx) error {
 	var body struct {
-		Password string      `json:"password"`
-		UserIDs  []uuid.UUID `json:"user_ids"`
+		Password string      `json:"password" validate:"required"`
+		UserIDs  []uuid.UUID `json:"user_ids" validate:"required,dive,required"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	token, taCount, err := h.Svc.Docs.MintAllApprovedZipToken(
 		c.Context(), UserID(c), body.Password, body.UserIDs)
@@ -1248,10 +1325,10 @@ func (h *DocsHandler) MintZipToken(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		Password string `json:"password"`
+		Password string `json:"password" validate:"required"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	token, err := h.Svc.Docs.MintZipToken(c.Context(), UserID(c), uid, body.Password)
 	if err != nil {
@@ -1332,7 +1409,20 @@ func (h *DocsHandler) PreviewWatermarked(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	email, err := h.Svc.Docs.LookupEmail(c.Context(), UserID(c))
+	caller := UserID(c)
+	// This route is adminOrStaff-only (router.go) — the visitor is always
+	// someone other than the document's owner, so every call is a "PII read
+	// back out" event in the same sense citizen_id.go's RevealCitizenID
+	// already treats that way. The watermark below traces a LEAKED copy back
+	// to the viewer; this traces the VIEW itself, queryable from the audit
+	// log without needing the leaked file in hand.
+	if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{
+		ActorID: &caller, Action: "ta_doc.view_watermarked", Entity: "ta_document", EntityID: docID.String(),
+		IP: c.IP(), UserAgent: c.Get("User-Agent"),
+	}); err != nil {
+		return err
+	}
+	email, err := h.Svc.Docs.LookupEmail(c.Context(), caller)
 	if err != nil {
 		return err
 	}
@@ -1378,6 +1468,10 @@ func (h *WorkloadHandler) ReplaceClasses(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "term_id required")
 	}
+	// Bind doesn't apply here: the body is a bare JSON array, and
+	// validator.Struct requires a struct (or pointer to one) — passed a slice
+	// it returns InvalidValidationError, which Bind would surface as a
+	// blanket "invalid body" for every request, valid or not.
 	var blocks []service.ClassBlock
 	if err := c.BodyParser(&blocks); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
@@ -1419,8 +1513,8 @@ func (h *WorkLogHandler) List(c *fiber.Ctx) error {
 
 func (h *WorkLogHandler) Upsert(c *fiber.Ctx) error {
 	var w service.WorkLog
-	if err := c.BodyParser(&w); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &w); err != nil {
+		return err
 	}
 	// Always trust the URL param for the assignment id — never the body — so a
 	// TA cannot target another TA's assignment by forging the payload.
@@ -1453,7 +1547,12 @@ func (h *WorkLogHandler) Approve(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	// year_month ("YYYY-MM") scopes the decision to one month; absent = all
-	// submitted rows (legacy behaviour, still used by staff bulk tools).
+	// submitted rows (legacy behaviour, still used by staff bulk tools). The
+	// parse error is intentionally swallowed — callers that send no body at
+	// all (or the wrong content-type) still get that "all rows" behaviour, so
+	// this can't become Bind: Bind would 400 on exactly the empty-body calls
+	// this endpoint is meant to accept. Format is still checked downstream by
+	// WorkLog.Approve's own validateYearMonth.
 	var body struct {
 		YearMonth string `json:"year_month"`
 	}
@@ -1471,11 +1570,11 @@ func (h *WorkLogHandler) Approve(c *fiber.Ctx) error {
 // half-approved whenever the second call was refused.
 func (h *WorkLogHandler) ApproveBatch(c *fiber.Ctx) error {
 	var body struct {
-		AssignmentIDs []string `json:"assignment_ids"`
-		YearMonth     string   `json:"year_month"`
+		AssignmentIDs []string `json:"assignment_ids" validate:"required,min=1,dive,uuid4"`
+		YearMonth     string   `json:"year_month" validate:"omitempty,datetime=2006-01"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if len(body.AssignmentIDs) == 0 {
 		return fiber.NewError(fiber.StatusBadRequest, "assignment_ids required")
@@ -1575,8 +1674,8 @@ func (h *WorkLogHandler) StaffListAssignments(c *fiber.Ctx) error {
 // StaffUpsert — PUT /staff/worklogs — edit or add a row on any TA's behalf.
 func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
 	var w service.WorkLog
-	if err := c.BodyParser(&w); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &w); err != nil {
+		return err
 	}
 	// Staff/admin may edit any course; a lecturer only their own, enforced in
 	// the service so the rule survives a future caller.
@@ -1622,11 +1721,11 @@ func (h *WorkLogHandler) Reject(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		Reason    string `json:"reason"`
-		YearMonth string `json:"year_month"`
+		Reason    string `json:"reason" validate:"required,max=500"`
+		YearMonth string `json:"year_month" validate:"omitempty,datetime=2006-01"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
 	if err := h.Svc.WorkLog.Reject(c.Context(), UserID(c), id, body.Reason, body.YearMonth, privileged); err != nil {
@@ -1671,8 +1770,8 @@ func (h *WorkLogHandler) AddTAReviewSchedule(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var in service.TAReviewScheduleInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	rsID, err := h.Svc.WorkLog.AddTAReviewSchedule(c.Context(), UserID(c), id, in)
 	if err != nil {
@@ -1692,8 +1791,8 @@ func (h *WorkLogHandler) UpdateTAReviewSchedule(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid rs id")
 	}
 	var in service.TAReviewScheduleInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	if err := h.Svc.WorkLog.UpdateTAReviewSchedule(c.Context(), UserID(c), id, rsID, in); err != nil {
 		return err
@@ -1857,8 +1956,8 @@ func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
 
 func (h *AnnounceHandler) Upsert(c *fiber.Ctx) error {
 	var in service.UpsertInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	id, err := h.Svc.Announce.Upsert(c.Context(), UserID(c), in)
 	if err != nil {
@@ -1935,8 +2034,8 @@ const announceImageMaxBytes = 5 * 1024 * 1024
 // on screen is the number of people reached, not an estimate.
 func (h *AnnounceHandler) AudiencePreview(c *fiber.Ctx) error {
 	var rule service.AudienceRule
-	if err := c.BodyParser(&rule); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &rule); err != nil {
+		return err
 	}
 	out, err := h.Svc.Announce.PreviewAudience(c.Context(), rule)
 	if err != nil {
@@ -2373,7 +2472,15 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	months := monthsParam(c)
+	// Resolve BEFORE anything uses it. An absent ?months= means "the whole
+	// term", and passing that through as nil made the batch ledger record SQL
+	// NULL — indistinguishable from a pre-split row, and invisible to the
+	// `months && $1` round predicates, which left whole-term exports flagged as
+	// still owing round 2 forever. See ExportService.ResolveCourseMonths.
+	months, err := h.Svc.Export.ResolveCourseMonths(c.Context(), id, monthsParam(c))
+	if err != nil {
+		return err
+	}
 	body, name, taCount, err := h.Svc.Export.BuildCourseZip(c.Context(), id, months)
 	if err != nil {
 		return err
@@ -2530,8 +2637,8 @@ func (h *ExportHandler) AppointmentRounds(c *fiber.Ctx) error {
 
 func (h *ExportHandler) AppointmentOrder(c *fiber.Ctx) error {
 	var in service.AppointmentOrderInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	body, name, err := h.Svc.Appointment.Build(c.Context(), UserID(c), in)
 	if err != nil {
@@ -2570,10 +2677,12 @@ func (h *ExportHandler) SetCertifier(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid term id")
 	}
 	var body struct {
-		OfficerID string `json:"officer_id"`
+		// Empty clears the override (falls back to the seat holder), so this
+		// is intentionally not `required` — only its shape is checked when set.
+		OfficerID string `json:"officer_id" validate:"omitempty,uuid4"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	var officer *uuid.UUID
 	if strings.TrimSpace(body.OfficerID) != "" {
@@ -2671,8 +2780,8 @@ func (h *AdminOfficerHandler) List(c *fiber.Ctx) error {
 
 func (h *AdminOfficerHandler) Upsert(c *fiber.Ctx) error {
 	var in service.AdminOfficer
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	out, err := h.Svc.AdminOfficers.Upsert(c.Context(), UserID(c), in)
 	if err != nil {
@@ -2729,8 +2838,8 @@ func (h *HolidayHandler) List(c *fiber.Ctx) error {
 
 func (h *HolidayHandler) Create(c *fiber.Ctx) error {
 	var in service.HolidayInput
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
 	id, err := h.Svc.Holiday.Create(c.Context(), UserID(c), in)
 	if err != nil {
@@ -2740,9 +2849,21 @@ func (h *HolidayHandler) Create(c *fiber.Ctx) error {
 }
 
 func (h *HolidayHandler) BulkCreate(c *fiber.Ctx) error {
+	// The wire body is a bare JSON array, not an {"items": [...]} envelope, so
+	// this can't go through Bind: validator.Struct only accepts a struct (or
+	// pointer to one) at the top level and errors out on a slice kind before
+	// it ever looks at the `validate` tags on HolidayInput. Parse as before,
+	// then validate each element with the same validator + error formatting
+	// Bind uses internally, so a bad row in the batch gets the same kind of
+	// message a single bad Create body would.
 	var in []service.HolidayInput
 	if err := c.BodyParser(&in); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	for i := range in {
+		if err := validate.Struct(&in[i]); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, humanizeValidationError(err))
+		}
 	}
 	inserted, err := h.Svc.Holiday.BulkCreate(c.Context(), UserID(c), in)
 	if err != nil {
@@ -2757,17 +2878,19 @@ func (h *HolidayHandler) Patch(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		NameTH string  `json:"name_th"`
-		NameEN *string `json:"name_en,omitempty"`
-		Note   *string `json:"note,omitempty"`
+		NameTH string  `json:"name_th" validate:"required,max=200"`
+		NameEN *string `json:"name_en,omitempty" validate:"omitempty,max=200"`
+		Note   *string `json:"note,omitempty" validate:"omitempty,max=1000"`
 		// Time window ("HH:MM"); both omitted/empty = all-day. Absent fields clear
 		// the window, which is what the staff form sends when the user switches a
-		// partial holiday back to "หยุดทั้งวัน".
-		StartTime *string `json:"start_time,omitempty"`
-		EndTime   *string `json:"end_time,omitempty"`
+		// partial holiday back to "หยุดทั้งวัน". Format-only check here;
+		// HolidayService.Patch (via normalizeHolidayWindow) still enforces "both
+		// or neither" + end > start.
+		StartTime *string `json:"start_time,omitempty" validate:"omitempty,datetime=15:04"`
+		EndTime   *string `json:"end_time,omitempty" validate:"omitempty,datetime=15:04"`
 	}
-	if err := c.BodyParser(&body); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &body); err != nil {
+		return err
 	}
 	if err := h.Svc.Holiday.Patch(c.Context(), UserID(c), id, body.NameTH, body.NameEN, body.Note,
 		body.StartTime, body.EndTime); err != nil {

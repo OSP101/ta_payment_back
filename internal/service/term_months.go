@@ -163,6 +163,29 @@ func normalizeMonthSelection(all []TermMonth, requested []string) ([]string, err
 	return out, nil
 }
 
+// ResolveCourseMonths turns a caller's month selection into the explicit list
+// the export actually covers — an empty selection becoming every month of the
+// course's term.
+//
+// (13/08/2026) This exists because "no selection" and "every month" were the
+// same value (nil) all the way from the query string into export_batches.months,
+// where NULL is stored. Two readers then disagreed about what that NULL meant:
+// CourseExportCoverage treats it as covering everything (below), while the
+// round predicates test `months && $1`, and `NULL && anything` is NULL, not
+// true. So a whole-term ZIP that really did claim ตุลาคม left the course flagged
+// "รอบ 2 ค้าง" forever, and stuck on the round-2 progress board with it.
+// Resolving here means the ledger records what was in the file, and NULL goes
+// back to meaning only what the migration says it means: a pre-split row.
+func (s *ExportService) ResolveCourseMonths(
+	ctx context.Context, courseID uuid.UUID, requested []string,
+) ([]string, error) {
+	all, err := s.CourseTermMonths(ctx, courseID)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeMonthSelection(all, requested)
+}
+
 // CourseExportCoverage answers "which months of this course have already been
 // claimed, and which have not" — the question that decides whether staff are
 // about to bill ตุลาคม twice or never bill it at all. Free month selection

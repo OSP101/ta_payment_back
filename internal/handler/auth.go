@@ -19,24 +19,21 @@ type AuthHandler struct {
 }
 
 type loginReq struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email    string `json:"email" validate:"required,email"`
+	Password string `json:"password" validate:"required"`
 }
 
 func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	var in loginReq
-	if err := c.BodyParser(&in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	if err := Bind(c, &in); err != nil {
+		return err
 	}
-	u, hash, err := h.Svc.Users.FindByEmail(c.Context(), in.Email)
-	if err != nil || u == nil || hash == "" {
-		// Spend the same time a real bcrypt check would, so a missing account is
-		// indistinguishable from a wrong password by timing.
-		auth.DummyCompare(in.Password)
-		return fiber.NewError(fiber.StatusUnauthorized, "อีเมลหรือรหัสผ่านไม่ถูกต้อง")
-	}
-	if !auth.CheckPassword(hash, in.Password) {
-		return fiber.NewError(fiber.StatusUnauthorized, "อีเมลหรือรหัสผ่านไม่ถูกต้อง")
+	// Authenticate owns the whole login rule — enumeration-safe timing,
+	// per-account lockout, and the audit trail for every outcome. See its doc
+	// comment in user.go.
+	u, err := h.Svc.Users.Authenticate(c.Context(), in.Email, in.Password, c.IP(), c.Get("User-Agent"))
+	if err != nil {
+		return err
 	}
 	// The synthetic executive role rides in the TOKEN only, not in u.Roles:
 	// RequireRole reads roles from JWT claims, so leaving it out here made the
@@ -47,12 +44,19 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	if u.IsExecutive {
 		tokenRoles = append(append([]string{}, u.Roles...), rbac.RoleExecutive)
 	}
-	tok, err := h.Tokens.Issue(u.ID, tokenRoles, h.Svc.Cfg.JWTLifetime)
+	// Single-device login: this also revokes every other session this user
+	// currently holds (reason "superseded"), so whatever device was signed in
+	// before is rejected on its very next request — see SessionService and
+	// AccountGuard.
+	sessionID, err := h.Svc.Sessions.CreateAndSupersede(c.Context(), u.ID, h.Svc.Cfg.JWTLifetime, c.IP(), c.Get("User-Agent"))
 	if err != nil {
 		return err
 	}
-	setAuthCookie(c, tok, h.Svc.Cfg.JWTLifetime)
-	h.Aud.Log(c.Context(), audit.Entry{ActorID: &u.ID, Action: "auth.login", Entity: "user", EntityID: u.ID.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")})
+	tok, err := h.Tokens.Issue(u.ID, tokenRoles, sessionID, h.Svc.Cfg.JWTLifetime)
+	if err != nil {
+		return err
+	}
+	setAuthCookie(c, tok, h.Svc.Cfg.JWTLifetime, h.Svc.Cfg.CookieSecure)
 	// The token lives only in the HttpOnly cookie — it is deliberately NOT
 	// returned in the body so it can't be stashed in localStorage where XSS
 	// could read it.
@@ -77,8 +81,32 @@ func (h *AuthHandler) SSOCallback(c *fiber.Ctx) error {
 	return fiber.NewError(fiber.StatusNotImplemented, "SSO callback not yet configured — supply SSO_* env vars and update handler once KKU IT provides endpoints/credentials")
 }
 
+// Logout sits outside the authed group (see router.go) so a client with an
+// already-expired or invalid token can still clear its cookie — logging out
+// must never itself require being logged in. That means UserID/SessionID
+// (which read Authenticated's Locals) are not available here; the token is
+// parsed directly, best-effort, so the session row gets revoked when there is
+// one to revoke.
 func (h *AuthHandler) Logout(c *fiber.Ctx) error {
-	clearAuthCookie(c)
+	if raw := extractToken(c); raw != "" {
+		if claims, err := h.Tokens.Parse(raw); err == nil {
+			if sid, err := claims.SessionID(); err == nil {
+				_ = h.Svc.Sessions.Revoke(c.Context(), sid, "logout")
+			}
+		}
+	}
+	clearAuthCookie(c, h.Svc.Cfg.CookieSecure)
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// Heartbeat is a deliberate no-op: AccountGuard already touches this
+// request's session (it is a POST) before the request ever reaches a
+// handler, so all this endpoint needs to do is exist as something the
+// frontend's idle-activity tracker can POST to. See SessionActivityGuard on
+// the frontend, which calls this at most once a minute while the user is
+// actually doing something — not on a fixed timer — so an idle tab cannot
+// keep its own session alive by polling.
+func (h *AuthHandler) Heartbeat(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
@@ -97,8 +125,15 @@ type changePwReq struct {
 
 func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 	var in changePwReq
-	if err := c.BodyParser(&in); err != nil || len(in.NewPassword) < 8 {
-		return fiber.NewError(fiber.StatusBadRequest, "password must be >= 8 chars")
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	// Checked up front for a fast, specific error before the current-password
+	// round trip below — UpdatePassword enforces the same rule again itself
+	// (see service.ValidatePassword), so this exists for response ordering
+	// only, not as the only place the rule is enforced.
+	if err := service.ValidatePassword(in.NewPassword); err != nil {
+		return err
 	}
 	uid := UserID(c)
 	u, err := h.Svc.Users.Get(c.Context(), uid)
@@ -122,27 +157,41 @@ func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 	if err := h.Svc.Users.UpdatePassword(c.Context(), uid, in.NewPassword); err != nil {
 		return err
 	}
+	// A changed password invalidates whatever session(s) were issued under the
+	// old one — including this very request's, which is deliberate: the
+	// response below still reaches the client (AccountGuard already let this
+	// request through before the change happened), but the next request has
+	// to sign in again with the new password. Under single-device login this
+	// revokes exactly the session that just changed the password, since it is
+	// the only one that could exist.
+	if err := h.Svc.Sessions.RevokeAllForUser(c.Context(), uid, "password_change"); err != nil {
+		return err
+	}
 	return c.JSON(fiber.Map{"ok": true})
 }
 
-func setAuthCookie(c *fiber.Ctx, token string, ttl time.Duration) {
+// secure comes from config.CookieSecure (AppBaseURL's scheme), not
+// c.Protocol() — see that field's doc comment for why request-time protocol
+// detection isn't reliable here.
+func setAuthCookie(c *fiber.Ctx, token string, ttl time.Duration, secure bool) {
 	c.Cookie(&fiber.Cookie{
 		Name:     "access_token",
 		Value:    token,
 		HTTPOnly: true,
 		SameSite: "Lax",
-		Secure:   c.Protocol() == "https",
+		Secure:   secure,
 		Path:     "/",
 		Expires:  time.Now().Add(ttl),
 	})
 }
 
-func clearAuthCookie(c *fiber.Ctx) {
+func clearAuthCookie(c *fiber.Ctx, secure bool) {
 	c.Cookie(&fiber.Cookie{
 		Name:     "access_token",
 		Value:    "",
 		HTTPOnly: true,
 		SameSite: "Lax",
+		Secure:   secure,
 		Path:     "/",
 		Expires:  time.Now().Add(-time.Hour),
 	})

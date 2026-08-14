@@ -20,6 +20,7 @@ type Container struct {
 	Auditor *audit.Auditor
 	Cfg     config.Config
 
+	Sessions          *SessionService
 	Appointment       *AppointmentOrderService
 	Users             *UserService
 	Courses           *CourseService
@@ -42,6 +43,7 @@ type Container struct {
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher) *Container {
 	c := &Container{Pool: pool, Storage: store, Mailer: mailer, Auditor: auditor, Cfg: cfg}
+	c.Sessions = &SessionService{pool: pool}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}

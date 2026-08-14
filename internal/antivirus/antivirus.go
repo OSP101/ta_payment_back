@@ -122,7 +122,9 @@ func (c *ClamAV) Scan(ctx context.Context, r io.Reader) error {
 	for {
 		n, readErr := r.Read(buf)
 		if n > 0 {
-			binary.BigEndian.PutUint32(sizeBuf[:], uint32(n))
+			// n is bounded by len(buf) == chunkSize (64 KiB, see its own
+			// comment above) — nowhere near uint32's range, so this can't overflow.
+			binary.BigEndian.PutUint32(sizeBuf[:], uint32(n)) // #nosec G115 -- n <= chunkSize (64KiB), far below uint32 range
 			if _, err := conn.Write(sizeBuf[:]); err != nil {
 				return fmt.Errorf("clamav: write chunk header: %w", err)
 			}

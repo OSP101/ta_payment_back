@@ -27,11 +27,11 @@ type AppointmentOrderService struct {
 
 // AppointmentOrderInput is the request payload from staff.
 type AppointmentOrderInput struct {
-	TermID          uuid.UUID `json:"term_id"`
-	OrderNo         string    `json:"order_no"`
-	OrderDate       string    `json:"order_date"` // "24 มกราคม 2569"
-	EffectiveDate   string    `json:"effective_date"`
-	SignerOfficerID uuid.UUID `json:"signer_officer_id"`
+	TermID          uuid.UUID `json:"term_id" validate:"required"`
+	OrderNo         string    `json:"order_no" validate:"required,max=200"`
+	OrderDate       string    `json:"order_date" validate:"required,max=200"` // "24 มกราคม 2569"
+	EffectiveDate   string    `json:"effective_date" validate:"required,max=200"`
+	SignerOfficerID uuid.UUID `json:"signer_officer_id" validate:"required"`
 }
 
 // Build renders the next round as appointment-order-<no>.docx.

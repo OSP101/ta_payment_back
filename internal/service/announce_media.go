@@ -31,11 +31,15 @@ type AnnouncementAttachment struct {
 // AttachmentInput is what the composer submits: keys it already uploaded, in
 // the order it wants them shown.
 type AttachmentInput struct {
-	Kind       string `json:"kind"`
-	StorageKey string `json:"storage_key"`
+	// Kind/StorageKey tags mirror the checks saveAttachments already applies
+	// below (validAttachmentKinds, the "announcements/" prefix) — the tag is
+	// a fast first-line reject; saveAttachments remains the authority,
+	// including its extra ".." traversal check that a struct tag can't express.
+	Kind       string `json:"kind" validate:"required,oneof=image video file"`
+	StorageKey string `json:"storage_key" validate:"required,startswith=announcements/"`
 	Filename   string `json:"filename"`
 	Mime       string `json:"mime"`
-	SizeBytes  int64  `json:"size_bytes"`
+	SizeBytes  int64  `json:"size_bytes" validate:"gte=0"`
 }
 
 var validAttachmentKinds = map[string]bool{"image": true, "video": true, "file": true}

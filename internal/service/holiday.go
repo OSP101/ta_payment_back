@@ -80,14 +80,18 @@ func (s *HolidayService) List(ctx context.Context, year int) ([]Holiday, error) 
 }
 
 type HolidayInput struct {
-	HolidayDate string  `json:"holiday_date"`
-	NameTH      string  `json:"name_th"`
-	NameEN      *string `json:"name_en,omitempty"`
-	Source      string  `json:"source,omitempty"`
-	Note        *string `json:"note,omitempty"`
-	// StartTime/EndTime ("HH:MM") — omit both for an all-day holiday.
-	StartTime *string `json:"start_time,omitempty"`
-	EndTime   *string `json:"end_time,omitempty"`
+	HolidayDate string  `json:"holiday_date" validate:"required,datetime=2006-01-02"`
+	NameTH      string  `json:"name_th" validate:"required,max=200"`
+	NameEN      *string `json:"name_en,omitempty" validate:"omitempty,max=200"`
+	// Source defaults to "custom" server-side when empty; must otherwise match
+	// the public_holidays_source_check constraint (migration 0035).
+	Source string  `json:"source,omitempty" validate:"omitempty,oneof=national university faculty custom"`
+	Note   *string `json:"note,omitempty" validate:"omitempty,max=1000"`
+	// StartTime/EndTime ("HH:MM") — omit both for an all-day holiday. Only a
+	// fast format check here; normalizeHolidayWindow still enforces "both or
+	// neither" + end > start, which a per-field tag can't express.
+	StartTime *string `json:"start_time,omitempty" validate:"omitempty,datetime=15:04"`
+	EndTime   *string `json:"end_time,omitempty" validate:"omitempty,datetime=15:04"`
 }
 
 // validHolidaySource reports whether s is one of the allowed holiday types.
