@@ -115,6 +115,18 @@ type Config struct {
 	// unset key could safely degrade into — the app would simply be unusable
 	// for those roles.
 	TOTPEncKey string
+	// MFAMandatoryEnforced gates the "admin/staff/executive MUST have 2FA
+	// enrolled" branch in AccountGuard — see mfaMandatoryFor. Defaults to
+	// true (production posture). Set MFA_MANDATORY_ENFORCED=false as a
+	// temporary operational escape hatch — e.g. rolling this feature out
+	// before anyone has enrolled a real authenticator app yet, or a support
+	// incident where enforcement itself is what's blocking someone. This
+	// does NOT touch 2FA for accounts that already opted in voluntarily
+	// (lecturer/TA): it only stops the mandatory tier from being BLOCKED for
+	// not having enrolled — anyone who already has TOTP enabled still gets
+	// challenged at login regardless of this flag. Flip back to true (or
+	// unset it) once real enrolment is ready to be required again.
+	MFAMandatoryEnforced bool
 	// BOT (Bank of Thailand) Open API — Financial Institutions' Holidays.
 	// Used by the "ซิงก์จาก BOT" button on /staff/holidays to seed national
 	// holidays. Empty ClientID → sync endpoint returns 503.
@@ -210,6 +222,7 @@ func Load() (Config, error) {
 		ClamAVAddr:           env("CLAMAV_ADDR", ""),
 		DemoJWTSecret:        env("DEMO_JWT_SECRET", ""),
 	}
+	c.MFAMandatoryEnforced = envBool("MFA_MANDATORY_ENFORCED", true)
 	c.DemoMode = envBool("DEMO_MODE", false)
 	c.DemoMaxWorkspaces = envInt("DEMO_MAX_WORKSPACES", 8)
 	c.DemoIdleReclaimDays = envInt("DEMO_IDLE_RECLAIM_DAYS", 14)

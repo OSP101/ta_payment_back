@@ -132,6 +132,17 @@ Enforced by `AccountGuard`'s `mfa_setup_required` branch — every endpoint
 except `/me`, `/me/2fa/*`, and `/auth/heartbeat` 403s for a mandatory-tier
 account with no TOTP enrolled.
 
+**Operational kill switch**: `MFA_MANDATORY_ENFORCED=false` in `.env` turns
+that blocking branch off — a mandatory-tier account with no TOTP can use
+every endpoint normally instead of being routed to `/setup-2fa`. Defaults to
+`true`. This does **not** touch 2FA for anyone who has already enrolled —
+`LoginTwoFactor` still challenges them at every login regardless of this
+flag; it only controls whether NOT having 2FA yet is itself a block. Use
+this when rolling the feature out before real authenticator apps are
+enrolled, or if enforcement itself is what's locking someone out mid-
+incident — flip it back to `true` (or remove it) once real enrolment is
+ready to be required again. See `config.Config.MFAMandatoryEnforced`.
+
 **Recovery, in order of preference**:
 1. One of the 10 recovery codes issued at enrolment (`POST
    /auth/login/2fa` accepts either a 6-digit TOTP or a recovery code).
@@ -167,6 +178,110 @@ all, so branching the mandatory-2FA check on it would have silently
 disabled 2FA enforcement for every real admin/staff account. If a future
 change ever needs to check "is this a demo request", use `IsDemoSlot`, not
 `DemoMode`.
+
+## PDPA consent (TA profile data)
+
+Added 2026-08-16. Before a TA can submit the profile form (citizen ID,
+bank/PromptPay details, signature — see `app/ta/(home)/documents/page.tsx`'s
+Step 1), the frontend shows a PDPA notice (`PdpaConsentModal`) explaining what
+is collected, why (staff forward the account number to Finance for entry into
+the university ERP system), that the citizen ID is stored encrypted, and that
+access is logged and role-restricted. `DocsService.UpsertProfile`
+(`internal/service/pdpa_consent.go`) refuses the request server-side if no
+consent is on file, so this is not just a UI gate — a direct API call without
+ever hitting `POST /me/pdpa-consent` still gets a 403.
+
+**Storage**: `pdpa_consents` (migration `0092_pdpa_consent`) — one row per
+`(user_id, version)`, insert-only, holding `consented_at`, `ip`, and
+`user_agent`. This is deliberately a durable proof-of-consent record, not a
+mutable flag: if a TA is ever asked "did you actually agree to this, and
+when", the answer is this row, not a developer's assurance.
+
+**Re-consent**: `pdpaConsentVersion` in `internal/service/pdpa_consent.go` is
+the currently-effective notice text's version. Bumping it (after a material
+change to the notice) makes `HasPdpaConsent` return false for every existing
+user, since it only checks for a row at the *current* version — no extra
+migration or backfill needed for a re-consent rollout.
+
+**Audit**: every acceptance also writes an `audit_logs` row via
+`Auditor.Log`, action `user.pdpa_consent` — searchable from `/staff/audit`
+like any other audited action, in addition to the dedicated table above.
+
+**Demo sandbox**: the scripted demo walkthrough (`internal/demo/scenario_steps.go`)
+calls `RecordPdpaConsent` for its seeded TA before `UpsertProfile`, standing
+in for a real user having read and accepted the modal — otherwise the
+scripted profile submission step would 403 the same as it would for a real
+user with no consent on file.
+
+## PDPA self-service data access and deletion
+
+Added 2026-08-16. Two rights, both self-service from `/account/my-data`:
+
+**View/export** (`GET /me/data-export`, `internal/service/data_export.go`) —
+returns everything the system holds on the caller: profile fields, the
+citizen ID's last 4 digits (never the full number — see below), document
+status, session/login history, the PDPA consent record, and their own recent
+audit trail. Requesting it is itself audited (`user.data_export`) — reading
+PII back out is worth a trail regardless of who is doing the reading, same
+reasoning `RevealCitizenID` already applies to staff/admin reveals.
+
+**Full citizen-ID reveal** (`POST /me/citizen-id/reveal`) is a separate,
+password-gated action (`service.VerifyUserPassword`, the same step-up-auth
+every other sensitive self-service action uses) — it is not part of the plain
+export precisely because it decrypts the one field this codebase otherwise
+treats as write-only. Reuses `DocsService.RevealCitizenID` with actor and
+target both set to the caller, so it audits identically to a staff reveal.
+
+**Deletion** is request-based, not an instant self-delete button — this
+system pays real people real money, and citizen ID / worklog / appointment
+data tied to an already-processed payout has its own accounting/tax
+retention basis that a data-subject request cannot override. Flow:
+
+1. `POST /me/data-deletion-request` (TA-only) — one pending request at a
+   time, enforced by a partial unique index
+   (`ix_data_deletion_requests_one_pending`, migration `0093`) rather than
+   application code.
+2. An **admin** (not staff — see below) reviews it via
+   `GET`/`POST /staff/data-deletion-requests`. Reject requires a note, same
+   "reason required" rule `DocsService.ReviewProfile` already applies to
+   rejecting a profile.
+3. Approve runs `DataDeletionService.ReviewDeletion`
+   (`internal/service/data_deletion.go`) in one transaction:
+   - **always**: deactivate the account, clear the avatar, clear the TOTP
+     secret/recovery codes (identical SQL to `MFAService.AdminReset`, a
+     different code path to the same effect), and afterward — as
+     best-effort follow-ups, same "physical side effects happen after the
+     row commits" convention `SetAvatar` already uses — revoke every
+     session, force-scrub any not-yet-expired document blobs
+     (`DocsService.ScrubUserDocuments`, a `sweepExpired` sibling scoped to
+     one user instead of the global retention timer), and notify the TA.
+   - **only if `HasPaymentHistory` is false** (no approved worklog, no
+     appointment-order line — checked via `EXISTS` over `work_logs`/
+     `ta_request_assignments` and `appointment_order_items`): also clear
+     `ta_profiles.citizen_id_enc`/`citizen_id_last4`/`citizen_id_key_version`
+     and set `users.deleted_at` — **the first real writer of that column**.
+     It has existed since migration `0001` and every read in this codebase
+     already filters `WHERE deleted_at IS NULL` (`UserService`'s
+     `Get`/`List`/`FindByEmail`, `AccountGuard`), but nothing had ever set
+     it before this feature.
+   - Both branches write `ta_deletion_request.approve` **and** a separate
+     `user.pdpa_erasure` audit row whose `Note` states which branch ran
+     (`"partial: payment history retained"` vs `"full: no payment history,
+     citizen ID cleared"`) — durable, staff-visible proof (via `/staff/audit`,
+     including its `before`/`after` column) of exactly what was and wasn't
+     erased, not something inferred later from column state alone.
+
+**Why admin-only, not staff**: erasure is irreversible and comparable in
+sensitivity to this router's other admin-only actions
+(`unlock-password-gate`, `2fa/reset`, `audit-logs`) — a bigger blast radius
+than the routine TA-submission review queues (`ta-review/*`, worklog
+approve/reject) staff can already action.
+
+**Known limitation**: `users.email` has a plain (non-partial) `UNIQUE`
+constraint, so a fully-erased account's email stays reserved forever — no
+future account (a re-hire, an SSO re-provision) can reuse it. Fixing this
+would mean a partial unique index scoped to `deleted_at IS NULL`, which is a
+separate, larger schema change than this feature's scope.
 
 ## SSO (currently a stub)
 

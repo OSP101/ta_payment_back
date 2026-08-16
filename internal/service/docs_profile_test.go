@@ -133,6 +133,9 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 	svc, makeUser := profileSvc(t)
 	ctx := context.Background()
 	uid := makeUser("นาย", "สุพพิธาน", "ภักสวัสดิ์", "653020111-1", "0812345678")
+	if err := svc.RecordPdpaConsent(ctx, uid, "127.0.0.1", "test-agent"); err != nil {
+		t.Fatalf("RecordPdpaConsent: %v", err)
+	}
 
 	if err := svc.UpsertProfile(ctx, uid, TAProfile{
 		StudentID: "653020111-1", Prefix: "นาย", Phone: "0812345678",

@@ -391,6 +391,12 @@ func stepTADocs(ctx context.Context, svc *service.Container) (string, error) {
 			AccountName:  "บัญชีทดลอง",
 			SignatureSVG: minimalSignatureSVG,
 		}
+		// The scripted walkthrough stands in for a TA who has already read and
+		// accepted the PDPA notice on the real form — UpsertProfile refuses
+		// without it, same as it would for a real user.
+		if err := svc.Docs.RecordPdpaConsent(ctx, taID, "demo", "demo-scenario"); err != nil {
+			return "", fmt.Errorf("บันทึกความยินยอม PDPA ของ %s: %w", cs.taEmail, err)
+		}
 		if err := svc.Docs.UpsertProfile(ctx, taID, profile); err != nil {
 			return "", fmt.Errorf("บันทึกโปรไฟล์ %s: %w", cs.taEmail, err)
 		}

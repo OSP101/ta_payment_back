@@ -246,6 +246,18 @@ func validateProfileInput(in *TAProfile) error {
 // Nothing sensitive is persisted: the national ID, bank details and signature
 // travel to BuildCreditorFormPDF in the same request and end up in the PDF.
 func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TAProfile) error {
+	// Defense-in-depth: the frontend already blocks this form behind
+	// PdpaConsentModal until /me/pdpa-consent succeeds, so this should be
+	// unreachable in normal use — but the API itself must not accept PII
+	// from someone who was never shown the notice, in case that gate is ever
+	// skipped (a direct API call, a future client, a frontend bug). Checked
+	// before validation so the response is unambiguous: this request would
+	// be refused regardless of what the payload contains.
+	if consented, err := s.HasPdpaConsent(ctx, userID); err != nil {
+		return err
+	} else if !consented {
+		return Forbidden("กรุณายอมรับข้อตกลงการเก็บและใช้ข้อมูลส่วนบุคคล (PDPA) ก่อนบันทึกข้อมูล")
+	}
 	if err := validateProfileInput(&in); err != nil {
 		return err
 	}

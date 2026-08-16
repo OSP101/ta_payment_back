@@ -196,7 +196,16 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 		// whenever the sandbox is merely switched on; branching on it here
 		// would silently turn mandatory 2FA off for every real admin/staff
 		// account the moment DEMO_MODE=true.
-		mustEnroll := !svc.Cfg.IsDemoSlot && totpEnabledAt == nil && mfaMandatoryFor(Roles(c), isExecutive)
+		//
+		// MFAMandatoryEnforced is the separate operational kill switch (see
+		// its own doc comment) — MFA_MANDATORY_ENFORCED=false lets a
+		// mandatory-tier account without TOTP through without touching
+		// anything for an account that already has 2FA on: the second
+		// factor is still checked at login (LoginTwoFactor) regardless of
+		// this flag, which only controls whether NOT having one yet blocks
+		// every other endpoint.
+		mustEnroll := svc.Cfg.MFAMandatoryEnforced && !svc.Cfg.IsDemoSlot &&
+			totpEnabledAt == nil && mfaMandatoryFor(Roles(c), isExecutive)
 		if mustEnroll &&
 			!strings.HasSuffix(p, "/me") &&
 			!strings.Contains(p, "/me/2fa/") &&

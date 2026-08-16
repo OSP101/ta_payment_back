@@ -139,6 +139,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	})
 
 	authed.Get("/me", authH.Me)
+	authed.Get("/me/data-export", authH.DataExport)
 	authed.Post("/me/password", authH.ChangePassword)
 	// Touched by AccountGuard itself (any POST does) — see AuthHandler.Heartbeat
 	// and SessionActivityGuard on the frontend.
@@ -272,6 +273,19 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	dh := &DocsHandler{Svc: svc}
 	authed.Get("/me/profile", RequireRole(rbac.RoleTA), dh.GetProfile)
 	authed.Put("/me/profile", RequireRole(rbac.RoleTA), dh.UpsertProfile)
+	authed.Post("/me/pdpa-consent", RequireRole(rbac.RoleTA), dh.RecordPdpaConsent)
+	authed.Post("/me/citizen-id/reveal", RequireRole(rbac.RoleTA), dh.RevealCitizenID)
+
+	// PDPA data-deletion requests. Review is admin-only (not adminOrStaff) —
+	// erasure is comparable in sensitivity to unlock-password-gate/2fa-reset/
+	// audit-logs, the other admin-only actions in this router, unlike routine
+	// TA-submission review queues (ta-review/*, worklog approve/reject) which
+	// staff can action too.
+	ddh := &DataDeletionHandler{Svc: svc}
+	authed.Post("/me/data-deletion-request", RequireRole(rbac.RoleTA), ddh.RequestDeletion)
+	authed.Get("/me/data-deletion-request", RequireRole(rbac.RoleTA), ddh.MyRequest)
+	authed.Get("/staff/data-deletion-requests", RequireRole(rbac.RoleAdmin), ddh.ListRequests)
+	authed.Post("/staff/data-deletion-requests/:id/review", RequireRole(rbac.RoleAdmin), ddh.Review)
 	authed.Get("/me/documents", RequireRole(rbac.RoleTA), dh.ListDocs)
 	authed.Post("/me/documents", RequireRole(rbac.RoleTA), heavyLimiter, dh.UploadDoc)
 	authed.Get("/me/history", RequireRole(rbac.RoleTA), dh.SelfHistory)

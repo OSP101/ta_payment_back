@@ -40,6 +40,7 @@ type Container struct {
 	Holiday           *HolidayService
 	DocProgress       *DocumentProgressService
 	MFA               *MFAService
+	DataDeletion      *DataDeletionService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
@@ -79,5 +80,9 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		botAPIClientID: cfg.BotAPIClientID,
 	}
 	c.MFA = &MFAService{pool: pool, aud: auditor, totp: totpCipher}
+	c.DataDeletion = &DataDeletionService{
+		pool: pool, aud: auditor, docs: c.Docs, users: c.Users,
+		sessions: c.Sessions, notify: c.Notify, store: store,
+	}
 	return c
 }

@@ -1004,3 +1004,52 @@ func (s *DocsService) sweepExpired(ctx context.Context) {
 		}
 	}
 }
+
+// ScrubUserDocuments force-deletes every not-yet-purged blob belonging to
+// userID, regardless of expires_at — sweepExpired only ever purges docs whose
+// normal retention timer has already elapsed, and a PDPA deletion-request
+// approval cannot wait on that. Same delete-then-mark shape as sweepExpired's
+// inner loop, just scoped to one user and callable synchronously (it returns
+// an error to its caller instead of only logging, since this runs as part of
+// an explicit request a caller needs to know the outcome of).
+func (s *DocsService) ScrubUserDocuments(ctx context.Context, actor, userID uuid.UUID) error {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, storage_key FROM ta_documents
+		 WHERE user_id = $1 AND file_deleted_at IS NULL`, userID)
+	if err != nil {
+		return err
+	}
+	type toPurge struct {
+		id  uuid.UUID
+		key string
+	}
+	var batch []toPurge
+	for rows.Next() {
+		var p toPurge
+		if err := rows.Scan(&p.id, &p.key); err != nil {
+			rows.Close()
+			return err
+		}
+		batch = append(batch, p)
+	}
+	rows.Close()
+
+	for _, p := range batch {
+		if err := s.store.Delete(p.key); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("delete %s: %w", p.key, err)
+		}
+		if err := writeAudited(ctx, s.pool, s.aud,
+			audit.Entry{ActorID: &actor, Action: "ta_doc.expire", Entity: "ta_document",
+				EntityID: p.id.String(), Note: "pdpa deletion request",
+				Before: map[string]any{"storage_key": p.key}},
+			func(tx pgx.Tx) error {
+				_, err := tx.Exec(ctx,
+					`UPDATE ta_documents SET file_deleted_at = NOW()
+					 WHERE id = $1 AND file_deleted_at IS NULL`, p.id)
+				return err
+			}); err != nil {
+			return err
+		}
+	}
+	return nil
+}

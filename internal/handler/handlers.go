@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"strconv"
@@ -996,6 +997,42 @@ func (h *DocsHandler) UpsertProfile(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
+}
+
+// RecordPdpaConsent is called by the PdpaConsentModal on the frontend before
+// UpsertProfile will accept a submission — see that function's own consent
+// check for why this is not merely a UI nicety.
+func (h *DocsHandler) RecordPdpaConsent(c *fiber.Ctx) error {
+	if err := h.Svc.Docs.RecordPdpaConsent(c.Context(), UserID(c), c.IP(), c.Get("User-Agent")); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+type revealCitizenIDReq struct {
+	Password string `json:"password" validate:"required"`
+}
+
+// RevealCitizenID lets a TA see their own full citizen ID on /account/my-data
+// — the PDPA "view my data" access right. Password-gated (same step-up-auth
+// pattern MFAHandler.Disable/RegenerateRecoveryCodes use) rather than free on
+// any authenticated request, since it decrypts and returns the one field this
+// codebase otherwise treats as write-only. Reuses RevealCitizenID's existing
+// audited path with actor == target == the caller themselves.
+func (h *DocsHandler) RevealCitizenID(c *fiber.Ctx) error {
+	var in revealCitizenIDReq
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	uid := UserID(c)
+	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, uid, in.Password); err != nil {
+		return err
+	}
+	nationalID, err := h.Svc.Docs.RevealCitizenID(c.Context(), uid, uid, "self-service PDPA data access")
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"national_id": nationalID})
 }
 
 func (h *DocsHandler) ListDocs(c *fiber.Ctx) error {
@@ -2740,7 +2777,7 @@ func (h *AuditHandler) List(c *fiber.Ctx) error {
 		limit = 100
 	}
 	rows, err := h.Svc.Pool.Query(c.Context(), `
-		SELECT id, at, actor_id, actor_role::text, action, entity, entity_id, ip::text, note
+		SELECT id, at, actor_id, actor_role::text, action, entity, entity_id, ip::text, before, after, note
 		FROM audit_logs ORDER BY at DESC LIMIT $1`, limit)
 	if err != nil {
 		return err
@@ -2754,12 +2791,20 @@ func (h *AuditHandler) List(c *fiber.Ctx) error {
 		var actorRole *string
 		var action, entity string
 		var entityID, ip, note *string
-		if err := rows.Scan(&id, &at, &actorID, &actorRole, &action, &entity, &entityID, &ip, &note); err != nil {
+		// before/after are JSONB, NULL for most actions (only writers that pass
+		// audit.Entry.Before/After populate them). Scanned as raw bytes and
+		// re-emitted as json.RawMessage so the API returns the actual object
+		// (or null) instead of a stringified blob — every write already stores
+		// this (audit.write, internal/audit/audit.go), this handler just never
+		// read it back out.
+		var before, after []byte
+		if err := rows.Scan(&id, &at, &actorID, &actorRole, &action, &entity, &entityID, &ip, &before, &after, &note); err != nil {
 			return err
 		}
 		out = append(out, fiber.Map{
 			"id": id, "at": at, "actor_id": actorID, "actor_role": actorRole,
-			"action": action, "entity": entity, "entity_id": entityID, "ip": ip, "note": note,
+			"action": action, "entity": entity, "entity_id": entityID, "ip": ip,
+			"before": json.RawMessage(before), "after": json.RawMessage(after), "note": note,
 		})
 	}
 	return c.JSON(out)

@@ -181,6 +181,25 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	return c.JSON(u)
 }
 
+// DataExport answers the PDPA "what do you have on me" request — see
+// UserService.ExportMyData. Requesting your own export is itself audit-worthy,
+// the same reasoning DocsService.RevealCitizenID already applies to reading
+// PII back out.
+func (h *AuthHandler) DataExport(c *fiber.Ctx) error {
+	uid := UserID(c)
+	out, err := h.Svc.Users.ExportMyData(c.Context(), uid)
+	if err != nil {
+		return err
+	}
+	if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{
+		ActorID: &uid, Action: "user.data_export", Entity: "user", EntityID: uid.String(),
+		IP: c.IP(), UserAgent: c.Get("User-Agent"),
+	}); err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 type changePwReq struct {
 	CurrentPassword string `json:"current_password"`
 	NewPassword     string `json:"new_password"`

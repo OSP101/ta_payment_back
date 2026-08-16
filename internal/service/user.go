@@ -49,6 +49,11 @@ type User struct {
 	// /account so a user notices before they run out, without ever
 	// re-displaying the codes themselves.
 	RecoveryCodesRemaining int `json:"recovery_codes_remaining"`
+	// PdpaConsentedAt is when this user accepted the CURRENT pdpaConsentVersion
+	// notice (see pdpa_consent.go), or nil if never. Only meaningful for TAs —
+	// the documents page uses its absence to gate the profile form behind
+	// PdpaConsentModal before any PII can be typed in.
+	PdpaConsentedAt *time.Time `json:"pdpa_consented_at,omitempty"`
 	// AvatarURL is derived, never stored: the API path that streams the
 	// picture, with the last-changed timestamp as a cache-buster. Nil when the
 	// user has not set one, which is what tells the UI to draw initials.
@@ -170,9 +175,10 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	var totpEnabledAt *time.Time
 	err := s.pool.QueryRow(ctx,
 		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, is_executive, admin_position, avatar_key, avatar_updated_at, totp_enabled_at,
-		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL)
+		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL),
+		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = 1)
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
-		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &totpEnabledAt, &u.RecoveryCodesRemaining,
+		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &totpEnabledAt, &u.RecoveryCodesRemaining, &u.PdpaConsentedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
