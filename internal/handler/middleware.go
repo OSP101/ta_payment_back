@@ -111,23 +111,36 @@ func RequireExecutiveView(pool *pgxpool.Pool) fiber.Handler {
 // last_activity_at so the session's idle clock resets. GET requests do not —
 // a tab left open on a read-only page, or background polling, must not by
 // itself keep a dead session alive.
+// mfaMandatoryFor decides whether the mandatory-2FA-enrolment tier applies to
+// a request carrying roles (from JWT claims) and isExecutive (read live from
+// the DB — see AccountGuard's own comment on why this one field can't be
+// trusted from the token). Pulled out of AccountGuard as its own function so
+// the tier logic — the part product policy actually changes, e.g. "should
+// lecturer be mandatory too" — has one answer that's unit-testable without
+// standing up a full service.Container and an HTTP round trip.
+func mfaMandatoryFor(roles []string, isExecutive bool) bool {
+	return rbac.Has(roles, rbac.RoleAdmin, rbac.RoleStaff) || isExecutive
+}
+
 func AccountGuard(svc *service.Container) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		p := c.Path()
 		uid := UserID(c)
 		sid := SessionID(c)
 
-		var isActive, mustChange bool
+		var isActive, mustChange, isExecutive bool
+		var totpEnabledAt *time.Time
 		var sessRevokedAt *time.Time
 		var sessRevokeReason *string
 		var sessLastActivity *time.Time
 		err := svc.Pool.QueryRow(c.Context(),
-			`SELECT u.is_active, u.must_change_password,
+			`SELECT u.is_active, u.must_change_password, u.is_executive, u.totp_enabled_at,
 			        s.revoked_at, s.revoke_reason, s.last_activity_at
 			 FROM users u
 			 LEFT JOIN sessions s ON s.id = $2
 			 WHERE u.id = $1 AND u.deleted_at IS NULL`,
-			uid, sid).Scan(&isActive, &mustChange, &sessRevokedAt, &sessRevokeReason, &sessLastActivity)
+			uid, sid).Scan(&isActive, &mustChange, &isExecutive, &totpEnabledAt,
+			&sessRevokedAt, &sessRevokeReason, &sessLastActivity)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "บัญชีนี้ไม่สามารถใช้งานได้"})
 		}
@@ -157,6 +170,45 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 			!strings.HasSuffix(p, "/me/password") &&
 			!strings.HasSuffix(p, "/auth/heartbeat") {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "password_change_required"})
+		}
+
+		// Mandatory 2FA enrolment for admin/staff/executive accounts. Checked
+		// AFTER mustChange, not before: a brand-new admin can have BOTH
+		// pending (must_change_password from CreateUserInput, no TOTP yet
+		// enrolled), and resolving password-change first means the two forced
+		// flows never have to be reconciled in one screen — see
+		// docs/SECURITY.md for why this ordering is load-bearing, not
+		// incidental.
+		//
+		// mustEnroll reads roles from the JWT (Roles(c)), NOT a fresh query —
+		// see Authenticated, which puts them there — because a role EDIT
+		// already revokes every session for that user (roles_changed, see
+		// UserHandler.Update), so a stale claim here is not possible: by the
+		// time a promoted admin/staff account is making requests again, it is
+		// on a freshly issued token. isExecutive is the one exception and IS
+		// read live above: RequireExecutiveView already established that
+		// is_executive can change without a session revocation (unlike
+		// user_roles), so trusting a token claim for it would let a freshly
+		// flagged executive skip enrolment for up to a full JWTLifetime.
+		//
+		// svc.Cfg.IsDemoSlot, NOT svc.Cfg.DemoMode — see that field's own doc
+		// comment. DemoMode is true on the real production Config too
+		// whenever the sandbox is merely switched on; branching on it here
+		// would silently turn mandatory 2FA off for every real admin/staff
+		// account the moment DEMO_MODE=true.
+		mustEnroll := !svc.Cfg.IsDemoSlot && totpEnabledAt == nil && mfaMandatoryFor(Roles(c), isExecutive)
+		if mustEnroll &&
+			!strings.HasSuffix(p, "/me") &&
+			!strings.Contains(p, "/me/2fa/") &&
+			!strings.HasSuffix(p, "/auth/heartbeat") {
+			// strings.Contains, not HasPrefix: demo mounts these same routes
+			// under /api/demo/w/<n>/me/2fa/... (see MountAll) — a prefix
+			// test would silently fail to exempt them there. Moot while
+			// IsDemoSlot already skips this branch entirely for every demo
+			// slot, but keeping the match style consistent with the
+			// mustChange allowlist above means this stays correct if that
+			// ever changes.
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "mfa_setup_required"})
 		}
 
 		if c.Method() != fiber.MethodGet && c.Method() != fiber.MethodHead {

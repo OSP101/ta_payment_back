@@ -39,9 +39,10 @@ type Container struct {
 	ExportBatches     *ExportBatchService
 	Holiday           *HolidayService
 	DocProgress       *DocumentProgressService
+	MFA               *MFAService
 }
 
-func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher) *Container {
+func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
 	c := &Container{Pool: pool, Storage: store, Mailer: mailer, Auditor: auditor, Cfg: cfg}
 	c.Sessions = &SessionService{pool: pool}
 	c.Users = &UserService{pool: pool, aud: auditor}
@@ -77,5 +78,6 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		botAPIBaseURL:  cfg.BotAPIBaseURL,
 		botAPIClientID: cfg.BotAPIClientID,
 	}
+	c.MFA = &MFAService{pool: pool, aud: auditor, totp: totpCipher}
 	return c
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -47,6 +48,47 @@ func TestFillCreditor_Smoke(t *testing.T) {
 	// A real overlay is at least ~10 KB because of the imported template.
 	if len(out) < 10_000 {
 		t.Errorf("output smaller than expected: %d bytes", len(out))
+	}
+}
+
+// TestFillCreditor_Overlong feeds every free-text field a value far longer
+// than its printed run, and every digit grid more digits than it has boxes.
+// Real profiles do hit the short runs — the "(………)" under the signature only
+// fits ~25 Thai characters at full size — and the shrink-to-fit loop in
+// setTextInField and the clamp in fillGrid are the only things standing
+// between that and a form with text sprawling across neighbouring cells.
+func TestFillCreditor_Overlong(t *testing.T) {
+	tpl := filepath.FromSlash("../../assets/creditor_form_template.pdf")
+	fonts := filepath.FromSlash("../../assets/fonts")
+	if _, err := os.Stat(tpl); err != nil {
+		t.Skipf("template missing (%v); skipping", err)
+	}
+	if _, err := os.Stat(filepath.Join(fonts, "Sarabun-Regular.ttf")); err != nil {
+		t.Skipf("fonts missing; skipping")
+	}
+
+	long := strings.Repeat("ประภัสสรากานต์ศรีวิโรจนานนท์", 4)
+	out, err := FillCreditor(CreditorInput{
+		TemplatePath: tpl,
+		FontDir:      fonts,
+		Data: CreditorData{
+			Prefix:      "นางสาว",
+			FullName:    long,
+			NationalID:  "12345678901234567890",
+			Phone:       "081-234-5678 ต่อ 12345",
+			Email:       strings.Repeat("a", 80) + "@kkumail.com",
+			AccountName: long,
+			BankName:    "ธนาคาร" + long,
+			BranchCode:  "05550555055505550555",
+			Branch:      long,
+			AccountNo:   "12345678901234567890",
+		},
+	})
+	if err != nil {
+		t.Fatalf("FillCreditor: %v", err)
+	}
+	if !bytes.HasPrefix(out, []byte("%PDF-")) {
+		t.Errorf("output is not a PDF (first bytes: %q)", out[:min(8, len(out))])
 	}
 }
 

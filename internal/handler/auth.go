@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -35,6 +36,61 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	if u.TOTPEnabled {
+		// Password verified, second factor still outstanding: no session,
+		// no cookie, and deliberately NO user object in the response — the
+		// full profile (email, names, roles) must not be handed out on a
+		// password-only success. See POST /auth/login/2fa (LoginTwoFactor)
+		// for step 2.
+		challenge, err := h.Svc.MFA.IssueChallenge(c.Context(), u.ID)
+		if err != nil {
+			return err
+		}
+		return c.JSON(fiber.Map{"mfa_required": true, "challenge": challenge})
+	}
+	return h.finishLogin(c, u)
+}
+
+type login2FAReq struct {
+	Challenge string `json:"challenge" validate:"required"`
+	Code      string `json:"code" validate:"required"`
+}
+
+// mfaInvalidMsg is shown for every rejection reason POST /auth/login/2fa can
+// hit — wrong code, expired challenge, already-consumed challenge, or
+// attempts exhausted. Deliberately identical across all of them: see
+// service.ErrMFAChallengeInvalid's own doc comment for why the difference
+// between those cases must not be observable to the caller.
+const mfaInvalidMsg = "รหัสยืนยันไม่ถูกต้องหรือหมดอายุ กรุณาเข้าสู่ระบบใหม่อีกครั้ง"
+
+// LoginTwoFactor is step 2 of login: redeem the challenge IssueChallenge
+// handed back from step 1 with a TOTP or recovery code. On success this does
+// exactly what a password-only Login already does — CreateAndSupersede,
+// Issue, setAuthCookie — via the same finishLogin helper.
+func (h *AuthHandler) LoginTwoFactor(c *fiber.Ctx) error {
+	var in login2FAReq
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	userID, err := h.Svc.MFA.RedeemChallenge(c.Context(), in.Challenge, in.Code, c.IP(), c.Get("User-Agent"))
+	if err != nil {
+		if errors.Is(err, service.ErrMFAChallengeInvalid) {
+			return fiber.NewError(fiber.StatusUnauthorized, mfaInvalidMsg)
+		}
+		return err
+	}
+	u, err := h.Svc.Users.Get(c.Context(), userID)
+	if err != nil {
+		return err
+	}
+	return h.finishLogin(c, u)
+}
+
+// finishLogin mints the session, token and cookie for an already-fully-
+// authenticated user (password alone when 2FA is off, or password+code when
+// it's on) and returns the same {"user": ...} body either path used to
+// return directly.
+func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User) error {
 	// The synthetic executive role rides in the TOKEN only, not in u.Roles:
 	// RequireRole reads roles from JWT claims, so leaving it out here made the
 	// analytics endpoints 403 for a flagged lecturer. u.Roles itself stays the
@@ -77,6 +133,13 @@ func (h *AuthHandler) SSOURL(c *fiber.Ctx) error {
 
 // SSOCallback exchanges an authorization code for a session.
 // Stub: real implementation depends on KKU IT integration protocol.
+//
+// When this is implemented: it MUST branch on TOTPEnabled and issue an MFA
+// challenge exactly like Login does, not go straight to CreateAndSupersede +
+// Issue + setAuthCookie. SSO is a second, independent path to a session, and
+// nothing about a KKU SSO assertion proves possession of the account's
+// second factor — copy Login's TOTPEnabled branch, don't skip it because
+// "SSO already authenticated them".
 func (h *AuthHandler) SSOCallback(c *fiber.Ctx) error {
 	return fiber.NewError(fiber.StatusNotImplemented, "SSO callback not yet configured — supply SSO_* env vars and update handler once KKU IT provides endpoints/credentials")
 }

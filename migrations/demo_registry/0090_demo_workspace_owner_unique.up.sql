@@ -1,0 +1,13 @@
+-- 15/08/2026 — closes a real race in Manager.Claim: the "does this email
+-- already own a slot" check ran unlocked, before the free-slot transaction
+-- even opened, so two concurrent /api/demo/enter calls for the SAME
+-- brand-new email could each independently lock and claim a DIFFERENT free
+-- slot — nothing stopped it, because owner_email carried no uniqueness
+-- constraint at all. A partial index (WHERE owner_email IS NOT NULL, so
+-- any number of FREE slots can all still be NULL at once) makes the
+-- database itself the backstop: Claim's final UPDATE now fails with a
+-- unique_violation on the losing side of that race instead of silently
+-- succeeding twice, and Claim (manager.go) catches that specific error and
+-- resumes the slot the winner just claimed rather than surfacing it to the
+-- caller as a failure.
+CREATE UNIQUE INDEX demo_workspaces_owner_email_uidx ON demo_workspaces (owner_email) WHERE owner_email IS NOT NULL;

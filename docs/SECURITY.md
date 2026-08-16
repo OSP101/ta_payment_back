@@ -29,6 +29,9 @@ it before every production deploy and before rotating any secret.
     `docker-compose.yml` is actually healthy, not just running —
     `clamdcheck.sh` takes a few minutes on a cold volume, and uploads
     fail-closed until it passes.
+  - `TOTP_ENC_KEY` — required unconditionally (like `PII_ENC_KEY`; the
+    server refuses to boot without it). Encrypts every TOTP secret at rest
+    — see "Two-factor authentication (2FA)" below.
 - [ ] `docker compose up -d` has been run since the last `.env` change at
       the repo root, so Postgres's port binding (`127.0.0.1:5432`, not
       `0.0.0.0:5432`) actually took effect on the running container.
@@ -94,6 +97,18 @@ corruption). **Back up `UPLOAD_DIR` before running `-apply`** — the tool is
 tested, but this is real, hard-to-replace TA data and the backup costs
 almost nothing next to what re-uploading hundreds of documents would cost.
 
+### `TOTP_ENC_KEY` (encrypts `users.totp_secret_enc` / `totp_pending_secret_enc`)
+Same one-key-at-a-time limitation as `PII_ENC_KEY` — swapping this without
+migrating existing rows makes every enrolled user's stored TOTP secret
+permanently undecryptable, which means their authenticator app can no longer
+be validated against and they are locked out at the next login. **There is
+no `cmd/rotate-totp-key` tool yet** (see "Known accepted risks" below) — do
+not rotate this key on a running system with any `totp_enabled_at IS NOT
+NULL` rows without first either building that tool (mirror
+`cmd/rotate-pii-key`'s dry-run/apply/version-check shape exactly) or accepting
+that every 2FA-enrolled user will need `cmd/reset-2fa` run against their
+account and will have to re-enrol.
+
 ### Secrets this project can't rotate by itself
 - `SMTP_PASS`, `BOT_API_CLIENT_ID`, `SSO_CLIENT_SECRET` (if SSO is ever
   wired up) are credentials issued by external systems (KKU mail/relay,
@@ -105,12 +120,68 @@ almost nothing next to what re-uploading hundreds of documents would cost.
   /users/:id/reset-password` (admin/staff) flow, which forces a
   `must_change_password` on next login. Don't hand-edit `password_hash`.
 
+## Two-factor authentication (2FA)
+
+TOTP-based (RFC 6238), added 2026-08-16. Login is two steps when 2FA is
+enabled — see `internal/handler/auth.go`'s `AuthHandler.Login` /
+`LoginTwoFactor` and `internal/handler/middleware.go`'s `AccountGuard`.
+
+**Policy**: mandatory for admin, staff, and any account with
+`is_executive=true`; optional (opt-in from `/account`) for lecturer and TA.
+Enforced by `AccountGuard`'s `mfa_setup_required` branch — every endpoint
+except `/me`, `/me/2fa/*`, and `/auth/heartbeat` 403s for a mandatory-tier
+account with no TOTP enrolled.
+
+**Recovery, in order of preference**:
+1. One of the 10 recovery codes issued at enrolment (`POST
+   /auth/login/2fa` accepts either a 6-digit TOTP or a recovery code).
+2. An admin-initiated reset: `POST /users/:id/2fa/reset`, **admin-only**
+   (not staff — see `MFAService.AdminReset`'s doc comment for why:
+   staff already hold unrestricted password reset, and adding
+   unrestricted 2FA reset on top would chain into a one-click admin
+   takeover), gated behind the acting admin's own password, refuses
+   targeting self.
+3. **Break-glass** — `cmd/reset-2fa`, for when there is no admin left with
+   access (the last admin lost their phone and their recovery codes, so
+   nobody can call #2 on their behalf):
+   ```
+   # Dry run first — reports current state, writes nothing.
+   DATABASE_URL=... go run ./cmd/reset-2fa -email=admin@example.com
+
+   # Apply — clears the account's TOTP secret and every recovery code.
+   DATABASE_URL=... go run ./cmd/reset-2fa -email=admin@example.com -apply
+   ```
+   Deliberately bypasses the API, the audit log, and every in-app
+   authorization check — by the time this is needed, none of those are
+   reachable. Whoever holds `DATABASE_URL` already holds the keys to the
+   whole system regardless. The account is left free to log in with just
+   its password and gets routed to `/setup-2fa` to re-enrol, same as any
+   other mandatory-tier account with no TOTP on file.
+
+**Demo sandbox**: mandatory 2FA is skipped entirely inside every demo slot
+(`config.Config.IsDemoSlot`, set only by `internal/demo.Bootstrap` on each
+slot's own Config copy). This is deliberately **not** the same flag as
+`DemoMode` — see `IsDemoSlot`'s doc comment: `DemoMode` is also `true` on
+the real production `Config` whenever the sandbox feature is switched on at
+all, so branching the mandatory-2FA check on it would have silently
+disabled 2FA enforcement for every real admin/staff account. If a future
+change ever needs to check "is this a demo request", use `IsDemoSlot`, not
+`DemoMode`.
+
 ## SSO (currently a stub)
 
 `AuthHandler.SSOCallback` returns 501 — there is no live OAuth/OIDC flow to
-secure yet. **Before implementing it**, the callback needs `state`
-(CSRF) and PKCE, not just an authorization-code exchange — add this as part
-of the implementation, not as a follow-up hardening pass afterward.
+secure yet. **Before implementing it**:
+- it needs `state` (CSRF) and PKCE, not just an authorization-code exchange
+  — add this as part of the implementation, not as a follow-up hardening
+  pass afterward.
+- it must branch on `TOTPEnabled` and issue an MFA challenge exactly like
+  `Login` does, not go straight to `CreateAndSupersede` + `Issue` +
+  `setAuthCookie`. SSO is a second, independent path to a session — nothing
+  about a KKU SSO assertion proves possession of the account's TOTP
+  secret, and skipping the 2FA branch "because SSO already authenticated
+  them" would let a mandatory-tier account bypass 2FA entirely through
+  this path.
 
 ## Known accepted risks (revisit periodically, not blocking)
 
@@ -126,6 +197,11 @@ of the implementation, not as a follow-up hardening pass afterward.
   itself (it likely contains password hashes and, if PII rows exist by
   then, ciphertext that's only as safe as `PII_ENC_KEY`). Delete it from
   disk once its purpose is done rather than leaving it to accumulate.
+- **No `cmd/rotate-totp-key` tool** — `TOTP_ENC_KEY` has the same
+  one-key-at-a-time limitation as `PII_ENC_KEY` and `TA_DOCS_ENC_KEY`, but
+  unlike those two there is no rotation tool yet (see "`TOTP_ENC_KEY`"
+  above). Low urgency while enrolment is new and the user count is small;
+  build it (mirroring `cmd/rotate-pii-key`) before it isn't.
 
 ## Incident record
 

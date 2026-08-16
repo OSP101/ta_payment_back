@@ -1,0 +1,1 @@
+DROP INDEX demo_workspaces_owner_email_uidx;

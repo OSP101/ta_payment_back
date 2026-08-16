@@ -100,4 +100,13 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 	} else if n > 0 {
 		log.Printf("scheduler: cleaned up %d expired session(s)", n)
 	}
+
+	// Same shape as session cleanup: mfa_challenges rows are cheap
+	// individually but unbounded over time — every step-1 login for a 2FA
+	// account writes one, whether or not step 2 ever completes.
+	if n, err := s.svc.MFA.CleanupChallenges(ctx); err != nil {
+		log.Printf("scheduler: mfa_challenge_cleanup err=%v", err)
+	} else if n > 0 {
+		log.Printf("scheduler: cleaned up %d expired mfa challenge(s)", n)
+	}
 }

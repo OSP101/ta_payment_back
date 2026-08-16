@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"ta-payment-back/internal/auth"
 	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/db"
+	"ta-payment-back/internal/demo"
 	"ta-payment-back/internal/handler"
 	"ta-payment-back/internal/mail"
 	"ta-payment-back/internal/pii"
@@ -97,11 +99,23 @@ func main() {
 		log.Fatalf("pii: %v", err)
 	}
 
+	// TOTP_ENC_KEY is validated as present by config.Load, same as
+	// PII_ENC_KEY — a deliberately separate key/cipher pair, see
+	// config.Config.TOTPEncKey's doc comment for why.
+	totpKey, err := storage.ParseKeyFromBase64(cfg.TOTPEncKey)
+	if err != nil {
+		log.Fatalf("TOTP_ENC_KEY: %v", err)
+	}
+	totpCipher, err := pii.New(totpKey)
+	if err != nil {
+		log.Fatalf("pii (totp): %v", err)
+	}
+
 	mailer := mail.New(cfg)
 	auditor := audit.New(pool)
 	tokens := auth.NewTokenService(cfg.JWTSecret, cfg.JWTIssuer)
 
-	services := service.NewContainer(pool, store, mailer, auditor, cfg, piiCipher)
+	services := service.NewContainer(pool, store, mailer, auditor, cfg, piiCipher, totpCipher)
 
 	if cfg.AppEnv == "production" && len(cfg.TrustedProxyIPs) == 0 {
 		// Not fatal — the app still runs correctly for cookie security (that's
@@ -168,7 +182,94 @@ func main() {
 	// why it cannot reject requests with no Origin/Referer at all.
 	app.Use(handler.OriginCheck(cfg.CORSOrigins))
 
+	if cfg.DemoMode {
+		// A browser that has ever logged into the demo sandbox carries
+		// "demo_access_token"/"demo_base_path" cookies at Path "/" (see
+		// internal/demo/auth.go) — root-scoped on purpose, so the Next.js
+		// server can read them for ANY page (see that file's doc comment).
+		// Left alone, those cookies survive a completely unrelated REAL
+		// login: ta_payment_front/app/lib/session.ts's resolveSession()
+		// checks them FIRST, so a fresh, successful login to production in
+		// that same browser would still have every subsequent
+		// server-rendered page quietly querying the (possibly stale or
+		// gone) demo workspace instead of the account that just logged in
+		// — surfacing as pages 404ing right after a login that itself
+		// reported success. Clearing the demo cookies here, symmetrically
+		// with demo.LoginHandler.Login clearing "access_token" on the way
+		// in, is what keeps the two sessions from ever fighting over which
+		// one a page load belongs to.
+		// Scoped to /api/v1/auth (not a bare app.Use) so this runs only where
+		// it's relevant, not on every request the process ever serves —
+		// including, previously, every request inside the demo sandbox
+		// itself. The inner switch narrows further, to just login/logout
+		// specifically (not e.g. /api/v1/auth/heartbeat).
+		app.Use("/api/v1/auth", func(c *fiber.Ctx) error {
+			err := c.Next()
+			switch c.Path() {
+			case "/api/v1/auth/login", "/api/v1/auth/logout":
+				for _, name := range []string{demo.CookieName, demo.BasePathCookieName} {
+					c.Cookie(&fiber.Cookie{
+						Name: name, Value: "", HTTPOnly: true, SameSite: "Lax",
+						Secure: cfg.CookieSecure, Path: demo.CookiePath, Expires: time.Now().Add(-time.Hour),
+					})
+				}
+			}
+			return err
+		})
+	}
+
 	handler.Mount(app, services, tokens, rbac.New(pool), auditor)
+
+	// Permanent onboarding sandbox — see docs/PLAN-demo-sandbox.md and
+	// config.DemoDatabaseURL's doc comment. DEMO_MODE defaults to false, so
+	// most deployments never open a second database connection, provision a
+	// slot, or mount a single extra route. When it's on, everything demo
+	// touches lives in its OWN database (DemoDatabaseURL) — self-provisioned
+	// here if it doesn't exist yet, never the production `pool` above. Must
+	// run before app.Listen: Fiber route registration is not safe once the
+	// app is serving live traffic (see demo.Mount's doc comment), so every
+	// slot is migrated and mounted here, up front, rather than lazily on
+	// someone's first visit.
+	if cfg.DemoMode {
+		if err := db.EnsureDatabase(ctx, cfg.DemoDatabaseURL); err != nil {
+			log.Fatalf("demo: provisioning database: %v", err)
+		}
+		demoPool, err := db.Connect(ctx, cfg.DemoDatabaseURL)
+		if err != nil {
+			log.Fatalf("demo: connecting to database: %v", err)
+		}
+		defer demoPool.Close()
+		// citext (demo_workspaces.owner_email, demo_authorized_testers.email)
+		// normally arrives via migrations/0001_init, which only ever runs
+		// per-slot (inside Bootstrap, below) — on a BRAND NEW demo database
+		// the registry migration right after this would be the first thing
+		// to touch it, before any slot has run 0001_init to install it.
+		// Idempotent and per-DATABASE (not per-schema), so every later
+		// per-slot 0001_init run just sees it already there and skips it.
+		for _, ext := range []string{"pgcrypto", "citext"} {
+			if _, err := demoPool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "`+ext+`"`); err != nil {
+				log.Fatalf("demo: enabling %s: %v", ext, err)
+			}
+		}
+		// The registry (demo_workspaces, demo_authorized_testers) — its own
+		// small migration set, applied only here, never against the real
+		// migrationDir/production pool. See migrations/demo_registry's own
+		// doc comment for why this is a separate directory rather than just
+		// more files in migrationDir.
+		if err := db.Migrate(ctx, demoPool, filepath.Join(migrationDir, "demo_registry")); err != nil {
+			log.Fatalf("demo: migrating registry: %v", err)
+		}
+		mgr, err := demo.Bootstrap(ctx, demoPool, cfg, piiCipher, totpCipher, encKey, migrationDir)
+		if err != nil {
+			log.Fatalf("demo: %v", err)
+		}
+		demo.Mount(app, mgr)
+		// Who is ALLOWED into the sandbox is managed from the real app
+		// (/staff/settings), not from inside it — see MountAdmin's own doc
+		// comment for why these routes register on the production router
+		// group instead of under demo.Mount's /api/demo prefix.
+		demo.MountAdmin(app, services, tokens, demoPool, mgr)
+	}
 
 	go func() {
 		if err := app.Listen(":" + cfg.Port); err != nil {

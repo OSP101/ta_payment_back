@@ -40,6 +40,15 @@ type User struct {
 	// draw from the separate admin_officers roster.
 	AdminPosition *string  `json:"admin_position,omitempty"`
 	Roles         []string `json:"roles"`
+	// TOTPEnabled is whether this account has completed 2FA enrolment
+	// (users.totp_enabled_at IS NOT NULL). Never expose totp_secret_enc,
+	// totp_pending_secret_enc, or totp_last_step through this or any other
+	// API response.
+	TOTPEnabled bool `json:"totp_enabled"`
+	// RecoveryCodesRemaining is 0 when TOTPEnabled is false. Shown on
+	// /account so a user notices before they run out, without ever
+	// re-displaying the codes themselves.
+	RecoveryCodesRemaining int `json:"recovery_codes_remaining"`
 	// AvatarURL is derived, never stored: the API path that streams the
 	// picture, with the last-changed timestamp as a cache-buster. Nil when the
 	// user has not set one, which is what tells the UI to draw initials.
@@ -158,10 +167,12 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	u := &User{ID: id}
 	var avatarKey *string
 	var avatarAt *time.Time
+	var totpEnabledAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, is_executive, admin_position, avatar_key, avatar_updated_at
+		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, is_executive, admin_position, avatar_key, avatar_updated_at, totp_enabled_at,
+		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL)
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
-		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt,
+		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &totpEnabledAt, &u.RecoveryCodesRemaining,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -185,6 +196,7 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	// TA submitted, which is the only place they exist.
 	applyDerivedStudyYear(u, currentAcademicYearBE(ctx, s.pool))
 	u.AvatarURL = avatarURL(id, avatarKey, avatarAt)
+	u.TOTPEnabled = totpEnabledAt != nil
 	return u, nil
 }
 
@@ -421,7 +433,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 	// over a non-unique sort key lets Postgres return tied rows in a different
 	// order per query — the same person could appear on two pages while someone
 	// else appeared on none.
-	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.is_executive, u.admin_position, u.avatar_key, u.avatar_updated_at
+	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.is_executive, u.admin_position, u.avatar_key, u.avatar_updated_at, u.totp_enabled_at IS NOT NULL
 	      FROM users u WHERE ` + where + ` ORDER BY ` + f.orderBy() + `, u.id
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)
@@ -435,7 +447,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 		var u User
 		var avatarKey *string
 		var avatarAt *time.Time
-		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &u.TOTPEnabled); err != nil {
 			return nil, 0, err
 		}
 		u.AvatarURL = avatarURL(u.ID, avatarKey, avatarAt)

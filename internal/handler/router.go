@@ -14,14 +14,31 @@ import (
 
 // Mount wires all routes on the app.
 func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r *rbac.RBAC, aud *audit.Auditor) {
+	app.Get("/api/health", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"ok": true}) })
+	MountAPI(app.Group("/api/v1"), svc, tokens, Authenticated(tokens), r, aud)
+}
+
+// MountAPI wires every /api/v1/* route onto api, which may be the app's own
+// "/api/v1" group (the only caller in production, via Mount above — same
+// behaviour as before this function existed) or any other fiber.Router
+// rooted somewhere else.
+//
+// That "somewhere else" is what the BETA demo sandbox (internal/demo) needs:
+// each sandbox slot gets a full, independently-bound copy of every route
+// under its own path (e.g. /api/v1/demo/w/3/...), pointed at that slot's own
+// service.Container — not this one. authMiddleware is the other half of that:
+// Mount always passes Authenticated(tokens) (unchanged), but a demo slot
+// passes its own middleware reading a differently-named, differently-scoped
+// cookie, so a demo login can never be read as a real session or vice versa
+// (see internal/demo.DemoAuthenticated's doc comment for why that matters —
+// Login below sets a root-scoped "access_token" cookie, which a same-secret
+// demo token would collide with).
+func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenService, authMiddleware fiber.Handler, r *rbac.RBAC, aud *audit.Auditor) {
 	// Gate that fires only for pure-TA users whose ta_profile is not yet
 	// approved. Applied selectively below to feature endpoints; profile,
 	// documents, and account endpoints are left open so the TA can complete
 	// onboarding.
 	taApproved := RequireApprovedTAProfile(svc.Pool)
-	app.Get("/api/health", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"ok": true}) })
-
-	api := app.Group("/api/v1")
 
 	// Baseline per-IP ceiling across EVERY /api/v1 endpoint, public and
 	// authenticated alike — a broad backstop against scripted flooding,
@@ -69,6 +86,14 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 		},
 	})
 	api.Post("/auth/login", loginLimiter, authH.Login)
+	// Same limiter as /auth/login, not the 600/min baseline: this is still
+	// step 2 of an anonymous login flow — the caller has a password-verified
+	// challenge but no session yet — so it needs the same brute-force ceiling
+	// as step 1. The per-account gate in mfa_gate.go is the OTHER half of
+	// this defense, and is what actually stops a guessing loop that rotates
+	// challenges to dodge a single challenge's own 5-attempt cap; see its doc
+	// comment.
+	api.Post("/auth/login/2fa", loginLimiter, authH.LoginTwoFactor)
 	api.Post("/auth/sso/callback", authH.SSOCallback) // stub
 	api.Get("/auth/sso/url", authH.SSOURL)
 	// Shared announcements. Anonymous by design — a link posted to Facebook or
@@ -90,7 +115,7 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
-	authed := api.Group("", Authenticated(tokens), AccountGuard(svc))
+	authed := api.Group("", authMiddleware, AccountGuard(svc))
 
 	// Applied below to routes that generate a PDF/XLSX/ZIP or accept an
 	// upload — every one of those costs real CPU, memory, or (for uploads)
@@ -119,6 +144,16 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// and SessionActivityGuard on the frontend.
 	authed.Post("/auth/heartbeat", authH.Heartbeat)
 
+	// Two-factor authentication (self-service). Reachable even while
+	// AccountGuard's mfa_setup_required is blocking every OTHER endpoint —
+	// see that branch's own "/me/2fa/" allowlist entry — since these are
+	// exactly the endpoints someone in that state needs to complete enrolment.
+	mfaH := &MFAHandler{Svc: svc}
+	authed.Post("/me/2fa/setup", mfaH.Setup)
+	authed.Post("/me/2fa/enable", mfaH.Enable)
+	authed.Post("/me/2fa/disable", mfaH.Disable)
+	authed.Post("/me/2fa/recovery-codes", mfaH.RegenerateRecoveryCodes)
+
 	// Users (admin, staff)
 	adminOrStaff := RequireRole(rbac.RoleAdmin, rbac.RoleStaff)
 	uh := &UserHandler{Svc: svc}
@@ -142,6 +177,13 @@ func Mount(app *fiber.App, svc *service.Container, tokens *auth.TokenService, r 
 	// move work forward. Staff are also the people the gate protects against a
 	// stolen session, so they must not be able to clear each other's lockouts.
 	authed.Post("/users/:id/unlock-password-gate", RequireRole(rbac.RoleAdmin), uh.UnlockPasswordGate)
+	// Admin-only for the same reason, raised further: staff already hold
+	// unrestricted /users/:id/reset-password (no target restriction, temp
+	// password returned in the body). Letting staff ALSO reset 2FA would chain
+	// into a one-click path to full admin takeover — reset password, log in,
+	// reset 2FA, done — for the one control that's supposed to stop exactly
+	// that. See MFAService.AdminReset's own doc comment.
+	authed.Post("/users/:id/2fa/reset", RequireRole(rbac.RoleAdmin), mfaH.AdminReset)
 
 	// Pay-rate & budget-cap settings (admin, staff). The faculty course catalog
 	// was removed — course identity now lives per-term on teaching_courses.

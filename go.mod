@@ -9,6 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pdfcpu/pdfcpu v0.13.0
+	github.com/pquerna/otp v1.5.0
 	github.com/signintech/gopdf v0.36.2
 	github.com/xuri/excelize/v2 v2.11.0
 	golang.org/x/crypto v0.53.0
@@ -17,6 +18,7 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
+	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
