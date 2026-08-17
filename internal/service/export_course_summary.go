@@ -134,8 +134,8 @@ func (s *ExportService) courseSummaryCourses(ctx context.Context, termID uuid.UU
 func (s *ExportService) courseSummaryTAs(ctx context.Context, termID uuid.UUID) (map[uuid.UUID][]courseSummaryTA, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (sec.teaching_course_id, u.id)
-		       sec.teaching_course_id, u.id, COALESCE(u.student_id,''),
-		       u.first_name || ' ' || u.last_name, u.study_level::text
+		       sec.teaching_course_id, u.id, COALESCE(a.student_id_snapshot, u.student_id, ''),
+		       u.first_name || ' ' || u.last_name, a.level::text
 		FROM ta_request_assignments a
 		JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
 		JOIN users u        ON u.id = a.ta_id

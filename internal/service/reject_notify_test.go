@@ -102,7 +102,7 @@ func TestPeriodStatus_RejectedIsCountedSeparately(t *testing.T) {
 	}
 
 	svc := &SubmissionPeriodService{pool: f.Pool}
-	rows, err := svc.PendingByTA(f.ctx, f.TAID)
+	rows, err := svc.PendingByTA(f.ctx, f.TAID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

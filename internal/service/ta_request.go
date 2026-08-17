@@ -283,6 +283,11 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	// materialise as ✓/✗ checklist entries — not blocking errors — so the
 	// resulting rejected request stays visible in the staff accordion.
 	levels := make([]string, len(in.Assignments))
+	// enrollmentIDs[i]/studentIDs[i] snapshot which ta_enrollments period (see
+	// migration 0094) was active for this TA at request-creation time — nil
+	// when the TA has no enrollment history yet, see validateTA.
+	enrollmentIDs := make([]*uuid.UUID, len(in.Assignments))
+	studentIDs := make([]*string, len(in.Assignments))
 	// perSection[i][sectionID] is the workload row that assignment will carry.
 	perSection := make([]map[uuid.UUID]WorkloadInput, len(in.Assignments))
 	// coGroup[i][sectionID] groups sections this TA covers simultaneously, so
@@ -290,11 +295,13 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	coGroup := make([]map[uuid.UUID]int, len(in.Assignments))
 
 	for i, a := range in.Assignments {
-		name, level, err := s.validateTA(ctx, a.TAID, a.Level)
+		name, level, enrollmentID, studentID, err := s.validateTA(ctx, a.TAID, a.Level)
 		if err != nil {
 			return nil, err
 		}
 		levels[i] = level
+		enrollmentIDs[i] = enrollmentID
+		studentIDs[i] = studentID
 
 		perSection[i] = resolveSectionWorkloads(a.SectionIDs, a.Workload, a.SectionWorkloads)
 		coGroup[i], err = s.detectCotaughtGroups(ctx, a.SectionIDs)
@@ -397,9 +404,9 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 				groupVal = group
 			}
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level, cotaught_group)
-				 VALUES ($1,$2,$3,$4,$5::study_level,$6)`,
-				aid, rid, secID, a.TAID, levels[i], groupVal); err != nil {
+				`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level, cotaught_group, enrollment_id, student_id_snapshot)
+				 VALUES ($1,$2,$3,$4,$5::study_level,$6,$7,$8)`,
+				aid, rid, secID, a.TAID, levels[i], groupVal, enrollmentIDs[i], studentIDs[i]); err != nil {
 				return nil, err
 			}
 			wl := perSection[i][secID]
@@ -1097,38 +1104,57 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 	return nil
 }
 
-// validateTA checks the user is an active TA and returns their display name
-// and authoritative study level (DB wins over client input).
-func (s *TARequestService) validateTA(ctx context.Context, taID uuid.UUID, clientLevel string) (name, level string, err error) {
+// validateTA checks the user is an active TA and returns their display name,
+// authoritative study level (DB wins over client input), and the enrollment
+// period (see migration 0094, ta_enrollments) their new assignment should be
+// attributed to — enrollmentID/studentID snapshot onto ta_request_assignments
+// (see the INSERT in Create) so a later level change does not retroactively
+// change which student_id an already-created assignment is attributed to.
+func (s *TARequestService) validateTA(ctx context.Context, taID uuid.UUID, clientLevel string) (name, level string, enrollmentID *uuid.UUID, studentID *string, err error) {
 	var first, last string
 	var dbLevel *string
-	var isActive, hasRole bool
+	var isActive, hasRole, hasAnyEnrollment bool
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.first_name, u.last_name, u.study_level::text, u.is_active AND u.deleted_at IS NULL,
-		       EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = u.id AND r.role = 'ta')
-		FROM users u WHERE u.id = $1
-	`, taID).Scan(&first, &last, &dbLevel, &isActive, &hasRole)
+		       EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = u.id AND r.role = 'ta'),
+		       e.id, e.student_id,
+		       EXISTS (SELECT 1 FROM ta_enrollments e2 WHERE e2.user_id = u.id)
+		FROM users u
+		LEFT JOIN ta_enrollments e ON e.user_id = u.id AND e.ended_at IS NULL
+		WHERE u.id = $1
+	`, taID).Scan(&first, &last, &dbLevel, &isActive, &hasRole, &enrollmentID, &studentID, &hasAnyEnrollment)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", "", errors.New("ไม่พบบัญชี TA ที่เลือก")
+			return "", "", nil, nil, errors.New("ไม่พบบัญชี TA ที่เลือก")
 		}
-		return "", "", err
+		return "", "", nil, nil, err
 	}
 	name = first + " " + last
 	if !isActive {
-		return "", "", fmt.Errorf("บัญชีของ %s ถูกปิดใช้งาน", name)
+		return "", "", nil, nil, fmt.Errorf("บัญชีของ %s ถูกปิดใช้งาน", name)
 	}
 	if !hasRole {
-		return "", "", fmt.Errorf("%s ไม่ได้มีสิทธิ์เป็น TA ในระบบ", name)
+		return "", "", nil, nil, fmt.Errorf("%s ไม่ได้มีสิทธิ์เป็น TA ในระบบ", name)
+	}
+	// A TA with at least one enrollment period must be assigned under their
+	// CURRENTLY ACTIVE one. Zero rows (pre-0094 account, or a new TA who
+	// hasn't finished onboarding yet) is fine and falls through with
+	// enrollmentID/studentID nil — the assignment just gets no snapshot, same
+	// as before this table existed. A TA whose enrollment(s) are all CLOSED
+	// (every RecordTransition pairs a close with an open, in one transaction)
+	// means something is wrong, so this is a hard error rather than a silent
+	// fallback to live users.student_id.
+	if enrollmentID == nil && hasAnyEnrollment {
+		return "", "", nil, nil, fmt.Errorf("%s ไม่มีข้อมูลการศึกษาที่ใช้งานอยู่ในขณะนี้ กรุณาติดต่อเจ้าหน้าที่", name)
 	}
 	level = clientLevel
 	if dbLevel != nil && *dbLevel != "" {
 		level = *dbLevel
 	}
 	if level != "undergrad" && level != "master" && level != "phd" {
-		return "", "", fmt.Errorf("ยังไม่ได้ระบุระดับการศึกษาของ %s", name)
+		return "", "", nil, nil, fmt.Errorf("ยังไม่ได้ระบุระดับการศึกษาของ %s", name)
 	}
-	return name, level, nil
+	return name, level, enrollmentID, studentID, nil
 }
 
 func (s *TARequestService) taName(ctx context.Context, taID uuid.UUID) string {

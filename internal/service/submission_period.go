@@ -354,7 +354,21 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 // synthesised via LEFT JOIN so we don't need to pre-populate
 // submission_period_status when a period is created — status rows are lazily
 // created only when the TA acts on them.
-func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUID) ([]SubmissionPeriodStatus, error) {
+//
+// enrollmentID, when non-nil, scopes this to one ta_enrollments period —
+// same "which period am I viewing" filter as DashboardService.TaOverview
+// (see that function's doc comment for the enrollment_id IS NULL fallback
+// reasoning). The condition has to be repeated on the outer `a` join AND on
+// each of the five `a2` subqueries below, since they each independently
+// re-derive hour counts for the month rather than reusing the outer row.
+func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUID, enrollmentID *uuid.UUID) ([]SubmissionPeriodStatus, error) {
+	outerFilter, subFilter := "", ""
+	args := []any{taID}
+	if enrollmentID != nil {
+		outerFilter = " AND (a.enrollment_id = $2 OR a.enrollment_id IS NULL)"
+		subFilter = " AND (a2.enrollment_id = $2 OR a2.enrollment_id IS NULL)"
+		args = append(args, *enrollmentID)
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT sp.id, sp.label, sp.year_month,
 		       TO_CHAR(sp.starts_on,'YYYY-MM-DD'),
@@ -374,41 +388,41 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
-		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')),
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')`+subFilter+`),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
-		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')`+subFilter+`
 		           AND wl2.status IN ('draft','submitted','rejected')),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
-		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')`+subFilter+`
 		           AND wl2.status IN ('draft','rejected')),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
-		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')`+subFilter+`
 		           AND wl2.status = 'submitted'),
 		       (SELECT COUNT(*) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
-		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')`+subFilter+`
 		           AND wl2.status = 'rejected'),
 		       COALESCE((SELECT SUM(wl2.hours) FROM work_logs wl2
 		          JOIN ta_request_assignments a2 ON a2.id = wl2.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $1 AND s2.teaching_course_id = tc.id
 		           AND to_char(wl2.work_date,'MM') = RIGHT(sp.year_month, 2)
-		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
+		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')`+subFilter+`
 		           AND wl2.status = 'approved'), 0)
 		FROM submission_periods sp
 		JOIN teaching_courses tc ON tc.term_id = sp.term_id
@@ -423,10 +437,10 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		  -- A TA whose ONLY assignment on this course is grad-special must not
 		  -- see the course at all here: there is nothing left for them to send
 		  -- or wait on.
-		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`+outerFilter+`
 		GROUP BY sp.id, sp.label, sp.year_month, sp.starts_on, sp.due_date, sp.is_closed,
 		         tc.id, tc.code, tc.name_th, st.status
-		ORDER BY sp.due_date, tc.code`, taID)
+		ORDER BY sp.due_date, tc.code`, args...)
 	if err != nil {
 		return nil, err
 	}

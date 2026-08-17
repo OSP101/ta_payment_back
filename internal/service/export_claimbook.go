@@ -485,7 +485,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		WHERE a.ta_id=$1 AND wl.status <> 'rejected'
 		  AND wl.activity IN ('lecture','lab')
 		  AND COALESCE(wl.note,'') NOT LIKE '%ชดเชย%'
-		  AND NOT (u.study_level::text IN ('master','phd') AND sec.track = 'special')`, taID, termID)
+		  AND NOT (a.level::text IN ('master','phd') AND sec.track = 'special')`, taID, termID)
 	if err != nil {
 		return err
 	}
@@ -527,7 +527,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id AND tc.term_id = $2
 		JOIN section_schedules ss ON ss.section_id = sec.id AND ss.kind IN ('lecture','lab')
 		WHERE a.ta_id = $1 AND a.state <> 'dropped'
-		  AND u.study_level::text IN ('master','phd')`, taID, termID)
+		  AND a.level::text IN ('master','phd')`, taID, termID)
 	if err != nil {
 		return err
 	}

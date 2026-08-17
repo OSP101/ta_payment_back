@@ -78,7 +78,7 @@ func (h *SubmissionPeriodHandler) Delete(c *fiber.Ctx) error {
 // MePending lists every (period × course) status row this TA still owes,
 // used by the TA reminders page.
 func (h *SubmissionPeriodHandler) MePending(c *fiber.Ctx) error {
-	out, err := h.Svc.SubmissionPeriods.PendingByTA(c.Context(), UserID(c))
+	out, err := h.Svc.SubmissionPeriods.PendingByTA(c.Context(), UserID(c), SelectedEnrollmentID(c))
 	if err != nil {
 		return err
 	}

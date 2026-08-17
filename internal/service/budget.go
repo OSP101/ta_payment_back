@@ -190,7 +190,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
              JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'regular'
              JOIN users u        ON u.id = a.ta_id
              CROSS JOIN latest pr
-             WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND u.study_level = 'undergrad')
+             WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND a.level = 'undergrad')
           +
             -- ป.ตรี ภาคพิเศษ: รายชั่วโมงแต่ไม่เกิน ug_special_monthly_cap ต่อคน/เดือน
             -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") คิดทีละเดือนแล้วรวม
@@ -204,7 +204,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
                 JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'special'
                 JOIN users u        ON u.id = a.ta_id
                 WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
-                  AND u.study_level = 'undergrad'
+                  AND a.level = 'undergrad'
                 GROUP BY a.ta_id, to_char(wl.work_date,'YYYY-MM')
              ) m)
           +
@@ -216,7 +216,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
              JOIN users u        ON u.id = a.ta_id
              CROSS JOIN latest pr
              WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
-               AND u.study_level IN ('master','phd') AND sec.track = 'regular')
+               AND a.level IN ('master','phd') AND sec.track = 'regular')
           +
             (SELECT COALESCE(SUM(
                 LEAST(pr.graduate_special_lumpsum, pr.grad_special_term_cap)
@@ -226,7 +226,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
              JOIN sections sec   ON sec.id = a.section_id
              JOIN users u        ON u.id = a.ta_id
              CROSS JOIN latest pr
-             WHERE r.teaching_course_id = $1 AND u.study_level IN ('master','phd')
+             WHERE r.teaching_course_id = $1 AND a.level IN ('master','phd')
                AND sec.track = 'special')
         , 0)`, tcID).Scan(&snap.UsedBaht)
 

@@ -21,9 +21,10 @@ import (
 type ctxKey string
 
 const (
-	CtxUserID    ctxKey = "user_id"
-	CtxRoles     ctxKey = "roles"
-	CtxSessionID ctxKey = "session_id"
+	CtxUserID             ctxKey = "user_id"
+	CtxRoles              ctxKey = "roles"
+	CtxSessionID          ctxKey = "session_id"
+	CtxSelectedEnrollment ctxKey = "selected_enrollment_id"
 )
 
 // Authenticated attaches user id, roles and session id from JWT (cookie or
@@ -133,14 +134,15 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 		var sessRevokedAt *time.Time
 		var sessRevokeReason *string
 		var sessLastActivity *time.Time
+		var selectedEnrollmentID *uuid.UUID
 		err := svc.Pool.QueryRow(c.Context(),
 			`SELECT u.is_active, u.must_change_password, u.is_executive, u.totp_enabled_at,
-			        s.revoked_at, s.revoke_reason, s.last_activity_at
+			        s.revoked_at, s.revoke_reason, s.last_activity_at, s.selected_enrollment_id
 			 FROM users u
 			 LEFT JOIN sessions s ON s.id = $2
 			 WHERE u.id = $1 AND u.deleted_at IS NULL`,
 			uid, sid).Scan(&isActive, &mustChange, &isExecutive, &totpEnabledAt,
-			&sessRevokedAt, &sessRevokeReason, &sessLastActivity)
+			&sessRevokedAt, &sessRevokeReason, &sessLastActivity, &selectedEnrollmentID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "บัญชีนี้ไม่สามารถใช้งานได้"})
 		}
@@ -220,6 +222,8 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "mfa_setup_required"})
 		}
 
+		c.Locals(string(CtxSelectedEnrollment), selectedEnrollmentID)
+
 		if c.Method() != fiber.MethodGet && c.Method() != fiber.MethodHead {
 			if err := svc.Sessions.Touch(c.Context(), sid); err != nil {
 				return err
@@ -253,6 +257,18 @@ func Roles(c *fiber.Ctx) []string {
 // missing one (see Authenticated).
 func SessionID(c *fiber.Ctx) uuid.UUID {
 	v, _ := c.Locals(string(CtxSessionID)).(uuid.UUID)
+	return v
+}
+
+// SelectedEnrollmentID returns the ta_enrollments period (migration 0094)
+// this TA session is currently "viewing" — nil when unset (no selection made,
+// or the TA has zero/one period and was never asked). Set by AccountGuard
+// from sessions.selected_enrollment_id on every request, so a change made via
+// EnrollmentService.SetSessionScope takes effect on the very next request
+// with no re-login. Display-scoping only — see that column's own doc
+// comment for why this never gates what a NEW assignment attaches to.
+func SelectedEnrollmentID(c *fiber.Ctx) *uuid.UUID {
+	v, _ := c.Locals(string(CtxSelectedEnrollment)).(*uuid.UUID)
 	return v
 }
 

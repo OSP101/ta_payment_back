@@ -81,7 +81,23 @@ type TACourseStatus struct {
 
 // TaOverview aggregates every course the TA is on. Read-only. Meant for the
 // TA's landing card grid.
-func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID) ([]TACourseStatus, error) {
+//
+// enrollmentID, when non-nil, scopes this to one ta_enrollments period
+// (migration 0094/0096 — the login-time "which period am I viewing" picker,
+// EnrollmentScopeModal on the frontend) — same optional-filter shape as
+// LecturerOverview's termFilter below. Assignment rows with no snapshot yet
+// (a.enrollment_id IS NULL — pre-migration-0095 rows, or an ambiguous
+// backfill case) are kept in EVERY period's view rather than silently
+// dropped from all of them: hiding real hours/pay from a TA because of a
+// missing snapshot would be a worse failure than occasionally showing an old
+// row under a period it may not exactly belong to.
+func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrollmentID *uuid.UUID) ([]TACourseStatus, error) {
+	filter := ""
+	args := []any{taID}
+	if enrollmentID != nil {
+		filter = " AND (a.enrollment_id = $2 OR a.enrollment_id IS NULL)"
+		args = append(args, *enrollmentID)
+	}
 	rows, err := s.pool.Query(ctx, `
 		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
 		SELECT tc.id, tc.code, tc.name_th,
@@ -107,9 +123,9 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID) ([]TA
 		JOIN academic_terms t ON t.id=tc.term_id
 		LEFT JOIN work_logs wl ON wl.assignment_id=a.id
 		CROSS JOIN latest pr
-		WHERE a.ta_id = $1
+		WHERE a.ta_id = $1`+filter+`
 		GROUP BY tc.id, tc.code, tc.name_th, t.academic_year, t.semester, a.level, sec.track, tc.exported_at
-		ORDER BY t.academic_year DESC, t.semester DESC, tc.code`, taID)
+		ORDER BY t.academic_year DESC, t.semester DESC, tc.code`, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -3163,7 +3163,7 @@ func (s *WorkLogService) StaffListByCourse(ctx context.Context, tcID uuid.UUID) 
 func (s *WorkLogService) StaffListAssignments(ctx context.Context, tcID uuid.UUID) ([]StaffAssignment, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.id, a.ta_id, u.first_name || ' ' || u.last_name,
-		       COALESCE(u.student_id,''), sec.sec_no, sec.track::text, a.level::text,
+		       COALESCE(a.student_id_snapshot, u.student_id, ''), sec.sec_no, sec.track::text, a.level::text,
 		       EXISTS(
 		         SELECT 1 FROM ta_request_assignments pa
 		         JOIN ta_requests pr ON pr.id = pa.request_id AND pr.status = 'approved'

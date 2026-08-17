@@ -195,6 +195,62 @@ func (h *UserHandler) Activate(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// -------------------- Enrollment --------------------
+
+// EnrollmentHandler exposes a TA's education-level history — see
+// internal/service/enrollment.go and migration 0094.
+type EnrollmentHandler struct{ Svc *service.Container }
+
+func (h *EnrollmentHandler) List(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	items, err := h.Svc.Enrollments.List(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": items})
+}
+
+// RecordTransition is staff/admin only (see the route gate in router.go) —
+// closes the TA's current active enrollment period and opens a new one.
+func (h *EnrollmentHandler) RecordTransition(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.RecordTransitionInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	e, err := h.Svc.Enrollments.RecordTransition(c.Context(), UserID(c), id, in)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "user not found")
+		}
+		return err
+	}
+	return c.Status(fiber.StatusCreated).JSON(e)
+}
+
+// SetSessionScope is POST /me/enrollment-scope — self-only, no role gate
+// beyond being authenticated: EnrollmentService.SetSessionScope's own
+// ownership check is what actually protects this, the same way any other
+// "/me/..." write only ever acts on the caller's own account.
+func (h *EnrollmentHandler) SetSessionScope(c *fiber.Ctx) error {
+	var in struct {
+		EnrollmentID uuid.UUID `json:"enrollment_id" validate:"required"`
+	}
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := h.Svc.Enrollments.SetSessionScope(c.Context(), UserID(c), SessionID(c), in.EnrollmentID); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // -------------------- Course --------------------
 
 type CourseHandler struct{ Svc *service.Container }
@@ -2466,7 +2522,7 @@ func (h *DashboardHandler) AnalyticsXLSX(c *fiber.Ctx) error {
 
 // TaOverview — GET /dashboard/ta/me — TA's per-course status + estimated pay.
 func (h *DashboardHandler) TaOverview(c *fiber.Ctx) error {
-	out, err := h.Svc.Dashboard.TaOverview(c.Context(), UserID(c))
+	out, err := h.Svc.Dashboard.TaOverview(c.Context(), UserID(c), SelectedEnrollmentID(c))
 	if err != nil {
 		return err
 	}

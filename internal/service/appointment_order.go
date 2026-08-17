@@ -69,7 +69,15 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		       tc.code,
 		       COALESCE(NULLIF(tc.name_en, ''), tc.name_th) AS course_name,
 		       tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
-		       COALESCE(u.student_id, '') AS student_id,
+		       -- MAX(), not a plain column, so it stays an aggregate and does
+		       -- NOT need to join the GROUP BY below — adding
+		       -- a.student_id_snapshot there directly would risk splitting one
+		       -- TA×course roster line into two if a TA was ever re-requested
+		       -- for the same course/term across a level transition (rare, but
+		       -- this feature exists precisely for that case). All of a TA's
+		       -- assignment rows for one course/request share the same
+		       -- snapshot in the normal case, so MAX just picks it.
+		       COALESCE(MAX(a.student_id_snapshot), u.student_id, '') AS student_id,
 		       COALESCE(NULLIF(tp.prefix, ''), NULLIF(u.title, ''), '') AS prefix,
 		       u.first_name, u.last_name,
 		       -- Carried for the round ledger, not for the printed page.

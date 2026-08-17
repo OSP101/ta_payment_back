@@ -142,7 +142,7 @@ func (s *ExportService) gradSpecialTAIDs(ctx context.Context, courseID uuid.UUID
 		JOIN sections sec  ON sec.id = a.section_id AND sec.track = 'special'
 		JOIN users u       ON u.id = a.ta_id
 		WHERE sec.teaching_course_id = $1
-		  AND u.study_level::text IN ('master','phd')`, courseID)
+		  AND a.level::text IN ('master','phd')`, courseID)
 	if err != nil {
 		return nil, err
 	}

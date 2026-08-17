@@ -41,6 +41,7 @@ type Container struct {
 	DocProgress       *DocumentProgressService
 	MFA               *MFAService
 	DataDeletion      *DataDeletionService
+	Enrollments       *EnrollmentService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
@@ -84,5 +85,6 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		pool: pool, aud: auditor, docs: c.Docs, users: c.Users,
 		sessions: c.Sessions, notify: c.Notify, store: store,
 	}
+	c.Enrollments = &EnrollmentService{pool: pool, aud: auditor}
 	return c
 }

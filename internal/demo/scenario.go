@@ -51,6 +51,18 @@ type ScenarioEvent struct {
 	// access to — offering it anyway would just send them into a 403 on a
 	// screen that was never going to be theirs to see this session.
 	ActorRole string `json:"actor_role"`
+	// ActorPath is the REAL page the ActorRole account itself would use to
+	// perform this step by hand — distinct from RelatedPath above, which is
+	// always a staff screen for viewing someone else's result. Only set for
+	// guided TA/lecturer-actor events whose real page isn't scoped to a
+	// specific course (so no per-record UUID is needed) — currently
+	// "ta_schedules" (/ta/schedule) and "ta_docs" (/ta/documents). The 3
+	// course-scoped TA/lecturer events (ta_requests, worklog_submit,
+	// worklog_approve) carry their own per-record ActorPath on SubStep
+	// instead, since each course has its own real URL. Empty for every
+	// staff-actor event — those already share ActorPath's job with
+	// RelatedPath, since staff acting and staff viewing are the same screen.
+	ActorPath string `json:"actor_path,omitempty"`
 }
 
 // scenarioEvents is the "เส้นทางหลัก" (happy path) — see plan doc §5's numbered
@@ -62,10 +74,10 @@ var scenarioEvents = []ScenarioEvent{
 	{Key: "term", Label: "1. สร้างปีการศึกษา / ภาคเรียน", Description: "เปิดภาคเรียนใหม่ พร้อมช่วงสอบกลางภาค/ปลายภาค", RelatedPath: "/staff/settings?tab=terms", ActorRole: "staff"},
 	{Key: "courses", Label: "2. เปิดรายวิชา + ตารางสอน (อาจารย์ 3 คน)", Description: "สร้าง 3 รายวิชา คนละ 1 วิชา พร้อมตารางบรรยายของแต่ละวิชา", RelatedPath: "/staff/teaching", ActorRole: "staff"},
 	{Key: "submission_periods", Label: "3. เปิดรอบส่งค่าตอบแทนเดือนนี้", Description: "เปิดรอบเบิกจ่ายของเดือนปัจจุบัน กำหนดส่งยังไม่ถึง", RelatedPath: "/staff/settings?tab=calendar", ActorRole: "staff"},
-	{Key: "ta_schedules", Label: "4. TA บันทึกตารางเรียนของตัวเอง (4 คน)", Description: "TA ทั้ง 4 คนยืนยันว่าตัวเองมีตารางเรียนในภาคเรียนนี้แล้ว", RelatedPath: "/staff/teaching", ActorRole: "ta"},
+	{Key: "ta_schedules", Label: "4. TA บันทึกตารางเรียนของตัวเอง (4 คน)", Description: "TA ทั้ง 4 คนยืนยันว่าตัวเองมีตารางเรียนในภาคเรียนนี้แล้ว", RelatedPath: "/staff/teaching", ActorPath: "/ta/schedule", ActorRole: "ta"},
 	{Key: "ta_requests", Label: "5. อาจารย์เสนอชื่อ TA (3 วิชา)", Description: "แต่ละวิชาเสนอชื่อ TA 1 คน ระบบจะตัดสินอนุมัติ/ปฏิเสธอัตโนมัติ", RelatedPath: "/staff/approvals", ActorRole: "lecturer"},
 	{Key: "appointment_order", Label: "6. ออกคำสั่งแต่งตั้ง TA", Description: "ออกคำสั่งแต่งตั้งสำหรับ TA ที่ได้รับอนุมัติทั้งหมดในภาคเรียนนี้", RelatedPath: "/staff/appointments", ActorRole: "staff"},
-	{Key: "ta_docs", Label: "7. TA ส่งเอกสาร + ข้อมูลส่วนตัว", Description: "TA ที่ได้รับแต่งตั้งกรอกโปรไฟล์และแนบเอกสาร 3 ฉบับ", RelatedPath: "/staff/review", ActorRole: "ta"},
+	{Key: "ta_docs", Label: "7. TA ส่งเอกสาร + ข้อมูลส่วนตัว", Description: "TA ที่ได้รับแต่งตั้งกรอกโปรไฟล์และแนบเอกสาร 3 ฉบับ", RelatedPath: "/staff/review", ActorPath: "/ta/documents", ActorRole: "ta"},
 	{Key: "docs_approve", Label: "8. เจ้าหน้าที่อนุมัติเอกสาร", Description: "อนุมัติเอกสารทั้งหมดของ TA ที่ส่งมาในขั้นตอนก่อนหน้า", RelatedPath: "/staff/review", ActorRole: "staff"},
 	{Key: "worklog_submit", Label: "9. TA ลงเวลาและส่งอนุมัติ", Description: "สร้างบันทึกเวลาปฏิบัติงานตามตารางสอนของเดือนนี้ แล้วส่งอนุมัติ", RelatedPath: "/staff/payouts", ActorRole: "ta"},
 	{Key: "worklog_approve", Label: "10. อาจารย์อนุมัติบันทึกเวลา", Description: "อาจารย์อนุมัติบันทึกเวลาที่ TA ส่งมา", RelatedPath: "/staff/payouts", ActorRole: "lecturer"},
@@ -85,6 +97,14 @@ var courseSeeds = []struct {
 	{"CP100002", "โครงสร้างข้อมูลและขั้นตอนวิธี (จำลอง)", "lecturer2@demo.local", "ta2@demo.local"},
 	{"CP100003", "ระบบฐานข้อมูล (จำลอง)", "lecturer3@demo.local", "ta3@demo.local"},
 }
+
+// allTAEmails is every seeded TA, unlike courseSeeds' 3 (which only covers
+// the ones an appointment actually gets made for — see courseSeeds' own doc
+// comment on why ta4 is deliberately left out there). "ta_schedules" is the
+// one guided step that needs all 4: its done-check requires every seeded TA
+// to have confirmed a schedule, appointed or not, since ta4 existing-but-
+// unassigned is itself a state worth being able to look at.
+var allTAEmails = []string{"ta1@demo.local", "ta2@demo.local", "ta3@demo.local", "ta4@demo.local"}
 
 // RunScenarioEvent dispatches by key. actorEmail identifies who is
 // "pretending" to perform the step (an admin for staff-only steps works for

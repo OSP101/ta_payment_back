@@ -293,6 +293,52 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 	if prevStatus == "approved" {
 		return errors.New("profile already approved; contact staff to reopen")
 	}
+
+	// Keep ta_enrollments (migration 0094) in sync with this self-service
+	// edit. We only reach here when prevStatus != "approved" (checked just
+	// above), so per the confirmed onboarding boundary this IS a still-open,
+	// freely-editable round — a student_id correction here is not a new
+	// education-level transition, it's a fix to the same period. So: update
+	// the TA's active enrollment row in place rather than opening a new one.
+	// A user with no enrollment row at all yet (their first-ever submission)
+	// gets one created here, self-authored (created_by = their own id, not
+	// staff) — EnrollmentService.RecordTransition is the staff-only path that
+	// opens every SUBSEQUENT period, once one already exists.
+	var hasActiveEnrollment, hasAnyEnrollment bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM ta_enrollments WHERE user_id = $1 AND ended_at IS NULL),
+		       EXISTS (SELECT 1 FROM ta_enrollments WHERE user_id = $1)`,
+		userID).Scan(&hasActiveEnrollment, &hasAnyEnrollment); err != nil {
+		return err
+	}
+	switch {
+	case hasActiveEnrollment:
+		if _, err := tx.Exec(ctx,
+			`UPDATE ta_enrollments SET student_id = $2 WHERE user_id = $1 AND ended_at IS NULL`,
+			userID, sid); err != nil {
+			return err
+		}
+	case !hasAnyEnrollment:
+		var level string
+		if err := tx.QueryRow(ctx,
+			`SELECT COALESCE(study_level::text, 'undergrad') FROM users WHERE id = $1`, userID,
+		).Scan(&level); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ta_enrollments (user_id, student_id, study_level, created_by) VALUES ($1,$2,$3::study_level,$1)`,
+			userID, sid, level); err != nil {
+			return err
+		}
+	default:
+		// Enrollment history exists but none of it is active — should not
+		// happen under the staff-only RecordTransition flow (every close
+		// pairs with an open in the same transaction). Leave ta_enrollments
+		// untouched rather than have self-service silently open a new period
+		// in an already-inconsistent state; users.student_id above still
+		// gets updated as before.
+	}
+
 	round := prevRound
 	if round == 0 {
 		round = 1

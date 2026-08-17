@@ -186,6 +186,20 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// that. See MFAService.AdminReset's own doc comment.
 	authed.Post("/users/:id/2fa/reset", RequireRole(rbac.RoleAdmin), mfaH.AdminReset)
 
+	// Education-level history (migration 0094, ta_enrollments) — a TA may see
+	// their own history (self-service transparency), same self-or-staff gate
+	// as GET /users/:id above; only staff/admin may record a new transition —
+	// see EnrollmentService.RecordTransition's doc comment for why this stays
+	// staff-authored rather than self-service.
+	enrollH := &EnrollmentHandler{Svc: svc}
+	authed.Get("/users/:id/enrollments", authed_forSelfOrStaff(), enrollH.List)
+	authed.Post("/users/:id/enrollments", adminOrStaff, enrollH.RecordTransition)
+	// Which enrollment period THIS session is viewing — a TA-only display
+	// filter (see migration 0096), set by the login-time picker
+	// (EnrollmentScopeModal on the frontend). Self-only by construction: the
+	// service validates the enrollment belongs to UserID(c), not a :id param.
+	authed.Post("/me/enrollment-scope", enrollH.SetSessionScope)
+
 	// Pay-rate & budget-cap settings (admin, staff). The faculty course catalog
 	// was removed — course identity now lives per-term on teaching_courses.
 	ch := &CourseHandler{Svc: svc}

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/auth"
@@ -173,12 +174,23 @@ func (h *AuthHandler) Heartbeat(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// meResponse embeds service.User (its fields flatten to the JSON top level,
+// same as if they were declared directly) plus the one piece of state that
+// belongs to the SESSION, not the account: which ta_enrollments period this
+// login is currently viewing (migration 0096). Read straight from
+// SelectedEnrollmentID(c) — already fetched by AccountGuard's own combined
+// query this request, no extra DB round trip.
+type meResponse struct {
+	*service.User
+	SelectedEnrollmentID *uuid.UUID `json:"selected_enrollment_id,omitempty"`
+}
+
 func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	u, err := h.Svc.Users.Get(c.Context(), UserID(c))
 	if err != nil {
 		return err
 	}
-	return c.JSON(u)
+	return c.JSON(meResponse{User: u, SelectedEnrollmentID: SelectedEnrollmentID(c)})
 }
 
 // DataExport answers the PDPA "what do you have on me" request — see
@@ -210,33 +222,12 @@ func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 	if err := c.BodyParser(&in); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	// Checked up front for a fast, specific error before the current-password
-	// round trip below — UpdatePassword enforces the same rule again itself
-	// (see service.ValidatePassword), so this exists for response ordering
-	// only, not as the only place the rule is enforced.
-	if err := service.ValidatePassword(in.NewPassword); err != nil {
-		return err
-	}
 	uid := UserID(c)
-	u, err := h.Svc.Users.Get(c.Context(), uid)
-	if err != nil {
-		return err
-	}
-	// A forced first-login change (must_change_password) has no current password
-	// to confirm — the user just authenticated with the temp password. For a
-	// voluntary change we require the current password so a hijacked live session
-	// on an unattended machine cannot silently take over the account.
-	if !u.MustChangePassword {
-		if in.CurrentPassword == "" {
-			return fiber.NewError(fiber.StatusBadRequest, "กรุณากรอกรหัสผ่านปัจจุบัน")
-		}
-		// Re-fetch the stored hash the same way Login does, then bcrypt-compare.
-		_, hash, err := h.Svc.Users.FindByEmail(c.Context(), u.Email)
-		if err != nil || hash == "" || !auth.CheckPassword(hash, in.CurrentPassword) {
-			return fiber.NewError(fiber.StatusUnauthorized, "รหัสผ่านปัจจุบันไม่ถูกต้อง")
-		}
-	}
-	if err := h.Svc.Users.UpdatePassword(c.Context(), uid, in.NewPassword); err != nil {
+	// All the business rules (current-password requirement for a voluntary
+	// change, reuse rejection, and the fuller ValidatePassword rule) live in
+	// UserService.ChangePassword so they're covered by service-level tests
+	// without needing an HTTP harness — see internal/service/user.go.
+	if err := h.Svc.Users.ChangePassword(c.Context(), uid, in.CurrentPassword, in.NewPassword); err != nil {
 		return err
 	}
 	// A changed password invalidates whatever session(s) were issued under the

@@ -98,7 +98,7 @@ func (s *ExportService) BuildGradWorkloadForms(
 		SELECT DISTINCT a.ta_id,
 		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
 		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
-		       COALESCE(u.student_id,''),
+		       COALESCE(a.student_id_snapshot, u.student_id, ''),
 		       a.level::text
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'

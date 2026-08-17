@@ -708,25 +708,43 @@ func (s *UserService) GetEmail(ctx context.Context, id uuid.UUID) (string, error
 	return e, err
 }
 
-// passwordRe matches ValidatePassword's letter+digit requirement.
+// passwordRe* match ValidatePassword's character-class requirements.
 var (
-	passwordHasLetter = regexp.MustCompile(`[A-Za-z]`)
-	passwordHasDigit  = regexp.MustCompile(`[0-9]`)
+	passwordHasUpper   = regexp.MustCompile(`[A-Z]`)
+	passwordHasLower   = regexp.MustCompile(`[a-z]`)
+	passwordHasDigit   = regexp.MustCompile(`[0-9]`)
+	passwordHasSpecial = regexp.MustCompile(`[!@#$%^&*()\-_=+\[\]{};:,.<>/?]`)
 )
 
 // ValidatePassword enforces the same rule the change-password page already
 // shows as live checklist items (ta_payment_front/app/change-password/page.tsx)
-// — length + a letter + a digit — so a caller that reaches this endpoint
-// directly (skipping the UI) cannot set something weaker than what the UI
-// would have accepted. Kept in sync with that page on purpose: the backend
-// being STRICTER than what the UI promises would reject input the user was
-// told was fine.
+// — length + uppercase + lowercase + digit + special char, plus rejecting
+// known-weak passwords (see common_passwords.go) — so a caller that reaches
+// this endpoint directly (skipping the UI) cannot set something weaker than
+// what the UI would have accepted. Kept in sync with that page on purpose:
+// the backend being STRICTER than what the UI promises would reject input
+// the user was told was fine. Only caller is ChangePassword/UpdatePassword
+// (the self-service /change-password flow) — staff account creation and
+// admin password reset intentionally use a lighter rule, see their own
+// validation.
 func ValidatePassword(pw string) error {
 	if len(pw) < 8 {
 		return Invalid("รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร")
 	}
-	if !passwordHasLetter.MatchString(pw) || !passwordHasDigit.MatchString(pw) {
-		return Invalid("รหัสผ่านต้องมีทั้งตัวอักษรและตัวเลข")
+	if !passwordHasUpper.MatchString(pw) {
+		return Invalid("รหัสผ่านต้องมีตัวพิมพ์ใหญ่อย่างน้อย 1 ตัว")
+	}
+	if !passwordHasLower.MatchString(pw) {
+		return Invalid("รหัสผ่านต้องมีตัวพิมพ์เล็กอย่างน้อย 1 ตัว")
+	}
+	if !passwordHasDigit.MatchString(pw) {
+		return Invalid("รหัสผ่านต้องมีตัวเลขอย่างน้อย 1 ตัว")
+	}
+	if !passwordHasSpecial.MatchString(pw) {
+		return Invalid("รหัสผ่านต้องมีอักขระพิเศษอย่างน้อย 1 ตัว")
+	}
+	if isCommonPassword(pw) {
+		return Invalid("รหัสผ่านนี้พบได้บ่อยเกินไป ไม่ปลอดภัย กรุณาตั้งรหัสอื่น")
 	}
 	return nil
 }
@@ -742,6 +760,47 @@ func (s *UserService) UpdatePassword(ctx context.Context, id uuid.UUID, newPassw
 	_, err = s.pool.Exec(ctx,
 		`UPDATE users SET password_hash=$1, must_change_password=FALSE, updated_at=NOW() WHERE id=$2`, h, id)
 	return err
+}
+
+// ChangePassword implements the self-service password change endpoint
+// (POST /me/password), covering both a forced first-login change (fresh off
+// a system-generated temp password) and a voluntary change from Account
+// Settings:
+//   - A voluntary change (MustChangePassword == false) must supply and prove
+//     the current password, so a hijacked live session on an unattended
+//     machine cannot silently take over the account.
+//   - Either way, the new password must not equal the current one — for a
+//     forced change this is what stops a TA from just keeping the temp
+//     password staff saw and relayed to them in plaintext (TempPasswordPanel),
+//     and for a voluntary change there is nothing gained from a same-password
+//     "change".
+//
+// ValidatePassword's fuller rule (length/case/digit/special/blocklist) is
+// enforced by UpdatePassword below, same as before this method existed.
+func (s *UserService) ChangePassword(ctx context.Context, userID uuid.UUID, currentPassword, newPassword string) error {
+	u, err := s.Get(ctx, userID)
+	if err != nil {
+		return err
+	}
+	_, hash, err := s.FindByEmail(ctx, u.Email)
+	if err != nil {
+		return err
+	}
+	if hash == "" {
+		return &UserError{Status: 500, Msg: "ไม่สามารถตรวจสอบรหัสผ่านได้"}
+	}
+	if !u.MustChangePassword {
+		if currentPassword == "" {
+			return Invalid("กรุณากรอกรหัสผ่านปัจจุบัน")
+		}
+		if !auth.CheckPassword(hash, currentPassword) {
+			return &UserError{Status: 401, Msg: "รหัสผ่านปัจจุบันไม่ถูกต้อง"}
+		}
+	}
+	if auth.CheckPassword(hash, newPassword) {
+		return Invalid("รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม")
+	}
+	return s.UpdatePassword(ctx, userID, newPassword)
 }
 
 // ResetPassword issues a fresh temp password and forces a change on next login.

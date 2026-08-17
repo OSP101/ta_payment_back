@@ -1406,13 +1406,31 @@ func (s *ExportService) BuildTimetableWorkbook(ctx context.Context, taID, termID
 	defer f.Close()
 
 	// With the คำนำหน้า: the college's form prints "นายชนาธิป สีลาพล" at I3.
+	//
+	// student_id prefers the assignment snapshot (migration 0095) for THIS
+	// term over the live users.student_id: this sheet is per (TA, term), so a
+	// TA who has since transitioned to a new level/id must still print the ID
+	// that applied to the term the timetable covers. Any one of the TA's
+	// assignments that term works — a mid-term transition is not expected to
+	// happen (see ta_enrollments' one-active-period rule), so every
+	// assignment created in a given term should carry the same snapshot.
+	// Falls back to the live column for pre-0095 assignments or a TA with no
+	// assignment that term (shouldn't normally reach this function then, but
+	// keeps the sheet from erroring rather than blocking on it).
 	var fullName, studentID string
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
 		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
-		       COALESCE(u.student_id,'')
+		       COALESCE(
+		         (SELECT a.student_id_snapshot
+		          FROM ta_request_assignments a
+		          JOIN sections sec ON sec.id = a.section_id
+		          JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+		          WHERE a.ta_id = u.id AND tc.term_id = $2 AND a.student_id_snapshot IS NOT NULL
+		          LIMIT 1),
+		         u.student_id, '')
 		FROM users u LEFT JOIN ta_profiles tp ON tp.user_id = u.id
-		WHERE u.id=$1`, taID).Scan(&fullName, &studentID); err != nil {
+		WHERE u.id=$1`, taID, termID).Scan(&fullName, &studentID); err != nil {
 		return nil, err
 	}
 	var semester, acadYear int
