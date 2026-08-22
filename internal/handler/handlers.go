@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -3040,4 +3041,57 @@ func (h *HolidayHandler) SyncFromBOT(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(res)
+}
+
+// ============================================================================
+// TDBMHandler — the webhook TDBM calls, plus a staff-facing manual trigger
+// and sync history. See docs/TDBM-API-requirements.md and internal/service/tdbm.go.
+// ============================================================================
+
+type TDBMHandler struct{ Svc *service.Container }
+
+// Webhook is POST /tdbm-webhook — called by TDBM, not a signed-in user (see
+// VerifyTDBMWebhookSecret, the only gate in front of this route). The body is
+// only ever {"event":"...","type":"holidays"|"extra-teachings"} and is purely
+// informational: whatever it says, the response is the same full re-sync of
+// the active term, so a malformed or empty body is not treated as an error —
+// there is nothing in the payload this handler actually branches on.
+//
+// Answers immediately; the pull itself runs in the background via
+// TriggerAsync so TDBM's request doesn't sit open for however long three
+// upstream calls take.
+func (h *TDBMHandler) Webhook(c *fiber.Ctx) error {
+	var body struct {
+		Event string `json:"event"`
+		Type  string `json:"type"`
+	}
+	_ = c.BodyParser(&body)
+	log.Printf("tdbm webhook received: event=%q type=%q", body.Event, body.Type)
+	h.Svc.TDBM.TriggerAsync("webhook")
+	return c.SendStatus(fiber.StatusOK)
+}
+
+// SyncNow is a staff-facing manual trigger (e.g. "ซิงก์ตอนนี้" button), for
+// testing the pipeline or nudging it after fixing a config problem without
+// waiting for the next webhook ping or hourly sweep. Runs synchronously —
+// unlike the webhook path — so the caller's button can show the actual
+// counts instead of "queued".
+func (h *TDBMHandler) SyncNow(c *fiber.Ctx) error {
+	results, err := h.Svc.TDBM.SyncAll(c.Context(), "manual")
+	if err != nil {
+		return err
+	}
+	return c.JSON(results)
+}
+
+// SyncLog lists recent tdbm_sync_log rows, newest first, so staff can see
+// whether the last pull actually happened and what it found without reading
+// server logs.
+func (h *TDBMHandler) SyncLog(c *fiber.Ctx) error {
+	limit, _ := strconv.Atoi(c.Query("limit", "50"))
+	out, err := h.Svc.TDBM.RecentSyncLog(c.Context(), limit)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
 }

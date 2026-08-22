@@ -42,6 +42,7 @@ type Container struct {
 	MFA               *MFAService
 	DataDeletion      *DataDeletionService
 	Enrollments       *EnrollmentService
+	TDBM              *TDBMService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
@@ -86,5 +87,6 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		sessions: c.Sessions, notify: c.Notify, store: store,
 	}
 	c.Enrollments = &EnrollmentService{pool: pool, aud: auditor}
+	c.TDBM = &TDBMService{pool: pool, apiBase: cfg.TDBMAPIBaseURL}
 	return c
 }

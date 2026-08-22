@@ -133,6 +133,17 @@ type Config struct {
 	BotAPIBaseURL  string
 	BotAPIClientID string
 
+	// TDBM (tdbm.computing.kku.ac.th) — the college's own teaching-compensation
+	// system. Source of truth for holidays and lecturer-filed makeup ("สอนชดเชย")
+	// submissions; see docs/TDBM-API-requirements.md. Public read API, no key.
+	TDBMAPIBaseURL string
+	// TDBMWebhookSecret authenticates inbound POST /tdbm-webhook calls (TDBM →
+	// us) via the X-TDBM-Webhook-Secret header — see VerifyTDBMWebhookSecret.
+	// Empty means the webhook is not configured yet: same "closed by default"
+	// posture as ClamAVAddr/BotAPIClientID, so an unset secret refuses every
+	// call (503) instead of silently accepting unauthenticated triggers.
+	TDBMWebhookSecret string
+
 	// DemoMode gates the BETA "โหมดทดลอง" sandbox (internal/demo) entirely —
 	// false means main.go never provisions a slot, mounts a demo route, or
 	// touches demo_workspaces beyond what migration 0086 itself created.
@@ -219,6 +230,8 @@ func Load() (Config, error) {
 		TOTPEncKey:           env("TOTP_ENC_KEY", ""),
 		BotAPIBaseURL:        env("BOT_API_BASE_URL", "https://gateway.api.bot.or.th/financial-institutions-holidays"),
 		BotAPIClientID:       env("BOT_API_CLIENT_ID", ""),
+		TDBMAPIBaseURL:       env("TDBM_API_BASE_URL", "https://tdbm.computing.kku.ac.th/api"),
+		TDBMWebhookSecret:    env("TDBM_WEBHOOK_SECRET", ""),
 		ClamAVAddr:           env("CLAMAV_ADDR", ""),
 		DemoJWTSecret:        env("DEMO_JWT_SECRET", ""),
 	}

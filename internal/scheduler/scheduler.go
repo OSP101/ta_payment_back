@@ -81,6 +81,16 @@ func (s *Scheduler) tick(ctx context.Context) {
 	if n > 0 {
 		log.Printf("scheduler: sent %d submission reminders", n)
 	}
+
+	// TDBM safety net: the webhook (POST /tdbm-webhook) is the fast path, but
+	// TDBM gives no delivery guarantee for it (see
+	// docs/TDBM-API-requirements.md's open questions on retry policy) — a
+	// missed ping would otherwise go unnoticed until someone thinks to check.
+	// Hourly bounds how stale we can get without one; SyncAll itself already
+	// no-ops cleanly when no term is active.
+	if _, err := s.svc.TDBM.SyncAll(ctx, "scheduler"); err != nil {
+		log.Printf("scheduler: tdbm_sync err=%v", err)
+	}
 }
 
 func (s *Scheduler) dailyClose(ctx context.Context) {

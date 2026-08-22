@@ -113,6 +113,13 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	api.Get("/public/document-progress/:linkId/checklist", publicDPH.PublicListChecklist)
 	api.Post("/auth/logout", authH.Logout)
 
+	// TDBM webhook — called by another SYSTEM, not a signed-in user, so it
+	// sits outside the JWT-authed group like the public routes above. Its own
+	// gate is VerifyTDBMWebhookSecret, not a session: see that function's doc
+	// comment and docs/TDBM-API-requirements.md.
+	tdbmH := &TDBMHandler{Svc: svc}
+	api.Post("/tdbm-webhook", VerifyTDBMWebhookSecret(svc.Cfg.TDBMWebhookSecret), tdbmH.Webhook)
+
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
 	authed := api.Group("", authMiddleware, AccountGuard(svc))
@@ -528,6 +535,13 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/holidays/sync-from-bot", adminOrStaff, hh.SyncFromBOT)
 	authed.Patch("/holidays/:id", adminOrStaff, hh.Patch)
 	authed.Delete("/holidays/:id", adminOrStaff, hh.Delete)
+
+	// TDBM sync — manual trigger + history, for staff to confirm the webhook
+	// (registered above, outside this group) and hourly sweep are actually
+	// working. Read-only history open to staff/admin; the trigger itself too,
+	// same tier as sync-from-bot above.
+	authed.Post("/tdbm/sync-now", adminOrStaff, tdbmH.SyncNow)
+	authed.Get("/tdbm/sync-log", adminOrStaff, tdbmH.SyncLog)
 
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}

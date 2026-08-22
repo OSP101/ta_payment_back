@@ -367,13 +367,32 @@ func stepTADocs(ctx context.Context, svc *service.Container) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		// Skip only when this TA's profile AND all 3 required documents are
+		// already there — checking completed_at alone was wrong: UpsertProfile
+		// commits on its own, separately from the 3 Upload calls below, so a
+		// TA whose upload failed partway (e.g. the antivirus scanner was
+		// briefly down — see RecordPdpaConsent's neighboring comment for
+		// another antivirus/inet class of "this ran while a dependency was
+		// down" bug caught the same way) ended up with a submitted profile
+		// and ZERO documents, PERMANENTLY: every later re-run of this step
+		// saw hasProfile=true and skipped them forever, with no way for the
+		// scripted walkthrough to ever finish that TA — confirmed live via
+		// a stuck ta2@demo.local (profile submitted, 0 rows in ta_documents)
+		// that then made step 8 (docs_approve) fail for every TA after it
+		// too, since that step aborts its whole loop on the first TA it
+		// can't approve.
 		var hasProfile bool
-		if err := svc.Pool.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM ta_profiles WHERE user_id=$1 AND completed_at IS NOT NULL)`, taID,
-		).Scan(&hasProfile); err != nil {
+		var docCount int
+		if err := svc.Pool.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM ta_profiles WHERE user_id=$1 AND completed_at IS NOT NULL),
+			       (SELECT COUNT(DISTINCT kind) FROM ta_documents
+			        WHERE user_id=$1 AND kind IN ('national_id','bank_book','creditor_form')
+			          AND superseded_at IS NULL AND file_deleted_at IS NULL)`,
+			taID,
+		).Scan(&hasProfile, &docCount); err != nil {
 			return "", err
 		}
-		if hasProfile {
+		if hasProfile && docCount >= 3 {
 			skipped++
 			continue
 		}
@@ -393,8 +412,12 @@ func stepTADocs(ctx context.Context, svc *service.Container) (string, error) {
 		}
 		// The scripted walkthrough stands in for a TA who has already read and
 		// accepted the PDPA notice on the real form — UpsertProfile refuses
-		// without it, same as it would for a real user.
-		if err := svc.Docs.RecordPdpaConsent(ctx, taID, "demo", "demo-scenario"); err != nil {
+		// without it, same as it would for a real user. "127.0.0.1", not
+		// "demo": this flows into audit_logs.ip, an INET column (migration
+		// 0001) — a non-IP placeholder there fails at the Postgres level with
+		// "invalid input syntax for type inet", not a validation error, so
+		// this step never completed for any TA until this was caught live.
+		if err := svc.Docs.RecordPdpaConsent(ctx, taID, "127.0.0.1", "demo-scenario"); err != nil {
 			return "", fmt.Errorf("บันทึกความยินยอม PDPA ของ %s: %w", cs.taEmail, err)
 		}
 		if err := svc.Docs.UpsertProfile(ctx, taID, profile); err != nil {

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"crypto/subtle"
 	"errors"
 	"log"
 	"net/url"
@@ -422,6 +423,30 @@ func OriginCheck(allowedOrigins string) fiber.Handler {
 		}
 		if !allowed[origin] {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "คำขอถูกปฏิเสธ (แหล่งที่มาไม่ได้รับอนุญาต)"})
+		}
+		return c.Next()
+	}
+}
+
+// VerifyTDBMWebhookSecret gates POST /tdbm-webhook — the one route in this
+// app called by another SYSTEM rather than a signed-in user, so it has no JWT
+// to check. TDBM's webhook design (see docs/TDBM-API-requirements.md) carries
+// no signature of its own, so the shared secret below is the only thing
+// stopping anyone who finds the URL from making us re-pull TDBM on demand.
+//
+// Same "closed by default" posture as BOT_API_CLIENT_ID: an unset secret
+// refuses every call (503, "not configured") rather than accepting an
+// unauthenticated trigger because nobody got around to setting one.
+// subtle.ConstantTimeCompare avoids leaking the secret's length/prefix via
+// response-time differences on a wrong guess.
+func VerifyTDBMWebhookSecret(secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if secret == "" {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "tdbm webhook not configured"})
+		}
+		got := c.Get("X-TDBM-Webhook-Secret")
+		if len(got) != len(secret) || subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid webhook secret"})
 		}
 		return c.Next()
 	}
