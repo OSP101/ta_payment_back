@@ -237,6 +237,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/exports/terms/:id/course-summary/warnings", adminOrStaff, th.CourseSummaryWarnings)
 	authed.Get("/exports/terms/:id/course-summary.xlsx", adminOrStaff, heavyLimiter, th.CourseSummaryXLSX)
 	authed.Get("/exports/terms/:id/course-summary/preview", adminOrStaff, th.CourseSummaryPreview)
+	authed.Get("/exports/terms/:id/course-summary/history", adminOrStaff, th.CourseSummaryHistory)
+	authed.Get("/exports/course-summary/:id/reprint", adminOrStaff, heavyLimiter, th.CourseSummaryReprint)
 
 	// Teaching courses
 	authed.Get("/teaching-courses", th.List)
@@ -438,6 +440,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// Phase 4 exports dashboard.
 	authed.Get("/exports/summary", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursesSummary)
 	authed.Get("/exports/course/:id/history", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseHistory)
+	// Re-download a past export's exact file, from its history-list entry.
+	authed.Get("/exports/batch/:id/download", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.BatchDownload)
 	// Appointment order (คำสั่งแต่งตั้ง) — PDF + DOCX in one ZIP.
 	// Issued in rounds: names already printed are never reprinted, so a late
 	// round carries only the courses that were not ready earlier.
@@ -485,7 +489,6 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	aoH := &AdminOfficerHandler{Svc: svc}
 	authed.Get("/settings/admin-officers", aoH.List)
 	authed.Post("/settings/admin-officers", adminOrStaff, aoH.Upsert)
-	authed.Delete("/settings/admin-officers/:id", adminOrStaff, aoH.Delete)
 
 	// Monthly submission periods (Phase 3): staff CRUD + TA-facing reminders.
 	spH := &SubmissionPeriodHandler{Svc: svc}

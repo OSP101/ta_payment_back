@@ -17,7 +17,7 @@ func (h *TeachingHandler) CourseSummaryWarnings(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	_, warnings, err := h.Svc.Export.BuildCourseSummaryWorkbook(c.Context(), termID)
+	warnings, err := h.Svc.Export.CourseSummaryWarnings(c.Context(), termID)
 	if err != nil {
 		return err
 	}
@@ -28,13 +28,15 @@ func (h *TeachingHandler) CourseSummaryWarnings(c *fiber.Ctx) error {
 }
 
 // CourseSummaryXLSX — GET /exports/terms/:id/course-summary.xlsx — the
-// "สรุปรายวิชาที่ขอใช้ TA" budget-request workbook.
+// "สรุปรายวิชาที่ขอใช้ TA" budget-request workbook. Records a ledger row (see
+// ExportService.BuildCourseSummaryWorkbook) so this generation can be
+// reprinted later even if the underlying data changes.
 func (h *TeachingHandler) CourseSummaryXLSX(c *fiber.Ctx) error {
 	termID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	body, _, err := h.Svc.Export.BuildCourseSummaryWorkbook(c.Context(), termID)
+	body, _, err := h.Svc.Export.BuildCourseSummaryWorkbook(c.Context(), UserID(c), termID)
 	if err != nil {
 		return err
 	}
@@ -69,4 +71,35 @@ func (h *TeachingHandler) CourseSummaryPreview(c *fiber.Ctx) error {
 		warnings = []string{}
 	}
 	return c.JSON(fiber.Map{"sheets": sheets, "warnings": warnings})
+}
+
+// CourseSummaryHistory — GET /exports/terms/:id/course-summary/history — the
+// generation ledger: who, when, how many courses, reprintable by id.
+func (h *TeachingHandler) CourseSummaryHistory(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Export.ListCourseSummaryExports(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// CourseSummaryReprint — GET /exports/course-summary/:id/reprint — re-renders
+// a past generation from its frozen snapshot rather than recomputing from
+// today's tables.
+func (h *TeachingHandler) CourseSummaryReprint(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	body, err := h.Svc.Export.ReprintCourseSummary(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	c.Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Set("Content-Disposition", contentDisposition("attachment", "course-summary.xlsx"))
+	return c.Send(body)
 }

@@ -19,12 +19,15 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/xuri/excelize/v2"
+
+	"ta-payment-back/internal/audit"
 )
 
 /* -------------------------------------------------------------------------- */
@@ -486,54 +489,87 @@ func buildCourseSummaryStyles(f *excelize.File) (*courseSummaryStyles, error) {
 
 func fmtPtr(s string) *string { return &s }
 
-// BuildCourseSummaryWorkbook renders "สรุปรายวิชาที่ขอใช้ TA": one sheet per
-// curriculum that has at least one course this term, one block per course (or
-// confirmed course_group), one row per approved TA. Returns the xlsx bytes and
-// any warnings — missing student counts or a course with no approved TA —
-// which do NOT block generation (this is an estimate document, made before
-// everything is settled), only flag what staff should double check.
-func (s *ExportService) BuildCourseSummaryWorkbook(ctx context.Context, termID uuid.UUID) ([]byte, []string, error) {
+// courseSummarySheetSnapshot is one curriculum sheet's worth of frozen blocks
+// — CurriculumFullNameTH and SheetName are copied from curricula at generation
+// time (not re-looked-up on reprint) because that table is staff-editable
+// (settings page, migration 0073's own comment): a later rename must not
+// silently reword a document already handed to someone.
+type courseSummarySheetSnapshot struct {
+	CurriculumCode string                `json:"curriculum_code"`
+	SheetName      string                `json:"sheet_name"`
+	FullNameTH     string                `json:"full_name_th"`
+	Blocks         []courseSummaryBlock  `json:"blocks"`
+}
+
+// courseSummarySnapshot is what's frozen into the ledger row: the term-line
+// text plus every sheet's blocks, exactly as BuildCourseSummaryWorkbook
+// resolved them. No PII to exclude here (unlike ปะหน้าจ่ายตรง's PromptPay
+// column), so reprint needs no live re-derivation step at all.
+type courseSummarySnapshot struct {
+	AcademicYear string                        `json:"academic_year"`
+	SemLabel     string                        `json:"sem_label"`
+	Sheets       []courseSummarySheetSnapshot  `json:"sheets"`
+}
+
+// renderCourseSummarySnapshot gathers everything writeCourseSummaryWorkbook
+// needs, live from today's tables — the read side shared by a fresh Build and
+// (indirectly, via the ledger) a later Reprint's Build.
+func (s *ExportService) renderCourseSummarySnapshot(ctx context.Context, termID uuid.UUID) (courseSummarySnapshot, []string, error) {
 	var academicYear, semLabel string
 	if err := s.pool.QueryRow(ctx, `
 		SELECT academic_year::text,
 		       CASE semester WHEN 1 THEN 'ภาคต้น' WHEN 2 THEN 'ภาคปลาย' ELSE 'ภาคฤดูร้อน' END
 		FROM academic_terms WHERE id = $1`, termID).Scan(&academicYear, &semLabel); err != nil {
-		return nil, nil, err
+		return courseSummarySnapshot{}, nil, err
 	}
 
 	curricula, err := s.teaching.ListCurricula(ctx)
 	if err != nil {
-		return nil, nil, err
+		return courseSummarySnapshot{}, nil, err
 	}
 	bySheet, warnings, err := s.buildCourseSummaryBlocks(ctx, termID)
 	if err != nil {
-		return nil, nil, err
+		return courseSummarySnapshot{}, nil, err
 	}
 
-	f := excelize.NewFile()
-	defer f.Close()
-	st, err := buildCourseSummaryStyles(f)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	wrote := false
+	var sheets []courseSummarySheetSnapshot
 	for _, cur := range curricula {
 		blocks := bySheet[cur.Code]
 		if len(blocks) == 0 {
 			continue
 		}
-		sheetName := cur.SheetName
+		sheets = append(sheets, courseSummarySheetSnapshot{
+			CurriculumCode: cur.Code, SheetName: cur.SheetName, FullNameTH: cur.FullNameTH, Blocks: blocks,
+		})
+	}
+	return courseSummarySnapshot{AcademicYear: academicYear, SemLabel: semLabel, Sheets: sheets}, warnings, nil
+}
+
+// writeCourseSummaryWorkbook renders an already-resolved snapshot into an
+// xlsx — shared by a fresh Build and ReprintCourseSummary, so a reprint always
+// produces byte-for-byte the same layout a fresh build would have, just from
+// frozen data.
+func writeCourseSummaryWorkbook(snap courseSummarySnapshot) ([]byte, error) {
+	f := excelize.NewFile()
+	defer f.Close()
+	st, err := buildCourseSummaryStyles(f)
+	if err != nil {
+		return nil, err
+	}
+
+	wrote := false
+	for _, sh := range snap.Sheets {
+		sheetName := sh.SheetName
 		if !wrote {
 			// The default sheet excelize creates ("Sheet1") is renamed for the
 			// first curriculum instead of deleted-then-recreated.
 			_ = f.SetSheetName("Sheet1", sheetName)
 		} else if _, err := f.NewSheet(sheetName); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		wrote = true
-		if err := writeCourseSummarySheet(f, st, sheetName, semLabel, academicYear, cur.FullNameTH, blocks); err != nil {
-			return nil, nil, err
+		if err := writeCourseSummarySheet(f, st, sheetName, snap.SemLabel, snap.AcademicYear, sh.FullNameTH, sh.Blocks); err != nil {
+			return nil, err
 		}
 	}
 	if !wrote {
@@ -546,9 +582,133 @@ func (s *ExportService) BuildCourseSummaryWorkbook(ctx context.Context, termID u
 
 	var buf bytes.Buffer
 	if err := f.Write(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// CourseSummaryWarnings answers "what should staff double check" without
+// rendering (and discarding) a whole workbook — the staff screen just needs
+// the count before the download button is even pressed.
+func (s *ExportService) CourseSummaryWarnings(ctx context.Context, termID uuid.UUID) ([]string, error) {
+	_, warnings, err := s.buildCourseSummaryBlocks(ctx, termID)
+	return warnings, err
+}
+
+// BuildCourseSummaryWorkbook renders "สรุปรายวิชาที่ขอใช้ TA": one sheet per
+// curriculum that has at least one course this term, one block per course (or
+// confirmed course_group), one row per approved TA. Returns the xlsx bytes and
+// any warnings — missing student counts or a course with no approved TA —
+// which do NOT block generation (this is an estimate document, made before
+// everything is settled), only flag what staff should double check.
+//
+// Records a ledger row (course_summary_exports, 27/08/2026) before returning
+// bytes, mirroring transfer_cover_exports: a student count or TA approval
+// corrected after this file went out must not make the original numbers
+// unrecoverable — see ReprintCourseSummary.
+func (s *ExportService) BuildCourseSummaryWorkbook(ctx context.Context, actor, termID uuid.UUID) ([]byte, []string, error) {
+	snap, warnings, err := s.renderCourseSummarySnapshot(ctx, termID)
+	if err != nil {
 		return nil, nil, err
 	}
-	return buf.Bytes(), warnings, nil
+	body, err := writeCourseSummaryWorkbook(snap)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.recordCourseSummaryExport(ctx, actor, termID, snap); err != nil {
+		return nil, nil, err
+	}
+	if err := s.aud.Log(ctx, audit.Entry{
+		ActorID: &actor, Action: "export.course_summary", Entity: "academic_term", EntityID: termID.String(),
+	}); err != nil {
+		return nil, nil, err
+	}
+	return body, warnings, nil
+}
+
+// recordCourseSummaryExport persists the ledger row BEFORE bytes are handed
+// back, same reasoning as recordTransferCoverExport: an unrecorded generation
+// can never be reprinted.
+func (s *ExportService) recordCourseSummaryExport(ctx context.Context, actor, termID uuid.UUID, snap courseSummarySnapshot) error {
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return err
+	}
+	var by *uuid.UUID
+	if actor != uuid.Nil {
+		by = &actor
+	}
+	courseCount := 0
+	for _, sh := range snap.Sheets {
+		courseCount += len(sh.Blocks)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO course_summary_exports (id, term_id, generated_by, course_count, document)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
+		termID, by, courseCount, raw)
+	return err
+}
+
+// ReprintCourseSummary hands back a copy of a generation already on the
+// ledger, rendered from the frozen snapshot rather than re-querying courses —
+// a student count or TA approval corrected after the fact must not silently
+// change a document already handed to someone.
+func (s *ExportService) ReprintCourseSummary(ctx context.Context, actor, exportID uuid.UUID) ([]byte, error) {
+	var raw []byte
+	if err := s.pool.QueryRow(ctx,
+		`SELECT document FROM course_summary_exports WHERE id = $1`, exportID).Scan(&raw); err != nil {
+		return nil, ErrNotFound
+	}
+	var snap courseSummarySnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return nil, fmt.Errorf("course summary export %s: snapshot unreadable: %w", exportID, err)
+	}
+	body, err := writeCourseSummaryWorkbook(snap)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.aud.Log(ctx, audit.Entry{
+		ActorID: &actor, Action: "export.course_summary.reprint",
+		Entity: "course_summary_export", EntityID: exportID.String(),
+	}); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// CourseSummaryExportSummary is one row of generation history — who, when,
+// how many courses, and its id for reprinting.
+type CourseSummaryExportSummary struct {
+	ID          uuid.UUID `json:"id"`
+	TermID      uuid.UUID `json:"term_id"`
+	GeneratedAt string    `json:"generated_at"`
+	GeneratedBy string    `json:"generated_by,omitempty"`
+	CourseCount int       `json:"course_count"`
+}
+
+// ListCourseSummaryExports returns the generation history for a term, newest
+// first.
+func (s *ExportService) ListCourseSummaryExports(ctx context.Context, termID uuid.UUID) ([]CourseSummaryExportSummary, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT e.id, e.term_id, TO_CHAR(e.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
+		       COALESCE(u.first_name || ' ' || u.last_name, ''), e.course_count
+		FROM course_summary_exports e
+		LEFT JOIN users u ON u.id = e.generated_by
+		WHERE e.term_id = $1
+		ORDER BY e.generated_at DESC`, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CourseSummaryExportSummary{}
+	for rows.Next() {
+		var r CourseSummaryExportSummary
+		if err := rows.Scan(&r.ID, &r.TermID, &r.GeneratedAt, &r.GeneratedBy, &r.CourseCount); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func writeCourseSummarySheet(

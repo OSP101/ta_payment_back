@@ -75,8 +75,10 @@ func (s *ExportService) ResolveCertifier(ctx context.Context, termID uuid.UUID) 
 	if chosen != nil {
 		var a signerAuthority
 		err := s.pool.QueryRow(ctx, `
-			SELECT COALESCE(academic_prefix,'') || full_name, title
-			FROM admin_officers WHERE id = $1`, *chosen).Scan(&a.Name, &a.Title)
+			SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
+			FROM admin_officers ao
+			LEFT JOIN users u ON u.id = ao.user_id
+			WHERE ao.id = $1`, *chosen).Scan(&a.Name, &a.Title)
 		if err == nil {
 			// Worded against the HEAD-OF-DEPARTMENT seat — that is the authority
 			// a claim form is certified under, not the dean's.
@@ -93,10 +95,11 @@ func (s *ExportService) ResolveCertifier(ctx context.Context, termID uuid.UUID) 
 	// No explicit choice: whoever currently holds the seat.
 	var name, title string
 	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(academic_prefix,'') || full_name, title
-		FROM admin_officers
-		WHERE is_active AND title LIKE $1 || '%'
-		ORDER BY created_at
+		SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
+		FROM admin_officers ao
+		LEFT JOIN users u ON u.id = ao.user_id
+		WHERE ao.is_active AND ao.title LIKE $1 || '%'
+		ORDER BY ao.created_at
 		LIMIT 1`, headTitlePrefix).Scan(&name, &title)
 	if err != nil {
 		return CertifierChoice{Resolved: false}, nil

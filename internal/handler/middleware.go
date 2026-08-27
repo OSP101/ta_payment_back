@@ -66,12 +66,12 @@ func RequireRole(roles ...string) fiber.Handler {
 }
 
 // RequireExecutiveView guards the read-only budget-analytics endpoints. The
-// synthetic executive role travels in the JWT (see Login), but the flag is
-// ticked by staff while the lecturer may already hold a 12-hour token — so a
-// claims miss falls back to the live users.is_executive read, and the grant
-// works immediately instead of after the next login. Revocation still waits
-// for token expiry only when the claims carry the role; the fallback path
-// re-reads every request.
+// synthetic executive role travels in the JWT (see Login), but an admin
+// officer appointment can happen while the lecturer already holds a 12-hour
+// token — so a claims miss falls back to a live admin_officers read, and the
+// grant works immediately instead of after the next login. Revocation still
+// waits for token expiry only when the claims carry the role; the fallback
+// path re-reads every request.
 func RequireExecutiveView(pool *pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleExecutive) {
@@ -79,7 +79,7 @@ func RequireExecutiveView(pool *pgxpool.Pool) fiber.Handler {
 		}
 		var ok bool
 		_ = pool.QueryRow(c.Context(),
-			`SELECT is_executive FROM users WHERE id = $1 AND deleted_at IS NULL`,
+			`SELECT EXISTS (SELECT 1 FROM admin_officers WHERE user_id = $1 AND is_active)`,
 			UserID(c)).Scan(&ok)
 		if ok {
 			return c.Next()
@@ -115,8 +115,8 @@ func RequireExecutiveView(pool *pgxpool.Pool) fiber.Handler {
 // itself keep a dead session alive.
 // mfaMandatoryFor decides whether the mandatory-2FA-enrolment tier applies to
 // a request carrying roles (from JWT claims) and isExecutive (read live from
-// the DB — see AccountGuard's own comment on why this one field can't be
-// trusted from the token). Pulled out of AccountGuard as its own function so
+// admin_officers — see AccountGuard's own comment on why this one field can't
+// be trusted from the token). Pulled out of AccountGuard as its own function so
 // the tier logic — the part product policy actually changes, e.g. "should
 // lecturer be mandatory too" — has one answer that's unit-testable without
 // standing up a full service.Container and an HTTP round trip.
@@ -137,7 +137,9 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 		var sessLastActivity *time.Time
 		var selectedEnrollmentID *uuid.UUID
 		err := svc.Pool.QueryRow(c.Context(),
-			`SELECT u.is_active, u.must_change_password, u.is_executive, u.totp_enabled_at,
+			`SELECT u.is_active, u.must_change_password,
+			        EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = u.id AND ao.is_active),
+			        u.totp_enabled_at,
 			        s.revoked_at, s.revoke_reason, s.last_activity_at, s.selected_enrollment_id
 			 FROM users u
 			 LEFT JOIN sessions s ON s.id = $2

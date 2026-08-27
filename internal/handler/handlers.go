@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -2604,6 +2605,17 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 		return err
 	}
 
+	// Keep the actual bytes so staff can re-download this exact file later
+	// (BatchDownload) instead of only seeing a history row with no file behind
+	// it. Best-effort like the Record below — a storage failure must not hide
+	// the (already-locked) zip the request came here for; the history row is
+	// simply left with an empty FilePath, which BatchDownload reports plainly.
+	filePath := ""
+	if key, _, serr := h.Svc.Storage.Save("export_batches", name, bytes.NewReader(body)); serr == nil {
+		filePath = key
+	} else {
+		log.Printf("export_batch: failed to persist zip for re-download (course %s): %v", id, serr)
+	}
 	// Persist the batch so the dashboard can list history + budget snapshot.
 	// TotalBaht is the ACTUAL paid sum (Σ actual_paid after the pro-rata cap) so
 	// the recorded figure matches the ZIP the staff hands to finance — the old
@@ -2612,7 +2624,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if prev, perr := h.Svc.Export.CoursePreview(c.Context(), id, months); perr == nil {
 		_, _ = h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
 			TeachingCourseID: id,
-			FilePath:         name, // in-memory zip; we persist just the name for reference
+			FilePath:         filePath,
 			FileName:         name,
 			TACount:          taCount,
 			Months:           months,
@@ -2699,6 +2711,44 @@ func (h *ExportHandler) CourseHistory(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(out)
+}
+
+// BatchDownload re-serves the exact ZIP a past export produced (see the
+// export_batches history list), so staff don't have to re-run the export
+// (which would re-lock already-locked months) just to get the file again.
+func (h *ExportHandler) BatchDownload(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	b, err := h.Svc.ExportBatches.Get(c.Context(), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประวัติการส่งออกนี้")
+		}
+		return err
+	}
+	if b.FilePath == "" {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบไฟล์ของการส่งออกนี้ในระบบจัดเก็บ (อาจเป็นรายการเก่าก่อนระบบเก็บไฟล์)")
+	}
+	rc, err := h.Svc.Storage.Open(b.FilePath)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบไฟล์ในระบบจัดเก็บ")
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		return err
+	}
+	// The zip carries national IDs + bank details — audit re-downloads the
+	// same as the original download (CourseZip). Not best-effort, same reason.
+	actor := UserID(c)
+	if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.batch_download", Entity: "export_batch", EntityID: b.ID.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")}); err != nil {
+		return err
+	}
+	c.Set("Content-Type", "application/zip")
+	c.Set("Content-Disposition", contentDisposition("attachment", b.FileName))
+	return c.Send(body)
 }
 
 // AppointmentPreview shows who the next คำสั่งแต่งตั้ง round would contain and
@@ -2890,20 +2940,6 @@ func (h *AdminOfficerHandler) Upsert(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(out)
-}
-
-func (h *AdminOfficerHandler) Delete(c *fiber.Ctx) error {
-	id, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-	}
-	if err := h.Svc.AdminOfficers.Delete(c.Context(), UserID(c), id); err != nil {
-		if errors.Is(err, service.ErrNotFound) {
-			return fiber.NewError(fiber.StatusNotFound, "admin officer not found")
-		}
-		return err
-	}
-	return c.JSON(fiber.Map{"ok": true})
 }
 
 func firstNonEmpty(s ...string) string {

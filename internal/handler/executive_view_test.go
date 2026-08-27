@@ -21,13 +21,23 @@ func TestRequireExecutiveView(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
 
+	// "Executive" is derived from holding an active admin_officers seat (see
+	// migration 0100) rather than a column on users, so granting it here
+	// means inserting a seat row, not flipping a flag.
 	mkUser := func(exec bool) uuid.UUID {
 		id := uuid.New()
 		if _, err := pool.Exec(ctx,
-			`INSERT INTO users (id, email, first_name, last_name, is_executive)
-			 VALUES ($1, $2, 'ท', 'ท', $3)`,
-			id, id.String()+"@test.local", exec); err != nil {
+			`INSERT INTO users (id, email, first_name, last_name) VALUES ($1, $2, 'ท', 'ท')`,
+			id, id.String()+"@test.local"); err != nil {
 			t.Fatal(err)
+		}
+		if exec {
+			if _, err := pool.Exec(ctx,
+				`INSERT INTO admin_officers (id, user_id, full_name, title, is_active)
+				 VALUES ($1, $2, 'ท ท', 'ทดสอบตำแหน่ง', TRUE)`,
+				uuid.New(), id); err != nil {
+				t.Fatal(err)
+			}
 		}
 		return id
 	}

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,6 +58,24 @@ func (s *ExportBatchService) Record(ctx context.Context, actor uuid.UUID, in Exp
 		return nil, err
 	}
 	return &in, nil
+}
+
+// Get returns one batch by id, for BatchDownload to resolve which file to
+// stream. FilePath is "" for a batch recorded before file retention existed,
+// or one whose storage write failed at generation time (see CourseZip) —
+// callers must handle that as "no file to re-download," not an error.
+func (s *ExportBatchService) Get(ctx context.Context, id uuid.UUID) (*ExportBatch, error) {
+	var b ExportBatch
+	if err := s.pool.QueryRow(ctx, `
+		SELECT id, teaching_course_id, submission_period_id, file_path, file_name
+		FROM export_batches WHERE id = $1`, id).Scan(
+		&b.ID, &b.TeachingCourseID, &b.SubmissionPeriodID, &b.FilePath, &b.FileName); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &b, nil
 }
 
 // ListByCourse returns the batch history for a course, newest first.

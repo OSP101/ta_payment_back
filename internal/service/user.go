@@ -31,8 +31,11 @@ type User struct {
 	IsActive           bool      `json:"is_active"`
 	ProfileComplete    bool      `json:"profile_completed"`
 	MustChangePassword bool      `json:"must_change_password"`
-	// IsExecutive grants the read-only budget-analytics dashboard. A flag,
-	// not a role_code value — see rbac.RoleExecutive.
+	// IsExecutive grants the read-only budget-analytics dashboard. Derived,
+	// never stored directly: true whenever this account holds an active row
+	// in admin_officers (see AdminOfficerService) — holding an administrative
+	// seat is what grants the view, not a separately-ticked flag. Not a
+	// role_code value — see rbac.RoleExecutive.
 	IsExecutive bool `json:"is_executive"`
 	// AdminPosition is a free-text administrative role (e.g. "หัวหน้าสาขาวิชา
 	// วิทยาการคอมพิวเตอร์") shown next to the person's role label. Display
@@ -174,7 +177,9 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	var avatarAt *time.Time
 	var totpEnabledAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password, is_executive, admin_position, avatar_key, avatar_updated_at, totp_enabled_at,
+		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password,
+		        EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = users.id AND ao.is_active),
+		        admin_position, avatar_key, avatar_updated_at, totp_enabled_at,
 		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL),
 		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = 1)
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
@@ -439,7 +444,9 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 	// over a non-unique sort key lets Postgres return tied rows in a different
 	// order per query — the same person could appear on two pages while someone
 	// else appeared on none.
-	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password, u.is_executive, u.admin_position, u.avatar_key, u.avatar_updated_at, u.totp_enabled_at IS NOT NULL
+	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password,
+	             EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = u.id AND ao.is_active),
+	             u.admin_position, u.avatar_key, u.avatar_updated_at, u.totp_enabled_at IS NOT NULL
 	      FROM users u WHERE ` + where + ` ORDER BY ` + f.orderBy() + `, u.id
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)
@@ -534,10 +541,6 @@ type UpdateUserInput struct {
 	StudyLevel *string   `json:"study_level,omitempty" validate:"omitempty,oneof=undergrad master phd"`
 	StudyYear  *int      `json:"study_year,omitempty" validate:"omitempty,gte=1,lte=8"`
 	Roles      *[]string `json:"roles,omitempty" validate:"omitempty,min=1,dive,oneof=admin staff lecturer ta"`
-	// Grants/revokes the read-only executive dashboard. Staff may set this —
-	// the management team are lecturers, and per the 06/08/2026 decision the
-	// officer ticks the flag per person in the users page.
-	IsExecutive *bool `json:"is_executive,omitempty"`
 	// AdminPosition: pass "" to clear. Staff/admin only — see the handler gate.
 	AdminPosition *string `json:"admin_position,omitempty" validate:"omitempty,max=200"`
 	// Bank* fields are accepted and ignored (see migration 0047 and Update's
@@ -587,9 +590,6 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 			args = append(args, *in.StudyLevel)
 			i++
 		}
-	}
-	if in.IsExecutive != nil {
-		add("is_executive", *in.IsExecutive)
 	}
 	if in.AdminPosition != nil {
 		if strings.TrimSpace(*in.AdminPosition) == "" {

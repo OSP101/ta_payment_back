@@ -83,8 +83,10 @@ type signerAuthority struct {
 func loadSignerAuthority(ctx context.Context, pool *pgxpool.Pool, officerID uuid.UUID) (signerAuthority, error) {
 	var a signerAuthority
 	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(academic_prefix,'') || full_name, title
-		FROM admin_officers WHERE id = $1`, officerID).Scan(&a.Name, &a.Title); err != nil {
+		SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
+		FROM admin_officers ao
+		LEFT JOIN users u ON u.id = ao.user_id
+		WHERE ao.id = $1`, officerID).Scan(&a.Name, &a.Title); err != nil {
 		return signerAuthority{}, Invalid("ไม่พบข้อมูลผู้ลงนามในระบบ")
 	}
 	a.applyActing(ctx, pool, deanTitlePrefix, fallbackDeanTitle)

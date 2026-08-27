@@ -140,7 +140,7 @@ func (f *csFixture) actor() uuid.UUID {
 
 func (f *csFixture) build() ([]byte, []string) {
 	f.t.Helper()
-	body, warnings, err := f.svc.BuildCourseSummaryWorkbook(f.ctx, f.termID)
+	body, warnings, err := f.svc.BuildCourseSummaryWorkbook(f.ctx, f.actor(), f.termID)
 	if err != nil {
 		f.t.Fatalf("BuildCourseSummaryWorkbook: %v", err)
 	}
