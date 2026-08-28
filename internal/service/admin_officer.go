@@ -65,6 +65,18 @@ var userTitleToPrefix = map[string]string{
 	"ศ. ดร.":  "ศาสตราจารย์ ดร.",
 }
 
+// documentAcademicPrefix spells an account's abbreviated academic title the way
+// documents print it ("ผศ. ดร." → "ผู้ช่วยศาสตราจารย์ ดร."). A title outside the
+// vocabulary passes through as written rather than vanishing: a signature line
+// missing its owner's rank is wrong in a way a slightly unexpected rank is not.
+func documentAcademicPrefix(title string) string {
+	title = strings.TrimSpace(title)
+	if full, ok := userTitleToPrefix[title]; ok {
+		return full
+	}
+	return title
+}
+
 func (s *AdminOfficerService) List(ctx context.Context, includeInactive bool) ([]AdminOfficer, error) {
 	q := `SELECT ao.id, ao.user_id, ao.academic_prefix, ao.full_name, ao.title, ao.is_active,
 	             u.email, u.is_active

@@ -34,12 +34,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -94,6 +96,9 @@ type combinedBookData struct {
 	AcademicYear int
 	Semester     int
 	MonthRange   string // "มิถุนายน 2569 - ตุลาคม 2569"
+	// LecturerName signs the หลักฐาน sheet, spelled with the academic title in
+	// FULL ("ผู้ช่วยศาสตราจารย์ ดร.วรัญญา วรรณศรี") — accounts store the
+	// abbreviation, documents print the long form.
 	LecturerName string
 	Certifier    CertifierChoice
 	// Rates for the three hourly lines the money block prints. Every line shows
@@ -733,25 +738,22 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 		}
 	}
 
-	// ── signatures: three thin-framed boxes ──────────────────────────────
+	// ── signature: ONE thin-framed box ───────────────────────────────────
+	//
+	// The block used to print three boxes side by side — ผู้ปฏิบัติงาน,
+	// อาจารย์ผู้สอน, ผู้รับรอง. The finance office asked for the lecturer's and
+	// the certifier's to be dropped (ส.ค. 2569): they sign the หลักฐาน sheet
+	// and the covering paperwork, and a rule they never sign on the timesheet
+	// only invites a second, contradictory wet signature. What the timesheet
+	// needs to carry is the TA's own attestation of the hours listed above it.
 	sig := grand + 2
-	for _, c := range []struct{ col, text string }{
-		{"A", "ผู้ปฏิบัติงาน"}, {"E", "อาจารย์ผู้สอน"}, {"H", "ผู้รับรอง"},
-	} {
-		if err := set(at(c.col, sig), c.text); err != nil {
-			return 0, err
-		}
+	if err := set(at("A", sig), "ผู้ปฏิบัติงาน"); err != nil {
+		return 0, err
 	}
 
 	rule := sig + 2
-	for _, c := range []struct{ col, text string }{
-		{"A", "ลงชื่อ…………....…...……………….....…"},
-		{"E", "ลงชื่อ…………..............……………………"},
-		{"H", "ลงชื่อ…………....………….........…………"},
-	} {
-		if err := set(at(c.col, rule), c.text); err != nil {
-			return 0, err
-		}
+	if err := set(at("A", rule), "ลงชื่อ…………....…...……………….....…"); err != nil {
+		return 0, err
 	}
 	// The performer's name is LINKED to the block's own name cell, as the
 	// college's file does (=B9): the signature line cannot drift from the
@@ -759,46 +761,18 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	if err := set(at("A", rule+1), fmt.Sprintf("=B%d", first)); err != nil {
 		return 0, err
 	}
-	if d.LecturerName != "" {
-		if err := set(at("E", rule+1), "("+d.LecturerName+")"); err != nil {
-			return 0, err
-		}
-	}
 	if err := set(at("A", rule+2), "วันที่….เดือน…………..…พ.ศ…..……"); err != nil {
 		return 0, err
 	}
-	if err := set(at("E", rule+2), "วันที่….เดือน…………..…พ.ศ…..……"); err != nil {
-		return 0, err
-	}
 	bottom := rule + 2
-	if certName, _, ok := d.Certifier.ClaimCells(); ok {
-		if err := set(at("H", rule+1), certName); err != nil {
-			return 0, err
-		}
-		// Own position on one line, the seat being exercised on the next —
-		// the same two-line acting form the appointment order prints.
-		if err := set(at("H", rule+2), "ตำแหน่ง "+d.Certifier.TitleLine); err != nil {
-			return 0, err
-		}
-		if d.Certifier.ActingFor != "" {
-			if err := set(at("H", rule+3), d.Certifier.ActingFor); err != nil {
-				return 0, err
-			}
-			bottom = rule + 3
-		}
-	}
 	for rr := sig; rr <= bottom; rr++ {
-		for _, m3 := range [][2]string{{"A", "C"}, {"E", "G"}, {"H", "J"}} {
-			if err := f.MergeCell(sheet, at(m3[0], rr), at(m3[1], rr)); err != nil {
-				return 0, err
-			}
+		if err := f.MergeCell(sheet, at("A", rr), at("C", rr)); err != nil {
+			return 0, err
 		}
-		// Header row: bold labels boxed top and bottom. Below: the verticals
-		// of the three boxes run to the block's last row, which closes them.
+		// Header row: bold label boxed top and bottom. Below: the verticals of
+		// the box run to the block's last row, which closes it.
 		for col, spec := range map[string]cellSpec{
-			"A": {bl: "thin"}, "C": {br: "thin"}, "G": {br: "thin"},
-			"H": {bl: "thin"}, "J": {br: "thin"},
-			"B": {}, "D": {}, "E": {}, "F": {}, "I": {},
+			"A": {bl: "thin"}, "C": {br: "thin"}, "B": {},
 		} {
 			spec.h = "center"
 			if rr == sig {
@@ -1081,12 +1055,19 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		return err
 	}
 
+	// ── the two signatures this document carries ─────────────────────────
+	//
+	// The left block used to be a bare ผู้จ่ายเงิน rule — a third signer, on a
+	// sheet the lecturer and the head of department already sign elsewhere in
+	// the same bundle. The finance office asked (ส.ค. 2569) to cut the paper
+	// chase to ONE place per person: the lecturer signs here, beside the
+	// certifier, and nowhere else. So this rule is now theirs, named and with
+	// the academic title spelled out in full the way the college's documents
+	// spell it ("ผู้ช่วยศาสตราจารย์ ดร.", not "ผศ.ดร.").
 	sig := sum + 4
-	if err := set(at("B", sig), "ลงชื่อ………………………………………………….ผู้จ่ายเงิน"); err != nil {
-		return err
-	}
-	if err := styAt("B", sig, cellSpec{}); err != nil {
-		return err
+	lectLines := []string{"ลงชื่อ …........................................................."}
+	if d.LecturerName != "" {
+		lectLines = append(lectLines, "("+d.LecturerName+")", "ตำแหน่ง อาจารย์ผู้สอน")
 	}
 	certLines := []string{"ลงชื่อ ….........................................................."}
 	if certName, _, ok := d.Certifier.ClaimCells(); ok {
@@ -1095,19 +1076,51 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 			certLines = append(certLines, d.Certifier.ActingFor)
 		}
 	}
-	for i, line := range certLines {
-		r := sig + i
-		if err := set(at("G", r), line); err != nil {
-			return err
-		}
-		if err := f.MergeCell(sheet, at("G", r), at("I", r)); err != nil {
-			return err
-		}
-		if err := sty(at("G", r), at("I", r), cellSpec{}); err != nil {
-			return err
+	for _, blk := range []struct {
+		from, to string
+		lines    []string
+	}{
+		{"B", "D", lectLines}, {"G", "I", certLines},
+	} {
+		for i, line := range blk.lines {
+			r := sig + i
+			if err := set(at(blk.from, r), line); err != nil {
+				return err
+			}
+			if err := f.MergeCell(sheet, at(blk.from, r), at(blk.to, r)); err != nil {
+				return err
+			}
+			if err := sty(at(blk.from, r), at(blk.to, r), cellSpec{}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// lecturerSignatory is the course's primary lecturer, named the way the
+// หลักฐาน sheet signs them: academic title in FULL. Accounts store the
+// abbreviation the UI uses, so the prefix is spelled out here rather than
+// printed as typed. A course with no lecturer on file yields "", which leaves
+// the signature line blank for a wet one instead of printing empty brackets.
+func (s *ExportService) lecturerSignatory(ctx context.Context, courseID uuid.UUID) (string, error) {
+	var title, first, last string
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(u.title,''), COALESCE(u.first_name,''), COALESCE(u.last_name,'')
+		FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
+		WHERE tl.teaching_course_id = $1
+		ORDER BY tl.is_primary DESC LIMIT 1`, courseID).Scan(&title, &first, &last)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(first + " " + last)
+	if name == "" {
+		return "", nil
+	}
+	return documentAcademicPrefix(title) + name, nil
 }
 
 // collectCombinedBook gathers every claimant on a course across the whole term.
@@ -1132,13 +1145,10 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	}
 	d.Certifier = certifier
 
-	// The lecturer signs with their academic title — the college's file prints
-	// "ผศ.ดร.วรัญญา วรรณศรี", not the bare name.
-	_ = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(NULLIF(u.title,''),'')||COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,'')
-		FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
-		WHERE tl.teaching_course_id = $1
-		ORDER BY tl.is_primary DESC LIMIT 1`, courseID).Scan(&d.LecturerName)
+	d.LecturerName, err = s.lecturerSignatory(ctx, courseID)
+	if err != nil {
+		return nil, err
+	}
 
 	var pr PayRate
 	_ = s.pool.QueryRow(ctx, `

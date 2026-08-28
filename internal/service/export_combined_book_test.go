@@ -68,7 +68,8 @@ func combinedFixture(t *testing.T) (*excelize.File, *combinedBookData, []claiman
 	t.Helper()
 	d := &combinedBookData{
 		CourseCode: "CP362104", AcademicYear: 2569, Semester: 1,
-		MonthRange: "มิถุนายน 2569 - ตุลาคม 2569", LecturerName: "วรัญญา วรรณศรี",
+		MonthRange:    "มิถุนายน 2569 - ตุลาคม 2569",
+		LecturerName:  "ผู้ช่วยศาสตราจารย์ ดร.วรัญญา วรรณศรี",
 		RateUGRegular: 40, RateUGSpecial: 50, RateGradRegular: 50,
 		Certifier: CertifierChoice{
 			Name: "ผศ. ดร.ณกร วัฒนกิจ", TitleLine: "รองคณบดีฝ่ายวิชาการ รักษาการแทน",
@@ -230,21 +231,79 @@ func TestCombinedSheet_BillsLabAndLectureIntoSeparateColumns(t *testing.T) {
 	}
 }
 
-// The certifier signs every block, in the acting form when they are standing in.
-func TestCombinedSheet_CertifierSignsEveryBlock(t *testing.T) {
+// Office instruction (ส.ค. 2569): the timesheet blocks carry ONE signature box,
+// the TA's own. The lecturer's and the certifier's boxes were removed — they
+// sign the หลักฐาน sheet instead, and an unsigned rule on the timesheet only
+// invited a contradictory second signature.
+func TestCombinedSheet_OnlyTheTASigns(t *testing.T) {
 	f, d, _ := combinedFixture(t)
 	rows, _ := f.GetRows(sheetClaimRegular)
-	found := 0
+	blocks := 0
 	for _, r := range rows {
 		for _, cell := range r {
-			if strings.Contains(cell, d.Certifier.ActingFor) && !strings.Contains(cell, "ตำแหน่ง") {
-				found++
+			switch {
+			case strings.Contains(cell, "ผู้ปฏิบัติงาน"):
+				blocks++
+			case strings.Contains(cell, "อาจารย์ผู้สอน"),
+				strings.Contains(cell, "ผู้รับรอง"),
+				strings.Contains(cell, d.Certifier.Name),
+				strings.Contains(cell, d.Certifier.ActingFor):
+				t.Errorf("timesheet still prints %q — only the TA signs this sheet now", cell)
 			}
 		}
 	}
-	if found < 2 {
-		t.Errorf("the acting seat appears %d times, want once per block — a signature "+
-			"block missing its authority line is an unsigned claim", found)
+	if blocks != 2 {
+		t.Errorf("ผู้ปฏิบัติงาน box appears %d times, want once per block (2)", blocks)
+	}
+}
+
+// Office instruction (ส.ค. 2569): the หลักฐาน sheet's left signature is the
+// LECTURER's, not a bare ผู้จ่ายเงิน rule — one signing place per person across
+// the whole bundle. The name carries the academic title spelled out in full.
+func TestCombinedEvidence_LecturerSignsInPlaceOfThePayer(t *testing.T) {
+	f, d, _ := combinedFixture(t)
+	rows, _ := f.GetRows(sheetEvidenceRegular)
+	var name, position, cert bool
+	for _, r := range rows {
+		for _, cell := range r {
+			if strings.Contains(cell, "ผู้จ่ายเงิน") {
+				t.Errorf("หลักฐาน still prints a ผู้จ่ายเงิน rule (%q)", cell)
+			}
+			switch {
+			case strings.Contains(cell, "("+d.LecturerName+")"):
+				name = true
+			case strings.Contains(cell, "ตำแหน่ง อาจารย์ผู้สอน"):
+				position = true
+			case strings.Contains(cell, d.Certifier.Name):
+				cert = true
+			}
+		}
+	}
+	if !name {
+		t.Errorf("the lecturer's full-title name is missing from %s", sheetEvidenceRegular)
+	}
+	if !position {
+		t.Error("the lecturer's signature line has no ตำแหน่ง อาจารย์ผู้สอน beneath it")
+	}
+	if !cert {
+		t.Error("the certifier must still sign the evidence sheet")
+	}
+}
+
+// The account vocabulary is abbreviated; documents spell the rank out.
+func TestDocumentAcademicPrefix(t *testing.T) {
+	for in, want := range map[string]string{
+		"ผศ. ดร.": "ผู้ช่วยศาสตราจารย์ ดร.",
+		"รศ. ดร.": "รองศาสตราจารย์ ดร.",
+		"อาจารย์": "อาจารย์",
+		"":        "",
+		// Outside the vocabulary: kept, not dropped — a rank we do not know is
+		// still the signer's rank.
+		"ศาสตราจารย์เกียรติคุณ": "ศาสตราจารย์เกียรติคุณ",
+	} {
+		if got := documentAcademicPrefix(in); got != want {
+			t.Errorf("documentAcademicPrefix(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -269,8 +328,8 @@ func TestCombinedSheet_FundedAmountPrintsOnlyWhenBudgetStopsShort(t *testing.T) 
 	if formula, _ := f.GetCellFormula(sheetClaimRegular, "C32"); formula == "" {
 		t.Error("C32 must keep the full-amount formula — the budget must not touch it")
 	}
-	// Block 2 (funded in full): top=41 → ขอเบิกจ่ายเพียง row 73 stays blank.
-	if got, _ := f.GetCellValue(sheetClaimRegular, "C73", raw); got != "" {
+	// Block 2 (funded in full): top=40 → ขอเบิกจ่ายเพียง row 72 stays blank.
+	if got, _ := f.GetCellValue(sheetClaimRegular, "C72", raw); got != "" {
 		t.Errorf("fully funded block prints ขอเบิกจ่ายเพียง %q, want blank", got)
 	}
 
