@@ -46,6 +46,21 @@ const (
 // Replaces whatever was there before — this is the "add" and the "edit" both,
 // since a profile picture is singular by nature.
 func (h *UserHandler) UploadAvatar(c *fiber.Ctx) error {
+	return h.uploadAvatarFor(c, UserID(c))
+}
+
+// UploadAvatarFor lets an admin/staff member set a picture on someone else's
+// account — used right after creating a user, since the create form takes a
+// picture before the account (and its self-serve /me/avatar) exists yet.
+func (h *UserHandler) UploadAvatarFor(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	return h.uploadAvatarFor(c, id)
+}
+
+func (h *UserHandler) uploadAvatarFor(c *fiber.Ctx, id uuid.UUID) error {
 	fh, err := c.FormFile("file")
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "กรุณาเลือกไฟล์รูปภาพ")
@@ -71,12 +86,11 @@ func (h *UserHandler) UploadAvatar(c *fiber.Ctx) error {
 		return err
 	}
 
-	uid := UserID(c)
 	key, _, err := h.Svc.Storage.Save("avatars", uuid.NewString()+".jpg", bytes.NewReader(jpg))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	url, replaced, err := h.Svc.Users.SetAvatar(c.Context(), uid, key)
+	url, replaced, err := h.Svc.Users.SetAvatar(c.Context(), UserID(c), id, key)
 	if err != nil {
 		// The row never took the new key, so the blob just written is an
 		// orphan. Remove it rather than leave litter in the store.

@@ -38,14 +38,14 @@ func TestValidate_BackdateUsesBangkokMonth(t *testing.T) {
 
 	// It is already August in Bangkok, so July is a closed month.
 	err := validateWorkLogEntry(backdateProbe("2026-07-20"), hardeningGate(),
-		start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref)
+		start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref, false)
 	if err == nil {
 		t.Fatal("a July date must be rejected once Bangkok has rolled into August")
 	}
 
 	// August itself stays writable at 03:00 on the 1st.
 	if err := validateWorkLogEntry(backdateProbe("2026-08-01"), hardeningGate(),
-		start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref); err != nil {
+		start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref, false); err != nil {
 		t.Fatalf("the current Bangkok month must be writable, got: %v", err)
 	}
 }
@@ -58,7 +58,7 @@ func TestValidate_BackdateWouldLeakUnderUTC(t *testing.T) {
 	ref := nowUTCButAugustInBangkok() // left in UTC on purpose
 
 	if err := validateWorkLogEntry(backdateProbe("2026-07-20"), hardeningGate(),
-		start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref); err != nil {
+		start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref, false); err != nil {
 		t.Fatalf("precondition: UTC reading still thinks it is July, so this "+
 			"write should pass — the divergence is the bug being guarded. got: %v", err)
 	}

@@ -722,6 +722,23 @@ func (h *TeachingHandler) AddMakeup(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// WaiveMakeup declares "no makeup needed" for a cancelled period — same
+// identity (section/date/kind) as AddMakeup, no date/time.
+func (h *TeachingHandler) WaiveMakeup(c *fiber.Ctx) error {
+	sectionID, err := uuid.Parse(c.Params("sectionId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
+	}
+	var r service.WaiveMakeupRequest
+	if err := Bind(c, &r); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.WaiveMakeup(c.Context(), UserID(c), sectionID, r); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // DeleteMakeup removes a filed makeup for the section. Service enforces that
 // submitted/approved worklog rows on the vanishing date block the delete.
 func (h *TeachingHandler) DeleteMakeup(c *fiber.Ctx) error {

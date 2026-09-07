@@ -190,6 +190,38 @@ func TestBuildDocsBundle_FallsBackToZipForLegacyImage(t *testing.T) {
 	}
 }
 
+// The creditor-form fixture is a real Word export, so before setPDFDocInfo
+// the merged bundle's Info dict was whatever that export carried ("Microsoft
+// Word - Document1", no author) — confusing on an official finance record.
+// This asserts the stamp actually lands on the bytes officers download.
+func TestBuildDocsBundle_StampsOwnMetadataOverSourceFile(t *testing.T) {
+	page := realPDF(t)
+	svc, ids := bundleFixture(t,
+		[][]byte{page, page, page},
+		[]string{"national_id", "bank_book", "creditor_form"})
+
+	body, _, err := svc.BuildDocsZip(context.Background(), ids)
+	if err != nil {
+		t.Fatalf("BuildDocsZip: %v", err)
+	}
+
+	conf := pdfcpuModel.NewDefaultConfiguration()
+	conf.ValidationMode = pdfcpuModel.ValidationRelaxed
+	info, err := pdfcpuAPI.PDFInfo(bytes.NewReader(body), "bundle.pdf", nil, false, conf)
+	if err != nil {
+		t.Fatalf("reading merged PDF info: %v", err)
+	}
+	if info.Title == "" || info.Title == "Microsoft Word - Document1" {
+		t.Errorf("Title = %q, want our own stamped title, not the source file's", info.Title)
+	}
+	if info.Author == "" {
+		t.Error("Author is empty, want it stamped")
+	}
+	if info.Subject == "" {
+		t.Error("Subject is empty, want it stamped")
+	}
+}
+
 func TestBuildDocsBundle_RejectsEmptySelection(t *testing.T) {
 	svc, _ := bundleFixture(t, nil, nil)
 	if _, _, err := svc.BuildDocsZip(context.Background(), nil); err == nil {

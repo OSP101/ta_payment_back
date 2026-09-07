@@ -70,15 +70,31 @@ func TestUpsert_GradRegularReview_NotConstrainedToSchedule(t *testing.T) {
 	}
 }
 
-// Undergrad is untouched by this rule — only grad-regular gets the schedule
-// tie.
-func TestUpsert_Undergrad_NotConstrainedToSchedule(t *testing.T) {
+// Undergrad used to be exempt: the 2026 meeting asked only for the grad-regular
+// tie, so the check bailed out for everyone else and this test pinned that.
+//
+// It no longer does. The exemption was the gap it looks like — the undergrad
+// majority could type a lecture onto a day the section never meets and collect
+// that week's quota for a class that never ran, every week, up to the term
+// ceiling. The caps bound how much; nothing bound whether the คาบ existed. The
+// tie now covers every level and track (see validateClassWindow), so the same
+// Tuesday that used to be accepted is refused.
+func TestUpsert_Undergrad_IsAlsoConstrainedToSchedule(t *testing.T) {
 	f := newFixture(t, fixtureOpts{Level: "undergrad", Track: "regular"})
-	_, tue := sameWeekDays()
+	_, tue := sameWeekDays() // Tuesday — the fixture only schedules Monday
 	if _, err := f.upsert(WorkLog{
 		AssignmentID: f.AssignmentID, WorkDate: tue,
 		StartTime: "10:00", EndTime: "11:00", Hours: 1, Activity: "lecture",
+	}); err == nil {
+		t.Fatal("an undergrad lecture on a day with no scheduled class must be refused")
+	}
+	// The real Monday lecture window still works, so the rule constrains rather
+	// than blocks.
+	mon, _ := sameWeekDays()
+	if _, err := f.upsert(WorkLog{
+		AssignmentID: f.AssignmentID, WorkDate: mon,
+		StartTime: "10:00", EndTime: "11:00", Hours: 1, Activity: "lecture",
 	}); err != nil {
-		t.Fatalf("undergrad lecture entries must stay unconstrained by this rule: %v", err)
+		t.Fatalf("an undergrad lecture inside the real period must still be accepted: %v", err)
 	}
 }

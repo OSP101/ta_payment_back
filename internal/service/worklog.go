@@ -195,23 +195,44 @@ func (s *WorkLogService) loadMakeupIndex(ctx context.Context, sectionID uuid.UUI
 	idx := makeupIndex{
 		byOriginal: map[string][]time.Time{},
 		byMakeup:   map[string]bool{},
+		waived:     map[string]bool{},
+		onDate:     map[string][]makeupWindow{},
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT original_date, makeup_date FROM makeup_schedules WHERE section_id = $1`, sectionID)
+		`SELECT original_date, makeup_date, kind,
+		        TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
+		 FROM makeup_schedules WHERE section_id = $1`, sectionID)
 	if err != nil {
 		return idx, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var orig, mk time.Time
-		if err := rows.Scan(&orig, &mk); err != nil {
+		// makeup_date is NULL on a waived row ("ไม่มีการชดเชย" — WaiveMakeup writes
+		// makeup_date = NULL). Scanning that into a bare time.Time fails the whole
+		// Upsert with a raw driver error, which is how one waived คาบ used to make
+		// every work-log save on the section impossible.
+		var orig time.Time
+		var mk *time.Time
+		var kind string
+		var st, en *string
+		if err := rows.Scan(&orig, &mk, &kind, &st, &en); err != nil {
 			return idx, err
 		}
 		ok := orig.Format("2006-01-02")
-		idx.byOriginal[ok] = append(idx.byOriginal[ok], mk)
-		idx.byMakeup[mk.Format("2006-01-02")] = true
+		if mk == nil {
+			idx.waived[ok] = true
+			continue
+		}
+		mkey := mk.Format("2006-01-02")
+		idx.byOriginal[ok] = append(idx.byOriginal[ok], *mk)
+		idx.byMakeup[mkey] = true
+		win := makeupWindow{kind: kind, origWeekday: orig.Weekday()}
+		if st != nil && en != nil {
+			win.start, win.end = *st, *en
+		}
+		idx.onDate[mkey] = append(idx.onDate[mkey], win)
 	}
-	return idx, nil
+	return idx, rows.Err()
 }
 
 // holidayWindow is one closure on one date. A faculty holiday may cover only
@@ -275,9 +296,28 @@ func (h holidaySet) overlapping(date string, startMin, endMin int) (holidayWindo
 // section that moved its lecture and its lab to different days kept only whichever
 // row the query happened to read last, and the refusal message named the wrong
 // date. Membership is all byMakeup is ever asked, so it is a plain set.
+// waived holds the original dates the course declared "ไม่มีการชดเชย" for. Those
+// rows live in makeup_schedules with makeup_date NULL, so they must never reach
+// byOriginal — a zero time.Time there renders as "ย้ายไปเป็นวันชดเชย 0001-01-01"
+// — and they are the reason every scan on this table has to be NULL-tolerant.
 type makeupIndex struct {
 	byOriginal map[string][]time.Time
 	byMakeup   map[string]bool
+	waived     map[string]bool
+	// onDate indexes the filed makeups BY THE DATE THEY LAND ON, with the window
+	// the lecturer picked. validateClassWindow needs it: a makeup is the one
+	// legitimate way for duty hours to fall outside the section's weekly grid, so
+	// the grid check has to know which hours that makeup actually authorised.
+	onDate map[string][]makeupWindow
+}
+
+// makeupWindow is one filed makeup as the class-window check sees it. start/end
+// are empty when the lecturer filed only a date — the คาบ then keeps its original
+// length, so the check falls back to the section's schedule for origWeekday.
+type makeupWindow struct {
+	kind        string
+	origWeekday time.Weekday
+	start, end  string // "HH:MM"
 }
 
 // activityGate is the compact "what's this TA authorized to log" packet the
@@ -323,6 +363,15 @@ func validateWorkLogEntry(
 	holidays holidaySet,
 	mk makeupIndex,
 	todayRef time.Time,
+	// periodOpen is true only when the caller has confirmed, via the actual
+	// submission_periods configuration, that this date's month is still
+	// explicitly open — see isMonthOpenForCourse. It lets a period staff
+	// extended past its calendar month-end override the calendar-month guess
+	// below instead of being silently refused by it. false is always safe:
+	// it just falls back to the plain calendar rule this function used before
+	// periods existed, so callers with no period info (tests, terms that never
+	// adopted the monthly workflow) keep the old behaviour unchanged.
+	periodOpen bool,
 ) error {
 	scope := gate.Scope
 	sm, ok1 := parseHM(w.StartTime)
@@ -356,8 +405,12 @@ func validateWorkLogEntry(
 	// No back-dating into a month that has already passed. Compared by
 	// (year, month) so it is timezone-robust. Future dates within the term are
 	// allowed (a TA may fill the whole term ahead of time). Disabled when
-	// todayRef is the zero value (staff override + unit tests).
-	if !todayRef.IsZero() {
+	// todayRef is the zero value (staff override + unit tests), and when the
+	// caller has confirmed the actual submission period for that month is
+	// still open — staff extending a period past its calendar month-end (the
+	// "ระยะเวลาเบิกจ่ายรายเดือน" screen) must actually reopen it, not just
+	// look like it did while this fallback guess still refuses every write.
+	if !todayRef.IsZero() && !periodOpen {
 		dy, dm, _ := d.Date()
 		ty, tm, _ := todayRef.Date()
 		if dy < ty || (dy == ty && dm < tm) {
@@ -452,6 +505,14 @@ func validateWorkLogEntry(
 
 	switch w.Activity {
 	case "lecture", "lab":
+		// Declared "ไม่มีการชดเชย": the คาบ was cancelled and is never taught, so
+		// there are no duty hours to bill on it. Checked before the closure branch
+		// because it is the more specific answer — and it still holds if the
+		// closure itself is later edited away.
+		if mk.waived[dkey] {
+			return Invalid(fmt.Sprintf(
+				"คาบของวันที่ %s ถูกระบุว่า “ไม่มีการชดเชย” จึงไม่มีชั่วโมงปฏิบัติงานให้ลงเวลา", dkey))
+		}
 		if isMovedAway {
 			// Name every replacement date, not just one: the lecture and the lab
 			// of this day may have moved to different days, and telling the TA
@@ -821,21 +882,33 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		hasTime    bool
 	}
 	makeup := map[makeupKey]makeupTo{}
+	// Periods declared "ไม่มีการชดเชย" (makeup_date NULL). They are not moved —
+	// they simply never happen — so the generator must skip them outright instead
+	// of planting a billable row on the cancelled date. This scan used to read
+	// makeup_date into a bare time.Time and drop the row on the scan error, which
+	// made a waived คาบ invisible here and generated it as if nothing happened.
+	waived := map[makeupKey]bool{}
 	if rows, err := s.pool.Query(ctx,
 		`SELECT original_date, makeup_date, kind,
 		        TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
 		 FROM makeup_schedules WHERE section_id=$1`,
 		sectionID); err == nil {
 		for rows.Next() {
-			var orig, mk time.Time
+			var orig time.Time
+			var mk *time.Time
 			var kind string
 			var st, en *string
 			if err := rows.Scan(&orig, &mk, &kind, &st, &en); err == nil {
-				to := makeupTo{date: mk}
+				key := makeupKey{orig.Format("2006-01-02"), kind}
+				if mk == nil {
+					waived[key] = true
+					continue
+				}
+				to := makeupTo{date: *mk}
 				if st != nil && en != nil {
 					to.start, to.end, to.hasTime = *st, *en, true
 				}
-				makeup[makeupKey{orig.Format("2006-01-02"), kind}] = to
+				makeup[key] = to
 			}
 		}
 		rows.Close()
@@ -925,6 +998,11 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			// makeup's explicit window, or narrowed to the attendance window
 			// below. The closure tests keep using the PERIOD's window: whether
 			// the class happened is a question about the class, not the duty.
+			// Cancelled outright with no replacement — nothing was taught, so
+			// nothing is billable.
+			if waived[makeupKey{key, sc.kind}] {
+				continue
+			}
 			useDate := d
 			rowStart, rowEnd, rowHours := sc.start, sc.end, sc.hours
 			explicitTime := false
@@ -945,9 +1023,12 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			// lecture as "14.00 - 15.00 เช็คชื่อ" when the declared attendance is
 			// one hour. Generating the full span both contradicted the signed
 			// form and immediately blew the weekly attendance cap it was
-			// declared under. A makeup with an explicit window is exempt — the
-			// lecturer already picked the exact duty hour.
-			if sc.kind == "lecture" && !explicitTime && ac.Level == "undergrad" &&
+			// declared under. A makeup's explicit window is the rescheduled
+			// CLASS period (same as section_schedules for the original slot),
+			// not a TA-duty-scoped window, so the same trim applies there too —
+			// otherwise a 2-hour makeup billed as "เช็คชื่อ" doubled the declared
+			// one-hour attendance duty from the signed ใบคำขอ.
+			if sc.kind == "lecture" && ac.Level == "undergrad" &&
 				ac.HasWorkloadForm && ac.WeeklyCapLecture > 0 && ac.WeeklyCapLecture < rowHours-0.01 {
 				if em, ok := parseHM(rowEnd); ok {
 					rowStart = hhmm(em - int(ac.WeeklyCapLecture*60+0.5))
@@ -2054,16 +2135,26 @@ func (s *WorkLogService) enforceWeeklyActivityCap(ctx context.Context, ac *assig
 	// System-generated makeup rows are exempt from the DESTINATION week's cap:
 	// the hour belongs to the origin week whose class was cancelled, and the
 	// college's own claim forms show both the regular and the relocated hour in
-	// one week. Scoped to source='auto' so a TA typing "ชดเชย" into a manual
-	// note cannot dodge the cap.
+	// one week.
+	//
+	// The exemption keys on makeup_schedules — staff/lecturer data the TA cannot
+	// write — plus source='auto'. It used to key on the row's own note matching
+	// "ชดเชย", which the TA CAN write: `note` is free text on any draft row and
+	// the edit path leaves `source` untouched, so adding the word to a generated
+	// row deleted it from its own week's total and freed the quota for a second
+	// row. That bought a doubled คาบ quota every week of the term.
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COALESCE(SUM(hours), 0) FROM work_logs
 		 WHERE assignment_id = $1
 		   AND date_trunc('week', work_date) = date_trunc('week', $2::date)
 		   AND activity = ANY($3)
 		   AND id <> $4
-		   AND NOT (source = 'auto' AND COALESCE(note,'') LIKE '%ชดเชย%')`,
-		w.AssignmentID, w.WorkDate, activities, w.ID).Scan(&weekTotal); err != nil {
+		   AND NOT (source = 'auto' AND EXISTS (
+		         SELECT 1 FROM makeup_schedules ms
+		          WHERE ms.section_id = $5
+		            AND ms.makeup_date = work_logs.work_date
+		            AND ms.kind = work_logs.activity))`,
+		w.AssignmentID, w.WorkDate, activities, w.ID, ac.SectionID).Scan(&weekTotal); err != nil {
 		return err
 	}
 	if weekTotal+w.Hours > cap+0.01 {
@@ -2197,16 +2288,23 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 		if b.cap <= 0 {
 			continue
 		}
-		// Same makeup exemption as enforceWeeklyActivityCap: a relocated class
-		// hour counts against its origin week, not the week it landed in.
+		// Same makeup exemption as enforceWeeklyActivityCap, keyed the same way:
+		// on the filed makeup dates, not on the row's own note. A relocated class
+		// hour counts against its origin week, not the week it landed in — and
+		// approval is the last gate, so it must not be persuadable by text the TA
+		// typed into the row it is judging.
 		wrows, err := tx.Query(ctx, `
 			SELECT TO_CHAR(date_trunc('week', work_date),'YYYY-MM-DD')
 			FROM work_logs
 			WHERE assignment_id=$1 AND status IN ('submitted','approved') AND activity = ANY($2)
-			  AND NOT (source = 'auto' AND COALESCE(note,'') LIKE '%ชดเชย%')
+			  AND NOT (source = 'auto' AND EXISTS (
+			        SELECT 1 FROM makeup_schedules ms
+			         WHERE ms.section_id = $4
+			           AND ms.makeup_date = work_logs.work_date
+			           AND ms.kind = work_logs.activity))
 			GROUP BY date_trunc('week', work_date)
 			HAVING SUM(hours) > $3 + 0.01
-			ORDER BY 1`, assignmentID, b.acts, b.cap)
+			ORDER BY 1`, assignmentID, b.acts, b.cap, ac.SectionID)
 		if err != nil {
 			return err
 		}
@@ -2356,22 +2454,30 @@ func (s *WorkLogService) enforceTermHourCeiling(ctx context.Context, ac *assignm
 	return nil
 }
 
-// validateGradRegularClassWindow requires a grad-regular (level master/phd,
-// track regular) TA's เช็คชื่อ/สอนปฏิบัติการ entry to fall within that
-// section's real scheduled class period for that weekday — per the 2026
-// staff meeting: attendance hours reference the actual lecture period, and
-// lab-teaching hours reference the actual class schedule, rather than being
-// freely typed the way manual entry allows today. Undergrad and grad-special
-// are untouched; ตรวจงาน (review/other) stays free-form, matching the
-// meeting's own scope ("ตรวจงานวันเวลาไหน" — no schedule tie called for there).
-// A makeup session logs as activity='makeup', not 'lecture'/'lab', so it
-// never reaches this check — its date legitimately differs from the weekly
-// pattern.
-func (s *WorkLogService) validateGradRegularClassWindow(ctx context.Context, ac *assignmentContext, w WorkLog) error {
-	if ac.Level == "undergrad" || ac.Track != "regular" {
-		return nil
-	}
-	if w.Activity != "lecture" && w.Activity != "lab" {
+// validateClassWindow ties a class-bound entry to the section's real timetable —
+// the raw section_schedules rows staff enter when they open the course — so
+// lecture/lab/makeup hours can only be billed for a period that actually meets.
+//
+// It used to run for grad-regular TAs only, which left the undergrad majority
+// with no grid at all: the caps bound how MUCH they could claim per week, but
+// nothing said the คาบ had to exist. A TA could invent a Sunday 03:00 lecture and
+// collect a full week's quota for a class that never met, every week of the term,
+// up to the term ceiling. The weekly cap is a budget; this is the timetable.
+//
+// Legal windows for an entry are:
+//   - any section_schedules period of the matching kind on the entry's weekday;
+//   - any makeup filed ONTO this date — with the lecturer's explicit window when
+//     they picked one, else the original คาบ's own weekday windows, since a
+//     makeup with no stated time keeps the period's normal length.
+//
+// The entry must fit INSIDE one of them (sm >= start && em <= end), not merely
+// touch it: a shorter เช็คชื่อ inside its 2-hour lecture is the normal case, but
+// a row spilling past the period's end is billing time the class did not run.
+//
+// review and other are deliberately exempt — grading and prep are off-site work
+// with their own caps, not timetabled duties.
+func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignmentContext, w WorkLog, mk makeupIndex) error {
+	if w.Activity != "lecture" && w.Activity != "lab" && w.Activity != "makeup" {
 		return nil
 	}
 	d, err := time.Parse("2006-01-02", w.WorkDate)
@@ -2383,41 +2489,227 @@ func (s *WorkLogService) validateGradRegularClassWindow(ctx context.Context, ac 
 	if !sok || !eok {
 		return nil // time format already validated upstream
 	}
+	// "makeup" is kind-agnostic: the row says a rescheduled class was taught, not
+	// which half of the course it belonged to.
+	kindMatches := func(k string) bool { return w.Activity == "makeup" || k == w.Activity }
+
+	// The section's whole weekly grid, read once: the makeup fallback below needs
+	// weekdays other than the entry's own.
+	type slot struct {
+		day      time.Weekday
+		kind     string
+		startMin int
+		endMin   int
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT start_time::text, end_time::text FROM section_schedules
-		WHERE section_id = $1 AND kind = $2 AND day_of_week = $3`,
-		ac.SectionID, w.Activity, int(d.Weekday()))
+		SELECT kind, day_of_week, TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
+		FROM section_schedules WHERE section_id = $1`, ac.SectionID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	label := "เช็คชื่อ (คาบบรรยาย)"
-	if w.Activity == "lab" {
-		label = "สอนปฏิบัติการ"
-	}
-	var windows []string
+	var grid []slot
 	for rows.Next() {
-		var st, et string
+		var kind, st, et string
+		var dow int
+		if err := rows.Scan(&kind, &dow, &st, &et); err != nil {
+			return err
+		}
+		stm, ok1 := parseHM(st)
+		etm, ok2 := parseHM(et)
+		if !ok1 || !ok2 {
+			continue
+		}
+		grid = append(grid, slot{time.Weekday(dow), kind, stm, etm})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// A section with no timetable at all cannot be graded against one. Staff not
+	// having entered it yet must not become a wall the TA cannot climb — the
+	// caps still bound the claim.
+	if len(grid) == 0 {
+		return nil
+	}
+
+	hhmmRange := func(a, b int) string {
+		return fmt.Sprintf("%02d:%02d-%02d:%02d", a/60, a%60, b/60, b%60)
+	}
+	var legal []string
+	fits := false
+	consider := func(startMin, endMin int) {
+		legal = append(legal, hhmmRange(startMin, endMin))
+		if sm >= startMin && em <= endMin {
+			fits = true
+		}
+	}
+	for _, g := range grid {
+		if g.day == d.Weekday() && kindMatches(g.kind) {
+			consider(g.startMin, g.endMin)
+		}
+	}
+	// Makeups landing on this date open their own window, whatever weekday it is.
+	for _, mw := range mk.onDate[w.WorkDate] {
+		if !kindMatches(mw.kind) {
+			continue
+		}
+		if mw.start != "" && mw.end != "" {
+			stm, ok1 := parseHM(mw.start)
+			etm, ok2 := parseHM(mw.end)
+			if ok1 && ok2 {
+				consider(stm, etm)
+				continue
+			}
+		}
+		// No explicit window: the คาบ runs its usual length on its usual clock.
+		for _, g := range grid {
+			if g.day == mw.origWeekday && g.kind == mw.kind {
+				consider(g.startMin, g.endMin)
+			}
+		}
+	}
+	if fits {
+		return nil
+	}
+
+	label := "บรรยาย"
+	switch w.Activity {
+	case "lab":
+		label = "ปฏิบัติการ"
+	case "makeup":
+		label = "ชดเชย"
+	}
+	if len(legal) == 0 {
+		return Invalid(fmt.Sprintf(
+			"วันที่ %s ไม่มีคาบ%sตามตารางสอนจริงของกลุ่มนี้ ลงเวลาไม่ได้", w.WorkDate, label))
+	}
+	// Duplicates are common (two identical periods filed twice); show each once.
+	seen := map[string]bool{}
+	uniq := legal[:0]
+	for _, v := range legal {
+		if !seen[v] {
+			seen[v] = true
+			uniq = append(uniq, v)
+		}
+	}
+	sort.Strings(uniq)
+	return Invalid(fmt.Sprintf(
+		"เวลาที่กรอกต้องอยู่ในคาบ%sจริงของวันนี้ (%s)", label, strings.Join(uniq, ", ")))
+}
+
+// validateReviewWindow ties a ตรวจงาน entry to a slot somebody declared for it
+// in advance, instead of letting the date and hour be typed freely.
+//
+// Grading has TWO legitimate sources and both must stay loggable, because
+// Generate itself writes rows from both:
+//
+//   - ta_review_schedules (kind='review') — the TA's OWN weekly grading slot,
+//     the "ตารางตรวจการบ้านของคุณ" card. Expanded weekly, so the entry's weekday
+//     and hours must fit one of those slots.
+//   - lecture_review_dates — specific grading dates filed against the section by
+//     the lecturer/staff, each with its own window.
+//
+// A TA declares the first themselves, so this is not an externally verified fact
+// the way the class timetable is. It is still worth binding: the slot is capped
+// by the hours the LECTURER declared (enforceReviewCap), is conflict-checked
+// against the TA's own classes and other duties (enforceReviewNoConflict), and is
+// visible on their timetable before the fact. That turns "any hour I type later"
+// into "the hours I committed to up front", which is the difference between a
+// record and a claim.
+//
+// Unlike validateClassWindow, an empty declaration is NOT deferred: the class
+// grid belongs to staff, so its absence is not the TA's fault, but this table is
+// the TA's own and the remedy is entirely in their hands. They are told to add
+// the slot rather than silently allowed to bill against nothing.
+func (s *WorkLogService) validateReviewWindow(ctx context.Context, ac *assignmentContext, w WorkLog) error {
+	if w.Activity != "review" {
+		return nil
+	}
+	d, err := time.Parse("2006-01-02", w.WorkDate)
+	if err != nil {
+		return nil // date format already validated upstream
+	}
+	sm, sok := parseHM(w.StartTime)
+	em, eok := parseHM(w.EndTime)
+	if !sok || !eok {
+		return nil // time format already validated upstream
+	}
+
+	// A grading date the lecturer filed for this section wins outright — it names
+	// this exact date, so it is more specific than any weekly pattern. A row with
+	// no window recorded (start/end are nullable) authorises the whole day.
+	rows, err := s.pool.Query(ctx, `
+		SELECT TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
+		FROM lecture_review_dates
+		WHERE section_id = $1 AND review_date = $2::date`, ac.SectionID, w.WorkDate)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var st, et *string
 		if err := rows.Scan(&st, &et); err != nil {
 			return err
 		}
-		stm, stok := parseHM(st)
-		etm, etok := parseHM(et)
-		if !stok || !etok {
-			continue
+		if st == nil || et == nil {
+			return nil
 		}
-		windows = append(windows, fmt.Sprintf("%02d:%02d-%02d:%02d", stm/60, stm%60, etm/60, etm%60))
-		if sm >= stm && em <= etm {
-			return nil // fits within this scheduled period
+		stm, ok1 := parseHM(*st)
+		etm, ok2 := parseHM(*et)
+		if ok1 && ok2 && sm >= stm && em <= etm {
+			return nil
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(windows) == 0 {
-		return Invalid(fmt.Sprintf("วันนี้ไม่มีคาบ%sตามตารางสอนจริงของกลุ่มนี้", label))
+
+	// Otherwise the TA's own weekly grading slots decide.
+	slotRows, err := s.pool.Query(ctx, `
+		SELECT day_of_week, TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
+		FROM ta_review_schedules
+		WHERE assignment_id = $1 AND kind = 'review'
+		ORDER BY day_of_week, start_time`, w.AssignmentID)
+	if err != nil {
+		return err
 	}
-	return Invalid(fmt.Sprintf("เวลาที่กรอกต้องอยู่ในคาบ%sจริง (%s)", label, strings.Join(windows, ", ")))
+	defer slotRows.Close()
+	var declared []string
+	for slotRows.Next() {
+		var dow int
+		var st, et string
+		if err := slotRows.Scan(&dow, &st, &et); err != nil {
+			return err
+		}
+		stm, ok1 := parseHM(st)
+		etm, ok2 := parseHM(et)
+		if !ok1 || !ok2 {
+			continue
+		}
+		declared = append(declared, fmt.Sprintf("%s %s-%s", thaiWeekday(dow), st, et))
+		if dow == int(d.Weekday()) && sm >= stm && em <= etm {
+			return nil
+		}
+	}
+	if err := slotRows.Err(); err != nil {
+		return err
+	}
+
+	if len(declared) == 0 {
+		return Invalid("ยังไม่ได้กำหนดตารางตรวจงานของคุณ กรุณาเพิ่มช่วงเวลาที่ “ตารางตรวจการบ้านของคุณ” ก่อน จึงจะลงเวลาตรวจงานได้")
+	}
+	return Invalid(fmt.Sprintf(
+		"เวลาที่กรอกต้องอยู่ในตารางตรวจงานที่คุณแจ้งไว้ (%s) หรือวันตรวจงานที่อาจารย์กำหนด",
+		strings.Join(declared, ", ")))
+}
+
+// thaiWeekday names a day_of_week (0=Sunday) for a refusal message.
+func thaiWeekday(dow int) string {
+	names := []string{"อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"}
+	if dow < 0 || dow >= len(names) {
+		return "?"
+	}
+	return names[dow]
 }
 
 func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog) (uuid.UUID, error) {
@@ -2447,6 +2739,7 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	if err != nil {
 		return uuid.Nil, err
 	}
+	periodOpen := isMonthOpenForCourse(ctx, s.pool, ac.TeachingCourseID, w.WorkDate)
 	if err := validateWorkLogEntry(w, activityGate{
 		Scope:        ac.ReimburseScope,
 		AllowLecture: ac.AllowLecture,
@@ -2456,10 +2749,13 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		// "today" must be Thailand's calendar day, not the host's. On a UTC
 		// server time.Now() still reports yesterday until 07:00 local, which
 		// would reopen a month the back-date rule should already have closed.
-	}, termStart, termEnd, midterm, final, holidays, mk, timeutil.Now()); err != nil {
+	}, termStart, termEnd, midterm, final, holidays, mk, timeutil.Now(), periodOpen); err != nil {
 		return uuid.Nil, err
 	}
-	if err := s.validateGradRegularClassWindow(ctx, ac, w); err != nil {
+	if err := s.validateClassWindow(ctx, ac, w, mk); err != nil {
+		return uuid.Nil, err
+	}
+	if err := s.validateReviewWindow(ctx, ac, w); err != nil {
 		return uuid.Nil, err
 	}
 	// Month lock: a finance_sent month is frozen for everyone; a closed period
@@ -3281,12 +3577,27 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		AllowLab:     ac.AllowLab,
 		AllowReview:  ac.AllowReview,
 		AllowOther:   ac.AllowOther,
-	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}); err != nil {
+		// periodOpen is irrelevant here: todayRef is already the zero value
+		// below (staff/lecturer override, per the comment on that param),
+		// which disables the calendar rule outright regardless of what's
+		// passed for periodOpen.
+	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}, false); err != nil {
 		return uuid.Nil, err
 	}
-	if err := s.validateGradRegularClassWindow(ctx, ac, w); err != nil {
+	if err := s.validateClassWindow(ctx, ac, w, mk); err != nil {
 		return uuid.Nil, err
 	}
+	// validateReviewWindow is deliberately NOT applied here, unlike the class
+	// window above. Its prerequisite — ta_review_schedules — is writable only by
+	// the TA (RequireRole(RoleTA) on /assignments/:id/review-schedules), so staff
+	// correcting a ตรวจงาน row for a TA who declared no slot could neither save
+	// the correction nor create what the rule demands: a dead end with no action
+	// available to the person holding the problem. The class grid has no such
+	// trap, because staff own that table and can fix it.
+	//
+	// This is not a hole in the rule: TAs cannot reach this path (it is staff and
+	// lecturer only), and every write through it is password-confirmed, reasoned,
+	// audited, and notified to both the TA and the lecturer.
 	// Staff get no exemption from the monthly deadline. A closed month is closed
 	// for them too (03/08/2026, at the staff's own request): the only way to
 	// correct a month after it closes is to move the period's due date in

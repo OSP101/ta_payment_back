@@ -309,11 +309,15 @@ func (s *HolidayService) Delete(ctx context.Context, actor, id uuid.UUID) error 
 // ---------------------------------------------------------------------------
 
 type HolidayImpactMakeup struct {
-	ID         uuid.UUID `json:"id"`
-	MakeupDate string    `json:"makeup_date"`
-	StartTime  *string   `json:"start_time,omitempty"`
-	EndTime    *string   `json:"end_time,omitempty"`
-	Note       *string   `json:"note,omitempty"`
+	ID uuid.UUID `json:"id"`
+	// MakeupDate is nil when Waived is true — a waiver has no replacement date.
+	MakeupDate *string `json:"makeup_date,omitempty"`
+	StartTime  *string `json:"start_time,omitempty"`
+	EndTime    *string `json:"end_time,omitempty"`
+	Note       *string `json:"note,omitempty"`
+	// Waived means a manager/TA confirmed this period will deliberately not
+	// get a makeup (migration 0104) — treated as resolved, same as a filed one.
+	Waived bool `json:"waived"`
 }
 
 type HolidayImpactSection struct {
@@ -374,8 +378,8 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		       sec.id, sec.sec_no, sec.track::text,
 		       sch.kind, sch.start_time::text, sch.end_time::text, sch.room,
 		       m.id,
-		       CASE WHEN m.id IS NULL THEN NULL ELSE TO_CHAR(m.makeup_date,'YYYY-MM-DD') END,
-		       m.start_time::text, m.end_time::text, m.note
+		       CASE WHEN m.makeup_date IS NULL THEN NULL ELSE TO_CHAR(m.makeup_date,'YYYY-MM-DD') END,
+		       m.start_time::text, m.end_time::text, m.note, m.waived
 		FROM public_holidays h
 		JOIN sections sec ON sec.teaching_course_id = $1
 		JOIN section_schedules sch
@@ -421,20 +425,27 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		var mID *uuid.UUID
 		var mDate, mStart, mEnd *string
 		var mNote *string
+		var mWaived *bool
 		if err := rows.Scan(&origDate, &dow, &nameTH, &hStart, &hEnd,
 			&sec.SectionID, &sec.SecNo, &trackStr,
 			&sec.Kind, &sec.StartTime, &sec.EndTime, &sec.Room,
-			&mID, &mDate, &mStart, &mEnd, &mNote); err != nil {
+			&mID, &mDate, &mStart, &mEnd, &mNote, &mWaived); err != nil {
 			return nil, err
 		}
 		sec.Track = trackStr
-		if mID != nil && mDate != nil {
+		// mID alone (not mID + mDate) marks resolved: a waived row has an id but
+		// no makeup_date, and must count the same as a filed one — that's the
+		// whole point of the waiver (see migration 0104). mWaived comes back NULL
+		// (LEFT JOIN, no matching row) exactly when mID does, so it's never nil
+		// on the branch that reads it.
+		if mID != nil {
 			sec.Makeup = &HolidayImpactMakeup{
 				ID:         *mID,
-				MakeupDate: *mDate,
+				MakeupDate: mDate,
 				StartTime:  mStart,
 				EndTime:    mEnd,
 				Note:       mNote,
+				Waived:     mWaived != nil && *mWaived,
 			}
 		} else {
 			unresolved++

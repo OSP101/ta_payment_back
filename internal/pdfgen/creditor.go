@@ -378,7 +378,7 @@ const (
 	// goes. Thai below-vowels (ุ ู) and the ์ mark descend ~2 pt at bodyFont,
 	// so writing exactly on the dots' own baseline draws them straight through
 	// those glyphs; a small lift reads as handwriting resting on the line.
-	dottedLift = 2.5
+	dottedLift = 4.5
 	// bodyFont is the size every value is written at, and minFont the floor
 	// setTextInField will shrink to before giving up and letting a value
 	// overrun. Below ~8 pt Sarabun's Thai marks stop being legible in print,

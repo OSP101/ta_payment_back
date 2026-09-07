@@ -175,6 +175,11 @@ type CreateTeachingCourseInput struct {
 		Track       string            `json:"track"`
 		Room        *string           `json:"room,omitempty"`
 		NumStudents int               `json:"num_students"`
+		// Curriculum is optional and only meaningful for the manual "add course"
+		// form — the Excel import path derives it from the registrar's ReservedFor
+		// column instead (see curriculumFromReserved). Validated against the same
+		// CHECK constraint as UpdateSection's Curriculum field.
+		Curriculum *string           `json:"curriculum,omitempty"`
 		Schedules   []SectionSchedule `json:"schedules,omitempty"`
 		Exams       []ExamSchedule    `json:"exams,omitempty"`
 	} `json:"sections"`
@@ -229,6 +234,9 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 		if err := validateSectionSchedules(sec.Schedules, lecHrs, labHrs); err != nil {
 			return uuid.Nil, err
 		}
+		if sec.Curriculum != nil && *sec.Curriculum != "" && !validCurriculum(*sec.Curriculum) {
+			return uuid.Nil, Invalid("หลักสูตรไม่ถูกต้อง")
+		}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -278,10 +286,14 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	var sumRegular, sumSpecial int
 	for _, sec := range in.Sections {
 		secID := uuid.New()
+		var curriculum *string
+		if sec.Curriculum != nil && *sec.Curriculum != "" {
+			curriculum = sec.Curriculum
+		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students)
-			 VALUES ($1,$2,$3,$4::section_track,$5,$6)`,
-			secID, id, sec.SecNo, sec.Track, sec.Room, sec.NumStudents); err != nil {
+			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students, curriculum)
+			 VALUES ($1,$2,$3,$4::section_track,$5,$6,$7)`,
+			secID, id, sec.SecNo, sec.Track, sec.Room, sec.NumStudents, curriculum); err != nil {
 			return uuid.Nil, err
 		}
 		if sec.Track == "special" {
@@ -1449,23 +1461,21 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	if !periodExists {
 		return Invalid("กลุ่มนี้ไม่มีคาบชนิดดังกล่าวในวันที่เลือก")
 	}
-	makeupDay, err := timeutil.ParseDate(m.MakeupDate)
-	if err != nil {
+	if _, err := timeutil.ParseDate(m.MakeupDate); err != nil {
 		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
 	}
-	// A makeup in a month that has already passed cannot produce payable work:
-	// the TA's work-log write for that month is already frozen, so the class
-	// would be filed and then be unloggable. The meeting asked for the same
-	// no-back-dating rule to cover makeups, not just time entries.
-	// Compared by (year, month) to match validateWorkLogEntry exactly.
-	now := timeutil.Now()
-	my, mm, _ := makeupDay.Date()
-	ny, nm, _ := now.Date()
-	if my < ny || (my == ny && mm < nm) {
-		return Invalid(fmt.Sprintf(
-			"กำหนดวันชดเชยย้อนหลังไปเดือนที่ผ่านไปแล้วไม่ได้ (%s) "+
-				"เดือนนั้นปิดการลงเวลาแล้ว TA จึงลงบันทึกคาบนี้ไม่ได้ กรุณาเลือกวันตั้งแต่เดือนปัจจุบันเป็นต้นไป",
-			m.MakeupDate))
+	// A makeup whose month's submission period is already closed cannot
+	// produce payable work: the TA's work-log write for that month is frozen,
+	// so the class would be filed and then be unloggable. This used to compare
+	// the makeup date's (year, month) against today's regardless of what staff
+	// actually configured for that month — which meant a period staff had
+	// deliberately extended past the calendar month-end (the "ระยะเวลาเบิกจ่าย
+	// รายเดือน" screen lets them set due_date independent of the month) still
+	// got refused here. Deferring to the real submission_periods row keeps this
+	// in sync with resolvePeriodState/assertWorklogWritable, the same check a
+	// worklog write in that month is actually held to.
+	if err := assertMonthOpenForCourse(ctx, s.pool, tcID, m.MakeupDate); err != nil {
+		return err
 	}
 	if m.StartTime != nil && m.EndTime != nil {
 		st, ok1 := parseHM(*m.StartTime)
@@ -1532,7 +1542,7 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 	// but we double-check the row belongs to it so a lecturer can't delete a
 	// makeup on another section by URL manipulation.
 	var tcID uuid.UUID
-	var makeupDate time.Time
+	var makeupDate *time.Time
 	if err := s.pool.QueryRow(ctx, `
 		SELECT sec.teaching_course_id, m.makeup_date
 		FROM makeup_schedules m
@@ -1549,6 +1559,17 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
 		return err
 	}
+
+	// A waived row (makeup_date NULL — see WaiveMakeup) never had a class
+	// scheduled on any date, so there is no work-log/draft cleanup to do: skip
+	// straight to deleting the row.
+	if makeupDate == nil {
+		if _, err := s.pool.Exec(ctx, `DELETE FROM makeup_schedules WHERE id = $1`, makeupID); err != nil {
+			return err
+		}
+		return s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "makeup.unwaive", Entity: "section", EntityID: sectionID.String()})
+	}
+
 	makeupDateStr := makeupDate.Format("2006-01-02")
 
 	// Block if any submitted/approved worklog references the makeup date on
@@ -1621,6 +1642,62 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 		}
 	}
 	return nil
+}
+
+// WaiveMakeupRequest is AddMakeup's counterpart for declaring "no makeup
+// needed" — same identity (section/date/period) but no makeup date/time,
+// since none will ever be filed.
+type WaiveMakeupRequest struct {
+	OriginalDate string  `json:"original_date" validate:"required"`
+	Kind         string  `json:"kind" validate:"oneof=lecture lab"`
+	Note         *string `json:"note,omitempty" validate:"omitempty,max=200"`
+}
+
+// WaiveMakeup records that a cancelled period will deliberately not get a
+// makeup — see migration 0104. Uses the same permission surface and period
+// validation as AddMakeup; the only difference is what lands in the row.
+func (s *TeachingService) WaiveMakeup(ctx context.Context, actor, sectionID uuid.UUID, r WaiveMakeupRequest) error {
+	var tcID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id FROM sections WHERE id=$1`, sectionID).Scan(&tcID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if err := assertMakeupManager(ctx, s.pool, actor, tcID); err != nil {
+		return err
+	}
+	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
+		return err
+	}
+	origDay, err := time.Parse("2006-01-02", r.OriginalDate)
+	if err != nil {
+		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	var periodExists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM section_schedules
+		   WHERE section_id = $1 AND kind = $2 AND day_of_week = $3)`,
+		sectionID, r.Kind, int(origDay.Weekday())).Scan(&periodExists); err != nil {
+		return err
+	}
+	if !periodExists {
+		return Invalid("กลุ่มนี้ไม่มีคาบชนิดดังกล่าวในวันที่เลือก")
+	}
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "makeup.waive", Entity: "section", EntityID: sectionID.String(), After: r},
+		func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO makeup_schedules (id, section_id, original_date, kind, waived, waived_by, waived_at, note)
+				VALUES ($1,$2,$3::date,$4,true,$5,NOW(),$6)
+				ON CONFLICT (section_id, original_date, kind) DO UPDATE
+				   SET waived = true, waived_by = EXCLUDED.waived_by, waived_at = NOW(),
+				       makeup_date = NULL, start_time = NULL, end_time = NULL, note = EXCLUDED.note`,
+				uuid.New(), sectionID, r.OriginalDate, r.Kind, actor, r.Note)
+			return err
+		})
 }
 
 func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uuid.UUID, r LectureReview) error {

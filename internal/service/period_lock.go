@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -69,6 +71,63 @@ func resolvePeriodState(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid
 		return periodState{}, err
 	}
 	return st, nil
+}
+
+// monthClosedForCourse is the TA-agnostic half of resolvePeriodState: whether
+// the submission_periods row covering workDate's month is closed (is_closed,
+// or past due_date + 1-day grace), without the per-TA submission_period_status
+// join. found=false means no period is defined for that month at all —
+// callers treat that as unrestricted, matching resolvePeriodState's own
+// backward-compatibility stance for terms that never adopted the monthly
+// workflow.
+func monthClosedForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) (closed bool, label string, found bool, err error) {
+	err = pool.QueryRow(ctx, `
+		SELECT sp.label, (sp.is_closed OR CURRENT_DATE > sp.due_date + INTERVAL '1 day')
+		FROM teaching_courses tc
+		JOIN academic_terms trm ON trm.id = tc.term_id
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		 AND sp.year_month = trm.academic_year::text || '-' || to_char($2::date, 'MM')
+		WHERE tc.id = $1`, tcID, workDate).Scan(&label, &closed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, "", false, nil
+		}
+		return false, "", false, err
+	}
+	return closed, label, true, nil
+}
+
+// assertMonthOpenForCourse rejects an action dated in a month whose
+// submission_periods row is closed — for call sites (like filing a makeup
+// class) that act on a whole section rather than one TA's worklog.
+func assertMonthOpenForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) error {
+	closed, label, found, err := monthClosedForCourse(ctx, pool, tcID, workDate)
+	if err != nil {
+		return err
+	}
+	if found && closed {
+		return Invalid(fmt.Sprintf(
+			"งวดส่งบันทึกเวลาเดือน %s ปิดแล้ว กำหนดวันชดเชยย้อนหลังเข้าไปไม่ได้", label))
+	}
+	return nil
+}
+
+// isMonthOpenForCourse reports whether workDate's month has a submission
+// period that staff have EXPLICITLY confirmed is still open (found and not
+// closed) — used to let validateWorkLogEntry's own back-dating rule defer to
+// the real period configuration instead of a bare "is this the current
+// calendar month" guess. A period staff extended past month-end (the
+// "ระยะเวลาเบิกจ่ายรายเดือน" screen sets due_date independent of the calendar
+// month) must count as open here even though the calendar month has passed.
+// Errors and "no period configured" both resolve to false — the caller's
+// existing calendar-month rule is the fallback for that case, not a reason to
+// loosen anything.
+func isMonthOpenForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) bool {
+	closed, _, found, err := monthClosedForCourse(ctx, pool, tcID, workDate)
+	if err != nil || !found {
+		return false
+	}
+	return !closed
 }
 
 // assertWorklogWritable rejects a write touching workDate when its month is

@@ -372,10 +372,36 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 		}
 	}
 
-	// Any remaining plain error is treated as a user-facing business message
-	// (services raise these via errors.New/fmt.Errorf with Thai text). These are
-	// never database errors — those are handled above — so it is safe to show.
+	// Any remaining plain error MAY be a user-facing business message — services
+	// raise those via errors.New/fmt.Errorf with Thai text — but it may equally
+	// be an internal failure that never reached the typed branches above: a pgx
+	// row-scan error ("cannot scan NULL into *time.Time"), a JSON error, an
+	// io/context failure. Those carry no *PgError, so echoing every plain error
+	// verbatim published driver internals to the end user as if they were
+	// validation advice.
+	//
+	// The discriminator is the script: every message this product intends a user
+	// to read is written in Thai, and every runtime/driver error is ASCII. Errors
+	// with no Thai character are logged with their real text and answered with a
+	// generic 500, so an unexpected internal fault degrades to "ระบบขัดข้อง"
+	// instead of leaking how the query is shaped.
+	if !containsThai(err.Error()) {
+		log.Printf("internal error on %s %s: %v", c.Method(), c.Path(), err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"})
+	}
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+}
+
+// containsThai reports whether s holds at least one Thai character. Used by
+// ErrorHandler to tell a Thai business message apart from an ASCII internal
+// error before deciding what the client is allowed to see.
+func containsThai(s string) bool {
+	for _, r := range s {
+		if r >= 0x0E00 && r <= 0x0E7F {
+			return true
+		}
+	}
+	return false
 }
 
 // OriginCheck is defense-in-depth against cross-site request forgery,

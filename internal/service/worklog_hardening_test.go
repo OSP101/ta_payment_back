@@ -50,14 +50,14 @@ func TestValidate_RowHoursCap(t *testing.T) {
 	// 7.0h exactly — allowed.
 	w := base
 	w.StartTime, w.EndTime, w.Hours = "08:00", "15:00", 7.0
-	if err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}); err != nil {
+	if err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}, false); err != nil {
 		t.Errorf("7.0h row should pass, got: %v", err)
 	}
 
 	// 7.5h — rejected by the per-row cap.
 	w = base
 	w.StartTime, w.EndTime, w.Hours = "08:00", "15:30", 7.5
-	err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{})
+	err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}, false)
 	if err == nil {
 		t.Fatalf("7.5h row must be rejected")
 	}
@@ -72,7 +72,7 @@ func TestValidate_HoursMustMatchSpan(t *testing.T) {
 		WorkDate: "2026-06-10", Activity: "review",
 		StartTime: "09:00", EndTime: "11:00", Hours: 2.5, // span is 2.0
 	}
-	if err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}); err == nil {
+	if err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}, false); err == nil {
 		t.Errorf("hours/span mismatch must be rejected")
 	}
 }
@@ -85,7 +85,7 @@ func TestValidate_ExamBlackoutStillEnforced(t *testing.T) {
 		WorkDate: "2026-08-03", Activity: "review",
 		StartTime: "09:00", EndTime: "11:00", Hours: 2,
 	}
-	if err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{Start: ms, End: me}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}); err == nil {
+	if err := validateWorkLogEntry(w, hardeningGate(), start, end, examWindow{Start: ms, End: me}, examWindow{}, holidaySet{}, makeupIndex{}, time.Time{}, false); err == nil {
 		t.Errorf("exam-window date must be rejected")
 	}
 }
@@ -102,7 +102,7 @@ func TestValidate_NoBackdatingPastMonth(t *testing.T) {
 	}
 	call := func(date string, ref time.Time) error {
 		return validateWorkLogEntry(mk(date), hardeningGate(), start, end,
-			examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref)
+			examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, ref, false)
 	}
 
 	// A prior month is rejected.
@@ -120,6 +120,27 @@ func TestValidate_NoBackdatingPastMonth(t *testing.T) {
 	// Zero todayRef disables the rule (staff override / other callers).
 	if err := call("2026-07-10", time.Time{}); err != nil {
 		t.Errorf("zero todayRef must disable the back-date rule, got: %v", err)
+	}
+}
+
+// A submission period staff explicitly extended past its calendar month-end
+// must actually let a TA log into it — the calendar-month guess is only a
+// fallback for when no such period exists, not an override of one that does.
+func TestValidate_PeriodOpenOverridesPastMonthGuess(t *testing.T) {
+	start, end := hardeningBounds() // 2026-06-01 .. 2026-10-31
+	today, _ := time.Parse("2006-01-02", "2026-09-07")
+	w := WorkLog{
+		WorkDate: "2026-07-26", Activity: "review",
+		StartTime: "09:00", EndTime: "11:00", Hours: 2,
+	}
+
+	if err := validateWorkLogEntry(w, hardeningGate(), start, end,
+		examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, today, false); err == nil {
+		t.Fatal("precondition: without period info, a July date in September must still be rejected")
+	}
+	if err := validateWorkLogEntry(w, hardeningGate(), start, end,
+		examWindow{}, examWindow{}, holidaySet{}, makeupIndex{}, today, true); err != nil {
+		t.Errorf("an explicitly open period must override the calendar-month guess, got: %v", err)
 	}
 }
 

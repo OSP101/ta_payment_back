@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	pdfcpuAPI "github.com/pdfcpu/pdfcpu/pkg/api"
 	pdfcpuModel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	pdfcpuTypes "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/timeutil"
@@ -684,6 +685,60 @@ func mergePDFs(readers []io.ReadSeeker) (out []byte, err error) {
 	return buf.Bytes(), nil
 }
 
+// setPDFDocInfo overwrites the merged PDF's Info dictionary (Title, Author,
+// Subject, Creator) so "Document Properties" in a PDF reader shows something
+// meaningful for this system instead of whatever the first source file (a
+// Word export, in practice) happened to carry — a doc always named
+// "Microsoft Word - Document1" with no author is confusing on an official
+// finance record. Producer/CreationDate/ModDate are left to pdfcpu, which
+// already stamps its own on every write.
+func setPDFDocInfo(data []byte, title, subject string) ([]byte, error) {
+	conf := pdfcpuModel.NewDefaultConfiguration()
+	conf.ValidationMode = pdfcpuModel.ValidationRelaxed
+
+	ctx, err := pdfcpuAPI.ReadValidateAndOptimize(bytes.NewReader(data), conf)
+	if err != nil {
+		return nil, err
+	}
+
+	d := pdfcpuTypes.NewDict()
+	if ctx.Info != nil {
+		if existing, derefErr := ctx.DereferenceDict(*ctx.Info); derefErr == nil && existing != nil {
+			d = existing
+		}
+	}
+	for key, val := range map[string]string{
+		"Title":   title,
+		"Subject": subject,
+		"Author":  "ระบบจ่ายค่าตอบแทน TA (COCO TAS)",
+		"Creator": "COCO TAS",
+	} {
+		encoded, err := pdfcpuTypes.EscapedUTF16String(val)
+		if err != nil {
+			continue // leave that one field as pdfcpu found it rather than fail the whole stamp
+		}
+		d.Update(key, pdfcpuTypes.StringLiteral(*encoded))
+	}
+	// Keywords carried nothing useful from the source file and could easily
+	// carry stray PII from whatever template the officer's Word doc used —
+	// clear it rather than pass it through.
+	d.Update("Keywords", pdfcpuTypes.StringLiteral(""))
+
+	if ctx.Info == nil {
+		ir, err := ctx.IndRefForNewObject(d)
+		if err != nil {
+			return nil, err
+		}
+		ctx.Info = ir
+	}
+
+	var out bytes.Buffer
+	if err := pdfcpuAPI.Write(ctx, &out, conf); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
 func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]byte, string, error) {
 	return s.buildDocsBundle(ctx, docIDs, "")
 }
@@ -718,13 +773,24 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 		return nil, "", errors.New("no docs to zip")
 	}
 	// Fetch metadata + owner for a suggested filename.
+	// Grouped by owner first (so a multi-person bulk download stays one
+	// person's documents at a time instead of interleaving everyone's ID
+	// copies together), then within each person in the print order staff
+	// hand-collate the physical stack in: creditor form, ID, bank book — see
+	// DOC_KIND_PRINT_ORDER on the frontend, which this mirrors.
 	rows, err := s.pool.Query(ctx, `
 		SELECT d.id, d.kind, d.filename, d.storage_key, d.file_deleted_at,
 		       u.first_name, u.last_name, COALESCE(u.student_id,'')
 		FROM ta_documents d
 		JOIN users u ON u.id = d.user_id
 		WHERE d.id = ANY($1)
-		ORDER BY d.kind`, docIDs)
+		ORDER BY u.last_name, u.first_name, u.id,
+		         CASE d.kind
+		           WHEN 'creditor_form' THEN 1
+		           WHEN 'national_id'   THEN 2
+		           WHEN 'bank_book'     THEN 3
+		           ELSE 4
+		         END`, docIDs)
 	if err != nil {
 		return nil, "", err
 	}
@@ -816,6 +882,17 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 			readers = append(readers, bytes.NewReader(f.data))
 		}
 		if merged, err := mergePDFs(readers); err == nil {
+			// MergeRaw carries over the FIRST source file's Info dict verbatim —
+			// officers were seeing "Microsoft Word - Document1" / no author,
+			// whatever the uploaded creditor form happened to have. Stamp our
+			// own before handing it back; a failure here is cosmetic only
+			// (wrong metadata, not a broken file) so it must never block the
+			// actual download.
+			if stamped, err := setPDFDocInfo(merged, stem, "เอกสารประกอบการเบิกจ่ายค่าตอบแทนผู้ช่วยสอน (TA)"); err == nil {
+				merged = stamped
+			} else {
+				log.Printf("docs bundle: could not stamp PDF metadata for %s: %v", stem, err)
+			}
 			return merged, stem + ".pdf", nil
 		} else {
 			// A malformed member must not block the download entirely — fall

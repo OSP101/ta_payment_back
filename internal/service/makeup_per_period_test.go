@@ -78,7 +78,7 @@ func TestMakeup_FilingOnePeriodLeavesTheOtherOutstanding(t *testing.T) {
 	}
 	if lecture.Makeup != nil {
 		t.Errorf("the lecture was marked as made up on %s, but no makeup was filed for it — "+
-			"and its slot would be the lab's %s", lecture.Makeup.MakeupDate, lab.Makeup.MakeupDate)
+			"and its slot would be the lab's %s", derefOr(lecture.Makeup.MakeupDate, "-"), derefOr(lab.Makeup.MakeupDate, "-"))
 	}
 	if impacts.UnresolvedCount != 1 {
 		t.Errorf("unresolved = %d, want 1 (the lecture) — the badge would say the day is done",
@@ -122,7 +122,7 @@ func TestMakeup_SecondPeriodCanBeFiledAtADifferentTime(t *testing.T) {
 			if s.Makeup == nil {
 				t.Fatalf("%s period has no makeup after both were filed", s.Kind)
 			}
-			seen[s.Kind] = s.Makeup.MakeupDate + " " + derefOr(s.Makeup.StartTime, "-")
+			seen[s.Kind] = derefOr(s.Makeup.MakeupDate, "-") + " " + derefOr(s.Makeup.StartTime, "-")
 		}
 	}
 	if seen["lecture"] == seen["lab"] {

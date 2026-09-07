@@ -79,6 +79,11 @@ type fixtureOpts struct {
 	// tests ABOUT that rule want it — every other test needs the realistic world,
 	// where a TA who is logging hours has already filed their timetable.
 	NoOwnClassSchedule bool
+	// NoReviewSchedule leaves the assignment with no declared grading slots.
+	// validateReviewWindow refuses ตรวจงาน entries in that state, so only tests
+	// ABOUT that rule want it — every other test needs the realistic world, where
+	// a TA who logs grading has already said when they grade.
+	NoReviewSchedule bool
 }
 
 // fixture is one fully wired assignment plus the service under test.
@@ -141,6 +146,9 @@ func newFixture(t *testing.T, opts fixtureOpts) *fixture {
 	if !opts.NoRequest {
 		f.RequestID = f.insertRequest(opts)
 		f.AssignmentID = f.insertAssignment(opts)
+	}
+	if !opts.NoRequest && !opts.NoReviewSchedule {
+		f.declareReviewSlots(f.AssignmentID)
 	}
 	if !opts.NoOwnClassSchedule {
 		// Sunday 07:00–08:00: satisfies the gate without ever colliding with the
@@ -306,6 +314,24 @@ func (f *fixture) insertRequest(o fixtureOpts) uuid.UUID {
 	        VALUES ($1, $2, $3, $4::reimburse_scope, $5::ta_request_status, NOW(), NOW())`,
 		id, f.CourseID, f.LecturerID, o.ReimburseScope, o.RequestStatus)
 	return id
+}
+
+// declareReviewSlots gives an assignment the TA-side grading timetable that
+// validateReviewWindow now requires before any ตรวจงาน row may be written.
+//
+// Every day, all day — deliberately wide, for the same reason the fixture's
+// own-class row is deliberately narrow: a great many tests log ตรวจงาน at
+// whatever hour suited the cap or money rule they were written about, and none
+// of them are about the grading timetable. Tests that ARE about it pass
+// NoReviewSchedule and declare their own narrow slot.
+//
+// Inserted directly rather than through AddTAReviewSchedule so the lecturer's
+// declared weekly budget does not bound a fixture convenience.
+func (f *fixture) declareReviewSlots(assignmentID uuid.UUID) {
+	for dow := 0; dow < 7; dow++ {
+		f.exec(`INSERT INTO ta_review_schedules (assignment_id, kind, day_of_week, start_time, end_time)
+		        VALUES ($1, 'review', $2, '00:00', '23:59')`, assignmentID, dow)
+	}
 }
 
 func (f *fixture) insertAssignment(o fixtureOpts) uuid.UUID {
@@ -477,6 +503,7 @@ func (f *fixture) secondTAOnSameCourse() uuid.UUID {
 	f.exec(`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
 	        VALUES ($1, $2, $3, $4, 'undergrad'::study_level)`,
 		assignID, reqID, f.SectionID, ta)
+	f.declareReviewSlots(assignID)
 	f.exec(`INSERT INTO work_logs
 	          (id, assignment_id, work_date, start_time, end_time, hours, activity, status)
 	        VALUES (gen_random_uuid(), $1, $2::date, '09:00', '11:00', 2, 'review', 'approved')`,
@@ -512,6 +539,7 @@ func (f *fixture) secondCourseAssignment(o fixtureOpts) uuid.UUID {
 	f.exec(`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
 	        VALUES ($1, $2, $3, $4, $5::study_level)`,
 		assignmentID, requestID, sectionID, f.TAID, o.Level)
+	f.declareReviewSlots(assignmentID)
 	w := o.Workload
 	f.exec(`INSERT INTO ta_workload_forms
 	          (id, assignment_id, help_teach_hrs, prep_hrs, grade_hrs, other_hrs,
@@ -550,6 +578,7 @@ func (f *fixture) siblingAssignment(track string, group any) uuid.UUID {
 	f.exec(`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level, cotaught_group)
 	        VALUES ($1, $2, $3, $4, 'undergrad', $5)`,
 		assignmentID, f.RequestID, sectionID, f.TAID, group)
+	f.declareReviewSlots(assignmentID)
 	// Both sides carry the marker: the exemption compares the two rows' groups,
 	// so tagging only the newcomer would leave the pair unmatched.
 	f.exec(`UPDATE ta_request_assignments SET cotaught_group = $1 WHERE id = $2`,

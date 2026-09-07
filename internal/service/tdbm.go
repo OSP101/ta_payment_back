@@ -219,6 +219,16 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 	res.Fetched = len(rows)
 
 	for _, r := range rows {
+		// h_type is undocumented upstream (docs/TDBM-API-requirements.md §3.2),
+		// but confirmed with the college: 'D' is an exam day, not a holiday.
+		// Exam days must never land in public_holidays — they'd wrongly block
+		// worklog entry and count toward the lecturer makeup reminder — and
+		// staff already have a separate mandatory manual entry for real
+		// holidays, so there is nothing for this sync to reconcile against.
+		if r.HType == "D" {
+			res.Skipped++
+			continue
+		}
 		if r.HolidayID == 0 || strings.TrimSpace(r.HDate) == "" || strings.TrimSpace(r.Title) == "" {
 			res.Skipped++
 			continue

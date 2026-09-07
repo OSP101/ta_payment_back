@@ -246,8 +246,11 @@ func (s *UserService) AvatarKey(ctx context.Context, id uuid.UUID) (string, erro
 // SetAvatar points the user at a freshly stored image and returns both the URL
 // to show and the key that was replaced, if any. Deleting the old blob is the
 // caller's job: it must happen only after the row commits, or a failed update
-// would leave the user pointing at a file that no longer exists.
-func (s *UserService) SetAvatar(ctx context.Context, id uuid.UUID, key string) (url string, replaced string, err error) {
+// would leave the user pointing at a file that no longer exists. `actor` is
+// logged separately from `id` so a staff member setting a picture on someone
+// else's behalf (e.g. while creating the account) shows up correctly in the
+// audit trail instead of looking like the target user acted alone.
+func (s *UserService) SetAvatar(ctx context.Context, actor, id uuid.UUID, key string) (url string, replaced string, err error) {
 	var old *string
 	var at time.Time
 	err = s.pool.QueryRow(ctx,
@@ -264,7 +267,7 @@ func (s *UserService) SetAvatar(ctx context.Context, id uuid.UUID, key string) (
 		}
 		return "", "", err
 	}
-	if err := s.aud.Log(ctx, audit.Entry{ActorID: &id, Action: "user.avatar.set", Entity: "user", EntityID: id.String()}); err != nil {
+	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "user.avatar.set", Entity: "user", EntityID: id.String()}); err != nil {
 		return "", "", err
 	}
 	if old != nil && *old != "" && *old != key {

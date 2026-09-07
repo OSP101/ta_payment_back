@@ -175,6 +175,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/users/:id/avatar", uh.ServeAvatar)
 	authed.Get("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.List)
 	authed.Post("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.Create)
+	// Same role gate as Create above — whoever can create a user can also set
+	// the picture, since the create form collects it before the account (and
+	// its self-serve /me/avatar) exists.
+	authed.Post("/users/:id/avatar", heavyLimiter, RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.UploadAvatarFor)
 	authed.Get("/users/:id", authed_forSelfOrStaff(), uh.Get)
 	authed.Patch("/users/:id", adminOrStaff, uh.Update)
 	authed.Post("/users/:id/reset-password", adminOrStaff, uh.ResetPassword)
@@ -268,6 +272,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// service.assertMakeupManager then requires an approved assignment in THIS
 	// course, so the role alone does not open other people's courses.
 	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.AddMakeup)
+	authed.Post("/teaching-courses/:id/makeup/:sectionId/waive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.WaiveMakeup)
 	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.DeleteMakeup)
 	authed.Get("/teaching-courses/:id/holiday-impacts", th.HolidayImpacts)
 	authed.Post("/teaching-courses/:id/holiday-impacts/:originalDate/remind", RequireRole(rbac.RoleTA), taApproved, th.RemindLecturerAboutMakeup)

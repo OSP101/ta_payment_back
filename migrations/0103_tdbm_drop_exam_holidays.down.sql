@@ -1,0 +1,3 @@
+-- Not reversible: the deleted rows' original data isn't preserved anywhere.
+-- If they're needed again, resync from TDBM (now that exam days are excluded,
+-- a resync will not reintroduce them anyway).

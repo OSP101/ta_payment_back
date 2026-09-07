@@ -160,7 +160,7 @@ func validateAgainst(t *testing.T, hs holidaySet, activity, start, end string, h
 	return validateWorkLogEntry(
 		WorkLog{WorkDate: "2026-06-08", Activity: activity, StartTime: start, EndTime: end, Hours: hours},
 		hardeningGate(), termStart, termEnd, examWindow{}, examWindow{},
-		hs, makeupIndex{}, time.Time{})
+		hs, makeupIndex{}, time.Time{}, false)
 }
 
 // The money case: the afternoon lab actually met, so the TA must be able to log
