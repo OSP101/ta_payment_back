@@ -12,7 +12,7 @@ import (
 // ExportBlocker is one reason a course may not be exported yet, phrased for the
 // staff screen rather than for a log.
 type ExportBlocker struct {
-	// Kind is "waiting_ta" | "waiting_lecturer" | "unreviewed" | "not_finance_sent".
+	// Kind is "waiting_ta" | "waiting_lecturer" | "unreviewed" | "not_exported".
 	Kind   string `json:"kind"`
 	TAName string `json:"ta_name"`
 	// Months affected, as Thai labels ("สิงหาคม 2569").
@@ -163,8 +163,8 @@ func exportBlockedError(blockers []ExportBlocker) error {
 			lines = append(lines, fmt.Sprintf("%s ยังไม่ส่งบันทึกเวลา %d รายการ (%s)", name, b.Rows, months))
 		case "waiting_lecturer":
 			lines = append(lines, fmt.Sprintf("%s รออาจารย์อนุมัติ %d รายการ (%s)", name, b.Rows, months))
-		case "not_finance_sent":
-			lines = append(lines, fmt.Sprintf("%s ตรวจสอบแล้วแต่ยังไม่ส่งการเงิน (%s)", name, months))
+		case "not_exported":
+			lines = append(lines, fmt.Sprintf("%s ตรวจสอบแล้วแต่ยังไม่ได้ส่งออกใบเบิกจ่าย (%s)", name, months))
 		default:
 			lines = append(lines, fmt.Sprintf("%s ยังไม่ได้ตรวจสอบเบิกจ่าย (%s)", name, months))
 		}
@@ -173,9 +173,22 @@ func exportBlockedError(blockers []ExportBlocker) error {
 }
 
 // TermExportBlockers is the ประตู before generating ปะหน้าจ่ายตรง
-// (transfer-cover): every course in the term must have reached finance_sent,
-// not merely staff_reviewed — this document IS the finance notice, so a
-// course that is reviewed but not yet sent to finance is still blocking.
+// (transfer-cover): every course in the term must have reached 'exported' —
+// the claim documents issued and the month locked, so the figures on this
+// sheet can no longer move.
+//
+// It used to require finance_sent, one stage further on, and that was a dead
+// end in two ways (08/09/2026). Ordering: this document IS what the finance
+// office keys into ERP, so it has to be producible BEFORE the handoff, not
+// after somebody has recorded that the handoff already happened. And in
+// practice: 'ส่งการเงิน' has no button anywhere in the staff UI, so no month
+// could ever reach finance_sent and the transfer cover was unobtainable for
+// every term. Waiting on a stage the product cannot perform is not a gate,
+// it is a wall.
+//
+// 'exported' is the right line to draw because it is the one that FREEZES the
+// figures: MarkCourseExported locks the month, and the worklog editor refuses
+// an exported month. Everything the sheet reports is final at that point.
 //
 // Scoped to the WHOLE TERM rather than one curriculum: the file bundles every
 // curriculum that has data into one workbook, and letting some curricula's
@@ -186,9 +199,9 @@ func exportBlockedError(blockers []ExportBlocker) error {
 // months (Gregorian "YYYY-MM", empty = the whole term) narrows the gate to the
 // slice being issued. Required by the fiscal-year split (10/08/2026): งบ closes
 // 30 กันยายน, so the มิ.ย.–ก.ย. document has to be issuable IN September, while
-// October is still being taught and could not possibly have reached
-// finance_sent. A term-wide gate makes that document unobtainable until after
-// the budget year it belongs to has already closed.
+// October is still being taught and could not possibly have been exported. A
+// term-wide gate makes that document unobtainable until after the budget year
+// it belongs to has already closed.
 //
 // level ("undergrad" | "graduate", 12/08/2026) narrows the gate to the FILE
 // being issued: ปะหน้าจ่ายตรง is now two separate documents, and a graduate
@@ -243,7 +256,7 @@ func (s *ExportService) TermMonthsNotReady(ctx context.Context, termID uuid.UUID
 		SELECT DISTINCT year_month
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
-		   OR (approved > 0 AND staff_status <> 'finance_sent')`, termID, level)
+		   OR (approved > 0 AND staff_status NOT IN ('exported','finance_sent'))`, termID, level)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +317,7 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		SELECT course_code, ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
-		   OR (approved > 0 AND staff_status <> 'finance_sent')
+		   OR (approved > 0 AND staff_status NOT IN ('exported','finance_sent'))
 		ORDER BY course_code, ta_name, year_month`, termID, months, level)
 	if err != nil {
 		return nil, err
@@ -337,15 +350,16 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		if waitingLecturer > 0 {
 			add("waiting_lecturer", code, name, ym, waitingLecturer)
 		}
-		if waitingTA == 0 && waitingLecturer == 0 && approved > 0 && staffStatus != "finance_sent" {
-			add("not_finance_sent", code, name, ym, 0)
+		if waitingTA == 0 && waitingLecturer == 0 && approved > 0 &&
+			staffStatus != "exported" && staffStatus != "finance_sent" {
+			add("not_exported", code, name, ym, 0)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "not_finance_sent": 2}
+	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "not_exported": 2}
 	sort.SliceStable(order, func(i, j int) bool {
 		if rank[order[i].kind] != rank[order[j].kind] {
 			return rank[order[i].kind] < rank[order[j].kind]

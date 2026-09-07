@@ -236,8 +236,10 @@ func TestBuildGradEvidenceWorkbook_AmountInWordsBandMatchesTheCollegesFill(t *te
 	x := openWorkbookBytes(t, book)
 	sheet := sheetGradEvidenceRegular
 
-	// One claimant → total on row 12, amount-in-words on row 13.
-	styleID, err := x.GetCellStyle(sheet, "D13")
+	// The grid is always ruled down to row 14 (gradMinGridRows), so the total
+	// lands on row 15 and the amount-in-words band on row 16 whether one person
+	// claims or five.
+	styleID, err := x.GetCellStyle(sheet, "D16")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +253,7 @@ func TestBuildGradEvidenceWorkbook_AmountInWordsBandMatchesTheCollegesFill(t *te
 	}
 	// ...and the total band above it is boxed thin, not in the undergrad
 	// form's medium side rules.
-	totalStyle, err := x.GetCellStyle(sheet, "F12")
+	totalStyle, err := x.GetCellStyle(sheet, "F15")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -490,6 +492,133 @@ func TestBuildGradEvidenceWorkbook_HonoursTheMonthSelection(t *testing.T) {
 	}
 	if got, _ := x.GetCellValue(sheet, "E10"); strings.TrimSpace(got) != "5.0" {
 		t.Errorf("September hours = %q, want 5.0 — October's 7 must not be folded in", got)
+	}
+}
+
+// gradSheetFixture builds a three-month grad-regular sheet — the same shape as
+// the college's own docs/14. CP363761-บัณฑิต.xls, which is what these layout
+// assertions are read off.
+func gradSheetFixture(t *testing.T, code string) *excelize.File {
+	t.Helper()
+	f := newTCFixture(t)
+	courseID, regSec, _ := f.insertCourse(tcCourseOpts{Code: code, Curriculum: "CY", LectureHrs: 3})
+	ta := f.newTA("บัณฑิตปกติ", "phd")
+	assign := f.assignTA(ta, courseID, regSec, "phd", nil)
+	f.gradLogHours(assign, "2026-06-10", "lecture", 6)
+	f.gradLogHours(assign, "2026-07-10", "lecture", 20)
+	f.gradLogHours(assign, "2026-08-10", "lecture", 18)
+	book, err := f.svc.BuildGradEvidenceWorkbook(f.ctx, courseID, []string{"2026-06", "2026-07", "2026-08"})
+	if err != nil {
+		t.Fatalf("BuildGradEvidenceWorkbook: %v", err)
+	}
+	if book == nil {
+		t.Fatal("a course with a grad-regular TA must produce the graduate workbook")
+	}
+	return openWorkbookBytes(t, book)
+}
+
+// The two level boxes on row 6 split the table down the middle, as the
+// college's form has them side by side.
+//
+// The split used to be counted forward from column E, which on a three-month
+// export left ปริญญาตรี alone in ONE 12-wide column — and Excel clips an
+// overlong label the moment the next cell is occupied, which the merged
+// บัณฑิตศึกษา block beside it always is. The label printed cut off.
+func TestBuildGradEvidenceWorkbook_LevelBoxesSplitTheTableEvenly(t *testing.T) {
+	x := gradSheetFixture(t, "CP363762")
+	sheet := sheetGradEvidenceRegular
+	merges, err := x.GetMergeCells(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := map[string]string{}
+	for _, m := range merges {
+		spans[m.GetStartAxis()] = m.GetEndAxis()
+	}
+	// Three months → E..G, then H,I,J,K,L,M: the midpoint of E(5)..M(13) is I.
+	for start, want := range map[string]string{"E6": "I6", "J6": "M6", "E7": "I7", "J7": "M7"} {
+		if got := spans[start]; got != want {
+			t.Errorf("%s merges to %q, want %q — the two boxes must each get half the table",
+				start, got, want)
+		}
+	}
+	// And the ปริญญาตรี label is not alone in a single cell any more.
+	if spans["E6"] == "E6" || spans["E6"] == "" {
+		t.Error("the ปริญญาตรี box is one column wide; its label will print clipped")
+	}
+	// The college's form carries no รหัสวิชา caption on this row — the code is
+	// already printed against every claimant in its own column.
+	if got, _ := x.GetCellValue(sheet, "B6"); strings.TrimSpace(got) != "" {
+		t.Errorf("B6 = %q, want blank — the college's form has nothing there", got)
+	}
+}
+
+// The table is ruled down to a fixed minimum height whatever the claim, because
+// the office adds a name by hand at the finance desk. One TA used to produce a
+// table with a single spare row.
+func TestBuildGradEvidenceWorkbook_GridKeepsRoomToAddANameByHand(t *testing.T) {
+	x := gradSheetFixture(t, "CP363763")
+	sheet := sheetGradEvidenceRegular
+	// Rows 10-14 ruled, total on 15, amount-in-words on 16.
+	for _, r := range []int{10, 11, 12, 13, 14} {
+		id, err := x.GetCellStyle(sheet, fmt.Sprintf("B%d", r))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := x.GetStyle(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.Border) == 0 {
+			t.Errorf("row %d is unruled; the table stops before the college's five rows", r)
+		}
+	}
+	if got, _ := x.GetCellValue(sheet, "B15"); got != "รวมเบิกเป็นเงินทั้งสิ้น" {
+		t.Errorf("B15 = %q, want the total directly under the ruled grid", got)
+	}
+	// The total still counts only the people who actually claimed.
+	if got, _ := x.GetCellFormula(sheet, "K15"); got != "SUM(K10:K10)" {
+		t.Errorf("total = %q, want SUM(K10:K10) — the blank writing rows must not be summed", got)
+	}
+}
+
+// The closing block is placed from the RIGHT edge, not from รับจริง: the sheet's
+// width moves with the month count, and the college signs both its sheets four
+// columns in from the last one (L of O, J of M). The silver amount-in-words band
+// stops two short of the edge, leaving the signing columns white — a fill under
+// a wet signature is the one place on the form ink does not read.
+func TestBuildGradEvidenceWorkbook_ClosingBlockIsAnchoredToTheRightEdge(t *testing.T) {
+	x := gradSheetFixture(t, "CP363764")
+	sheet := sheetGradEvidenceRegular
+	merges, err := x.GetMergeCells(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := map[string]string{}
+	for _, m := range merges {
+		spans[m.GetStartAxis()] = m.GetEndAxis()
+	}
+	// Three months → last column M. Band D16:K16, signature block from J.
+	if got := spans["D16"]; got != "K16" {
+		t.Errorf("(ตัวอักษร) band merges D16 to %q, want K16 — it must stop before "+
+			"the two signing columns", got)
+	}
+	for _, col := range []string{"L", "M"} {
+		id, err := x.GetCellStyle(sheet, col+"16")
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := x.GetStyle(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.Fill.Color) > 0 && strings.Contains(strings.ToUpper(st.Fill.Color[0]), "C0C0C0") {
+			t.Errorf("%s16 is filled silver; the signing columns stay white", col)
+		}
+	}
+	if got := spans["J19"]; got != "M19" {
+		t.Errorf("signature line merges J19 to %q, want M19 — four columns against "+
+			"the right edge, as the college's file signs", got)
 	}
 }
 

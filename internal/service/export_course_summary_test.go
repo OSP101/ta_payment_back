@@ -535,3 +535,91 @@ func TestBuildCourseSummaryWorkbook_GraduateCourseWithNoGradSheetWarns(t *testin
 		}
 	}
 }
+
+// summaryStyle reads back the effective style of one cell on a summary sheet.
+func summaryStyle(t *testing.T, wb *excelize.File, sheet, cell string) *excelize.Style {
+	t.Helper()
+	id, err := wb.GetCellStyle(sheet, cell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := wb.GetStyle(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// A course with several TAs takes one row per TA, and only the first of them
+// carries the course's own columns. The reference (docs/ค่าตอบแทนTAภาคต้น-2569)
+// still rules A–N on every one of those rows, so the sheet reads as one grid
+// with the course spanning it.
+//
+// We used to style only the cells we wrote a value into, which meant that from
+// the second TA down everything except รหัสนักศึกษา/ชื่อ TA/ระดับ printed with
+// no rules — the table fell apart down the middle of every course with more
+// than one TA, which is most of them.
+func TestBuildCourseSummaryWorkbook_GridIsUnbrokenUnderEveryTA(t *testing.T) {
+	f := newCSFixture(t)
+	courseID := f.insertCourse(csCourseOpts{
+		Code: "CP100002", NameTH: "Grid Course", Credits: 3, LectureHrs: 3, LabHrs: 3, SelfHrs: 6,
+		NumRegular: 60, NumSpecial: 30, Curriculum: "CS",
+	})
+	f.addApprovedTA(courseID, "หนึ่ง", "undergrad", 3, 0)
+	f.addApprovedTA(courseID, "สอง", "undergrad", 3, 0)
+	f.addApprovedTA(courseID, "สาม", "undergrad", 3, 0)
+
+	body, _ := f.build()
+	wb := openWorkbook(t, body)
+	defer wb.Close()
+
+	// Three TAs, so rows 5, 6 and 7 — the last two being the ones that used to
+	// print bare.
+	for r := 5; r <= 7; r++ {
+		for _, col := range []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"} {
+			cell := fmt.Sprintf("%s%d", col, r)
+			s := summaryStyle(t, wb, "CS", cell)
+			for _, side := range []string{"left", "right", "top", "bottom"} {
+				if got := borderOf(s, side); got != "thin" {
+					t.Errorf("%s has no %s rule (%q) — the grid is torn open",
+						cell, side, got)
+				}
+			}
+		}
+	}
+}
+
+// The ขออนุมัติเบิกจ่าย pair carries the header tint down the WHOLE column in
+// the reference, not only beside the first TA.
+func TestBuildCourseSummaryWorkbook_MoneyColumnsKeepTheirTintOnEveryRow(t *testing.T) {
+	f := newCSFixture(t)
+	courseID := f.insertCourse(csCourseOpts{
+		Code: "CP100003", NameTH: "Tint Course", Credits: 3, LectureHrs: 3, LabHrs: 3, SelfHrs: 6,
+		NumRegular: 60, NumSpecial: 30, Curriculum: "CS",
+	})
+	f.addApprovedTA(courseID, "หนึ่ง", "undergrad", 3, 0)
+	f.addApprovedTA(courseID, "สอง", "undergrad", 3, 0)
+
+	body, _ := f.build()
+	wb := openWorkbook(t, body)
+	defer wb.Close()
+
+	for _, cell := range []string{"M5", "N5", "M6", "N6"} {
+		s := summaryStyle(t, wb, "CS", cell)
+		if s.Fill.Type != "pattern" || len(s.Fill.Color) == 0 || s.Fill.Color[0] != csHeaderFill {
+			t.Errorf("%s is not on the header tint (type=%q color=%v)",
+				cell, s.Fill.Type, s.Fill.Color)
+		}
+	}
+	// The figure itself still belongs to the course, not to each TA: only the
+	// first row of the block carries it.
+	// Read raw: the accounting format renders an empty cell as padding, so a
+	// formatted read cannot tell a blank apart from a value.
+	raw := excelize.Options{RawCellValue: true}
+	if got, _ := wb.GetCellValue("CS", "M6", raw); got != "" {
+		t.Errorf("M6 = %q — the course's budget was repeated against a second TA", got)
+	}
+	if got, _ := wb.GetCellValue("CS", "M5", raw); got == "" {
+		t.Error("M5 is empty — the block's own budget figure went missing")
+	}
+}

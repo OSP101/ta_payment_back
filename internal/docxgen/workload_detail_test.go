@@ -158,10 +158,20 @@ func TestBuildWorkloadDetailDOCX_MatchesTheCollegesTableFormatting(t *testing.T)
 	}
 }
 
-// An odd number of months still prints two-up, with the right-hand half blank —
-// the college's own file does exactly this. The failure it guards against is a
-// stray "จำนวนชั่วโมง" heading over an empty column.
-func TestBuildWorkloadDetailDOCX_OddMonthCountLeavesTheRightHalfBlank(t *testing.T) {
+// An odd number of months still prints two-up, and the right-hand half keeps
+// its SKELETON — heading, งาน, the three duty rows, รวม — with only the month
+// caption and the figures left empty.
+//
+// This test used to assert the opposite, on the stated grounds that "the
+// college's own file does exactly this". It does not. Their มกราคม block reads:
+//
+//	['เดือน มกราคม 2569', 'จำนวนชั่วโมง', '',   'จำนวนชั่วโมง']
+//	['งาน',              '',            'งาน', '']
+//	['เตรียมการสอน',      '20',          'เตรียมการสอน', '']
+//	['รวม',              '30',          'รวม', '']
+//
+// — a spare month waiting to be written in, not an empty box.
+func TestBuildWorkloadDetailDOCX_OddMonthCountKeepsTheSpareHalfsSkeleton(t *testing.T) {
 	d := sampleWorkload()
 	d.Months = d.Months[:1]
 	b, err := BuildWorkloadDetailDOCX(d)
@@ -169,27 +179,36 @@ func TestBuildWorkloadDetailDOCX_OddMonthCountLeavesTheRightHalfBlank(t *testing
 		t.Fatal(err)
 	}
 	doc := partText(t, b, "word/document.xml")
-	if n := strings.Count(doc, "จำนวนชั่วโมง"); n != 1 {
-		t.Errorf("จำนวนชั่วโมง appears %d times for a single month, want 1 — "+
-			"the empty half must not carry a column heading", n)
-	}
 	// เตรียมการสอน rather than ช่วยสอน as the probe: the latter is a substring
 	// of ผู้ช่วยสอน in the title and the identification line, so counting it
-	// measures the heading, not the table.
-	if n := strings.Count(doc, "เตรียมการสอน"); n != 1 {
-		t.Errorf("เตรียมการสอน appears %d times for a single month, want 1", n)
+	// measures the heading, not the table. "งาน" is left out for the same
+	// reason — it is inside ภาระงาน in the document's own title.
+	for _, label := range []string{"จำนวนชั่วโมง", "เตรียมการสอน", "ตรวจแบบทดสอบ", "รวม"} {
+		if n := strings.Count(doc, label); n != 2 {
+			t.Errorf("%q appears %d times for a single month, want 2 — "+
+				"the spare half keeps the college's row labels", label, n)
+		}
+	}
+	// The one thing the spare half must NOT carry is a month of its own.
+	if n := strings.Count(doc, "เดือน "); n != 1 {
+		t.Errorf("%d month captions for a single month, want 1 — "+
+			"the spare half is captionless, it is not a second month", n)
 	}
 
 	// ...and two months really do print two blocks, so the check above is
-	// measuring the month count rather than a layout that only ever emits one.
+	// measuring the layout rather than a template that always emits two labels.
 	two := sampleWorkload()
 	two.Months = two.Months[:2]
 	b2, err := BuildWorkloadDetailDOCX(two)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := strings.Count(partText(t, b2, "word/document.xml"), "เตรียมการสอน"); n != 2 {
+	doc2 := partText(t, b2, "word/document.xml")
+	if n := strings.Count(doc2, "เตรียมการสอน"); n != 2 {
 		t.Errorf("เตรียมการสอน appears %d times for two months, want 2", n)
+	}
+	if n := strings.Count(doc2, "เดือน "); n != 2 {
+		t.Errorf("%d month captions for two months, want 2", n)
 	}
 }
 

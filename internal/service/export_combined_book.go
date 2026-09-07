@@ -695,6 +695,18 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 		if err := set(at("C", grand+1), p.PaidBaht); err != nil {
 			return 0, err
 		}
+		// The figure that is actually paid gets the same unit and the same
+		// written-out amount as the line above it. A bare "2,750.00" with no
+		// baht text is the one number on the sheet a hand could alter without
+		// leaving a trace — and it is the number the money follows, so it is
+		// the one that most needs the words beside it. Blank when nothing is
+		// printed above: the unit must never appear against an empty amount.
+		if err := set(at("E", grand+1), "บาท"); err != nil {
+			return 0, err
+		}
+		if err := set(at("G", grand+1), fmt.Sprintf(`=" = "&BAHTTEXT(C%d)&" = "`, grand+1)); err != nil {
+			return 0, err
+		}
 	}
 	for _, row := range []int{grand, grand + 1} {
 		if err := f.MergeCell(sheet, at("G", row), at("J", row)); err != nil {
@@ -757,8 +769,9 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	}
 	// The performer's name is LINKED to the block's own name cell, as the
 	// college's file does (=B9): the signature line cannot drift from the
-	// claim it signs.
-	if err := set(at("A", rule+1), fmt.Sprintf("=B%d", first)); err != nil {
+	// claim it signs. Parenthesised, which is what marks it as the printed
+	// reading of the signature written above rather than a second name.
+	if err := set(at("A", rule+1), fmt.Sprintf(`="("&B%d&")"`, first)); err != nil {
 		return 0, err
 	}
 	if err := set(at("A", rule+2), "วันที่….เดือน…………..…พ.ศ…..……"); err != nil {
@@ -991,9 +1004,11 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		} else if err := set(at("G", r), fmt.Sprintf("=F%d", r)); err != nil {
 			return err
 		}
-		if err := set(at("J", r), d.CourseCode); err != nil {
-			return err
-		}
+		// หมายเหตุ is left EMPTY, as the college's file leaves it. The course
+		// code was being repeated down the column, but it is already printed in
+		// the รหัสวิชา line above the table and on every page of the claim
+		// sheet; the column is there for whatever the office writes by hand
+		// against a particular row, and pre-filling it takes that space away.
 	}
 	// Data grid + one spare row closing the table: thin verticals, hair rules
 	// between rows, thin rule closing the bottom — the college's file keeps an
@@ -1024,11 +1039,32 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		}
 	}
 
+	// The total and the amount in words are ONE ruled band in the college's
+	// file, running the full width of the table: an outer rule down A and J, a
+	// thin rule above the total, another between the two rows, and one closing
+	// beneath the words. Without it the two lines float away from the table
+	// they belong to. Laid down across A:J first; the three cells that carry
+	// text or a figure are restyled on top, each keeping the band's rules.
 	sum := lastRow + 2
+	for _, r := range []int{sum, sum + 1} {
+		for _, col := range []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"} {
+			spec := cellSpec{bt: "thin", bb: "thin"}
+			switch col {
+			case "A":
+				spec.bl = "thin"
+			case "J":
+				spec.br = "thin"
+			}
+			if err := styAt(col, r, spec); err != nil {
+				return err
+			}
+		}
+	}
 	if err := set(at("B", sum), "รวมเบิกเป็นเงินทั้งสิ้น"); err != nil {
 		return err
 	}
-	if err := styAt("B", sum, cellSpec{bold: true, h: "left"}); err != nil {
+	if err := styAt("B", sum, cellSpec{bold: true, h: "left",
+		bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
 	if err := set(at("G", sum), fmt.Sprintf("=SUM(G10:G%d)", lastRow)); err != nil {
@@ -1042,7 +1078,8 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 	if err := set(at("B", sum+1), "(ตัวอักษร)"); err != nil {
 		return err
 	}
-	if err := styAt("B", sum+1, cellSpec{bold: true, h: "right"}); err != nil {
+	if err := styAt("B", sum+1, cellSpec{bold: true, h: "right",
+		bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
 	if err := set(at("C", sum+1), fmt.Sprintf(`="("&BAHTTEXT(G%d)&")"`, sum)); err != nil {
@@ -1051,7 +1088,12 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 	if err := f.MergeCell(sheet, at("C", sum+1), at("H", sum+1)); err != nil {
 		return err
 	}
-	if err := sty(at("C", sum+1), at("H", sum+1), cellSpec{bold: true, h: "center"}); err != nil {
+	// The amount in words sits on a silver band in the college's file — the
+	// same C0C0C0 the graduate sheet already carries. It is what makes the
+	// figure the finance office reads first stand out from the ruled table
+	// above it.
+	if err := sty(at("C", sum+1), at("H", sum+1), cellSpec{bold: true, h: "center",
+		fill: fillSilver, bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
 
@@ -1090,7 +1132,11 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 			if err := f.MergeCell(sheet, at(blk.from, r), at(blk.to, r)); err != nil {
 				return err
 			}
-			if err := sty(at(blk.from, r), at(blk.to, r), cellSpec{}); err != nil {
+			// Centred within the merged block, as the college's file sets its
+			// signature lines: the rule, the name beneath it and the position
+			// have to sit on one axis or the name reads as belonging to the
+			// column beside it rather than to the rule above it.
+			if err := sty(at(blk.from, r), at(blk.to, r), cellSpec{h: "center"}); err != nil {
 				return err
 			}
 		}

@@ -49,6 +49,18 @@ const (
 	// sheet's own fillGrey (D8D8D8) is a different, lighter band used for a
 	// different row, so the two are not interchangeable.
 	fillSilver = "C0C0C0"
+	// Font sizes read off the college's own file. The body stays at
+	// evidenceFontSize (16); everything above the data rows is smaller, and the
+	// month labels smaller still, because those columns are only ~12 wide and a
+	// 16pt "มิถุนายน 2569" wraps.
+	gradPreambleSize   = 15
+	gradHeaderSize     = 14
+	gradMonthLabelSize = 12
+	// gradMinGridRows is how many ruled rows the table carries even when fewer
+	// people claim. The college's form is filed with room to add a name by hand,
+	// and staff do — a table that stops one row under the last printed name
+	// leaves nowhere to write.
+	gradMinGridRows = 5
 )
 
 // gradEvidencePerson is one graduate TA's row on one of the two sheets.
@@ -146,6 +158,25 @@ type gradEvidenceCols struct {
 	Last string
 }
 
+// colOffsetFrom shifts a column letter by delta, clamping at column A. The
+// graduate sheet's closing block is positioned from the RIGHT edge — the sheet's
+// width changes with the month count, and the college's file places these
+// against the last column, not the first.
+func colOffsetFrom(col string, delta int) string {
+	n, err := excelize.ColumnNameToNumber(col)
+	if err != nil {
+		return col
+	}
+	if n+delta < 1 {
+		return col
+	}
+	name, err := excelize.ColumnNumberToName(n + delta)
+	if err != nil {
+		return col
+	}
+	return name
+}
+
 func gradEvidenceLayout(nMonths int, lump bool) gradEvidenceCols {
 	col := func(i int) string {
 		name, _ := excelize.ColumnNumberToName(i)
@@ -230,8 +261,15 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 		return f.SetCellValue(sheet, cell, v)
 	}
 	at := func(col string, r int) string { return fmt.Sprintf("%s%d", col, r) }
+	// evidenceFontSize is the DEFAULT, not a fixed size. The college's own file
+	// sets the two header rows smaller than the body (14, and 12 for the month
+	// labels) because the month columns are narrow: at the body's 16 a label like
+	// "มิถุนายน 2569" wraps onto a second line and the header row grows to swallow
+	// the top of the page. A spec that names its own size keeps it.
 	sty := func(from, to string, spec cellSpec) error {
-		spec.size = evidenceFontSize
+		if spec.size == 0 {
+			spec.size = evidenceFontSize
+		}
 		id, err := st.id(spec)
 		if err != nil {
 			return err
@@ -258,7 +296,8 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 		if err := f.MergeCell(sheet, at(c.Seq, r), at(c.Last, r)); err != nil {
 			return err
 		}
-		if err := sty(at(c.Seq, r), at(c.Last, r), cellSpec{bold: true, h: "center"}); err != nil {
+		if err := sty(at(c.Seq, r), at(c.Last, r),
+			cellSpec{size: gradPreambleSize, bold: true, h: "center"}); err != nil {
 			return err
 		}
 	}
@@ -270,22 +309,36 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	if lump {
 		trackReg, trackSp = "(    )", "(  / )"
 	}
-	half := len(c.Months)/2 + 4
-	if half < 5 {
-		half = 5
+	// The two boxes split the span from the first month column to the last one
+	// down the middle, so each gets half the table — the balanced pair the
+	// college's form prints.
+	//
+	// This was an offset counted from column E, which does not survive a
+	// variable month count: on a three-month export it made the ปริญญาตรี box a
+	// SINGLE column, and Excel clips an overlong label the moment its neighbour
+	// is occupied — so the left-hand box printed cut off mid-word while the
+	// right-hand one ran the whole rest of the sheet.
+	firstMonth, err := excelize.ColumnNameToNumber(c.Months[0])
+	if err != nil {
+		return err
 	}
-	midCol, _ := excelize.ColumnNumberToName(half)
-	rightCol, _ := excelize.ColumnNumberToName(half + 1)
+	lastNum, err := excelize.ColumnNameToNumber(c.Last)
+	if err != nil {
+		return err
+	}
+	midCol, _ := excelize.ColumnNumberToName((firstMonth + lastNum) / 2)
+	rightCol, _ := excelize.ColumnNumberToName((firstMonth+lastNum)/2 + 1)
 	for _, box := range []struct {
 		cell, to, text string
 		spec           cellSpec
 	}{
-		{at(c.Name, 6), "", "รหัสวิชา " + d.CourseCode, cellSpec{bold: true, h: "center"}},
-		{at(c.Code, 6), at(c.Level, 6), "รายวิชาระดับ", cellSpec{bold: true, h: "center"}},
-		{at(c.Months[0], 6), at(midCol, 6), "(    ) ปริญญาตรี", cellSpec{bold: true, h: "left"}},
-		{at(rightCol, 6), at(c.Last, 6), "(  / ) บัณฑิตศึกษา", cellSpec{bold: true, h: "left"}},
-		{at(c.Months[0], 7), at(midCol, 7), trackReg + " ภาคปกติ", cellSpec{bold: true, h: "left"}},
-		{at(rightCol, 7), at(c.Last, 7), trackSp + " โครงการพิเศษ", cellSpec{bold: true, h: "left"}},
+		// No รหัสวิชา caption here: the college's form does not carry one, and the
+		// code is already printed against every row in its own column.
+		{at(c.Code, 6), at(c.Level, 6), "รายวิชาระดับ", cellSpec{size: gradPreambleSize, bold: true, h: "center"}},
+		{at(c.Months[0], 6), at(midCol, 6), "(    ) ปริญญาตรี", cellSpec{size: gradPreambleSize, bold: true, h: "left"}},
+		{at(rightCol, 6), at(c.Last, 6), "(  / ) บัณฑิตศึกษา", cellSpec{size: gradPreambleSize, bold: true, h: "left"}},
+		{at(c.Months[0], 7), at(midCol, 7), trackReg + " ภาคปกติ", cellSpec{size: gradPreambleSize, bold: true, h: "left"}},
+		{at(rightCol, 7), at(c.Last, 7), trackSp + " โครงการพิเศษ", cellSpec{size: gradPreambleSize, bold: true, h: "left"}},
 	} {
 		if err := set(box.cell, box.text); err != nil {
 			return err
@@ -370,13 +423,29 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 			return err
 		}
 	}
-	// The two header rows read as one tall box, and — faithfully to the
-	// college's file — are NOT bold.
-	if err := sty(at(c.Seq, 8), at(c.Last, 8), cellSpec{h: "center", wrap: true, bl: "thin", br: "thin", bt: "thin"}); err != nil {
+	// The two header rows read as one tall box. Bold and one size down from the
+	// body, which is what the college's graduate file has — every cell of its
+	// rows 8 and 9 is bold at 14pt. This writer had them at the body's 16 and NOT
+	// bold, on the strength of a comment about the undergrad form; the graduate
+	// one does not follow it.
+	head := cellSpec{size: gradHeaderSize, bold: true, h: "center", wrap: true, bl: "thin", br: "thin"}
+	head.bt = "thin"
+	if err := sty(at(c.Seq, 8), at(c.Last, 8), head); err != nil {
 		return err
 	}
-	if err := sty(at(c.Seq, 9), at(c.Last, 9), cellSpec{h: "center", wrap: true, bl: "thin", br: "thin", bb: "thin"}); err != nil {
+	head.bt, head.bb = "", "thin"
+	if err := sty(at(c.Seq, 9), at(c.Last, 9), head); err != nil {
 		return err
+	}
+	// The month labels are smaller again: their columns are the narrowest on the
+	// sheet, and at the header size "กันยายน 2569" wraps to two lines and drags
+	// the whole header row down with it.
+	for _, m := range c.Months {
+		small := head
+		small.size = gradMonthLabelSize
+		if err := styAt(m, 9, small); err != nil {
+			return err
+		}
 	}
 
 	// Data rows.
@@ -429,6 +498,13 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	// file leaves one between the last name and the total.
 	lastRow := 9 + len(people)
 	spare := lastRow + 1
+	// …and the table never stops short of the college's own height. Their form
+	// carries five ruled rows whatever the claim, because a name gets added by
+	// hand at the finance desk and there has to be somewhere to write it. One TA
+	// used to produce a two-row table with nowhere to add a second.
+	if min := 9 + gradMinGridRows; spare < min {
+		spare = min
+	}
 	specs := map[string]cellSpec{
 		c.Seq:      {h: "center"},
 		c.Name:     {},
@@ -469,7 +545,8 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	// medium side rules the undergrad one does (compare their two files) — and
 	// the ตัวอักษร band carries a silver C0C0C0 fill across its whole width.
 	// That fill is the one the office spotted missing.
-	sum := lastRow + 2
+	// Directly under the ruled grid, wherever that now ends.
+	sum := spare + 1
 	if err := set(at(c.Name, sum), "รวมเบิกเป็นเงินทั้งสิ้น"); err != nil {
 		return err
 	}
@@ -494,15 +571,19 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	// and edited by hand after export, and a Go-rendered string would not follow
 	// the total if a figure is corrected.
 	//
-	// The band runs from the ระดับ column to the last one on the sheet, so the
-	// fill reaches the right edge rather than stopping under รับจริง.
+	// The band runs from the ระดับ column and STOPS TWO COLUMNS SHORT of the
+	// right edge, which on both sheets is where the signing columns begin
+	// (ลายมือชื่อผู้รับเงิน / ผู้รับรอง on ปกติ, ลายมือชื่อ / หมายเหตุ on พิเศษ).
+	// The college leaves those white — they are written in by hand, and a silver
+	// band under a signature is the one place on the form ink does not read.
+	bandEnd := colOffsetFrom(c.Last, -2)
 	if err := set(at(c.Level, sum+1), fmt.Sprintf(`="("&BAHTTEXT(%s%d)&")"`, c.Received, sum)); err != nil {
 		return err
 	}
-	if err := f.MergeCell(sheet, at(c.Level, sum+1), at(c.Last, sum+1)); err != nil {
+	if err := f.MergeCell(sheet, at(c.Level, sum+1), at(bandEnd, sum+1)); err != nil {
 		return err
 	}
-	if err := sty(at(c.Level, sum+1), at(c.Last, sum+1), cellSpec{bold: true, h: "center",
+	if err := sty(at(c.Level, sum+1), at(bandEnd, sum+1), cellSpec{bold: true, h: "center",
 		fill: fillSilver, bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
@@ -521,7 +602,11 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 			certLines = append(certLines, d.Certifier.ActingFor)
 		}
 	}
-	sigFrom := c.Received
+	// Four columns wide against the right edge, as the college's file signs both
+	// its sheets (column L of O, column J of M). Anchoring on รับจริง instead
+	// moved with the month count, and on a short export the block started so far
+	// right that "รักษาการแทนหัวหน้าสาขาวิชาวิทยาการคอมพิวเตอร์" had nowhere to sit.
+	sigFrom := colOffsetFrom(c.Last, -3)
 	for i, line := range certLines {
 		r := sig + i
 		if err := set(at(sigFrom, r), line); err != nil {
@@ -530,7 +615,9 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 		if err := f.MergeCell(sheet, at(sigFrom, r), at(c.Last, r)); err != nil {
 			return err
 		}
-		if err := sty(at(sigFrom, r), at(c.Last, r), cellSpec{}); err != nil {
+		// Centred within the merged block, the same way the undergrad book's
+		// evidence sheet sets its signature lines.
+		if err := sty(at(sigFrom, r), at(c.Last, r), cellSpec{h: "center"}); err != nil {
 			return err
 		}
 	}

@@ -175,7 +175,23 @@ func (f *tcFixture) ensurePeriod() uuid.UUID {
 	return spID
 }
 
+// financeSend puts every TA of the course at the LAST stage of the pipeline.
+// Kept for the tests that are about the finance handoff itself; the export gate
+// only needs 'exported', which markExported gives.
 func (f *tcFixture) financeSend(courseID uuid.UUID) {
+	f.t.Helper()
+	f.setPeriodStatus(courseID, "finance_sent")
+}
+
+// markExported is the state the transfer-cover gate actually opens on: the
+// claim documents have been issued and the month is locked, so the figures on
+// the cover can no longer move. 'ส่งการเงิน' comes AFTER this document exists.
+func (f *tcFixture) markExported(courseID uuid.UUID) {
+	f.t.Helper()
+	f.setPeriodStatus(courseID, "exported")
+}
+
+func (f *tcFixture) setPeriodStatus(courseID uuid.UUID, status string) {
 	f.t.Helper()
 	spID := f.ensurePeriod()
 	rows, err := f.pool.Query(f.ctx, `
@@ -198,9 +214,9 @@ func (f *tcFixture) financeSend(courseID uuid.UUID) {
 	rows.Close()
 	for _, taID := range taIDs {
 		f.exec(`INSERT INTO submission_period_status (id, submission_period_id, ta_id, teaching_course_id, status)
-		        VALUES (gen_random_uuid(), $1, $2, $3, 'finance_sent')
+		        VALUES (gen_random_uuid(), $1, $2, $3, $4)
 		        ON CONFLICT (submission_period_id, ta_id, teaching_course_id)
-		        DO UPDATE SET status = 'finance_sent'`, spID, taID, courseID)
+		        DO UPDATE SET status = $4`, spID, taID, courseID, status)
 	}
 }
 
@@ -451,10 +467,14 @@ func TestBuildTransferCoverWorkbook_TotalIsARealFormula(t *testing.T) {
 	}
 }
 
-// The หมายเหตุ (ใหม่/เก่า) column must reflect TASeniority — not print blank
-// for every row, which is what happened before this test existed (the field
-// was declared on transferCoverRow but nothing ever set it).
-func TestBuildTransferCoverWorkbook_SeniorityColumnPopulated(t *testing.T) {
+// Seniority (ใหม่/เก่า) must reflect TASeniority — not come back blank for
+// every row, which is what happened before this test existed (the field was
+// declared on transferCoverRow but nothing ever set it).
+//
+// It is asserted on the PREVIEW, not on the workbook: the office's template
+// has no หมายเหตุ column, so the printed file carries five columns and this
+// reading lives only on the screen staff check before downloading.
+func TestTransferCoverPreview_SeniorityPopulated(t *testing.T) {
 	f := newTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	newTA := f.newTA("กมล ใหม่เอี่ยม", "undergrad")
@@ -462,36 +482,37 @@ func TestBuildTransferCoverWorkbook_SeniorityColumnPopulated(t *testing.T) {
 	f.exec(`UPDATE users SET ta_first_term_id = $2 WHERE id = $1`, newTA, f.termID)
 	f.assignTA(newTA, courseA, regA, "undergrad", []int{1})
 	f.assignTA(oldTA, courseA, regA, "undergrad", []int{2})
-	f.financeSend(courseA)
 
-	body, warnings, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil, "undergrad")
+	sheets, _, err := f.svc.TransferCoverPreview(f.ctx, f.termID, nil, "undergrad")
 	if err != nil {
-		t.Fatalf("BuildTransferCoverWorkbook: %v\nwarnings: %v", err, warnings)
+		t.Fatalf("TransferCoverPreview: %v", err)
 	}
-	wb := openWorkbookBytes(t, body)
-	defer wb.Close()
-
-	sheetName := "CY ปกติ"
-	// Sorted by name: "กมล..." (row 6) before "ยุพา..." (row 7).
-	newRow, _ := wb.GetCellValue(sheetName, "F6")
-	oldRow, _ := wb.GetCellValue(sheetName, "F7")
-	if newRow != "ใหม่" {
-		t.Errorf("F6 (seniority for a TA whose ta_first_term_id is this term) = %q, want ใหม่", newRow)
+	got := map[string]string{}
+	for _, sh := range sheets {
+		for _, r := range sh.Rows {
+			got[r.Name] = r.Seniority
+		}
 	}
-	if oldRow != "เก่า" {
-		t.Errorf("F7 (seniority for a TA with no ta_first_term_id stamp) = %q, want เก่า", oldRow)
+	// Sorted by name: "กมล..." is the TA whose ta_first_term_id is this term.
+	if got["กมล ใหม่เอี่ยม ทดสอบ"] != "ใหม่" {
+		t.Errorf("a TA first appointed this term reads %q, want ใหม่ (all: %v)",
+			got["กมล ใหม่เอี่ยม ทดสอบ"], got)
+	}
+	if got["ยุพา เก่าแก่ ทดสอบ"] != "เก่า" {
+		t.Errorf("a TA with no ta_first_term_id stamp reads %q, want เก่า (all: %v)",
+			got["ยุพา เก่าแก่ ทดสอบ"], got)
 	}
 }
 
-// The gate must be term-wide: one course still short of finance_sent blocks
-// the whole document, even if every other course is fully done.
-func TestTermExportBlockers_RejectsWhenOneMonthNotFinanceSent(t *testing.T) {
+// The gate must be term-wide: one course whose claim documents have not been
+// issued blocks the whole document, even if every other course is done.
+func TestTermExportBlockers_RejectsWhenOneMonthIsNotExported(t *testing.T) {
 	f := newTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
-	ta := f.newTA("นายค้าง จ่ายเงิน", "undergrad")
+	ta := f.newTA("นายค้าง ส่งออก", "undergrad")
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
 	// The period exists (staff always create these up front) but its status
-	// was never advanced to finance_sent — the case that must still block.
+	// was never advanced — the case that must still block.
 	f.ensurePeriod()
 
 	blockers, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil, "undergrad")
@@ -499,20 +520,60 @@ func TestTermExportBlockers_RejectsWhenOneMonthNotFinanceSent(t *testing.T) {
 		t.Fatalf("TermExportBlockers: %v", err)
 	}
 	if len(blockers) == 0 {
-		t.Fatal("expected at least one blocker for the un-sent course")
+		t.Fatal("expected at least one blocker for the un-exported course")
 	}
 	found := false
 	for _, b := range blockers {
-		if b.CourseCode == "CP111" && b.Kind == "not_finance_sent" {
+		if b.CourseCode == "CP111" && b.Kind == "not_exported" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("blockers = %+v, want a not_finance_sent entry tagged CP111", blockers)
+		t.Errorf("blockers = %+v, want a not_exported entry tagged CP111", blockers)
 	}
 
 	if _, _, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil, "undergrad"); err == nil {
 		t.Error("BuildTransferCoverWorkbook must refuse while the gate is open")
+	}
+}
+
+// THE DEAD END THIS GATE USED TO BE. ปะหน้าจ่ายตรง required finance_sent — one
+// stage PAST the point where the figures freeze — and 'ส่งการเงิน' has no
+// button anywhere in the staff UI, so no month could ever reach it and the
+// document was unobtainable for every term. It is also the wrong order: this
+// sheet is what the finance office keys into ERP, so it has to exist before
+// the handoff, not after somebody recorded that the handoff happened.
+//
+// 'exported' is the line that matters: the claim documents are issued, the
+// month is locked, and nothing on the cover can move any more.
+func TestTermExportBlockers_ExportedIsEnoughWithoutTheFinanceHandoff(t *testing.T) {
+	f := newTCFixture(t)
+	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP222", Curriculum: "CY", LectureHrs: 100})
+	ta := f.newTA("นางสาวส่งออก แล้ว", "undergrad")
+	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
+	f.markExported(courseA) // and deliberately NOT financeSend
+
+	blockers, err := f.svc.TermExportBlockers(f.ctx, f.termID, nil, "undergrad")
+	if err != nil {
+		t.Fatalf("TermExportBlockers: %v", err)
+	}
+	if len(blockers) != 0 {
+		t.Fatalf("blockers = %+v, want none — an exported month is settled, and "+
+			"waiting for a finance handoff that has no button is not a gate", blockers)
+	}
+	if _, _, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil, "undergrad"); err != nil {
+		t.Errorf("BuildTransferCoverWorkbook refused an exported term: %v", err)
+	}
+
+	// And the picker must agree with the gate, or the month is greyed out on a
+	// screen whose download would have accepted it.
+	notReady, err := f.svc.TermMonthsNotReady(f.ctx, f.termID, "undergrad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notReady) != 0 {
+		t.Errorf("TermMonthsNotReady = %v, want empty — the picker still calls an "+
+			"exported month unready while the download accepts it", notReady)
 	}
 }
 

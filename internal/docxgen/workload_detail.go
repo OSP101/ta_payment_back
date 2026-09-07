@@ -200,8 +200,13 @@ func workloadBorder(edge string) string {
 }
 
 // writeWorkloadMonthPair renders two months side by side as one bordered table.
-// An empty right-hand month prints its half blank, exactly as the college's own
-// form does when a term has an odd number of months.
+//
+// An odd month count leaves the right-hand half without a month. The college's
+// own file still prints that half's SKELETON — จำนวนชั่วโมง, งาน, the three
+// duty rows and รวม — and leaves only the caption and the figures empty, so the
+// block reads as a spare month waiting to be filled in by hand. This wrote the
+// whole half blank instead, which turned the last block into a lopsided table
+// with an unexplained empty box beside it.
 func writeWorkloadMonthPair(b *strings.Builder, left, right WorkloadMonth) {
 	b.WriteString(`<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>` +
 		`<w:tblInd w:w="250" w:type="dxa"/>`)
@@ -216,7 +221,6 @@ func writeWorkloadMonthPair(b *strings.Builder, left, right WorkloadMonth) {
 	}
 	b.WriteString(`</w:tblGrid>`)
 
-	hasRight := right.Label != ""
 	hours := func(m WorkloadMonth, pick func(WorkloadMonth) string) string {
 		if m.Label == "" {
 			return ""
@@ -224,38 +228,30 @@ func writeWorkloadMonthPair(b *strings.Builder, left, right WorkloadMonth) {
 		return pick(m)
 	}
 	// A work row: the label reads left, the figure centred — the label column is
-	// a list of duties, not a heading.
+	// a list of duties, not a heading. The duty labels print on BOTH halves
+	// whether or not the right one has a month behind it.
 	workRow := func(label string, pick func(WorkloadMonth) string) {
-		rightLabel := label
-		if !hasRight {
-			rightLabel = ""
-		}
 		writeWorkloadRow(b, workloadRow{cells: []workloadCell{
 			{text: label},
 			{text: hours(left, pick), align: "center"},
-			{text: rightLabel},
+			{text: label},
 			{text: hours(right, pick), align: "center"},
 		}})
 	}
 
-	rightCaption, rightHoursCaption := "", ""
-	if hasRight {
-		rightCaption, rightHoursCaption = right.Label, "จำนวนชั่วโมง"
-	}
 	// Month caption, then the งาน / ชั่วโมง headings — both on the grey band.
+	// Only the caption itself is left empty on a monthless half; its จำนวนชั่วโมง
+	// heading still prints, which is what makes the empty half read as a column
+	// rather than a hole.
 	writeWorkloadRow(b, workloadRow{height: captionRowHeight, bold: true, fill: workloadHeadFill,
 		cells: []workloadCell{
 			{text: left.Label, align: "center"}, {text: "จำนวนชั่วโมง", align: "center"},
-			{text: rightCaption, align: "center"}, {text: rightHoursCaption, align: "center"},
+			{text: right.Label, align: "center"}, {text: "จำนวนชั่วโมง", align: "center"},
 		}})
-	rightWork := ""
-	if hasRight {
-		rightWork = "งาน"
-	}
 	writeWorkloadRow(b, workloadRow{bold: true, fill: workloadHeadFill,
 		cells: []workloadCell{
 			{text: "งาน", align: "center"}, {},
-			{text: rightWork, align: "center"}, {},
+			{text: "งาน", align: "center"}, {},
 		}})
 
 	workRow("ช่วยสอน", func(m WorkloadMonth) string { return m.HelpTeach })
@@ -265,14 +261,10 @@ func writeWorkloadMonthPair(b *strings.Builder, left, right WorkloadMonth) {
 	// total read as a total rather than a fourth kind of work.
 	writeWorkloadRow(b, workloadRow{cells: make([]workloadCell, 4)})
 
-	rightTotal := ""
-	if hasRight {
-		rightTotal = "รวม"
-	}
 	writeWorkloadRow(b, workloadRow{bold: true, bottomRule: true, cells: []workloadCell{
 		{text: "รวม", align: "center"},
 		{text: hours(left, func(m WorkloadMonth) string { return m.Total }), align: "center"},
-		{text: rightTotal, align: "center"},
+		{text: "รวม", align: "center"},
 		{text: hours(right, func(m WorkloadMonth) string { return m.Total }), align: "center"},
 	}})
 

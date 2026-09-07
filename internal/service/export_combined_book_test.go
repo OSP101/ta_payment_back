@@ -347,6 +347,51 @@ func TestCombinedSheet_FundedAmountPrintsOnlyWhenBudgetStopsShort(t *testing.T) 
 	}
 }
 
+// Office instruction (ก.ย. 2569): ขอเบิกจ่ายเพียง carries the same unit and the
+// same written-out amount as รวมเป็นเงินทั้งสิ้น above it. It is the figure the
+// money actually follows, so it is the one that most needs words beside the
+// digits — a bare "2,750.00" is the one number on the sheet a pen could alter
+// without leaving a trace.
+func TestCombinedSheet_FundedAmountCarriesUnitAndBahtText(t *testing.T) {
+	f, _, _ := combinedFixture(t)
+	raw := excelize.Options{RawCellValue: true}
+
+	// Block 1 is underfunded: row 33 prints a figure, so it gets the words.
+	if got, _ := f.GetCellValue(sheetClaimRegular, "E33", raw); got != "บาท" {
+		t.Errorf("ขอเบิกจ่ายเพียง E33 = %q, want the unit บาท beside the amount", got)
+	}
+	formula, _ := f.GetCellFormula(sheetClaimRegular, "G33")
+	if !strings.Contains(formula, "BAHTTEXT(C33)") {
+		t.Errorf("G33 = %q, want BAHTTEXT over C33 — the funded figure, not the full one",
+			formula)
+	}
+
+	// Block 2 is funded in full, so row 72 is blank — and a unit standing
+	// against an empty amount would read as a claim for zero baht.
+	for _, cell := range []string{"E72", "G72"} {
+		if got, _ := f.GetCellValue(sheetClaimRegular, cell, raw); strings.TrimSpace(got) != "" {
+			t.Errorf("%s = %q, want blank when ขอเบิกจ่ายเพียง prints no figure", cell, got)
+		}
+	}
+}
+
+// The name under the signature rule is the printed reading OF that signature,
+// which is what the parentheses say. Without them it reads as a second name
+// sitting loose on the form.
+func TestCombinedSheet_PerformerNameIsParenthesised(t *testing.T) {
+	f, _, _ := combinedFixture(t)
+	// Block 1: grand total 32 → signature box 34, rule 36, name 37.
+	formula, err := f.GetCellFormula(sheetClaimRegular, "A37")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// GetCellFormula returns the expression without its leading "=".
+	if want := `"("&B9&")"`; formula != want {
+		t.Errorf("A37 = %q, want %q — parenthesised and still linked to the claim's own name cell",
+			formula, want)
+	}
+}
+
 // A track nobody worked produces no sheet, rather than a blank one to leaf past.
 func TestCombinedSheet_SkipsAnEmptyTrack(t *testing.T) {
 	f, _, _ := combinedFixture(t)

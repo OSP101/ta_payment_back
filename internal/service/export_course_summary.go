@@ -489,6 +489,43 @@ func buildCourseSummaryStyles(f *excelize.File) (*courseSummaryStyles, error) {
 
 func fmtPtr(s string) *string { return &s }
 
+// summaryBodyColumns is the sheet's body grid, column by column, in the styles
+// the reference gives them: names read from the left, everything countable is
+// centred, and the ขออนุมัติเบิกจ่าย pair carries the header tint down the whole
+// column. D is listed with no value of its own — the reference keeps it ruled
+// and empty, and dropping it from this list is what leaves a gap in the grid.
+func summaryBodyColumns(st *courseSummaryStyles) []struct {
+	col   string
+	style int
+} {
+	return []struct {
+		col   string
+		style int
+	}{
+		{"A", st.bodyCenter}, {"B", st.bodyCenter}, {"C", st.body}, {"D", st.body},
+		{"E", st.bodyCenter}, {"F", st.body}, {"G", st.bodyCenter}, {"H", st.body},
+		{"I", st.bodyCenter}, {"J", st.bodyCenter}, {"K", st.bodyCenter},
+		{"L", st.bodyCenter}, {"M", st.money}, {"N", st.money},
+	}
+}
+
+// ruleSummaryBlock draws the grid for one course: one row per TA, or a single
+// row when the course has none on file yet.
+func ruleSummaryBlock(f *excelize.File, st *courseSummaryStyles, sheet string, top, tas int) error {
+	if tas < 1 {
+		tas = 1
+	}
+	for r := top; r < top+tas; r++ {
+		for _, c := range summaryBodyColumns(st) {
+			cell := fmt.Sprintf("%s%d", c.col, r)
+			if err := f.SetCellStyle(sheet, cell, cell, c.style); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // courseSummarySheetSnapshot is one curriculum sheet's worth of frozen blocks
 // — CurriculumFullNameTH and SheetName are copied from curricula at generation
 // time (not re-looked-up on reprint) because that table is staff-editable
@@ -736,6 +773,14 @@ func writeCourseSummarySheet(
 	// 2–3 so no rule cuts through them. The reference gets that look by leaving
 	// the row-2 bottom border off; merging says the same thing structurally and
 	// survives a reader widening a column.
+	//
+	// The sheet ENDS at N, on purpose. The college's own file
+	// (docs/ค่าตอบแทนTAภาคต้น-2569.xlsx) carries two further pairs — O:P
+	// เบิกจ่ายเดือน … and Q:R คงเหลือ — and they are deliberately not
+	// reproduced: this document answers one question, how much each course may
+	// claim, and what was actually paid out is reported by the claim book and
+	// the transfer cover instead. Anyone diffing against the reference will
+	// find those columns missing; that is the decision, not an omission.
 	headers := []struct {
 		cell, mergeTo, label string
 	}{
@@ -781,6 +826,20 @@ func writeCourseSummarySheet(
 	row := 5
 	for i, b := range blocks {
 		top := row
+		// EVERY cell of the block is ruled first, then the values are written
+		// on top of the rules.
+		//
+		// A course with more than one TA occupies one row per TA, and only the
+		// first of them carries the course's own columns — but the reference
+		// still rules A–N on every one of those rows, so the table reads as a
+		// single grid with the course spanning it. Styling only the cells that
+		// take a value tore that grid open: from the second TA down, everything
+		// outside รหัสนักศึกษา/ชื่อ TA/ระดับ printed with no rules at all, and
+		// column D — which the reference keeps ruled and empty across the whole
+		// sheet — had none on any row.
+		if err := ruleSummaryBlock(f, st, sheet, top, len(b.TAs)); err != nil {
+			return err
+		}
 		if err := set(fmt.Sprintf("A%d", top), st.bodyCenter, i+1); err != nil {
 			return err
 		}

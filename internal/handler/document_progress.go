@@ -198,11 +198,10 @@ func (h *DocProgressHandler) RevokeShareLink(c *fiber.Ctx) error {
 // (every round, showFinalStage on), because a public reader is not a TA the
 // stepper needs to hide the dean's step from.
 func (h *DocProgressHandler) PublicGet(c *fiber.Ctx) error {
-	linkID, err := uuid.Parse(c.Params("linkId"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "ไม่พบลิงก์")
-	}
-	termID, termLabel, err := h.Svc.DocProgress.PublicResolveTerm(c.Context(), linkID)
+	// The token is a short slug now, not a UUID — parsing it as one here would
+	// 404 every link the shorter format issues. Unknown tokens are refused by
+	// the resolver, identically to revoked ones.
+	termID, termLabel, err := h.Svc.DocProgress.PublicResolveTerm(c.Context(), c.Params("linkId"))
 	if err != nil {
 		if errors.Is(err, service.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบลิงก์ หรือลิงก์นี้ถูกยกเลิกแล้ว")
@@ -220,15 +219,11 @@ func (h *DocProgressHandler) PublicGet(c *fiber.Ctx) error {
 // the anonymous counterpart of ListChecklist, scoped to whatever term the
 // link points at (?round= defaults to 1, same as the authenticated route).
 func (h *DocProgressHandler) PublicListChecklist(c *fiber.Ctx) error {
-	linkID, err := uuid.Parse(c.Params("linkId"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusNotFound, "ไม่พบลิงก์")
-	}
 	round, err := roundParam(c)
 	if err != nil {
 		return err
 	}
-	termID, _, err := h.Svc.DocProgress.PublicResolveTerm(c.Context(), linkID)
+	termID, _, err := h.Svc.DocProgress.PublicResolveTerm(c.Context(), c.Params("linkId"))
 	if err != nil {
 		if errors.Is(err, service.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบลิงก์ หรือลิงก์นี้ถูกยกเลิกแล้ว")

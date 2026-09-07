@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/xuri/excelize/v2"
@@ -50,6 +49,10 @@ type transferCoverRow struct {
 	Baht      float64   `json:"baht"`
 	PromptPay string    `json:"-"`
 	Seniority string    `json:"seniority"` // "ใหม่" | "เก่า"
+	// sortName is the name WITHOUT its คำนำหน้า, used only to order the sheet.
+	// Unexported, so it never reaches the reprint snapshot — a reprint writes
+	// the rows back in the order they were already stored.
+	sortName string
 }
 
 type transferCoverSheet struct {
@@ -102,28 +105,47 @@ func (s *ExportService) transferCoverPrintCurricula(ctx context.Context, termID 
 // taNamesByCourse maps every TA with a live approved assignment on courseID to
 // their display name — the same roster claimCostByTASlot's rows draw from,
 // gathered separately because taSlotCost carries only the id.
-func (s *ExportService) taNamesByCourse(ctx context.Context, courseID uuid.UUID) (map[uuid.UUID]string, error) {
+//
+// Names carry the คำนำหน้า, as the office's own template writes them
+// ("นายอภิภัทร คําพุทธ", "นางสาวณัฐนิชา ทะยานรัมย์") and as every other
+// document in this package already does. The TA profile's own prefix wins over
+// the account title: the profile is what the TA filled in for these documents,
+// and the account title may still be whatever the registrar import left.
+func (s *ExportService) taNamesByCourse(ctx context.Context, courseID uuid.UUID) (map[uuid.UUID]transferCoverName, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT u.id, u.first_name || ' ' || u.last_name
+		SELECT DISTINCT u.id,
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       u.first_name || ' ' || u.last_name,
+		       u.first_name || ' ' || u.last_name
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN users u       ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		JOIN sections sec  ON sec.id = a.section_id
 		WHERE sec.teaching_course_id = $1 AND a.state <> 'dropped'`, courseID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[uuid.UUID]string{}
+	out := map[uuid.UUID]transferCoverName{}
 	for rows.Next() {
 		var id uuid.UUID
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
+		var n transferCoverName
+		if err := rows.Scan(&id, &n.display, &n.sort); err != nil {
 			return nil, err
 		}
-		out[id] = name
+		out[id] = n
 	}
 	return out, rows.Err()
+}
+
+// transferCoverName carries a TA's printed name and the key the list is
+// ordered by. They differ on purpose: the คำนำหน้า is printed, but ordering on
+// it would group the whole sheet into นางสาว then นาย before any given name is
+// consulted. Thai name lists are ordered by ชื่อ.
+type transferCoverName struct {
+	display string
+	sort    string
 }
 
 // gradSpecialTAIDs returns every graduate TA on courseID's special-track
@@ -159,9 +181,10 @@ func (s *ExportService) gradSpecialTAIDs(ctx context.Context, courseID uuid.UUID
 }
 
 type transferCoverAcc struct {
-	name    string
-	baht    float64
-	courses map[string]bool
+	name     string
+	sortName string
+	baht     float64
+	courses  map[string]bool
 }
 
 type transferCoverKey struct {
@@ -262,11 +285,11 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 	}
 
 	accum := map[transferCoverKey]*transferCoverAcc{}
-	get := func(cur, track string, ta uuid.UUID, name string) *transferCoverAcc {
+	get := func(cur, track string, ta uuid.UUID, n transferCoverName) *transferCoverAcc {
 		k := transferCoverKey{cur, track, ta}
 		a, ok := accum[k]
 		if !ok {
-			a = &transferCoverAcc{name: name, courses: map[string]bool{}}
+			a = &transferCoverAcc{name: n.display, sortName: n.sort, courses: map[string]bool{}}
 			accum[k] = a
 		}
 		return a
@@ -376,7 +399,8 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 			seniorityTH = "ใหม่"
 		}
 		grouped[sheetKey{k.curriculum, k.track}] = append(grouped[sheetKey{k.curriculum, k.track}], transferCoverRow{
-			TAID: k.ta, Name: a.name, Courses: strings.Join(codes, ", "), Baht: round2(a.baht), Seniority: seniorityTH,
+			TAID: k.ta, Name: a.name, sortName: a.sortName,
+			Courses: strings.Join(codes, ", "), Baht: round2(a.baht), Seniority: seniorityTH,
 		})
 	}
 
@@ -387,7 +411,17 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 			if len(rows) == 0 {
 				continue
 			}
-			sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+			// Ordered by ชื่อ, not by คำนำหน้า — see transferCoverName.
+			sort.Slice(rows, func(i, j int) bool {
+				a, b := rows[i].sortName, rows[j].sortName
+				if a == "" {
+					a = rows[i].Name
+				}
+				if b == "" {
+					b = rows[j].Name
+				}
+				return a < b
+			})
 			trackTH := "ปกติ"
 			if track == "special" {
 				trackTH = "พิเศษ"
@@ -436,6 +470,7 @@ func (s *ExportService) fillPromptPay(ctx context.Context, actor uuid.UUID, shee
 
 type transferCoverStyles struct {
 	title, memo, subtitle, colHeader int
+	subtitleRuled                    int
 	body, bodyCenter, money          int
 	totalLabel, totalMoney           int
 	sign                             int
@@ -449,9 +484,21 @@ func buildTransferCoverStyles(f *excelize.File) (*transferCoverStyles, error) {
 	center := &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true}
 	left := &excelize.Alignment{Horizontal: "left", Vertical: "center", WrapText: true}
 	right := &excelize.Alignment{Horizontal: "right", Vertical: "center"}
-	thin := []excelize.Border{
-		{Type: "left", Color: "999999", Style: 1}, {Type: "right", Color: "999999", Style: 1},
-		{Type: "top", Color: "999999", Style: 1}, {Type: "bottom", Color: "999999", Style: 1},
+	// Black, as the office's template draws them. The grey these used to be
+	// read as a different document next to the real one — the claim book made
+	// exactly the same mistake and was corrected the same way.
+	//
+	// Verticals thin, horizontals hair: the template rules the columns firmly
+	// and separates the names lightly, so a long list reads as one block rather
+	// than as forty boxes.
+	const black = "000000"
+	box := []excelize.Border{
+		{Type: "left", Color: black, Style: 1}, {Type: "right", Color: black, Style: 1},
+		{Type: "top", Color: black, Style: 1}, {Type: "bottom", Color: black, Style: 1},
+	}
+	rowRules := []excelize.Border{
+		{Type: "left", Color: black, Style: 1}, {Type: "right", Color: black, Style: 1},
+		{Type: "top", Color: black, Style: 7}, {Type: "bottom", Color: black, Style: 7},
 	}
 	const moneyFmt = `_-* #,##0.00_-;\-* #,##0.00_-;_-* "-"??_-;_-@_-`
 
@@ -464,16 +511,31 @@ func buildTransferCoverStyles(f *excelize.File) (*transferCoverStyles, error) {
 		id, err = f.NewStyle(s)
 		return id
 	}
-	st.title = mk(&excelize.Style{Font: font(18, true), Alignment: center})
-	st.memo = mk(&excelize.Style{Font: font(15, false), Alignment: left})
-	st.subtitle = mk(&excelize.Style{Font: font(15, false), Alignment: left})
-	st.colHeader = mk(&excelize.Style{Font: font(15, true), Alignment: center, Border: thin})
-	st.body = mk(&excelize.Style{Font: font(14, false), Alignment: left, Border: thin})
-	st.bodyCenter = mk(&excelize.Style{Font: font(14, false), Alignment: center, Border: thin})
-	st.money = mk(&excelize.Style{Font: font(14, false), Alignment: right, Border: thin, CustomNumFmt: fmtPtr(moneyFmt)})
-	st.totalLabel = mk(&excelize.Style{Font: font(15, true), Alignment: center, Border: thin})
-	st.totalMoney = mk(&excelize.Style{Font: font(15, true), Alignment: right, Border: thin, CustomNumFmt: fmtPtr(moneyFmt)})
-	st.sign = mk(&excelize.Style{Font: font(14, false), Alignment: center})
+	// The four heading lines are ALL centred and bold in the template, at 20
+	// for the document's name and 18 for the three lines under it. They used to
+	// print left-aligned at 15 and unbolded, which is most of why the file did
+	// not read as the same document at a glance.
+	st.title = mk(&excelize.Style{Font: font(20, true), Alignment: center})
+	st.memo = mk(&excelize.Style{Font: font(18, true), Alignment: center})
+	st.subtitle = mk(&excelize.Style{Font: font(18, true), Alignment: center})
+	// The last heading line carries the rule that separates the heading block
+	// from the table.
+	st.subtitleRuled = mk(&excelize.Style{Font: font(18, true), Alignment: center,
+		Border: []excelize.Border{{Type: "bottom", Color: black, Style: 1}}})
+	st.colHeader = mk(&excelize.Style{Font: font(16, true), Alignment: center, Border: box})
+	st.body = mk(&excelize.Style{Font: font(16, false), Alignment: left, Border: rowRules})
+	st.bodyCenter = mk(&excelize.Style{Font: font(16, false), Alignment: center, Border: rowRules})
+	st.money = mk(&excelize.Style{Font: font(16, false), Alignment: right, Border: rowRules, CustomNumFmt: fmtPtr(moneyFmt)})
+	st.totalLabel = mk(&excelize.Style{Font: font(16, true), Alignment: center, Border: box})
+	// The grand total is closed with a DOUBLE rule underneath, the accounting
+	// convention the template follows.
+	st.totalMoney = mk(&excelize.Style{Font: font(16, true), Alignment: right,
+		Border: []excelize.Border{
+			{Type: "left", Color: black, Style: 1}, {Type: "right", Color: black, Style: 1},
+			{Type: "top", Color: black, Style: 1}, {Type: "bottom", Color: black, Style: 6},
+		},
+		CustomNumFmt: fmtPtr(moneyFmt)})
+	st.sign = mk(&excelize.Style{Font: font(16, false), Alignment: center})
 	if err != nil {
 		return nil, err
 	}
@@ -554,52 +616,62 @@ func writeTransferCoverSheet(f *excelize.File, st *transferCoverStyles, sh trans
 		return f.SetCellStyle(sheet, cell, cell, style)
 	}
 
-	_ = f.MergeCell(sheet, "A1", "F1")
-	if err := set("A1", st.title, "แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร"); err != nil {
-		return err
-	}
-	_ = f.MergeCell(sheet, "A2", "F2")
-	if err := set("A2", st.memo, h.MemoLine); err != nil {
-		return err
-	}
-	_ = f.MergeCell(sheet, "A3", "F3")
-	subject := fmt.Sprintf("ค่าตอบแทนผู้ช่วยสอนและผู้ช่วยปฏิบัติงาน%s หลักสูตร %s (%s)",
-		levelHeadingTH(sh.CurriculumLevel), sh.CurriculumLabel, sh.TrackTH)
-	if err := set("A3", st.subtitle, subject); err != nil {
-		return err
-	}
-	_ = f.MergeCell(sheet, "A4", "F4")
-	if err := set("A4", st.subtitle, h.TermLine); err != nil {
-		return err
+	// The sheet is FIVE columns wide, A–E, exactly as the office's template
+	// (docs/ปะหน้าจ่ายตรง-CY.xls) draws it. It used to carry a sixth,
+	// หมายเหตุ, holding the TA's ใหม่/เก่า seniority — a column the template
+	// does not have. That reading is still on the preview screen, where it
+	// costs the finance office nothing; it does not belong on the paper they
+	// key from.
+	const lastCol = "E"
+
+	// The four heading lines, each merged across the full width and centred.
+	for _, line := range []struct {
+		row   int
+		style int
+		text  string
+	}{
+		{1, st.title, "แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร"},
+		{2, st.memo, h.MemoLine},
+		{3, st.subtitle, fmt.Sprintf("ค่าตอบแทนผู้ช่วยสอนและผู้ช่วยปฏิบัติงาน%s หลักสูตร %s (%s)",
+			levelHeadingTH(sh.CurriculumLevel), sh.CurriculumLabel, sh.TrackTH)},
+		{4, st.subtitleRuled, h.TermLine},
+	} {
+		first := fmt.Sprintf("A%d", line.row)
+		last := fmt.Sprintf("%s%d", lastCol, line.row)
+		_ = f.MergeCell(sheet, first, last)
+		if err := set(first, line.style, line.text); err != nil {
+			return err
+		}
+		// Merging keeps only the anchor's style, so without this the rule under
+		// the last heading line would stop at column A.
+		if err := f.SetCellStyle(sheet, first, last, line.style); err != nil {
+			return err
+		}
 	}
 
-	headers := []string{"ลำดับที่", "ชื่อ-สกุล", "รายวิชา", "จำนวนเงิน", "หมายเลขพร้อมเพย์", "หมายเหตุ"}
-	cols := []string{"A", "B", "C", "D", "E", "F"}
+	headers := []string{"ลำดับที่", "ชื่อ-สกุล", "รายวิชา", "จำนวนเงิน", "หมายเลขพร้อมเพย์"}
+	cols := []string{"A", "B", "C", "D", "E"}
 	for i, label := range headers {
 		if err := set(cols[i]+"5", st.colHeader, label); err != nil {
 			return err
 		}
 	}
 
+	// Column styles for the body, in template order: only the name reads from
+	// the left; the course codes are centred under their heading.
+	bodyStyle := map[string]int{
+		"A": st.bodyCenter, "B": st.body, "C": st.bodyCenter,
+		"D": st.money, "E": st.bodyCenter,
+	}
 	row := 6
 	for i, r := range sh.Rows {
-		if err := set(fmt.Sprintf("A%d", row), st.bodyCenter, i+1); err != nil {
-			return err
+		values := map[string]any{
+			"A": i + 1, "B": r.Name, "C": r.Courses, "D": r.Baht, "E": r.PromptPay,
 		}
-		if err := set(fmt.Sprintf("B%d", row), st.body, r.Name); err != nil {
-			return err
-		}
-		if err := set(fmt.Sprintf("C%d", row), st.body, r.Courses); err != nil {
-			return err
-		}
-		if err := set(fmt.Sprintf("D%d", row), st.money, r.Baht); err != nil {
-			return err
-		}
-		if err := set(fmt.Sprintf("E%d", row), st.bodyCenter, r.PromptPay); err != nil {
-			return err
-		}
-		if err := set(fmt.Sprintf("F%d", row), st.bodyCenter, r.Seniority); err != nil {
-			return err
+		for _, col := range cols {
+			if err := set(fmt.Sprintf("%s%d", col, row), bodyStyle[col], values[col]); err != nil {
+				return err
+			}
 		}
 		row++
 	}
@@ -607,7 +679,17 @@ func writeTransferCoverSheet(f *excelize.File, st *transferCoverStyles, sh trans
 	if lastDataRow < 6 {
 		lastDataRow = 6
 	}
-	row++ // one blank spacer row, matching the office's own template
+	// The template closes the list with one empty RULED row before the total,
+	// not with a gap: the table stays a single block down to its own total
+	// line. (This used to be an unstyled spacer, which tore the grid open right
+	// above the figure the office keys.)
+	for _, col := range cols {
+		cell := fmt.Sprintf("%s%d", col, row)
+		if err := f.SetCellStyle(sheet, cell, cell, bodyStyle[col]); err != nil {
+			return err
+		}
+	}
+	row++
 
 	totalRow := row
 	_ = f.MergeCell(sheet, fmt.Sprintf("B%d", totalRow), fmt.Sprintf("C%d", totalRow))
@@ -617,6 +699,10 @@ func writeTransferCoverSheet(f *excelize.File, st *transferCoverStyles, sh trans
 	if err := set(fmt.Sprintf("B%d", totalRow), st.totalLabel, BahtText(sh.TotalBaht)); err != nil {
 		return err
 	}
+	if err := f.SetCellStyle(sheet, fmt.Sprintf("B%d", totalRow),
+		fmt.Sprintf("C%d", totalRow), st.totalLabel); err != nil {
+		return err
+	}
 	sumFormula := fmt.Sprintf("SUM(D6:D%d)", lastDataRow)
 	if err := f.SetCellFormula(sheet, fmt.Sprintf("D%d", totalRow), sumFormula); err != nil {
 		return err
@@ -624,33 +710,49 @@ func writeTransferCoverSheet(f *excelize.File, st *transferCoverStyles, sh trans
 	if err := f.SetCellStyle(sheet, fmt.Sprintf("D%d", totalRow), fmt.Sprintf("D%d", totalRow), st.totalMoney); err != nil {
 		return err
 	}
+	if err := f.SetCellStyle(sheet, fmt.Sprintf("E%d", totalRow),
+		fmt.Sprintf("E%d", totalRow), st.totalLabel); err != nil {
+		return err
+	}
 
+	// The signature block sits under the last two columns, as the template
+	// places it — not spilling into a sixth column that no longer exists.
 	signRow := totalRow + 3
-	_ = f.MergeCell(sheet, fmt.Sprintf("D%d", signRow), fmt.Sprintf("F%d", signRow))
-	_ = f.MergeCell(sheet, fmt.Sprintf("D%d", signRow+1), fmt.Sprintf("F%d", signRow+1))
-	_ = f.MergeCell(sheet, fmt.Sprintf("D%d", signRow+2), fmt.Sprintf("F%d", signRow+2))
-	if err := set(fmt.Sprintf("D%d", signRow), st.sign, "ลงชื่อ ........................................................"); err != nil {
-		return err
-	}
-	signerLine := ""
-	if h.SignerName != "" {
-		signerLine = fmt.Sprintf("(%s)", h.SignerName)
-	}
-	if err := set(fmt.Sprintf("D%d", signRow+1), st.sign, signerLine); err != nil {
-		return err
-	}
-	if err := set(fmt.Sprintf("D%d", signRow+2), st.sign, "ผู้แจ้งโอน"); err != nil {
-		return err
+	for i, line := range []string{
+		"ลงชื่อ ........................................................",
+		signerLineOf(h.SignerName),
+		"ผู้แจ้งโอน",
+	} {
+		r := signRow + i
+		first := fmt.Sprintf("D%d", r)
+		last := fmt.Sprintf("%s%d", lastCol, r)
+		_ = f.MergeCell(sheet, first, last)
+		if err := set(first, st.sign, line); err != nil {
+			return err
+		}
+		if err := f.SetCellStyle(sheet, first, last, st.sign); err != nil {
+			return err
+		}
 	}
 
+	// The template's own column widths.
 	widths := []struct {
 		col string
 		w   float64
-	}{{"A", 8}, {"B", 28}, {"C", 26}, {"D", 15}, {"E", 18}, {"F", 12}}
+	}{{"A", 7.9}, {"B", 23.4}, {"C", 23}, {"D", 17.6}, {"E", 27.7}}
 	for _, w := range widths {
 		_ = f.SetColWidth(sheet, w.col, w.col, w.w)
 	}
 	return nil
+}
+
+// signerLineOf brackets the ผู้แจ้งโอน name, or yields "" so the line prints
+// blank for a wet signature rather than as an empty pair of brackets.
+func signerLineOf(name string) string {
+	if name == "" {
+		return ""
+	}
+	return fmt.Sprintf("(%s)", name)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -658,18 +760,26 @@ func writeTransferCoverSheet(f *excelize.File, st *transferCoverStyles, sh trans
 /* -------------------------------------------------------------------------- */
 
 // transferCoverHeaders resolves the header text for every sheet already
-// computed: the term line (from the term's own dates, so it reads correctly
-// even if generated well after the term closed) and, per curriculum, whatever
-// memo number/date/signer staff have configured via term_export_docs — blank
-// where nothing has been set yet, never invented.
+// computed: the term line and, per curriculum, whatever memo number/date/signer
+// staff have configured via term_export_docs — blank where nothing has been set
+// yet, never invented.
+//
+// months (Gregorian "YYYY-MM", empty = the whole term) is the selection this
+// document was issued for, and the heading names EXACTLY those months.
+//
+// It used to print the term's own starts_on–ends_on span instead, which was
+// wrong on every document that is not the whole term — and since งบแผ่นดิน
+// closes 30 กันยายน, a ภาคต้น that teaches มิ.ย.–ต.ค. is ALWAYS issued in
+// slices. A มิ.ย.–ก.ย. cover headed "(เดือนมิถุนายน - ตุลาคม 2569)" tells the
+// finance office it covers a month whose money is not on the sheet, against an
+// appropriation that no longer exists.
 func (s *ExportService) transferCoverHeaders(
-	ctx context.Context, termID uuid.UUID, sheets []transferCoverSheet,
+	ctx context.Context, termID uuid.UUID, months []string, sheets []transferCoverSheet,
 ) (map[string]transferCoverHeader, error) {
 	var academicYear, semester int
-	var startsOn, endsOn *time.Time
 	if err := s.pool.QueryRow(ctx, `
-		SELECT academic_year, semester, starts_on, ends_on FROM academic_terms WHERE id = $1`,
-		termID).Scan(&academicYear, &semester, &startsOn, &endsOn); err != nil {
+		SELECT academic_year, semester FROM academic_terms WHERE id = $1`,
+		termID).Scan(&academicYear, &semester); err != nil {
 		return nil, err
 	}
 	semLabel := "ภาคฤดูร้อน"
@@ -680,11 +790,20 @@ func (s *ExportService) transferCoverHeaders(
 		semLabel = "ภาคปลาย"
 	}
 	termLine := fmt.Sprintf("%s ปีการศึกษา %d", semLabel, academicYear)
-	if startsOn != nil && endsOn != nil {
-		startM := thaiMonths[int(startsOn.Month())-1]
-		endM := thaiMonths[int(endsOn.Month())-1]
-		endYearBE := endsOn.Year() + 543
-		termLine = fmt.Sprintf("%s  (เดือน%s - %s %d)", termLine, startM, endM, endYearBE)
+	// An empty selection means the whole term, so name the term's own months —
+	// the same list the picker offers, not a date span that could include a
+	// month with no submission period behind it.
+	if len(months) == 0 {
+		all, err := s.TermMonths(ctx, termID)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range all {
+			months = append(months, m.YearMonth)
+		}
+	}
+	if label := thaiSelectedMonthsLabel(months); label != "" {
+		termLine = fmt.Sprintf("%s  (เดือน%s)", termLine, label)
 	}
 
 	out := map[string]transferCoverHeader{}
@@ -696,6 +815,66 @@ func (s *ExportService) transferCoverHeaders(
 		}
 	}
 	return out, nil
+}
+
+// thaiSelectedMonthsLabel names exactly the months a document covers, in the
+// office's own phrasing:
+//
+//	one month        มิถุนายน 2569
+//	a run            มิถุนายน - กันยายน 2569   (the year is written once)
+//	a run of years   ธันวาคม 2568 - มกราคม 2569
+//	gaps             มิถุนายน 2569, สิงหาคม 2569
+//
+// A gap is spelled out rather than collapsed to first–last: a cover headed
+// "มิ.ย. - ส.ค." that silently omits July would have the finance office looking
+// for a month of payments that is not on the sheet.
+func thaiSelectedMonthsLabel(months []string) string {
+	type ym struct{ y, m int }
+	seen := map[string]bool{}
+	keys := make([]string, 0, len(months))
+	for _, k := range months {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	parsed := make([]ym, 0, len(keys))
+	for _, k := range keys {
+		var y, m int
+		if _, err := fmt.Sscanf(k, "%d-%d", &y, &m); err != nil || m < 1 || m > 12 {
+			continue
+		}
+		parsed = append(parsed, ym{y, m})
+	}
+	if len(parsed) == 0 {
+		return ""
+	}
+	named := func(p ym) string { return fmt.Sprintf("%s %d", thaiMonths[p.m-1], p.y+543) }
+	if len(parsed) == 1 {
+		return named(parsed[0])
+	}
+	contiguous := true
+	for i := 1; i < len(parsed); i++ {
+		prev, cur := parsed[i-1], parsed[i]
+		if prev.y*12+prev.m+1 != cur.y*12+cur.m {
+			contiguous = false
+			break
+		}
+	}
+	first, last := parsed[0], parsed[len(parsed)-1]
+	if contiguous {
+		if first.y == last.y {
+			return fmt.Sprintf("%s - %s", thaiMonths[first.m-1], named(last))
+		}
+		return fmt.Sprintf("%s - %s", named(first), named(last))
+	}
+	out := make([]string, 0, len(parsed))
+	for _, p := range parsed {
+		out = append(out, named(p))
+	}
+	return strings.Join(out, ", ")
 }
 
 // transferCoverSnapshot is what's frozen into the ledger row: every sheet's
@@ -761,7 +940,7 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 	}
 	warnings = append(warnings, s.fillPromptPay(ctx, actor, sheets)...)
 
-	headers, err := s.transferCoverHeaders(ctx, termID, sheets)
+	headers, err := s.transferCoverHeaders(ctx, termID, months, sheets)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -914,7 +1093,13 @@ type TransferCoverMonthStatus struct {
 	// lecturer, or the finance step. The document is keyed straight into the
 	// university's ERP, so its figures have to be final — a month that is still
 	// moving must not be selectable at all, rather than refused after the press.
-	Ready bool `json:"ready"`
+	//
+	// A POINTER, and omitted when nil, because this struct is shared with
+	// CourseExportCoverage, which has no such gate. As a plain bool the zero
+	// value shipped `"ready": false` from that endpoint too and the shared month
+	// picker greyed out every month on the course export page — a readiness rule
+	// that belongs to one document silently disabling another.
+	Ready *bool `json:"ready,omitempty"`
 }
 
 // level ("undergrad" | "graduate") scopes coverage to one file: issuing the
@@ -1024,10 +1209,11 @@ func (s *ExportService) TransferCoverCoverage(ctx context.Context, termID uuid.U
 	}
 	out := &TransferCoverCoverage{Split: split, Months: make([]TransferCoverMonthStatus, 0, len(all))}
 	for _, m := range all {
+		ready := !notReady[m.YearMonth]
 		out.Months = append(out.Months, TransferCoverMonthStatus{
 			TermMonth: m,
 			Issued:    issued[m.YearMonth],
-			Ready:     !notReady[m.YearMonth],
+			Ready:     &ready,
 		})
 	}
 	return out, nil
