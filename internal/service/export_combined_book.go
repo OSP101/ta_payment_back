@@ -1181,7 +1181,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 		}
 		k := taTrackKey{c.TA, c.Track}
 		fullCost[k] += c.Baht
-		if !t.unpaidFrom(c.Date, c.StartTime) {
+		if !t.unpaidFor(c.TA, c.Date, c.StartTime) {
 			funded[k] += c.Baht
 		}
 	}

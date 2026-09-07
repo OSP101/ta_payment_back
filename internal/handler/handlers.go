@@ -616,6 +616,25 @@ func (h *TeachingHandler) UpdateSettings(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// UpdateCourseInfo — PATCH /teaching-courses/:id/info
+//
+// Corrects a course's code, name, credits, credit hours and curriculum after it
+// has been opened. Staff-only, and refused once the course is exported.
+func (h *TeachingHandler) UpdateCourseInfo(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.UpdateCourseInfoInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.UpdateCourseInfo(c.Context(), UserID(c), id, in); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // Section CRUD — all three gate on the course NOT being exported. Locked
 // courses return 409 so the frontend can render a lock banner.
 func (h *TeachingHandler) AddSection(c *fiber.Ctx) error {
@@ -2715,6 +2734,32 @@ func (h *ExportHandler) BudgetSettlement(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(out)
+}
+
+// SetSettlementMode switches a course between paying คาบ in date order until the
+// budget runs out and spreading the budget across every month.
+//
+// No role guard on the route: the service checks that the caller teaches the
+// course, because this is the lecturer's decision to make — they are the one who
+// knows whether the budget can carry it. Staff pass on the privileged flag.
+func (h *ExportHandler) SetSettlementMode(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Mode string `json:"settlement_mode"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.Export.SetSettlementMode(
+		c.Context(), UserID(c), id, service.SettlementMode(body.Mode),
+		rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff),
+	); err != nil {
+		return err
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // CourseHistory returns the export batches for a single course, newest first.

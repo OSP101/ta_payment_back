@@ -163,7 +163,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		if issued > 0 {
 			return nil, "", Invalid("ออกคำสั่งครบทุกคนแล้วสำหรับภาคเรียนนี้ ไม่มีรายชื่อค้างให้ออกรอบใหม่")
 		}
-		return nil, "", Invalid("ยังไม่มีทีเอที่ได้รับอนุมัติในภาคเรียนนี้")
+		return nil, "", Invalid("ยังไม่มี TA ที่ได้รับอนุมัติในภาคเรียนนี้")
 	}
 
 	// Fold the flat, pre-ordered rows into level → course → appointee groups.

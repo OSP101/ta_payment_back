@@ -202,6 +202,69 @@ func exportBlockedError(blockers []ExportBlocker) error {
 // Filtered on work_date's own Gregorian month, not on sp.year_month, which
 // carries a BUDDHIST academic year ("2569-06") and cannot be compared with a
 // caller's Gregorian selection — see term_months.go.
+// TermMonthsNotReady names the months of a term that still have something
+// outstanding at this level — Gregorian keys, so the month picker can key off
+// them directly.
+//
+// Same predicate as TermExportBlockers, asked per month instead of per person.
+// The gate on the download has always been able to say WHY a term is not ready;
+// what it could not do is say WHICH MONTHS, early enough for the picker to stop
+// the officer choosing them. Pressing a button and being handed a wall of names
+// is a worse way to learn that ตุลาคม is not signed off than seeing ตุลาคม
+// greyed out before pressing anything.
+func (s *ExportService) TermMonthsNotReady(ctx context.Context, termID uuid.UUID, level string) (map[string]bool, error) {
+	if level != "undergrad" && level != "graduate" {
+		return nil, fmt.Errorf("TermMonthsNotReady: invalid level %q", level)
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH months AS (
+		    SELECT sp.year_month,
+		           COALESCE(st.status,'pending') AS staff_status,
+		           COUNT(*) FILTER (WHERE `+waitingTASQL("wl")+`)       AS waiting_ta,
+		           COUNT(*) FILTER (WHERE `+waitingLecturerSQL("wl")+`) AS waiting_lecturer,
+		           COUNT(*) FILTER (WHERE wl.status = 'approved')       AS approved
+		    FROM teaching_courses tc
+		    JOIN submission_periods sp ON sp.term_id = tc.term_id
+		    JOIN sections sec          ON sec.teaching_course_id = tc.id
+		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		    JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		    JOIN work_logs wl ON wl.assignment_id = a.id
+		     AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		    LEFT JOIN submission_period_status st
+		      ON st.submission_period_id = sp.id
+		     AND st.ta_id = a.ta_id
+		     AND st.teaching_course_id = tc.id
+		    WHERE tc.term_id = $1
+		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		      AND CASE WHEN $2 = 'graduate' THEN a.level::text IN ('master','phd')
+		               ELSE a.level::text = 'undergrad' END
+		    GROUP BY sp.year_month, st.ta_id, tc.id, st.status
+		)
+		SELECT DISTINCT year_month
+		FROM months
+		WHERE waiting_ta > 0 OR waiting_lecturer > 0
+		   OR (approved > 0 AND staff_status <> 'finance_sent')`, termID, level)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var buddhist string
+		if err := rows.Scan(&buddhist); err != nil {
+			return nil, err
+		}
+		// submission_periods.year_month is the BUDDHIST academic key ("2569-06");
+		// everything the picker speaks in is Gregorian. See term_months.go.
+		greg, err := gregorianYearMonth(buddhist)
+		if err != nil {
+			return nil, err
+		}
+		out[greg] = true
+	}
+	return out, rows.Err()
+}
+
 func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID, months []string, level string) ([]ExportBlocker, error) {
 	if level != "undergrad" && level != "graduate" {
 		return nil, fmt.Errorf("TermExportBlockers: invalid level %q", level)

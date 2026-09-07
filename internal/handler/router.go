@@ -261,6 +261,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// which is why the route still admits them.
 	authed.Patch("/teaching-courses/:id/num-students", adminOrStaff, th.SetNumStudents)
 	authed.Patch("/teaching-courses/:id/settings", adminOrStaff, th.UpdateSettings)
+	// Course identity — the registrar file arrives with typos, and rebuilding a
+	// course to fix one meant re-entering every section and schedule by hand.
+	authed.Patch("/teaching-courses/:id/info", adminOrStaff, th.UpdateCourseInfo)
 	authed.Post("/teaching-courses/:id/sections", adminOrStaff, th.AddSection)
 	authed.Patch("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.UpdateSection)
 	authed.Delete("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.DeleteSection)
@@ -442,6 +445,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// No role guard: the service checks that the caller teaches or assists the
 	// course. A budget that decides a TA's own pay is not a staff secret.
 	authed.Get("/teaching-courses/:tcId/budget-settlement", eh.BudgetSettlement)
+	// Same reasoning, and the service checks the caller teaches the course: which
+	// months of the term get paid is the lecturer's call, not staff's alone.
+	authed.Patch("/teaching-courses/:tcId/settlement-mode", eh.SetSettlementMode)
 	// Phase 4 exports dashboard.
 	authed.Get("/exports/summary", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursesSummary)
 	authed.Get("/exports/course/:id/history", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseHistory)

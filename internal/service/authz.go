@@ -194,6 +194,19 @@ type assignmentContext struct {
 	// weeks-in-term it yields the TERM ceiling that bounds total logged hours.
 	// Zero when HasWorkloadForm=false.
 	WeeklyTotalHours float64
+	// AttendanceDutyHrs is how long the เช็คชื่อ duty runs inside ONE lecture
+	// period — a duration, not a weekly budget.
+	//
+	// Undergrad: the workload form's attendance_hrs, which the lecturer states
+	// per course and the college's signed forms follow — SC363101 declares the
+	// full period and its claim form bills the whole window, while SC362004
+	// declares one hour of a two-hour lecture and bills only that hour.
+	//
+	// Graduate: a flat one hour. That form has no attendance field at all
+	// (help_teach_hrs is a combined lecture+lab ceiling — a budget, and using it
+	// as a duration would bill the lab's hours as attendance), so the length is
+	// the system's to set.
+	AttendanceDutyHrs float64
 }
 
 func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID uuid.UUID) (*assignmentContext, error) {
@@ -257,6 +270,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		// per activity, not per parent_kind. prep_hrs is grad-only.
 		ac.AllowOther = ugOther > 0 || labOther > 0
 		ac.WeeklyCapLecture = attendance
+		ac.AttendanceDutyHrs = attendance
 		ac.WeeklyCapLab = lab
 		ac.WeeklyCapReview = check
 		ac.WeeklyCapOther = ugOther + labOther
@@ -277,6 +291,7 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		// enforcement to sum the two activities before comparing.
 		ac.WeeklyCapLecture = help
 		ac.WeeklyCapLab = help
+		ac.AttendanceDutyHrs = attendanceDutyHours
 		ac.WeeklyCapReview = grade
 		ac.WeeklyCapOther = other + prep
 		ac.WeeklyLectureLabShared = true

@@ -87,7 +87,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	}
 	if len([]rune(strings.TrimSpace(in.Reason))) < editReasonMinLen {
 		return nil, Invalid(fmt.Sprintf(
-			"ต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร เหตุผลนี้จะถูกส่งให้อาจารย์และทีเอ", editReasonMinLen))
+			"ต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร เหตุผลนี้จะถูกส่งให้อาจารย์และ TA", editReasonMinLen))
 	}
 	if len(in.Evidence) > maxEvidenceFiles {
 		return nil, Invalid(fmt.Sprintf("แนบรูปได้ไม่เกิน %d รูป", maxEvidenceFiles))
@@ -140,7 +140,7 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	// an arbitrary-row editor that happens to take a course id in its path.
 	for _, c := range in.Changes {
 		if _, ok := before[c.WorkLogID]; !ok {
-			return nil, Invalid("มีรายการที่ไม่ได้อยู่ในเดือน/วิชา/ทีเอนี้ ยกเลิกทั้งชุด")
+			return nil, Invalid("มีรายการที่ไม่ได้อยู่ในเดือน/วิชา/TA นี้ ยกเลิกทั้งชุด")
 		}
 	}
 

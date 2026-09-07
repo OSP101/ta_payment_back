@@ -712,6 +712,12 @@ type GenerateResult struct {
 	TermHourCeiling      float64 `json:"term_hour_ceiling,omitempty"`
 }
 
+// attendanceDutyHours is how long เช็คชื่อ is billed for inside a lecture period,
+// whatever the period's length and whatever the TA's level. Taking the register
+// happens at the start of a class, not throughout it, and the college's signed
+// claim forms bill it as one hour.
+const attendanceDutyHours float64 = 1.0
+
 func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.UUID) (*GenerateResult, error) {
 	ac, err := s.assertTAOwnsAssignment(ctx, actor, assignmentID)
 	if err != nil {
@@ -1028,11 +1034,23 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			// not a TA-duty-scoped window, so the same trim applies there too —
 			// otherwise a 2-hour makeup billed as "เช็คชื่อ" doubled the declared
 			// one-hour attendance duty from the signed ใบคำขอ.
-			if sc.kind == "lecture" && ac.Level == "undergrad" &&
-				ac.HasWorkloadForm && ac.WeeklyCapLecture > 0 && ac.WeeklyCapLecture < rowHours-0.01 {
+			//
+			// (07/09/2026) The trim used to run for undergrads only and read its
+			// length from WeeklyCapLecture, which for a graduate is
+			// help_teach_hrs — a COMBINED lecture+lab weekly ceiling. That is a
+			// budget, not a duration: trimming to it would bill the lab's hours
+			// as attendance, so grad rows were left at the full class period
+			// instead. CP363205 then billed 2 hours against a signed form saying
+			// 1 and broke the very help_teach ceiling it was declared under,
+			// which is why its lecturer could not approve any month at all.
+			// AttendanceDutyHrs is the duration proper — the form's own
+			// attendance_hrs for an undergrad, a flat hour for a graduate — so
+			// the rule now applies to both without confusing the two ideas.
+			if sc.kind == "lecture" &&
+				ac.AttendanceDutyHrs > 0 && ac.AttendanceDutyHrs < rowHours-0.01 {
 				if em, ok := parseHM(rowEnd); ok {
-					rowStart = hhmm(em - int(ac.WeeklyCapLecture*60+0.5))
-					rowHours = ac.WeeklyCapLecture
+					rowStart = hhmm(em - int(ac.AttendanceDutyHrs*60+0.5))
+					rowHours = ac.AttendanceDutyHrs
 				}
 			}
 			// This period's hours, used by the holiday overlap tests and reused

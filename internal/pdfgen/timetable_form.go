@@ -242,7 +242,7 @@ func BuildTimetableFormPDF(in TimetableFormInput) ([]byte, error) {
 		}
 	}
 	if len(manual) > 0 || len(auto) > 0 {
-		y = ttOutTable(&pdf, margin, y, "ทีเอเพิ่มเอง",
+		y = ttOutTable(&pdf, margin, y, "TA เพิ่มเอง",
 			"ไม่ตรงช่องใดในตาราง และเป็นรายการที่พิมพ์เอง", manual)
 		y = ttOutTable(&pdf, margin, y+6, "นอกตาราง แต่ระบบสร้าง",
 			"ส่วนใหญ่คือคาบชดเชยที่เลื่อนวัน", auto)

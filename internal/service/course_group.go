@@ -185,7 +185,12 @@ func (s *TeachingService) DetectCourseGroups(ctx context.Context, termID uuid.UU
 		groups[root] = append(groups[root], tcID)
 	}
 
-	var candidates []CourseGroupCandidate
+	// Non-nil from the start: a nil slice marshals to JSON `null`, and the
+	// screens that call this reach straight for `.length` on the result. An
+	// empty list is the ORDINARY answer here — most terms have no duplicate
+	// codes at all — so returning null crashed the download button on exactly
+	// the courses that had nothing wrong with them.
+	candidates := []CourseGroupCandidate{}
 	for _, tcID := range order { // stable order
 		root := find(tcID)
 		if root != tcID {

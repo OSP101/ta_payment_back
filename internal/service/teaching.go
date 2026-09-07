@@ -905,6 +905,160 @@ func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUI
 		})
 }
 
+// UpdateCourseInfoInput carries the identity fields staff may correct after a
+// course is open. Every field is a pointer: nil means "leave alone", so a screen
+// that edits one thing does not have to resend the rest and cannot blank a field
+// it never showed.
+type UpdateCourseInfoInput struct {
+	Code       *string `json:"code,omitempty"`
+	NameTH     *string `json:"name_th,omitempty"`
+	NameEN     *string `json:"name_en,omitempty"`
+	Credits    *int    `json:"credits,omitempty"`
+	LectureHrs *int    `json:"lecture_hrs,omitempty"`
+	LabHrs     *int    `json:"lab_hrs,omitempty"`
+	SelfHrs    *int    `json:"self_hrs,omitempty"`
+	// Curriculum is a property of the SECTION, not the course, but staff set it
+	// once for the whole course when they open one. Sent here it is written to
+	// every section, which is what the open dialog promises ("แก้ทีหลังได้ที่
+	// หน้าตั้งค่ารายวิชา"); per-section overrides stay available on each section.
+	Curriculum *string `json:"curriculum,omitempty"`
+}
+
+// UpdateCourseInfo corrects a course's identity — code, name, credits, hours,
+// curriculum — after it has been opened.
+//
+// The registrar file is the usual source of these, but it arrives with typos and
+// with courses missing, and staff have had no way to fix either without deleting
+// the course and rebuilding its sections and schedules by hand.
+//
+// Refused once the course is exported. The code and name are printed on the
+// claim documents and the appointment order, so changing them afterwards would
+// leave the system describing a course the signed paperwork does not.
+//
+// Level is deliberately NOT editable here: it decides the pay rate, which
+// workload fields apply and which caps are enforced, so moving a course between
+// ปริญญาตรี and บัณฑิตศึกษา would silently re-price work already logged under it.
+func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.UUID, in UpdateCourseInfoInput) error {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return err
+	}
+	if !priv {
+		return Forbidden("ข้อมูลรายวิชาต้องให้เจ้าหน้าที่แก้ไข")
+	}
+	if err := s.assertNotExported(ctx, nil, id); err != nil {
+		return err
+	}
+
+	sets := []string{}
+	args := []any{}
+	i := 1
+	addStr := func(col string, v string) {
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, i))
+		args = append(args, v)
+		i++
+	}
+
+	if in.Code != nil {
+		code := strings.ToUpper(strings.Join(strings.Fields(*in.Code), ""))
+		if !courseCodeRe.MatchString(code) {
+			return Invalid("รูปแบบรหัสวิชาไม่ถูกต้อง ต้องเป็นตัวเลข 6 หลัก (เช่น 342233) หรือตัวอักษรพิมพ์ใหญ่ 2 ตัวตามด้วยตัวเลข 6 หลัก (เช่น CP353201)")
+		}
+		// Unique within the term — the same code opened twice would make every
+		// per-course figure ambiguous.
+		var clash bool
+		if err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM teaching_courses tc
+				WHERE tc.code = $1 AND tc.id <> $2
+				  AND tc.term_id = (SELECT term_id FROM teaching_courses WHERE id = $2))`,
+			code, id).Scan(&clash); err != nil {
+			return err
+		}
+		if clash {
+			return Conflict(fmt.Sprintf("รหัสวิชา %s มีอยู่แล้วในภาคเรียนนี้", code))
+		}
+		addStr("code", code)
+	}
+	if in.NameTH != nil {
+		name := strings.TrimSpace(*in.NameTH)
+		if name == "" {
+			return Invalid("ชื่อวิชาต้องไม่ว่าง")
+		}
+		addStr("name_th", name)
+	}
+	if in.NameEN != nil {
+		name := strings.TrimSpace(*in.NameEN)
+		sets = append(sets, fmt.Sprintf("name_en = $%d", i))
+		if name == "" {
+			args = append(args, nil)
+		} else {
+			args = append(args, name)
+		}
+		i++
+	}
+	addInt := func(col string, v *int, label string) error {
+		if v == nil {
+			return nil
+		}
+		if *v < 0 || *v > 30 {
+			return Invalid(label + "ต้องอยู่ระหว่าง 0 ถึง 30")
+		}
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, i))
+		args = append(args, *v)
+		i++
+		return nil
+	}
+	for _, f := range []struct {
+		col, label string
+		v          *int
+	}{
+		{"credits", "หน่วยกิต", in.Credits},
+		{"lecture_hrs", "ชั่วโมงบรรยาย", in.LectureHrs},
+		{"lab_hrs", "ชั่วโมงปฏิบัติการ", in.LabHrs},
+		{"self_hrs", "ชั่วโมงศึกษาด้วยตนเอง", in.SelfHrs},
+	} {
+		if err := addInt(f.col, f.v, f.label); err != nil {
+			return err
+		}
+	}
+	if in.Curriculum != nil && *in.Curriculum != "" && !validCurriculum(*in.Curriculum) {
+		return Invalid("หลักสูตรไม่ถูกต้อง")
+	}
+	if len(sets) == 0 && in.Curriculum == nil {
+		return nil
+	}
+
+	return writeAudited(ctx, s.pool, s.aud,
+		audit.Entry{
+			ActorID: &actor, Action: "teaching_course.update_info",
+			Entity: "teaching_course", EntityID: id.String(), After: in,
+		},
+		func(tx pgx.Tx) error {
+			if len(sets) > 0 {
+				sets = append(sets, "updated_at = NOW()")
+				q := fmt.Sprintf("UPDATE teaching_courses SET %s WHERE id = $%d",
+					strings.Join(sets, ", "), i)
+				if _, err := tx.Exec(ctx, q, append(args, id)...); err != nil {
+					return err
+				}
+			}
+			if in.Curriculum != nil {
+				// "" clears it back to ยังไม่ระบุ, matching the per-section editor.
+				var v any
+				if *in.Curriculum != "" {
+					v = *in.Curriculum
+				}
+				if _, err := tx.Exec(ctx,
+					`UPDATE sections SET curriculum = $2 WHERE teaching_course_id = $1`,
+					id, v); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+}
+
 // ErrCourseLocked is returned when a mutation would change a course whose
 // export snapshot has been taken. Frontend surfaces this as a lock icon.
 var ErrCourseLocked = errors.New("course is locked after export")

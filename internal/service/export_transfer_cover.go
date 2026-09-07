@@ -309,7 +309,7 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 			if c.Track == "special" {
 				trackSettle = settlement.Special
 			}
-			if !trackSettle.unpaidFrom(c.Date, c.StartTime) {
+			if !trackSettle.unpaidFor(c.TA, c.Date, c.StartTime) {
 				a.baht += c.Baht
 			}
 		}
@@ -730,6 +730,10 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 		return nil, nil, Invalid(err.Error())
 	}
 
+	if err := assertOneFiscalYear(all, months); err != nil {
+		return nil, nil, err
+	}
+
 	blockers, err := s.TermExportBlockers(ctx, termID, months, level)
 	if err != nil {
 		return nil, nil, err
@@ -906,12 +910,85 @@ type TransferCoverMonthStatus struct {
 	// Issued is true once any generation covered this month. Rows predating
 	// the months column covered the whole term, so they mark every month.
 	Issued bool `json:"issued"`
+	// Ready is false while anything in the month is still waiting on a TA, a
+	// lecturer, or the finance step. The document is keyed straight into the
+	// university's ERP, so its figures have to be final — a month that is still
+	// moving must not be selectable at all, rather than refused after the press.
+	Ready bool `json:"ready"`
 }
 
 // level ("undergrad" | "graduate") scopes coverage to one file: issuing the
 // undergrad file must not make the graduate screen believe those same months
 // are already covered, and vice versa — the two files are on independent
 // schedules.
+// assertOneFiscalYear refuses a month selection that draws on two budget years.
+//
+// ปะหน้าจ่ายตรง is not a report — the finance office keys its figures into the
+// university's ERP to move the money, against ONE appropriation. A term that
+// teaches across 30 September spends from two, so a single sheet covering both
+// halves cannot be keyed at all: whichever year it is entered under, the other
+// half's months are paid from the wrong budget.
+//
+// This is refused rather than warned about because the mistake is invisible on
+// the sheet itself. The document shows names and amounts; nothing on it says
+// which appropriation they belong to, so the officer keying it has no way to
+// notice. The month lists in the message are what they need to reissue: one
+// document per half.
+//
+// The finance_sent gate above is deliberately month-scoped and stays that way —
+// the closing year's document must be issuable while October is still being
+// approved, which is the whole reason a term crossing the boundary is split.
+func assertOneFiscalYear(all []TermMonth, months []string) error {
+	byYear := map[int][]string{}
+	var years []int
+	for _, ym := range months {
+		fy, err := fiscalYearOf(ym)
+		if err != nil {
+			return err
+		}
+		if _, seen := byYear[fy]; !seen {
+			years = append(years, fy)
+		}
+		byYear[fy] = append(byYear[fy], ym)
+	}
+	if len(years) < 2 {
+		return nil
+	}
+	sort.Ints(years)
+	parts := make([]string, 0, len(years))
+	for _, fy := range years {
+		parts = append(parts, fmt.Sprintf("ปีงบ %d (%s)", fy+543,
+			strings.Join(monthLabelsOf(all, byYear[fy]), ", ")))
+	}
+	return Invalid(
+		"เลือกเดือนข้ามปีงบประมาณในเอกสารฉบับเดียวไม่ได้ ต้องแยกออกเป็นคนละฉบับ: " +
+			strings.Join(parts, " / "))
+}
+
+// monthLabelsOf turns Gregorian keys into the Thai labels staff see on screen,
+// so a refusal names the months the way the picker does.
+//
+// Sorted on the Gregorian KEY, not the label: Thai month names sort
+// alphabetically into กรกฎาคม, กันยายน, มิถุนายน, สิงหาคม — an order that reads
+// as a jumble to anyone checking a list of months against a calendar.
+func monthLabelsOf(all []TermMonth, months []string) []string {
+	label := map[string]string{}
+	for _, m := range all {
+		label[m.YearMonth] = m.Label
+	}
+	keys := append([]string(nil), months...)
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, ym := range keys {
+		if l, ok := label[ym]; ok {
+			out = append(out, l)
+		} else {
+			out = append(out, ym)
+		}
+	}
+	return out
+}
+
 func (s *ExportService) TransferCoverCoverage(ctx context.Context, termID uuid.UUID, level string) (*TransferCoverCoverage, error) {
 	if level != "undergrad" && level != "graduate" {
 		return nil, Invalid("level ต้องเป็น undergrad หรือ graduate")
@@ -941,9 +1018,17 @@ func (s *ExportService) TransferCoverCoverage(ctx context.Context, termID uuid.U
 	if err != nil {
 		return nil, err
 	}
+	notReady, err := s.TermMonthsNotReady(ctx, termID, level)
+	if err != nil {
+		return nil, err
+	}
 	out := &TransferCoverCoverage{Split: split, Months: make([]TransferCoverMonthStatus, 0, len(all))}
 	for _, m := range all {
-		out.Months = append(out.Months, TransferCoverMonthStatus{TermMonth: m, Issued: issued[m.YearMonth]})
+		out.Months = append(out.Months, TransferCoverMonthStatus{
+			TermMonth: m,
+			Issued:    issued[m.YearMonth],
+			Ready:     !notReady[m.YearMonth],
+		})
 	}
 	return out, nil
 }

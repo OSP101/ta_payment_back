@@ -56,7 +56,7 @@ func slotPaidFlags(t TrackSettlement) []bool {
 
 func TestSettleTrack_PaysWholeMonthsUntilTheMoneyRunsOut(t *testing.T) {
 	// 5,000 + 5,000 + 5,000 = 15,000 fits; the fourth month does not.
-	got := settleTrack("regular", 16000, 0, months(5000, 5000, 5000, 5000))
+	got := settleTrack(SettleChronological, "regular", 16000, 0, months(5000, 5000, 5000, 5000))
 
 	want := []bool{true, true, true, false}
 	for i, w := range want {
@@ -72,24 +72,28 @@ func TestSettleTrack_PaysWholeMonthsUntilTheMoneyRunsOut(t *testing.T) {
 	}
 }
 
-// The month after the cutoff is NOT paid even when it would fit in the
-// leftover. Paying November but not October is impossible to explain to
-// somebody who worked both.
-func TestSettleTrack_DoesNotSkipAheadToASmallerMonth(t *testing.T) {
-	got := settleTrack("regular", 16000, 0, months(5000, 5000, 5000, 5000, 500))
+// A later, cheaper คาบ IS paid out of what the expensive one could not use.
+//
+// This reverses the rule that stood until 07/09/2026, when the cutoff stopped
+// everything after the first คาบ it could not afford. That read tidily on a
+// claim form and quietly left money in the account: here, 1,000฿ of the pool
+// went unspent while a 500฿ month sat unpaid. The college chose the money.
+func TestSettleTrack_SkipsAheadToASmallerMonth(t *testing.T) {
+	got := settleTrack(SettleChronological, "regular", 16000, 0, months(5000, 5000, 5000, 5000, 500))
 
-	if got.Months[4].Paid {
-		t.Error("the last month was paid out of order — the cutoff must stop everything after it")
+	if !got.Months[4].Paid {
+		t.Error("the 500฿ month fits in what is left and must be paid — leaving it " +
+			"unpaid strands money that belongs to a TA")
 	}
-	if math.Abs(got.DroppedBaht-5500) > .01 {
-		t.Errorf("dropped = %.2f, want 5500 (both months after the cutoff)", got.DroppedBaht)
+	if math.Abs(got.DroppedBaht-5000) > .01 {
+		t.Errorf("dropped = %.2f, want 5000 (only the month that did not fit)", got.DroppedBaht)
 	}
 }
 
 // Everything fits: no cutoff, nothing dropped, and the leftover is simply not
 // claimed.
 func TestSettleTrack_UnderBudgetPaysEverything(t *testing.T) {
-	got := settleTrack("regular", 30000, 0, months(5000, 5000, 5000))
+	got := settleTrack(SettleChronological, "regular", 30000, 0, months(5000, 5000, 5000))
 	if got.CutoffMonth != "" || got.DroppedBaht != 0 {
 		t.Errorf("cutoff=%q dropped=%.2f, want none", got.CutoffMonth, got.DroppedBaht)
 	}
@@ -101,7 +105,7 @@ func TestSettleTrack_UnderBudgetPaysEverything(t *testing.T) {
 // The graduate-special lump is a flat term figure that cannot be cut by month,
 // so it comes off the top and the monthly cutoff works on what is left.
 func TestSettleTrack_CommittedSpendComesOffTheTop(t *testing.T) {
-	got := settleTrack("special", 16000, 12000, months(3000, 3000))
+	got := settleTrack(SettleChronological, "special", 16000, 12000, months(3000, 3000))
 
 	if !got.Months[0].Paid || got.Months[1].Paid {
 		t.Errorf("paid = %v, want only the first month — 12,000 is already committed",
@@ -115,7 +119,7 @@ func TestSettleTrack_CommittedSpendComesOffTheTop(t *testing.T) {
 // A cap of zero means the student count has not been entered, not that the
 // course has no money. Zeroing everyone on that basis would be a silent wipe.
 func TestSettleTrack_ZeroCapIsUnconfiguredNotBroke(t *testing.T) {
-	got := settleTrack("regular", 0, 0, months(5000, 5000))
+	got := settleTrack(SettleChronological, "regular", 0, 0, months(5000, 5000))
 	if got.DroppedBaht != 0 || got.CutoffMonth != "" {
 		t.Errorf("an unconfigured cap dropped %.2f at %q — it must pay everything and "+
 			"leave the export's own student-count gate to refuse", got.DroppedBaht, got.CutoffMonth)
@@ -125,7 +129,7 @@ func TestSettleTrack_ZeroCapIsUnconfiguredNotBroke(t *testing.T) {
 // A month costing exactly the remaining budget fits. Off-by-one here would
 // drop a month for a rounding cent.
 func TestSettleTrack_AnExactFitIsPaid(t *testing.T) {
-	got := settleTrack("regular", 10000, 0, months(6000, 4000))
+	got := settleTrack(SettleChronological, "regular", 10000, 0, months(6000, 4000))
 	if !got.Months[1].Paid {
 		t.Error("a month that costs exactly the remainder must be paid")
 	}
@@ -192,11 +196,11 @@ func TestSettleTrack_ABorrowedBahtSavesTheLastMonth(t *testing.T) {
 		{Date: "2569-07-01", StartTime: "09:00", YearMonth: "2569-07", Baht: 600},
 		{Date: "2569-08-01", StartTime: "09:00", YearMonth: "2569-08", Baht: 500},
 	}
-	if got := settleTrack("regular", 1000, 0, months); got.CutoffMonth != "2569-08" {
+	if got := settleTrack(SettleChronological, "regular", 1000, 0, months); got.CutoffMonth != "2569-08" {
 		t.Fatalf("without the spill the second month must be cut, got cutoff %q", got.CutoffMonth)
 	}
 	spill := spillAllowance(1000, 2000, 0, 1100, 0, 500)
-	out := settleTrack("regular", 1000+spill, 0, months)
+	out := settleTrack(SettleChronological, "regular", 1000+spill, 0, months)
 	if out.CutoffMonth != "" || out.DroppedBaht != 0 {
 		t.Errorf("with %v borrowed both months must be paid, got cutoff %q dropped %v",
 			spill, out.CutoffMonth, out.DroppedBaht)
@@ -284,7 +288,7 @@ func TestSpillableRegularBaht_KeepsDisjointOverlapsSeparate(t *testing.T) {
 
 func TestSettleTrack_FillsPartOfAMonthInsteadOfDroppingItWhole(t *testing.T) {
 	// One month of five 1,000฿ คาบ against a 3,000฿ pool.
-	got := settleTrack("regular", 3000, 0, slots(1000, 1000, 1000, 1000, 1000))
+	got := settleTrack(SettleChronological, "regular", 3000, 0, slots(1000, 1000, 1000, 1000, 1000))
 
 	if got.PaidBaht != 3000 {
 		t.Errorf("paid = %v, want the pool filled to 3000", got.PaidBaht)
@@ -307,13 +311,15 @@ func TestSettleTrack_FillsPartOfAMonthInsteadOfDroppingItWhole(t *testing.T) {
 // mostly unspent.
 func TestSettleTrack_WastesFarLessThanTheMonthRuleDid(t *testing.T) {
 	// SC362102's real regular months against a 4,000 pool.
-	byMonth := settleTrack("regular", 4000, 0, months(400, 800, 3600, 4160, 2000))
-	if byMonth.PaidBaht != 1200 {
-		t.Fatalf("month-sized คาบ still cut whole: paid = %v, want 1200", byMonth.PaidBaht)
+	byMonth := settleTrack(SettleChronological, "regular", 4000, 0, months(400, 800, 3600, 4160, 2000))
+	// 400 + 800 + 2,000 = 3,200. The 3,600 and 4,160 months never fit, but the
+	// 2,000 one does once the fill is allowed to step over them (07/09/2026).
+	if byMonth.PaidBaht != 3200 {
+		t.Fatalf("month-sized คาบ: paid = %v, want 3200", byMonth.PaidBaht)
 	}
 
 	// Same money, but August is five คาบ the cutoff can walk into.
-	fine := settleTrack("regular", 4000, 0, []SlotSettlement{
+	fine := settleTrack(SettleChronological, "regular", 4000, 0, []SlotSettlement{
 		{Date: "2026-06-01", StartTime: "09:00", YearMonth: "2026-06", Baht: 400},
 		{Date: "2026-07-01", StartTime: "09:00", YearMonth: "2026-07", Baht: 800},
 		{Date: "2026-08-01", StartTime: "09:00", YearMonth: "2026-08", Baht: 900},
@@ -330,31 +336,30 @@ func TestSettleTrack_WastesFarLessThanTheMonthRuleDid(t *testing.T) {
 	}
 }
 
-// Strict chronology survives the finer granularity: a cheap later คาบ must not
-// jump the queue ahead of the expensive one that stopped the budget.
-func TestSettleTrack_DoesNotSkipAheadToASmallerSlot(t *testing.T) {
-	got := settleTrack("regular", 1000, 0, slots(600, 500, 100))
-	if want := []bool{true, false, false}; !equalBools(slotPaidFlags(got), want) {
-		t.Errorf("slot paid = %v, want %v the 100฿ คาบ would fit, but it is later",
+// A cheap later คาบ is bought with what the expensive one left behind.
+func TestSettleTrack_SkipsAheadToASmallerSlot(t *testing.T) {
+	got := settleTrack(SettleChronological, "regular", 1000, 0, slots(600, 500, 100))
+	if want := []bool{true, false, true}; !equalBools(slotPaidFlags(got), want) {
+		t.Errorf("slot paid = %v, want %v — 600 + 100 fits in 1,000 and the 500 does not",
 			slotPaidFlags(got), want)
 	}
-	if got.PaidBaht != 600 {
-		t.Errorf("paid = %v, want 600", got.PaidBaht)
+	if got.PaidBaht != 700 {
+		t.Errorf("paid = %v, want 700", got.PaidBaht)
 	}
 }
 
 func TestSettleTrack_CutoffNamesTheExactSlot(t *testing.T) {
-	got := settleTrack("regular", 1500, 0, slots(1000, 1000))
+	got := settleTrack(SettleChronological, "regular", 1500, 0, slots(1000, 1000))
 	if got.CutoffDate != "2026-06-02" || got.CutoffStart != "09:00" {
 		t.Errorf("cutoff = %q %q, want 2026-06-02 09:00", got.CutoffDate, got.CutoffStart)
 	}
-	if !got.unpaidFrom("2026-06-02", "09:00") {
+	if !got.unpaidFor(uuid.Nil, "2026-06-02", "09:00") {
 		t.Error("the cutoff คาบ itself must be unpaid")
 	}
-	if got.unpaidFrom("2026-06-01", "09:00") {
+	if got.unpaidFor(uuid.Nil, "2026-06-01", "09:00") {
 		t.Error("an earlier คาบ must stay paid")
 	}
-	if !got.unpaidFrom("2026-07-01", "09:00") {
+	if !got.unpaidFor(uuid.Nil, "2026-07-01", "09:00") {
 		t.Error("everything after the cutoff must be unpaid")
 	}
 }
