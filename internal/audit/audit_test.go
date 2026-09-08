@@ -131,3 +131,125 @@ func TestLogTx_RollsBackWithTheCallersTransaction(t *testing.T) {
 		t.Errorf("%d audit row(s) survived a rolled-back transaction", n)
 	}
 }
+
+// Every audit call site takes IP, role and session from the request context
+// instead of asking each of the 122 of them to pass it. Before this, the live
+// table had 0 rows with a role and 0 with an IP out of 407.
+func TestLog_TakesTheRequestIdentityFromTheContext(t *testing.T) {
+	pool := testutil.NewPool(t)
+	a := New(pool)
+
+	req := RequestInfo{
+		RequestID: uuid.New(),
+		SessionID: uuid.New(),
+		ActorRole: "staff",
+		IP:        "203.0.113.9",
+		UserAgent: "probe/1.0",
+		Method:    "POST",
+		Path:      "/api/v1/things/:id",
+	}
+	ctx := WithRequest(context.Background(), req)
+
+	// The call site passes NOTHING but the action — exactly like the 110 sites
+	// that never populated any of this.
+	if err := a.Log(ctx, Entry{Action: "test.ctx", Entity: "thing", EntityID: "x"}); err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+
+	var role, ip, ua, method, path string
+	var reqID, sessID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT actor_role::text, host(ip), user_agent, method, path, request_id, session_id
+		FROM audit_logs WHERE action='test.ctx'`).
+		Scan(&role, &ip, &ua, &method, &path, &reqID, &sessID); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	for _, c := range []struct{ got, want, field string }{
+		{role, "staff", "actor_role"},
+		{ip, "203.0.113.9", "ip"},
+		{ua, "probe/1.0", "user_agent"},
+		{method, "POST", "method"},
+		{path, "/api/v1/things/:id", "path"},
+		{reqID.String(), req.RequestID.String(), "request_id"},
+		{sessID.String(), req.SessionID.String(), "session_id"},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q — the row cannot be traced without it", c.field, c.got, c.want)
+		}
+	}
+}
+
+// A caller that DID pass a value keeps it. The context fills gaps; it does not
+// overwrite a deliberate choice (an admin acting on behalf of someone, a job
+// recording the address a webhook came from).
+func TestLog_ExplicitFieldsBeatTheContext(t *testing.T) {
+	pool := testutil.NewPool(t)
+	a := New(pool)
+	ctx := WithRequest(context.Background(), RequestInfo{ActorRole: "ta", IP: "10.0.0.1"})
+
+	if err := a.Log(ctx, Entry{Action: "test.explicit", Entity: "thing", EntityID: "x",
+		ActorRole: "admin", IP: "198.51.100.4"}); err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+	var role, ip string
+	if err := pool.QueryRow(ctx,
+		`SELECT actor_role::text, host(ip) FROM audit_logs WHERE action='test.explicit'`).
+		Scan(&role, &ip); err != nil {
+		t.Fatal(err)
+	}
+	if role != "admin" || ip != "198.51.100.4" {
+		t.Errorf("got role=%q ip=%q, want the values the caller passed", role, ip)
+	}
+}
+
+// No request behind the action (the scheduler, a migration) records no request:
+// a zero uuid stored verbatim would look like an id someone could look up.
+func TestLog_NoRequestLeavesTheTraceColumnsNull(t *testing.T) {
+	pool := testutil.NewPool(t)
+	a := New(pool)
+	ctx := context.Background()
+
+	if err := a.Log(ctx, Entry{Action: "test.noreq", Entity: "thing", EntityID: "x"}); err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+	var reqID, sessID, ip *string
+	if err := pool.QueryRow(ctx,
+		`SELECT request_id::text, session_id::text, host(ip) FROM audit_logs WHERE action='test.noreq'`).
+		Scan(&reqID, &sessID, &ip); err != nil {
+		t.Fatal(err)
+	}
+	if reqID != nil || sessID != nil || ip != nil {
+		t.Errorf("got request_id=%v session_id=%v ip=%v, want all NULL", reqID, sessID, ip)
+	}
+}
+
+// The trail is evidence, so the database refuses to let the application edit or
+// erase it. Nothing in the product updates or deletes an audit row; the trigger
+// is there so that no future handler — and no injected statement — can.
+func TestAuditLogs_AreAppendOnly(t *testing.T) {
+	pool := testutil.NewPool(t)
+	a := New(pool)
+	ctx := context.Background()
+	if err := a.Log(ctx, Entry{Action: "test.immutable", Entity: "thing", EntityID: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`UPDATE audit_logs SET action='tampered' WHERE action='test.immutable'`,
+		`DELETE FROM audit_logs WHERE action='test.immutable'`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err == nil {
+			t.Errorf("%q succeeded — the audit trail can be rewritten by anything "+
+				"that can reach the database", stmt)
+		} else if !strings.Contains(err.Error(), "append-only") {
+			t.Errorf("%q failed with %v, want the append-only guard", stmt, err)
+		}
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM audit_logs WHERE action='test.immutable'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("row count = %d after the blocked statements, want 1", n)
+	}
+}

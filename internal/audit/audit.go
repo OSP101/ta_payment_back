@@ -22,6 +22,14 @@ type Entry struct {
 	Before    any
 	After     any
 	Note      string
+
+	// The fields below are normally left blank by callers and filled in from
+	// the request context (see request.go). Set them explicitly only when
+	// recording something on behalf of a request you are not inside.
+	RequestID uuid.UUID
+	SessionID uuid.UUID
+	Method    string
+	Path      string
 }
 
 type Auditor struct {
@@ -63,6 +71,11 @@ func (a *Auditor) LogTx(ctx context.Context, tx pgx.Tx, e Entry) error {
 }
 
 func write(ctx context.Context, q execer, e Entry) error {
+	// Anything the caller did not set is taken from the request on the context.
+	// This is what gives every one of the 122 call sites an IP, a role, a
+	// session and a request id without any of them asking for one.
+	e.fillFromContext(ctx)
+
 	var before, after []byte
 	if e.Before != nil {
 		var err error
@@ -97,9 +110,13 @@ func write(ctx context.Context, q execer, e Entry) error {
 		actor = nil
 	}
 	if _, err := q.Exec(ctx,
-		`INSERT INTO audit_logs (actor_id, actor_role, action, entity, entity_id, ip, user_agent, before, after, note)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		actor, role, e.Action, e.Entity, nilIfEmpty(e.EntityID), ip, nilIfEmpty(e.UserAgent), before, after, nilIfEmpty(e.Note)); err != nil {
+		`INSERT INTO audit_logs (actor_id, actor_role, action, entity, entity_id, ip, user_agent,
+		                         before, after, note, request_id, session_id, method, path)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		actor, role, e.Action, e.Entity, nilIfEmpty(e.EntityID), ip, nilIfEmpty(e.UserAgent),
+		before, after, nilIfEmpty(e.Note),
+		nilIfNilUUID(e.RequestID), nilIfNilUUID(e.SessionID),
+		nilIfEmpty(e.Method), nilIfEmpty(e.Path)); err != nil {
 		return fmt.Errorf("audit %s on %s %s: %w", e.Action, e.Entity, e.EntityID, err)
 	}
 	return nil
@@ -110,4 +127,14 @@ func nilIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nilIfNilUUID keeps the zero uuid out of the table. It is not an id — it is
+// "no request behind this", and storing 00000000-… would make a scheduler's
+// row look like it belonged to a request that could be looked up.
+func nilIfNilUUID(id uuid.UUID) any {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id
 }

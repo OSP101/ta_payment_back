@@ -43,11 +43,13 @@ type Container struct {
 	DataDeletion      *DataDeletionService
 	Enrollments       *EnrollmentService
 	TDBM              *TDBMService
+	Audit             *AuditService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
 	c := &Container{Pool: pool, Storage: store, Mailer: mailer, Auditor: auditor, Cfg: cfg}
 	c.Sessions = &SessionService{pool: pool}
+	c.Audit = &AuditService{pool: pool, store: store}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}

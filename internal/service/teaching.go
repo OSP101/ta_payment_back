@@ -171,17 +171,17 @@ type CreateTeachingCourseInput struct {
 	NumStudents int         `json:"num_students" validate:"gte=0"`
 	LecturerIDs []uuid.UUID `json:"lecturer_ids"`
 	Sections    []struct {
-		SecNo       string            `json:"sec_no"`
-		Track       string            `json:"track"`
-		Room        *string           `json:"room,omitempty"`
-		NumStudents int               `json:"num_students"`
+		SecNo       string  `json:"sec_no"`
+		Track       string  `json:"track"`
+		Room        *string `json:"room,omitempty"`
+		NumStudents int     `json:"num_students"`
 		// Curriculum is optional and only meaningful for the manual "add course"
 		// form — the Excel import path derives it from the registrar's ReservedFor
 		// column instead (see curriculumFromReserved). Validated against the same
 		// CHECK constraint as UpdateSection's Curriculum field.
 		Curriculum *string           `json:"curriculum,omitempty"`
-		Schedules   []SectionSchedule `json:"schedules,omitempty"`
-		Exams       []ExamSchedule    `json:"exams,omitempty"`
+		Schedules  []SectionSchedule `json:"schedules,omitempty"`
+		Exams      []ExamSchedule    `json:"exams,omitempty"`
 	} `json:"sections"`
 }
 
@@ -391,9 +391,13 @@ func (s *TeachingService) Delete(ctx context.Context, actor, id uuid.UUID) error
 	case hasHoliday:
 		return Conflict("ลบไม่ได้ วิชานี้มีข้อมูลที่เกี่ยวข้องอยู่")
 	}
-	return writeAudited(ctx, s.pool, s.aud,
+	// The whole row is kept in the before-image: a deleted course took its
+	// credits, hours and student counts with it, and those are what every
+	// figure on the claim documents was computed from.
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "teaching_course.delete",
 			Entity: "teaching_course", EntityID: id.String()},
+		"teaching_courses", id,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `DELETE FROM teaching_courses WHERE id=$1`, id)
 			return err
@@ -840,10 +844,13 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 	} else if total < 0 {
 		total = curTotal
 	}
-	return writeAudited(ctx, s.pool, s.aud,
+	// Student counts drive the workload formula, so a change here moves money.
+	// The hand-built After is dropped in favour of the column diff, which also
+	// carries what the counts WERE.
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "teaching_course.num_students",
-			Entity: "teaching_course", EntityID: id.String(),
-			After: map[string]int{"num_students": total, "regular": regular, "special": special}},
+			Entity: "teaching_course", EntityID: id.String()},
+		"teaching_courses", id,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
 				UPDATE teaching_courses
@@ -900,11 +907,15 @@ func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUI
 	sets = append(sets, "updated_at = NOW()")
 	args = append(args, id)
 	q := fmt.Sprintf("UPDATE teaching_courses SET %s WHERE id = $%d", strings.Join(sets, ", "), i)
-	return writeAudited(ctx, s.pool, s.aud,
+	// `in` is the REQUEST, not the row: it carries only the fields the caller
+	// chose to send, and would have recorded a confident After even for an
+	// update that matched nothing. The column diff is the row itself.
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{
 			ActorID: &actor, Action: "teaching_course.update_settings",
-			Entity: "teaching_course", EntityID: id.String(), After: in,
+			Entity: "teaching_course", EntityID: id.String(),
 		},
+		"teaching_courses", id,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, q, args...)
 			return err
@@ -1035,11 +1046,12 @@ func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.U
 		return nil
 	}
 
-	return writeAudited(ctx, s.pool, s.aud,
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{
 			ActorID: &actor, Action: "teaching_course.update_info",
-			Entity: "teaching_course", EntityID: id.String(), After: in,
+			Entity: "teaching_course", EntityID: id.String(),
 		},
+		"teaching_courses", id,
 		func(tx pgx.Tx) error {
 			if len(sets) > 0 {
 				sets = append(sets, "updated_at = NOW()")
@@ -1489,6 +1501,15 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 	}
 	args = append(args, sectionID, tcID)
 	q := fmt.Sprintf("UPDATE sections SET %s WHERE id=$%d AND teaching_course_id=$%d", strings.Join(sets, ", "), i, i+1)
+	// Read on this transaction, immediately before the write. `in` (the request)
+	// used to be recorded as the After; it carries only the fields the caller
+	// chose to send and says nothing about what they replaced — and a section's
+	// num_students feeds the workload formula, so this is a change that moves
+	// money.
+	secBefore, err := snapshotRow(ctx, tx, "sections", sectionID)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, q, args...); err != nil {
 		return err
 	}
@@ -1497,8 +1518,14 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 			return err
 		}
 	}
-	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.update",
-		Entity: "section", EntityID: sectionID.String(), After: in}); err != nil {
+	secAfter, err := snapshotRow(ctx, tx, "sections", sectionID)
+	if err != nil {
+		return err
+	}
+	secEntry := audit.Entry{ActorID: &actor, Action: "section.update",
+		Entity: "section", EntityID: sectionID.String()}
+	setAuditDiff(&secEntry, secBefore, secAfter)
+	if err := s.aud.LogTx(ctx, tx, secEntry); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1526,6 +1553,12 @@ func (s *TeachingService) DeleteSection(ctx context.Context, actor, tcID, sectio
 	if err := s.assertNotExported(ctx, tx, tcID); err != nil {
 		return err
 	}
+	// Captured while it still exists: a deleted section takes its schedule,
+	// room and student count with it, and nothing else records them.
+	gone, err := snapshotRow(ctx, tx, "sections", sectionID)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM sections WHERE id=$1 AND teaching_course_id=$2`, sectionID, tcID); err != nil {
 		return err
@@ -1533,8 +1566,10 @@ func (s *TeachingService) DeleteSection(ctx context.Context, actor, tcID, sectio
 	if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
 		return err
 	}
-	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.delete",
-		Entity: "section", EntityID: sectionID.String()}); err != nil {
+	delEntry := audit.Entry{ActorID: &actor, Action: "section.delete",
+		Entity: "section", EntityID: sectionID.String()}
+	setAuditDiff(&delEntry, gone, nil)
+	if err := s.aud.LogTx(ctx, tx, delEntry); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1554,8 +1589,12 @@ func (s *TeachingService) MarkExported(ctx context.Context, tcID uuid.UUID) erro
 // Unexport clears the export lock so an accidentally-exported course can be
 // edited again. Admin-only (enforced at the route).
 func (s *TeachingService) Unexport(ctx context.Context, actor, tcID uuid.UUID) error {
-	return writeAudited(ctx, s.pool, s.aud,
+	// The before-image carries the exported_at that is being cleared — which
+	// is the whole fact being reversed, and the only record that the course was
+	// ever locked.
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "course.unexport", Entity: "teaching_course", EntityID: tcID.String()},
+		"teaching_courses", tcID,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx,
 				`UPDATE teaching_courses SET exported_at = NULL WHERE id = $1 AND exported_at IS NOT NULL`, tcID)
@@ -3016,8 +3055,12 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 	if existYear != in.AcademicYear || existSem != in.Semester {
 		return nil, ErrConflict
 	}
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "term.update", Entity: "term", EntityID: in.ID.String(), After: in},
+	// Covers THIS term's row. demoteOtherActiveTerms below may also clear
+	// is_active on a different term; that row is not in this diff, and the
+	// action name is what says a demotion may have happened alongside.
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "term.update", Entity: "term", EntityID: in.ID.String()},
+		"academic_terms", in.ID,
 		func(tx pgx.Tx) error {
 			if err := demoteOtherActiveTerms(ctx, tx, in.ID, in.IsActive); err != nil {
 				return err

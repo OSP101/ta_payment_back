@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
-	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	pdfcpu "github.com/pdfcpu/pdfcpu/pkg/api"
 
@@ -29,6 +29,44 @@ import (
 	"ta-payment-back/internal/service"
 	"ta-payment-back/internal/storage"
 )
+
+// proxyHeader decides whether c.IP() reads X-Forwarded-For at all.
+//
+// Returning "" makes fiber use the socket address, which is the only address
+// that means anything when there is no proxy in front whose header can be
+// trusted. See the ProxyHeader comment in the fiber config for the audit-trail
+// bug this fixes.
+func proxyHeader(trusted []string) string {
+	if len(trusted) == 0 {
+		return ""
+	}
+	return fiber.HeaderXForwardedFor
+}
+
+// initLogging installs the process-wide structured logger.
+//
+// JSON in production because the lines are read by a log collector and by grep
+// with a filter, never by eye; text in development because they are read by eye
+// and nothing else. LOG_LEVEL raises or lowers the floor without a rebuild —
+// during an incident "give me debug for an hour" should not need a deploy.
+func initLogging(env string) {
+	level := slog.LevelInfo
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		_ = level.UnmarshalText([]byte(v))
+	}
+	opts := &slog.HandlerOptions{Level: level}
+	var h slog.Handler = slog.NewTextHandler(os.Stdout, opts)
+	if env == "production" {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
+	logger := slog.New(h)
+	slog.SetDefault(logger)
+	// The standard log package still has ~100 call sites in this codebase and
+	// third-party libraries write to it too. Routing it through slog means one
+	// stream, one format, one place to point a collector — rather than half the
+	// output being structured and half of it not.
+	slog.SetLogLoggerLevel(slog.LevelInfo)
+}
 
 func main() {
 	// pdfcpu writes a config.yml under os.UserConfigDir() the first time any
@@ -55,6 +93,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	initLogging(cfg.AppEnv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,10 +178,30 @@ func main() {
 		// Next.js hop's — everyone else's copy of the header is ignored.
 		EnableTrustedProxyCheck: len(cfg.TrustedProxyIPs) > 0,
 		TrustedProxies:          cfg.TrustedProxyIPs,
-		ProxyHeader:             fiber.HeaderXForwardedFor,
+		// ProxyHeader is set ONLY when there is a trusted proxy to read it
+		// from. It used to be set unconditionally, and that is why every one of
+		// the 407 audit rows on the live database had a NULL ip while 141 of
+		// them had a user agent: with no trusted-proxy list fiber trusts every
+		// peer, takes c.IP() from X-Forwarded-For, and — its own comment —
+		// returns that header "even if it is empty or invalid". Nothing sends
+		// the header in dev, so c.IP() was the empty string, every time.
+		//
+		// The same default was worse than useless in production: with the
+		// header unvalidated and every peer trusted, any client could put any
+		// string in X-Forwarded-For and have it stored verbatim as the source
+		// address of their own actions.
+		ProxyHeader: proxyHeader(cfg.TrustedProxyIPs),
+		// Belt and braces behind that: with validation on, a header that is
+		// absent or not an IP falls back to the real socket address instead of
+		// being passed through.
+		EnableIPValidation: true,
 	})
 	app.Use(recover.New())
-	app.Use(logger.New())
+	// Order matters. RequestID is first so that everything below it — including
+	// a panic recovered above, and the access log's own line — can name the
+	// request. AccessLog wraps the rest so its duration covers the real work.
+	app.Use(handler.RequestID())
+	app.Use(handler.AccessLog())
 	app.Use(helmet.New(helmet.Config{
 		ContentTypeNosniff: "nosniff",
 		XFrameOptions:      "SAMEORIGIN",

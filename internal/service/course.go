@@ -163,8 +163,20 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 	if in.UGSpecialMonthlyCap == 0 {
 		in.UGSpecialMonthlyCap = 2000
 	}
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "pay_rate.create", Entity: "pay_rate", EntityID: in.ID.String(), After: in},
+	// A new pay_rates row supersedes the one that was in force, so the rate it
+	// REPLACED is the before-image — without it the trail says "the graduate
+	// rate is 60" and never that it used to be 50. Read inside the transaction
+	// so a concurrent insert cannot slip between the two.
+	prev, err := s.latestPayRateSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entry := audit.Entry{ActorID: &actor, Action: "pay_rate.create", Entity: "pay_rate",
+		EntityID: in.ID.String(), After: in}
+	if prev != nil {
+		entry.Before = prev
+	}
+	if err := writeAudited(ctx, s.pool, s.aud, entry,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
 		INSERT INTO pay_rates (id, effective_from, undergrad_regular, undergrad_special,
@@ -216,8 +228,16 @@ func (s *CourseService) UpsertBudgetCap(ctx context.Context, actor uuid.UUID, in
 		return nil, Invalid("จำนวนเงินต้องไม่ติดลบ")
 	}
 	in.ID = uuid.New()
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "budget_cap.create", Entity: "budget_cap", EntityID: in.ID.String(), After: in},
+	prevCap, err := s.latestBudgetCapSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	capEntry := audit.Entry{ActorID: &actor, Action: "budget_cap.create", Entity: "budget_cap",
+		EntityID: in.ID.String(), After: in}
+	if prevCap != nil {
+		capEntry.Before = prevCap
+	}
+	if err := writeAudited(ctx, s.pool, s.aud, capEntry,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx,
 				`INSERT INTO budget_caps (id, effective_from, per_course_max, note) VALUES ($1,$2::date,$3,$4)`,
@@ -227,4 +247,19 @@ func (s *CourseService) UpsertBudgetCap(ctx context.Context, actor uuid.UUID, in
 		return nil, err
 	}
 	return &in, nil
+}
+
+// latestPayRateSnapshot returns the rate currently in force, as a plain map, or
+// nil when this is the first one ever set.
+//
+// Read as a whole row rather than a chosen list of columns: pay_rates has
+// grown a dozen caps and ceilings over the project's life, and a hand-picked
+// list would go stale the next time one is added — silently, and only visible
+// years later when somebody asks what a cap used to be.
+func (s *CourseService) latestPayRateSnapshot(ctx context.Context) (map[string]any, error) {
+	return latestRowSnapshot(ctx, s.pool, "pay_rates")
+}
+
+func (s *CourseService) latestBudgetCapSnapshot(ctx context.Context) (map[string]any, error) {
+	return latestRowSnapshot(ctx, s.pool, "budget_caps")
 }

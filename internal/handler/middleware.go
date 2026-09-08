@@ -3,7 +3,7 @@ package handler
 import (
 	"crypto/subtle"
 	"errors"
-	"log"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -330,45 +330,73 @@ func RequireApprovedTAProfile(pool *pgxpool.Pool) fiber.Handler {
 // message. Genuine internal failures are logged server-side and returned as a
 // generic 500.
 func ErrorHandler(c *fiber.Ctx, err error) error {
+	status, msg := errorResponse(err)
+
+	// The two cases whose real detail must never reach the client are the two
+	// worth a log line. Both carry the request id, so the generic
+	// "ระบบขัดข้อง" a user reports is findable from the X-Request-Id their
+	// browser was handed.
+	if status == fiber.StatusInternalServerError || isDBError(err) {
+		slog.ErrorContext(c.Context(), "request_failed",
+			"request_id", ReqID(c).String(), "actor_id", UserID(c).String(),
+			"method", c.Method(), "route", c.Route().Path,
+			"status", status, "error", err.Error())
+	}
+	return c.Status(status).JSON(fiber.Map{"error": msg})
+}
+
+func isDBError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr)
+}
+
+// errorResponse maps an error to the status and the message the client gets.
+//
+// Split out of ErrorHandler so the access log can report the status a request
+// ACTUALLY answered with. Fiber runs ErrorHandler outside the middleware chain,
+// after every middleware has already returned, so a logger that reads
+// c.Response().StatusCode() sees the status from before the error was handled —
+// which is 200. Every 404 and every 500 was being logged as a success, at INFO,
+// which is precisely the filter an incident starts from.
+func errorResponse(err error) (int, string) {
 	// Explicit fiber errors (auth, bad body, etc.).
 	var fe *fiber.Error
 	if errors.As(err, &fe) {
-		return c.Status(fe.Code).JSON(fiber.Map{"error": fe.Message})
+		return fe.Code, fe.Message
 	}
 
 	// User-facing business errors with an explicit status.
 	var ue *service.UserError
 	if errors.As(err, &ue) {
-		return c.Status(ue.Status).JSON(fiber.Map{"error": ue.Msg})
+		return ue.Status, ue.Msg
 	}
 
 	// Service sentinels.
 	switch {
 	case errors.Is(err, service.ErrNotFound):
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ไม่พบข้อมูลที่ต้องการ"})
+		return fiber.StatusNotFound, "ไม่พบข้อมูลที่ต้องการ"
 	case errors.Is(err, service.ErrForbidden):
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "คุณไม่มีสิทธิ์ดำเนินการนี้"})
+		return fiber.StatusForbidden, "คุณไม่มีสิทธิ์ดำเนินการนี้"
 	case errors.Is(err, service.ErrConflict):
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "ข้อมูลขัดแย้งกับสถานะปัจจุบัน"})
+		return fiber.StatusConflict, "ข้อมูลขัดแย้งกับสถานะปัจจุบัน"
 	case errors.Is(err, service.ErrInvalidInput):
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ข้อมูลไม่ถูกต้อง"})
+		return fiber.StatusBadRequest, "ข้อมูลไม่ถูกต้อง"
 	case errors.Is(err, pgx.ErrNoRows):
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "ไม่พบข้อมูลที่ต้องการ"})
+		return fiber.StatusNotFound, "ไม่พบข้อมูลที่ต้องการ"
 	}
 
-	// Database errors — log the real detail, return a safe generic message.
+	// Database errors — the real detail is logged by the caller, never returned.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		log.Printf("db error [%s] on %s %s: %s", pgErr.Code, c.Method(), c.Path(), pgErr.Message)
 		switch pgErr.Code {
 		case "23505": // unique_violation
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "ข้อมูลนี้มีอยู่แล้วในระบบ"})
+			return fiber.StatusConflict, "ข้อมูลนี้มีอยู่แล้วในระบบ"
 		case "23503": // foreign_key_violation
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "ไม่สามารถดำเนินการได้เพราะมีข้อมูลอ้างอิงอยู่"})
+			return fiber.StatusConflict, "ไม่สามารถดำเนินการได้เพราะมีข้อมูลอ้างอิงอยู่"
 		case "23514", "22001", "22003", "22007", "22P02": // check/length/numeric/datetime/text-repr
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ข้อมูลที่กรอกไม่ถูกต้องตามรูปแบบที่กำหนด"})
+			return fiber.StatusBadRequest, "ข้อมูลที่กรอกไม่ถูกต้องตามรูปแบบที่กำหนด"
 		default:
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"})
+			return fiber.StatusInternalServerError, "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
 		}
 	}
 
@@ -382,14 +410,13 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 	//
 	// The discriminator is the script: every message this product intends a user
 	// to read is written in Thai, and every runtime/driver error is ASCII. Errors
-	// with no Thai character are logged with their real text and answered with a
-	// generic 500, so an unexpected internal fault degrades to "ระบบขัดข้อง"
-	// instead of leaking how the query is shaped.
+	// with no Thai character are answered with a generic 500, so an unexpected
+	// internal fault degrades to "ระบบขัดข้อง" instead of leaking how the query
+	// is shaped.
 	if !containsThai(err.Error()) {
-		log.Printf("internal error on %s %s: %v", c.Method(), c.Path(), err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"})
+		return fiber.StatusInternalServerError, "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
 	}
-	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	return fiber.StatusBadRequest, err.Error()
 }
 
 // containsThai reports whether s holds at least one Thai character. Used by

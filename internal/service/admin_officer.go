@@ -148,8 +148,12 @@ func (s *AdminOfficerService) Upsert(ctx context.Context, actor uuid.UUID, in Ad
 	in.IsDean = IsDeanTitle(in.Title)
 	in.IsHead = IsHeadTitle(in.Title)
 
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "admin_officer.reassign", Entity: "admin_officer", EntityID: in.ID.String(), After: in},
+	// An administrative seat changing hands decides who signs the claim
+	// documents, so the trail has to name the person it was taken FROM — not
+	// only the one it went to, which is all the request struct could say.
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "admin_officer.reassign", Entity: "admin_officer", EntityID: in.ID.String()},
+		"admin_officers", in.ID,
 		func(tx pgx.Tx) error {
 			res, err := tx.Exec(ctx, `
 				UPDATE admin_officers

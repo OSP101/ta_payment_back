@@ -187,9 +187,13 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 	if isNew {
 		in.ID = uuid.New()
 	}
-	if err := writeAudited(ctx, s.pool, s.aud,
+	// Deadlines decide whether a TA can still submit at all, so "the due date
+	// used to be the 5th" is the answer to "why was my month forfeited". The
+	// request struct that was recorded as After could not say it.
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "submission_period.upsert",
-			Entity: "submission_period", EntityID: in.ID.String(), After: in},
+			Entity: "submission_period", EntityID: in.ID.String()},
+		"submission_periods", in.ID,
 		func(tx pgx.Tx) error {
 			if isNew {
 				_, err := tx.Exec(ctx, `
@@ -229,9 +233,10 @@ func (s *SubmissionPeriodService) Delete(ctx context.Context, actor, id uuid.UUI
 	if lockedCount > 0 {
 		return Conflict("ลบงวดนี้ไม่ได้ มีเดือนที่ส่งออกไฟล์หรือส่งการเงินไปแล้ว กรุณาตีกลับหรือให้ผู้ดูแลระบบปลดล็อกก่อน")
 	}
-	return writeAudited(ctx, s.pool, s.aud,
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "submission_period.delete",
 			Entity: "submission_period", EntityID: id.String()},
+		"submission_periods", id,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `DELETE FROM submission_periods WHERE id=$1`, id)
 			return err
@@ -698,9 +703,19 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 		return err
 	}
 	name := s.userDisplayName(ctx, actor)
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "submission_period.finance_sent",
-			Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String()},
+	// Read on the pool before the transaction opens. Slightly weaker than an
+	// in-transaction read, and deliberately so: these cells are serialised by
+	// the workflow itself (only staff move them, one screen at a time) and the
+	// alternative is restructuring five callers around a wrapper. The state it
+	// records is what the operator was looking at when they clicked.
+	prevStatus, err := periodStatus(ctx, s.pool, periodID, taID, tcID)
+	if err != nil {
+		return err
+	}
+	sentEntry := audit.Entry{ActorID: &actor, Action: "submission_period.finance_sent",
+		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
+		Before: prevStatus, After: map[string]any{"status": "finance_sent"}}
+	if err := writeAudited(ctx, s.pool, s.aud, sentEntry,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx, `
 				UPDATE submission_period_status
@@ -880,10 +895,14 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 		return err
 	}
 	name := s.userDisplayName(ctx, actor)
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "submission_period.finance_revert",
-			Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-			Note: reason},
+	prevStatus, err := periodStatus(ctx, s.pool, periodID, taID, tcID)
+	if err != nil {
+		return err
+	}
+	revertEntry := audit.Entry{ActorID: &actor, Action: "submission_period.finance_revert",
+		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
+		Note: reason, Before: prevStatus, After: map[string]any{"status": "exported"}}
+	if err := writeAudited(ctx, s.pool, s.aud, revertEntry,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx, `
 				UPDATE submission_period_status SET

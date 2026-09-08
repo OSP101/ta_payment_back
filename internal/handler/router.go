@@ -40,6 +40,14 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// onboarding.
 	taApproved := RequireApprovedTAProfile(svc.Pool)
 
+	// Publish the request's identity for the audit package, on EVERY /api/v1
+	// route including the anonymous ones. A failed login is the single most
+	// important row in the table for "ตามหาคนร้าย" and it is written by an
+	// unauthenticated request — before this, those rows had no address at all.
+	// Mounted again inside the authed group below, once there is a user and a
+	// session to add.
+	api.Use(AuditContext())
+
 	// Baseline per-IP ceiling across EVERY /api/v1 endpoint, public and
 	// authenticated alike — a broad backstop against scripted flooding,
 	// layered UNDER the tighter route-specific limiters below (loginLimiter,
@@ -122,7 +130,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
-	authed := api.Group("", authMiddleware, AccountGuard(svc))
+	authed := api.Group("", authMiddleware, AccountGuard(svc), AuditContext())
 
 	// Applied below to routes that generate a PDF/XLSX/ZIP or accept an
 	// upload — every one of those costs real CPU, memory, or (for uploads)
@@ -173,13 +181,23 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/me/avatar", heavyLimiter, uh.UploadAvatar)
 	authed.Delete("/me/avatar", uh.DeleteAvatar)
 	authed.Get("/users/:id/avatar", uh.ServeAvatar)
-	authed.Get("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.List)
+	// Reading the roster is a bulk PII disclosure — every account's email and
+	// student id — so it is recorded, throttled to one entry per viewer per
+	// hour. See audit_read.go for why the throttle rather than one row per
+	// request.
+	authed.Get("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer),
+		AuditRead(aud, "users.list.view", "user", ""), uh.List)
 	authed.Post("/users", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.Create)
 	// Same role gate as Create above — whoever can create a user can also set
 	// the picture, since the create form collects it before the account (and
 	// its self-serve /me/avatar) exists.
 	authed.Post("/users/:id/avatar", heavyLimiter, RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.UploadAvatarFor)
-	authed.Get("/users/:id", authed_forSelfOrStaff(), uh.Get)
+	// Subject is the :id, so looking up two different people files two entries:
+	// the question here is "who has been reading THIS person's record". A
+	// self-read is recorded like any other and needs no special case — actor
+	// and subject are simply equal, which reads correctly on the screen.
+	authed.Get("/users/:id", authed_forSelfOrStaff(),
+		AuditRead(aud, "user.record.view", "user", "id"), uh.Get)
 	authed.Patch("/users/:id", adminOrStaff, uh.Update)
 	authed.Post("/users/:id/reset-password", adminOrStaff, uh.ResetPassword)
 	authed.Post("/users/:id/deactivate", adminOrStaff, uh.Deactivate)
@@ -240,7 +258,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// hand at the start of every term.
 	authed.Get("/exports/terms/:id/course-summary/warnings", adminOrStaff, th.CourseSummaryWarnings)
 	authed.Get("/exports/terms/:id/course-summary.xlsx", adminOrStaff, heavyLimiter, th.CourseSummaryXLSX)
-	authed.Get("/exports/terms/:id/course-summary/preview", adminOrStaff, th.CourseSummaryPreview)
+	authed.Get("/exports/terms/:id/course-summary/preview", adminOrStaff,
+		AuditRead(aud, "export.course_summary.preview", "term", "id"), th.CourseSummaryPreview)
 	authed.Get("/exports/terms/:id/course-summary/history", adminOrStaff, th.CourseSummaryHistory)
 	authed.Get("/exports/course-summary/:id/reprint", adminOrStaff, heavyLimiter, th.CourseSummaryReprint)
 
@@ -427,7 +446,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 
 	// Dashboard
 	dashH := &DashboardHandler{Svc: svc}
-	authed.Get("/dashboard/executive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), dashH.Executive)
+	// The single widest disclosure in the product: every TA's hours and money
+	// across every course, on one page.
+	authed.Get("/dashboard/executive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff),
+		AuditRead(aud, "dashboard.executive.view", "academic_term", ""), dashH.Executive)
 	// The analytics view is the one thing the executive role can see.
 	authed.Get("/dashboard/analytics", RequireExecutiveView(svc.Pool), dashH.Analytics)
 	authed.Get("/dashboard/analytics.xlsx", RequireExecutiveView(svc.Pool), heavyLimiter, dashH.AnalyticsXLSX)
@@ -440,7 +462,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// Admin-only escape hatch to undo an accidental export lock.
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 	// Read-only payout preview — review the numbers before the locking download.
-	authed.Get("/exports/course/:id/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CoursePreview)
+	// The preview shows the same per-person figures the exported file carries,
+	// and unlike the download (export.course) it left no trace at all.
+	authed.Get("/exports/course/:id/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff),
+		AuditRead(aud, "export.course.preview", "teaching_course", "id"), eh.CoursePreview)
 	authed.Get("/exports/course/:id/coverage", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseExportCoverage)
 	// No role guard: the service checks that the caller teaches or assists the
 	// course. A budget that decides a TA's own pay is not a staff secret.
@@ -510,7 +535,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/me/submission-periods", spH.MePending)
 	// Staff step 3 — ตรวจสอบเบิกจ่ายค่าตอบแทน. Sits between the lecturer's
 	// daily approval and the export, which now refuses months that skipped it.
-	authed.Get("/submission-periods/review-queue", adminOrStaff, spH.ReviewQueue)
+	authed.Get("/submission-periods/review-queue", adminOrStaff,
+		AuditRead(aud, "payout.queue.view", "academic_term", ""), spH.ReviewQueue)
 	// Nudge a course's lecturers about work still sitting in THEIR queue. The
 	// merged payout screen groups those months under "waiting on someone else";
 	// this is the one action available there.
@@ -560,6 +586,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}
 	authed.Get("/audit-logs", RequireRole(rbac.RoleAdmin), audH.List)
+	// Feeds the screen's action filter. Same admin-only gate: the list of action
+	// names is itself a map of what the system records.
+	authed.Get("/audit-logs/actions", RequireRole(rbac.RoleAdmin), audH.Actions)
+	authed.Get("/audit-logs/summary", RequireRole(rbac.RoleAdmin), audH.Summary)
 }
 
 // authed_forSelfOrStaff allows the user to fetch their own profile OR staff/admin.

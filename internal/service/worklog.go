@@ -1929,8 +1929,9 @@ func (s *WorkLogService) UpdateTAReviewSchedule(ctx context.Context, actor, assi
 	if err := s.enforceReviewCap(ctx, assignmentID, in.Kind, &rsID, slotHours(in.StartTime, in.EndTime)); err != nil {
 		return err
 	}
-	return writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "ta_review_schedule.update", Entity: "ta_review_schedule", EntityID: rsID.String(), After: in},
+	return writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "ta_review_schedule.update", Entity: "ta_review_schedule", EntityID: rsID.String()},
+		"ta_review_schedules", rsID,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx,
 				`UPDATE ta_review_schedules
@@ -2888,8 +2889,13 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	}
 	// Editable states: draft (in progress) and rejected (TA fixing after a
 	// bounce — the update resets it to draft so it can be resubmitted).
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "worklog.update", Entity: "work_log", EntityID: w.ID.String(), After: w},
+	// Snapshotted rather than recording the struct the caller sent: the trail
+	// needs the row as it WAS and as it ENDED UP, and "what the request asked
+	// for" is neither — an update that hit no row would still have recorded a
+	// confident After.
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "worklog.update", Entity: "work_log", EntityID: w.ID.String()},
+		"work_logs", w.ID,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx,
 				`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8, status='draft'
@@ -3082,6 +3088,11 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 		if err := s.recheckCapsForApproval(ctx, tx, ctxs[id], id); err != nil {
 			return err
 		}
+		// Listed BEFORE the update, while the rows still say 'submitted'.
+		moving, hours, err := worklogSetSnapshot(ctx, tx, id, yearMonth, "submitted")
+		if err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx,
 			`UPDATE work_logs SET status='approved', approved_at=NOW(), approved_by=$1
 			 WHERE assignment_id=$2 AND status='submitted'
@@ -3096,7 +3107,10 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 		}
 		affected += tag.RowsAffected()
 		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "worklog.approve",
-			Entity: "assignment", EntityID: id.String(), Note: yearMonth}); err != nil {
+			Entity: "assignment", EntityID: id.String(), Note: yearMonth,
+			Before: map[string]any{"status": "submitted", "rows": moving},
+			After:  map[string]any{"status": "approved", "count": tag.RowsAffected(), "hours": hours},
+		}); err != nil {
 			return err
 		}
 	}
@@ -3680,8 +3694,13 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	if isNew {
 		w.ID = uuid.New()
 	}
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(), After: w},
+	// Staff editing a single entry — including one a lecturer already approved.
+	// The struct being recorded as After is what the request ASKED for; the
+	// snapshot is what the row was and what it became. On a create the
+	// before-image is simply absent, which is the honest record.
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String()},
+		"work_logs", w.ID,
 		func(tx pgx.Tx) error {
 			if isNew {
 				_, err := tx.Exec(ctx,
@@ -3720,6 +3739,47 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 // Delete removes a single work_log entry owned by the calling TA. Draft and
 // rejected rows are the only removable states — submitted/approved must go
 // through Reject or staff intervention so the audit trail isn't lost.
+// worklogSetSnapshot lists the rows a bulk status change is about to move, with
+// the hours each one carries.
+//
+// Approve and Reject act on a SET — every submitted row of one assignment in
+// one month — so the single-row snapshot in audit_snapshot.go does not fit
+// them. What an investigation needs here is not a column diff but the answer to
+// "which entries moved, and how many hours went with them": a month approved by
+// mistake has to be identifiable row by row afterwards, and the rows themselves
+// are about to stop saying 'submitted'.
+//
+// Read on the caller's transaction, immediately before the statement that
+// changes them, so the list cannot include a row someone else settled in the
+// meantime.
+func worklogSetSnapshot(ctx context.Context, tx pgx.Tx, assignmentID uuid.UUID, yearMonth, status string) ([]map[string]any, float64, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id, TO_CHAR(work_date,'YYYY-MM-DD'), hours, activity, status::text
+		FROM work_logs
+		WHERE assignment_id = $1 AND status::text = $2
+		  AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)
+		ORDER BY work_date, start_time`, assignmentID, status, yearMonth)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	var total float64
+	for rows.Next() {
+		var id uuid.UUID
+		var date, activity, st string
+		var hours float64
+		if err := rows.Scan(&id, &date, &hours, &activity, &st); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, map[string]any{
+			"id": id, "work_date": date, "hours": hours, "activity": activity, "status": st,
+		})
+		total += hours
+	}
+	return out, total, rows.Err()
+}
+
 func (s *WorkLogService) Delete(ctx context.Context, actor, logID uuid.UUID) error {
 	// Resolve the owning assignment + status in one query. When the row is
 	// missing the join returns zero rows and RowsAffected on the follow-up
@@ -3741,8 +3801,11 @@ func (s *WorkLogService) Delete(ctx context.Context, actor, logID uuid.UUID) err
 	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, workDate); err != nil {
 		return err
 	}
-	return writeAudited(ctx, s.pool, s.aud,
+	// The deleted row is kept whole in the before-image. This is the last
+	// moment its hours exist anywhere.
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "worklog.delete", Entity: "work_log", EntityID: logID.String()},
+		"work_logs", logID,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx,
 				`DELETE FROM work_logs WHERE id=$1 AND status IN ('draft','rejected')`, logID)
@@ -3829,22 +3892,36 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 	if err := assertNoFinanceLockedRows(ctx, s.pool, assignmentID, []string{"submitted"}, yearMonth); err != nil {
 		return err
 	}
-	if err := writeAudited(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "worklog.reject", Entity: "assignment", EntityID: assignmentID.String(), Note: reason},
-		func(tx pgx.Tx) error {
-			tag, err := tx.Exec(ctx,
-				`UPDATE work_logs SET status='rejected', reject_reason=$1
-				 WHERE assignment_id=$2 AND status='submitted'
-				   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`,
-				reason, assignmentID, yearMonth)
-			if err != nil {
-				return err
-			}
-			if tag.RowsAffected() == 0 {
-				return Invalid("ไม่มีรายการที่รออนุมัติ (อาจถูกดำเนินการไปแล้ว)")
-			}
-			return nil
-		}); err != nil {
+	// The entry is built inside the transaction so the before-image is the set
+	// of rows this statement actually moves.
+	rejectEntry := audit.Entry{ActorID: &actor, Action: "worklog.reject",
+		Entity: "assignment", EntityID: assignmentID.String(), Note: reason}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	moving, hours, err := worklogSetSnapshot(ctx, tx, assignmentID, yearMonth, "submitted")
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE work_logs SET status='rejected', reject_reason=$1
+		 WHERE assignment_id=$2 AND status='submitted'
+		   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`,
+		reason, assignmentID, yearMonth)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return Invalid("ไม่มีรายการที่รออนุมัติ (อาจถูกดำเนินการไปแล้ว)")
+	}
+	rejectEntry.Before = map[string]any{"status": "submitted", "rows": moving}
+	rejectEntry.After = map[string]any{"status": "rejected", "count": tag.RowsAffected(), "hours": hours}
+	if err := s.aud.LogTx(ctx, tx, rejectEntry); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	if s.notify != nil {

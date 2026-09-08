@@ -318,11 +318,20 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 	}
 
 	name := s.userDisplayName(ctx, actor)
+	// The state this sign-off replaced. Without it a re-sign of a month that
+	// was already reviewed is indistinguishable from the first one — and the
+	// two mean very different things when a month turns out to be wrong.
+	prevStatus, err := periodStatus(ctx, s.pool, periodID, taID, tcID)
+	if err != nil {
+		return err
+	}
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{
 			ActorID: &actor, Action: "submission.staff_reviewed",
 			Entity: "submission_period_status", EntityID: periodID.String(),
-			Note: fmt.Sprintf("ta=%s course=%s", taID, tcID),
+			Note:   fmt.Sprintf("ta=%s course=%s", taID, tcID),
+			Before: prevStatus,
+			After:  map[string]any{"status": StatusStaffReviewed},
 		},
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx, `

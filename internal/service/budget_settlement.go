@@ -1032,10 +1032,22 @@ func (s *ExportService) SetSettlementMode(
 	if len(reissue) > 0 {
 		note += " (ต้องออกใบเบิกใหม่: " + strings.Join(reissue, ", ") + ")"
 	}
+	// The previous mode was already known here and was only ever written into
+	// the note as free text. In the columns it is queryable: "every course whose
+	// split was changed away from เฉลี่ย after the term started" is a question
+	// a note cannot answer.
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
 		ActorID: &actor, Action: "course.settlement_mode",
 		Entity: "teaching_course", EntityID: courseID.String(),
-		Note: note,
+		Note:   note,
+		Before: map[string]any{"settlement_mode": string(previous)},
+		After: map[string]any{
+			"settlement_mode": string(mode),
+			// Naming the months forced back to staff_reviewed matters: this is
+			// the trail's only record that a claim document already in
+			// circulation stopped matching the system.
+			"reissue_months": reissue,
+		},
 	}); err != nil {
 		return err
 	}

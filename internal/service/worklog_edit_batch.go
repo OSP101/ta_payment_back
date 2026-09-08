@@ -146,6 +146,8 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 
 	res := &EditBatchResult{}
 	applied := make([]map[string]any, 0, len(in.Changes))
+	auditBefore := make([]map[string]any, 0, len(in.Changes))
+	auditAfter := make([]map[string]any, 0, len(in.Changes))
 	for _, c := range in.Changes {
 		var err error
 		switch c.Action {
@@ -165,19 +167,34 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 			continue
 		}
 		res.Applied++
+		// Kept as one interleaved list for worklog_edit_batches.changes, which
+		// is what the reprint/history screen reads…
 		entry := map[string]any{
 			"work_log_id": c.WorkLogID,
 			"action":      c.Action,
 			"before":      before[c.WorkLogID],
 		}
+		var afterRow map[string]any
 		if c.Action == "update" {
-			entry["after"] = map[string]any{
+			afterRow = map[string]any{
 				"work_date": c.After.WorkDate, "start_time": c.After.StartTime,
 				"end_time": c.After.EndTime, "hours": c.After.Hours,
 				"activity": c.After.Activity, "note": c.After.Note,
 			}
+			entry["after"] = afterRow
 		}
 		applied = append(applied, entry)
+		// …and split into two lists for the audit row's own before/after
+		// columns. The images were already being collected here; they were all
+		// being filed under After, so the column that says what the hours USED
+		// to be stayed null on the single most sensitive action in the product
+		// — staff rewriting hours a lecturer had already approved.
+		auditBefore = append(auditBefore, map[string]any{
+			"work_log_id": c.WorkLogID, "row": before[c.WorkLogID],
+		})
+		auditAfter = append(auditAfter, map[string]any{
+			"work_log_id": c.WorkLogID, "action": c.Action, "row": afterRow,
+		})
 	}
 
 	if res.Applied == 0 {
@@ -224,7 +241,8 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 		Entity: "worklog_edit_batch", EntityID: batchID.String(),
 		Note: fmt.Sprintf("%s แก้ %d รายการ, แนบ %d รูป: %s",
 			in.YearMonth, res.Applied, len(in.Evidence), strings.TrimSpace(in.Reason)),
-		After: applied,
+		Before: auditBefore,
+		After:  auditAfter,
 	}); err != nil {
 		return nil, err
 	}

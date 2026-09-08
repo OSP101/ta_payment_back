@@ -1,0 +1,12 @@
+DROP TRIGGER IF EXISTS audit_logs_no_delete ON audit_logs;
+DROP TRIGGER IF EXISTS audit_logs_no_update ON audit_logs;
+DROP FUNCTION IF EXISTS audit_logs_append_only();
+DROP INDEX IF EXISTS audit_ip_idx;
+DROP INDEX IF EXISTS audit_action_idx;
+DROP INDEX IF EXISTS audit_session_idx;
+DROP INDEX IF EXISTS audit_request_idx;
+ALTER TABLE audit_logs DROP COLUMN IF EXISTS status;
+ALTER TABLE audit_logs DROP COLUMN IF EXISTS path;
+ALTER TABLE audit_logs DROP COLUMN IF EXISTS method;
+ALTER TABLE audit_logs DROP COLUMN IF EXISTS session_id;
+ALTER TABLE audit_logs DROP COLUMN IF EXISTS request_id;

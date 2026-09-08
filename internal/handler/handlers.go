@@ -2,7 +2,6 @@ package handler
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -2940,43 +2939,134 @@ func (h *ExportHandler) UnlockCourse(c *fiber.Ctx) error {
 
 type AuditHandler struct{ Svc *service.Container }
 
+// List answers one question about the audit trail.
+//
+// It replaced a handler that read the newest 200 rows and left every filter to
+// the browser — which meant no question could reach a row outside that window,
+// however it was phrased. Everything is now decided in SQL against the indexes
+// migration 0107 added.
 func (h *AuditHandler) List(c *fiber.Ctx) error {
-	limit, _ := strconv.Atoi(c.Query("limit", "100"))
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	q := service.AuditQuery{
+		Role:     c.Query("role"),
+		Action:   c.Query("action"),
+		Entity:   c.Query("entity"),
+		EntityID: c.Query("entity_id"),
+		IP:       c.Query("ip"),
+		Q:        strings.TrimSpace(c.Query("q")),
 	}
-	rows, err := h.Svc.Pool.Query(c.Context(), `
-		SELECT id, at, actor_id, actor_role::text, action, entity, entity_id, ip::text, before, after, note
-		FROM audit_logs ORDER BY at DESC LIMIT $1`, limit)
+	var err error
+	if q.From, err = optTime(c.Query("from")); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "from ไม่ใช่วันที่ที่ถูกต้อง")
+	}
+	if q.To, err = optTime(c.Query("to")); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "to ไม่ใช่วันที่ที่ถูกต้อง")
+	}
+	if q.ActorID, err = optUUID(c.Query("actor_id")); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "actor_id ไม่ถูกต้อง")
+	}
+	if q.RequestID, err = optUUID(c.Query("request_id")); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "request_id ไม่ถูกต้อง")
+	}
+	if q.SessionID, err = optUUID(c.Query("session_id")); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "session_id ไม่ถูกต้อง")
+	}
+	q.Limit, _ = strconv.Atoi(c.Query("limit", "50"))
+	q.Offset, _ = strconv.Atoi(c.Query("offset", "0"))
+
+	items, total, err := h.Svc.Audit.ListAudit(c.Context(), q)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	out := []fiber.Map{}
-	for rows.Next() {
-		var id int64
-		var at any
-		var actorID *uuid.UUID
-		var actorRole *string
-		var action, entity string
-		var entityID, ip, note *string
-		// before/after are JSONB, NULL for most actions (only writers that pass
-		// audit.Entry.Before/After populate them). Scanned as raw bytes and
-		// re-emitted as json.RawMessage so the API returns the actual object
-		// (or null) instead of a stringified blob — every write already stores
-		// this (audit.write, internal/audit/audit.go), this handler just never
-		// read it back out.
-		var before, after []byte
-		if err := rows.Scan(&id, &at, &actorID, &actorRole, &action, &entity, &entityID, &ip, &before, &after, &note); err != nil {
+
+	// Looking someone up in the audit trail is itself an act worth recording —
+	// the trail's own blind spot is the person reading it. Only TARGETED
+	// lookups are recorded: paging through the newest rows is routine and
+	// writing a row for it would bury the searches that mean something under
+	// the ones that do not.
+	if subject := auditLookupSubject(q); subject != "" {
+		actor := UserID(c)
+		if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{
+			ActorID: &actor, Action: "audit_log.search", Entity: "audit_log",
+			Note: subject,
+		}); err != nil {
 			return err
 		}
-		out = append(out, fiber.Map{
-			"id": id, "at": at, "actor_id": actorID, "actor_role": actorRole,
-			"action": action, "entity": entity, "entity_id": entityID, "ip": ip,
-			"before": json.RawMessage(before), "after": json.RawMessage(after), "note": note,
-		})
 	}
-	return c.JSON(out)
+	return c.JSON(fiber.Map{"items": items, "total": total})
+}
+
+// auditLookupSubject describes a targeted search, or "" for plain browsing.
+func auditLookupSubject(q service.AuditQuery) string {
+	var parts []string
+	if q.ActorID != nil {
+		parts = append(parts, "actor="+q.ActorID.String())
+	}
+	if q.EntityID != "" {
+		parts = append(parts, "entity_id="+q.EntityID)
+	}
+	if q.IP != "" {
+		parts = append(parts, "ip="+q.IP)
+	}
+	if q.RequestID != nil {
+		parts = append(parts, "request="+q.RequestID.String())
+	}
+	if q.SessionID != nil {
+		parts = append(parts, "session="+q.SessionID.String())
+	}
+	if q.Q != "" {
+		parts = append(parts, "q="+q.Q)
+	}
+	return strings.Join(parts, " ")
+}
+
+// Summary feeds the overview strip above the table: what happened in the window
+// and who was active in it, so the first question ("is anything wrong?") is
+// answered without reading a single row.
+func (h *AuditHandler) Summary(c *fiber.Ctx) error {
+	from, err := optTime(c.Query("from"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "from ไม่ใช่วันที่ที่ถูกต้อง")
+	}
+	to, err := optTime(c.Query("to"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "to ไม่ใช่วันที่ที่ถูกต้อง")
+	}
+	sum, err := h.Svc.Audit.SummarizeAudit(c.Context(), from, to)
+	if err != nil {
+		return err
+	}
+	return c.JSON(sum)
+}
+
+// Actions lists the distinct action names, so the screen's filter offers what
+// the table actually contains rather than a list hardcoded in the frontend that
+// drifts every time a new action is audited.
+func (h *AuditHandler) Actions(c *fiber.Ctx) error {
+	actions, err := h.Svc.Audit.ListAuditActions(c.Context())
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": actions})
+}
+
+// optTime parses an optional RFC3339 timestamp; "" means "not given".
+func optTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
+// optUUID parses an optional uuid; "" means "not given".
+func optUUID(s string) (*uuid.UUID, error) {
+	if s == "" {
+		return nil, nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 
 // -------------------- Admin officers (executive roster) --------------------

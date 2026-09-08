@@ -532,10 +532,26 @@ func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uu
 		}
 	}
 	name := userDisplayName(ctx, s.pool, actor)
+	// Moving BACKWARD here deletes the recorded dates of every stage above the
+	// new one (the CASE ... ELSE NULL arms below), and the board is the only
+	// record of when each desk signed. Without a before-image those timestamps
+	// are gone with nothing left saying they ever existed — which is exactly
+	// the accident the confirmation dialog on this control exists to prevent.
+	var prevStage *int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT stage FROM document_progress WHERE term_id=$1 AND fiscal_round=$2`,
+		termID, round).Scan(&prevStage); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	before := map[string]any{"stage": nil, "round": round}
+	if prevStage != nil {
+		before["stage"] = *prevStage
+	}
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "document_progress.set_stage",
 			Entity: "academic_term", EntityID: termID.String(),
-			After: map[string]any{"stage": stage, "round": round}},
+			Before: before,
+			After:  map[string]any{"stage": stage, "round": round}},
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
 		INSERT INTO document_progress

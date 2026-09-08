@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -318,6 +320,24 @@ func (s *UserService) Authenticate(ctx context.Context, email, password, ip, use
 	u, hash, err := s.FindByEmail(ctx, email)
 	if err != nil || u == nil || hash == "" {
 		auth.DummyCompare(password)
+		// An attempt against an address that is not an account used to leave NO
+		// trace whatsoever — no audit row, nothing but a 401. That is the exact
+		// shape of credential stuffing and of someone guessing at staff
+		// addresses, and it was the one attack the trail could not see. IP,
+		// user agent and request id come from the context.
+		//
+		// There is no actor_id to record: nobody did this, in the sense the
+		// column means. The identifier is recorded as its DOMAIN in clear plus a
+		// SHA-256 of the full address — the domain answers "are they working
+		// through our own address space", the hash groups repeats and can be
+		// matched against a specific address once you have one to test. Neither
+		// puts a third party's email address permanently in a table that this
+		// migration also made impossible to delete from.
+		_ = s.aud.Log(ctx, audit.Entry{
+			Action: "auth.login_unknown_account", Entity: "user",
+			IP: ip, UserAgent: userAgent,
+			Note: attemptedIdentifier(email),
+		})
 		return nil, &UserError{Status: 401, Msg: "อีเมลหรือรหัสผ่านไม่ถูกต้อง"}
 	}
 	if err := loginGateCheck(u.ID); err != nil {
@@ -562,6 +582,15 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 	}
 	defer tx.Rollback(ctx)
 
+	// Snapshotted first, on this transaction. `in` (the request) was being
+	// recorded as the After, which for the one question this row exists to
+	// answer — "who granted this account admin, and what did it hold before" —
+	// said nothing at all: the request carries the new roles and never the old.
+	beforeUser, err := userSnapshotWithRoles(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+
 	sets := []string{}
 	args := []any{}
 	i := 1
@@ -663,7 +692,13 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 	// 0047. Rejecting them would break older clients for no benefit; silently
 	// dropping them is what "never stored" means here.
 
-	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.update", Entity: "user", EntityID: id.String(), After: in}); err != nil {
+	afterUser, err := userSnapshotWithRoles(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	userEntry := audit.Entry{ActorID: &actor, Action: "user.update", Entity: "user", EntityID: id.String()}
+	setAuditDiff(&userEntry, beforeUser, afterUser)
+	if err := s.aud.LogTx(ctx, tx, userEntry); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -676,8 +711,11 @@ func (s *UserService) Deactivate(ctx context.Context, actor, id uuid.UUID) error
 	if actor == id {
 		return Invalid("ไม่สามารถปิดใช้งานบัญชีของตนเองได้")
 	}
-	return writeAudited(ctx, s.pool, s.aud,
+	// The before-image carries is_active and the account's own details, so a
+	// deactivation can be told apart from one that was already off.
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "user.deactivate", Entity: "user", EntityID: id.String()},
+		"users", id,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `UPDATE users SET is_active = FALSE, updated_at=NOW() WHERE id=$1`, id)
 			return err
@@ -686,8 +724,9 @@ func (s *UserService) Deactivate(ctx context.Context, actor, id uuid.UUID) error
 
 // Activate re-enables a previously deactivated account.
 func (s *UserService) Activate(ctx context.Context, actor, id uuid.UUID) error {
-	return writeAudited(ctx, s.pool, s.aud,
+	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "user.activate", Entity: "user", EntityID: id.String()},
+		"users", id,
 		func(tx pgx.Tx) error {
 			tag, err := tx.Exec(ctx,
 				`UPDATE users SET is_active = TRUE, updated_at=NOW() WHERE id=$1 AND deleted_at IS NULL`, id)
@@ -813,8 +852,12 @@ func (s *UserService) ResetPassword(ctx context.Context, actor, id uuid.UUID) (s
 	if err != nil {
 		return "", err
 	}
-	if err := writeAudited(ctx, s.pool, s.aud,
+	// password_hash is redacted in the snapshot, so this records THAT the
+	// credential changed and the flags around it (must_change_password, the
+	// gate counters) without keeping a second copy of the hash anywhere.
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "user.reset_password", Entity: "user", EntityID: id.String()},
+		"users", id,
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx,
 				`UPDATE users SET password_hash=$1, must_change_password=TRUE, updated_at=NOW() WHERE id=$2`, h, id)
@@ -925,4 +968,50 @@ func uintToString(n uint64) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// attemptedIdentifier describes a login identifier that matched no account,
+// without storing it. "domain=kkumail.com sha256=1f3a…" — enough to count
+// attempts, spot a targeted domain and confirm a suspected address, and not
+// enough to harvest one.
+func attemptedIdentifier(email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	domain := ""
+	if i := strings.LastIndex(email, "@"); i >= 0 && i+1 < len(email) {
+		domain = email[i+1:]
+	}
+	sum := sha256.Sum256([]byte(email))
+	return fmt.Sprintf("domain=%s sha256=%x", domain, sum[:8])
+}
+
+// userSnapshotWithRoles is the users row plus the roles it holds, as one image.
+//
+// Roles live in their own table with no id of its own, so the generic row
+// snapshot cannot reach them — and they are the privilege-escalation surface:
+// an account quietly gaining "admin" is the change this trail most needs to be
+// able to show, side by side with what it held before.
+func userSnapshotWithRoles(ctx context.Context, tx pgx.Tx, id uuid.UUID) (map[string]any, error) {
+	row, err := snapshotRow(ctx, tx, "users", id)
+	if err != nil || row == nil {
+		return row, err
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT role::text FROM user_roles WHERE user_id = $1 ORDER BY role`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	roles := []string{}
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
+		}
+		roles = append(roles, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	row["roles"] = roles
+	return row, nil
 }

@@ -12,6 +12,7 @@ import (
 	"log"
 	"time"
 
+	"ta-payment-back/internal/handler"
 	"ta-payment-back/internal/service"
 )
 
@@ -59,6 +60,12 @@ func (s *Scheduler) loop(ctx context.Context) {
 }
 
 func (s *Scheduler) tick(ctx context.Context) {
+	// Drop expired read-audit throttle keys. Cheap and unconditional: the map
+	// holds one key per (viewer, audited screen, subject) seen in the last
+	// hour, and without a sweep a long-lived process keeps every one of them
+	// for the life of the process. See handler/audit_read.go.
+	handler.SweepReadAudit(time.Now())
+
 	// Safety net for the deferred TA-request decision. The primary trigger runs
 	// when a TA saves their timetable; this catches anything that trigger
 	// missed (a failed call, a crash mid-save, a timetable written by staff
@@ -94,6 +101,18 @@ func (s *Scheduler) tick(ctx context.Context) {
 }
 
 func (s *Scheduler) dailyClose(ctx context.Context) {
+	// Age audit rows out at five years, archiving each batch to the document
+	// store and verifying it before anything is deleted. Daily and batched: a
+	// table that has never been purged catches up over several nights rather
+	// than trying to move years of rows in one pass, and nothing is waiting on
+	// it. An error here deletes nothing — see PurgeExpiredAudit's ordering.
+	if r, err := s.svc.Audit.PurgeExpiredAudit(ctx, s.svc.Auditor); err != nil {
+		log.Printf("scheduler: audit_purge err=%v", err)
+	} else if r.Deleted > 0 {
+		log.Printf("scheduler: archived and purged %d audit row(s) up to %s (sha256 %s)",
+			r.Deleted, r.CoversTo.Format("2006-01-02"), r.SHA256[:12])
+	}
+
 	n, err := s.svc.SubmissionPeriods.AutoCloseExpired(ctx)
 	if err != nil {
 		log.Printf("scheduler: auto_close err=%v", err)
