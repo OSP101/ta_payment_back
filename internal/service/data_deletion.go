@@ -44,6 +44,12 @@ type DataDeletionRequest struct {
 	ReviewedBy  *uuid.UUID `json:"reviewed_by,omitempty"`
 	ReviewNote  *string    `json:"review_note,omitempty"`
 	ExecutedAt  *time.Time `json:"executed_at,omitempty"`
+	// ScrubCompletedAt is NULL, even after Status is "approved", when the
+	// document/avatar blob delete has not finished successfully yet — see
+	// migration 0109 and runScrub. ScrubError carries the last failure's
+	// message so the staff queue can show why.
+	ScrubCompletedAt *time.Time `json:"scrub_completed_at,omitempty"`
+	ScrubError       *string    `json:"scrub_error,omitempty"`
 }
 
 // DataDeletionRequestForReview is what the staff queue shows — the request
@@ -124,6 +130,7 @@ func (s *DataDeletionService) ListDeletionRequests(ctx context.Context, status s
 	q := `
 		SELECT r.id, r.user_id, r.reason, r.status, r.requested_at,
 		       r.reviewed_at, r.reviewed_by, r.review_note, r.executed_at,
+		       r.scrub_completed_at, r.scrub_error,
 		       u.email, COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''),
 		       EXISTS(
 		           SELECT 1 FROM work_logs w
@@ -151,12 +158,13 @@ func (s *DataDeletionService) ListDeletionRequests(ctx context.Context, status s
 		var r DataDeletionRequestForReview
 		if err := rows.Scan(&r.ID, &r.UserID, &r.Reason, &r.Status, &r.RequestedAt,
 			&r.ReviewedAt, &r.ReviewedBy, &r.ReviewNote, &r.ExecutedAt,
+			&r.ScrubCompletedAt, &r.ScrubError,
 			&r.RequesterEmail, &r.RequesterName, &r.HasPaymentHistory); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ReviewDeletion is the admin decision on one request.
@@ -266,8 +274,9 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE data_deletion_requests
-		SET status='approved', reviewed_at=NOW(), reviewed_by=$2, review_note=$3, executed_at=NOW()
-		WHERE id=$1`, requestID, actor, note); err != nil {
+		SET status='approved', reviewed_at=NOW(), reviewed_by=$2, review_note=$3, executed_at=NOW(),
+		    avatar_key_to_scrub=$4
+		WHERE id=$1`, requestID, actor, note, avatarKey); err != nil {
 		return err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
@@ -290,16 +299,30 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 			log.Printf("data_deletion: revoke sessions for %s failed: %v", userID, err)
 		}
 	}
-	if s.docs != nil {
-		if err := s.docs.ScrubUserDocuments(ctx, actor, userID); err != nil {
-			log.Printf("data_deletion: scrub documents for %s failed: %v", userID, err)
+
+	scrubErr := s.runScrub(ctx, actor, userID, avatarKey)
+	if scrubErr != nil {
+		// ไม่ rollback: การปิดบัญชี ลบ 2FA และ recovery code commit ไปแล้ว
+		// และถูกต้องแล้ว · แต่ห้ามรายงานว่า "ลบข้อมูลเสร็จ" ทั้งที่ไฟล์ยังอยู่
+		// บันทึกไว้ให้ sweeper มาทำต่อ และให้คิวของเจ้าหน้าที่เห็นว่าค้าง
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE data_deletion_requests
+			 SET scrub_error = $2, scrub_attempts = scrub_attempts + 1
+			 WHERE id = $1`, requestID, scrubErr.Error()); err != nil {
+			log.Printf("data_deletion: recording scrub_error for %s failed: %v", requestID, err)
 		}
+		_ = s.aud.Log(ctx, audit.Entry{
+			ActorID: &actor, Action: "user.pdpa_erasure_incomplete",
+			Entity: "user", EntityID: userID.String(), Note: scrubErr.Error(),
+		})
+		return &UserError{Status: 500, Msg: "ปิดบัญชีแล้ว แต่ลบไฟล์เอกสารไม่สำเร็จ ระบบจะลองใหม่อัตโนมัติ กรุณาแจ้งผู้ดูแลระบบ"}
 	}
-	if avatarKey != nil && *avatarKey != "" && s.store != nil {
-		if err := s.store.Delete(*avatarKey); err != nil && !os.IsNotExist(err) {
-			log.Printf("data_deletion: delete avatar %s failed: %v", *avatarKey, err)
-		}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE data_deletion_requests SET scrub_completed_at = NOW(), scrub_error = NULL WHERE id = $1`,
+		requestID); err != nil {
+		log.Printf("data_deletion: recording scrub_completed_at for %s failed: %v", requestID, err)
 	}
+
 	if s.notify != nil {
 		msg := "บัญชีของคุณถูกปิดใช้งานและข้อมูลส่วนบุคคลที่ไม่จำเป็นถูกลบแล้วตามคำขอ"
 		if hasPayment {
@@ -310,4 +333,82 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 		s.notify.Send(ctx, userID, "คำขอลบข้อมูลได้รับการอนุมัติ", msg, "/account/my-data")
 	}
 	return nil
+}
+
+// runScrub deletes everything ReviewDeletion's post-commit step owes: the
+// document blobs (DocsService.ScrubUserDocuments, force-deleting regardless
+// of the normal retention timer) and the avatar blob, if there was one.
+// Pulled out of ReviewDeletion so SweepPendingScrubs can retry the exact same
+// work later without duplicating it.
+func (s *DataDeletionService) runScrub(ctx context.Context, actor, userID uuid.UUID, avatarKey *string) error {
+	if s.docs != nil {
+		if err := s.docs.ScrubUserDocuments(ctx, actor, userID); err != nil {
+			return fmt.Errorf("scrub documents: %w", err)
+		}
+	}
+	if avatarKey != nil && *avatarKey != "" && s.store != nil {
+		if err := s.store.Delete(*avatarKey); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("delete avatar %s: %w", *avatarKey, err)
+		}
+	}
+	return nil
+}
+
+// SweepPendingScrubs retries the document/avatar scrub for every approved
+// deletion request whose files did not finish deleting the first time
+// (scrub_completed_at still NULL — see migration 0109). Intended for the
+// scheduler's hourly tick, not dailyClose: a failed scrub sitting for up to
+// 24 hours is a PDPA exposure window worth shrinking, unlike audit-retention
+// or session cleanup which tolerate a day's delay fine.
+func (s *DataDeletionService) SweepPendingScrubs(ctx context.Context) (int, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, user_id, avatar_key_to_scrub, reviewed_by
+		FROM data_deletion_requests
+		WHERE status = 'approved' AND scrub_completed_at IS NULL`)
+	if err != nil {
+		return 0, err
+	}
+	type pending struct {
+		id, userID uuid.UUID
+		avatarKey  *string
+		reviewedBy *uuid.UUID
+	}
+	var batch []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.userID, &p.avatarKey, &p.reviewedBy); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		batch = append(batch, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	rows.Close()
+
+	fixed := 0
+	for _, p := range batch {
+		actor := p.userID
+		if p.reviewedBy != nil {
+			actor = *p.reviewedBy
+		}
+		if err := s.runScrub(ctx, actor, p.userID, p.avatarKey); err != nil {
+			if _, uerr := s.pool.Exec(ctx,
+				`UPDATE data_deletion_requests
+				 SET scrub_error = $2, scrub_attempts = scrub_attempts + 1
+				 WHERE id = $1`, p.id, err.Error()); uerr != nil {
+				log.Printf("data_deletion: recording scrub_error for %s failed: %v", p.id, uerr)
+			}
+			continue
+		}
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE data_deletion_requests SET scrub_completed_at = NOW(), scrub_error = NULL WHERE id = $1`,
+			p.id); err != nil {
+			log.Printf("data_deletion: recording scrub_completed_at for %s failed: %v", p.id, err)
+			continue
+		}
+		fixed++
+	}
+	return fixed, nil
 }

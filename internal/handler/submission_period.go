@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -388,8 +389,20 @@ func (h *SubmissionPeriodHandler) StaffEditBatch(c *fiber.Ctx) error {
 			src.Close()
 			return err
 		}
-		key, size, err := h.Svc.Storage.Save("worklog-edits", uuid.New().String()+ext, src)
+		// PDPA-02: buffer for scanning — the scanner and the store both need
+		// the same bytes, and an HTTP multipart part can only be read once.
+		buf, err := io.ReadAll(io.LimitReader(src, worklogEditMaxBytes+1))
 		src.Close()
+		if err != nil {
+			return err
+		}
+		if int64(len(buf)) > worklogEditMaxBytes {
+			return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 5MB")
+		}
+		if err := h.Svc.ScanUpload(c.Context(), UserID(c), "worklog_edit_evidence", fh.Filename, buf); err != nil {
+			return err
+		}
+		key, size, err := h.Svc.Storage.Save("worklog-edits", uuid.New().String()+ext, bytes.NewReader(buf))
 		if err != nil {
 			return fiber.NewError(fiber.StatusBadRequest, err.Error())
 		}

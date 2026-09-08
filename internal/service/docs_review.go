@@ -309,6 +309,22 @@ func (s *DocsService) mintZipToken(actor, userID uuid.UUID, docIDs []uuid.UUID) 
 	return token, nil
 }
 
+// SweepZipTokens ลบโทเคนที่หมดอายุแล้วออกจาก zipTokens
+//
+// zipTokenTTL ถูกเช็คตอน consume เท่านั้น ดังนั้นโทเคนที่ไม่เคยถูกใช้ (กดเตรียม
+// ดาวน์โหลดแล้วเปลี่ยนหน้า, ดาวน์โหลดล้มเหลว, ปิดแท็บ) จะค้างตลอดอายุโปรเซส
+// และ key เป็นค่าสุ่มใหม่ทุกครั้ง จึงไม่มีเพดานแบบที่ loginAttempts มี
+//
+// เรียกจาก scheduler.tick ข้าง ๆ handler.SweepReadAudit ด้วยเหตุผลเดียวกันเป๊ะ
+func (s *DocsService) SweepZipTokens(now time.Time) {
+	s.zipTokens.Range(func(k, v any) bool {
+		if e, ok := v.(*zipTokenEntry); ok && now.After(e.Expires) {
+			s.zipTokens.Delete(k)
+		}
+		return true
+	})
+}
+
 // MintAllApprovedZipToken gates the bulk download behind the officer's password
 // and resolves the documents of the TAs the caller names.
 //

@@ -170,8 +170,32 @@ func writeFile600(full string, nonce, ct []byte) error {
 	return nil
 }
 
-func (l *Local) Open(key string) (io.ReadCloser, error) {
+// resolve แปลง key เป็น path จริงพร้อมยืนยันว่าไม่หลุดออกนอก root
+//
+// เดิมทุกจุดที่เปิดไฟล์ต้องตรวจ ".." เองก่อนเรียก Open — ซึ่งแปลว่าผู้เรียก
+// รายใหม่ที่ลืมตรวจจะเปิดช่องอ่านไฟล์อะไรก็ได้บนเครื่อง · ย้ายการตรวจมาไว้
+// ที่นี่ทำให้เป็นค่าคงที่ของ store ไม่ใช่กฎที่ต้องจำ (QUAL-04)
+func (l *Local) resolve(key string) (string, error) {
 	p := filepath.Join(l.root, filepath.FromSlash(key))
+	root, err := filepath.Abs(l.root)
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if abs != root && !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+		return "", errors.New("storage: key escapes root")
+	}
+	return abs, nil
+}
+
+func (l *Local) Open(key string) (io.ReadCloser, error) {
+	p, err := l.resolve(key)
+	if err != nil {
+		return nil, err
+	}
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
@@ -201,9 +225,21 @@ func (l *Local) Open(key string) (io.ReadCloser, error) {
 }
 
 func (l *Local) Delete(key string) error {
-	return os.Remove(filepath.Join(l.root, filepath.FromSlash(key)))
+	p, err := l.resolve(key)
+	if err != nil {
+		return err
+	}
+	return os.Remove(p)
 }
 
+// Path returns the resolved path for a key that has already been validated,
+// or the raw (unresolved) join on any traversal attempt — Path is used in
+// a handful of places that build a URL/log line rather than open the file,
+// where returning an error would change every caller's signature for a case
+// storage.Local's own Open/Delete already refuse to act on.
 func (l *Local) Path(key string) string {
+	if p, err := l.resolve(key); err == nil {
+		return p
+	}
 	return filepath.Join(l.root, filepath.FromSlash(key))
 }

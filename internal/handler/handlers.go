@@ -111,6 +111,20 @@ func (h *UserHandler) ResetPassword(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// staff รีเซ็ตรหัสให้บัญชี admin/staff/executive ไม่ได้ — เฉพาะ admin เท่านั้น
+	// เหตุผลเดียวกับที่ /users/:id/2fa/reset เป็น admin-only (ดูข้างบน): staff
+	// ที่รีเซ็ตรหัส admin ได้ + อ่าน temp_password จาก response ได้ = เส้นทาง
+	// ยึดบัญชี admin แบบคลิกเดียว ที่มี 2FA บังคับเป็นตัวกั้นตัวเดียว — และ
+	// MFA_MANDATORY_ENFORCED ปิดตัวกั้นนั้นได้ด้วย env ตัวเดียว
+	if !rbac.Has(Roles(c), rbac.RoleAdmin) {
+		targetRoles, err := h.Svc.Users.RolesOf(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		if rbac.Has(targetRoles, rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleExecutive) {
+			return fiber.NewError(fiber.StatusForbidden, "รีเซ็ตรหัสผ่านของบัญชีผู้ดูแล/เจ้าหน้าที่ ต้องให้ผู้ดูแลระบบดำเนินการ")
+		}
+	}
 	pw, err := h.Svc.Users.ResetPassword(c.Context(), UserID(c), id)
 	if err != nil {
 		return err
@@ -2297,7 +2311,24 @@ func (h *AnnounceHandler) UploadMedia(c *fiber.Ctx) error {
 		return err
 	}
 
-	key, size, err := h.Svc.Storage.Save("announcements", uuid.New().String()+spec.Ext, src)
+	// PDPA-02: this is the most exposed of the four unscanned upload paths —
+	// what lands here is served to anyone with no account at all via
+	// GET /public/announcements/media/*. Buffering the whole file is what
+	// scanning needs anyway (the scanner and the store both need the same
+	// bytes, and an HTTP multipart part can only be read once).
+	buf, err := io.ReadAll(io.LimitReader(src, announceMediaMaxBytes[spec.Kind]+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(buf)) > announceMediaMaxBytes[spec.Kind] {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge,
+			"ไฟล์ใหญ่เกิน "+strconv.FormatInt(announceMediaMaxBytes[spec.Kind]/(1024*1024), 10)+" MB")
+	}
+	if err := h.Svc.ScanUpload(c.Context(), UserID(c), "announcement_media", fh.Filename, buf); err != nil {
+		return err
+	}
+
+	key, size, err := h.Svc.Storage.Save("announcements", uuid.New().String()+spec.Ext, bytes.NewReader(buf))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
@@ -2425,10 +2456,23 @@ func (h *AnnounceHandler) UploadImage(c *fiber.Ctx) error {
 		return err
 	}
 
+	// PDPA-02: buffer for scanning — the scanner and the store both need the
+	// same bytes, and an HTTP multipart part can only be read once.
+	buf, err := io.ReadAll(io.LimitReader(src, announceImageMaxBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(buf)) > announceImageMaxBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 5MB")
+	}
+	if err := h.Svc.ScanUpload(c.Context(), UserID(c), "announcement_image", fh.Filename, buf); err != nil {
+		return err
+	}
+
 	// Preserve the true extension based on the sniffed MIME rather than the
 	// (possibly forged) filename.
 	stored := uuid.New().String() + ext
-	key, size, err := h.Svc.Storage.Save("announcements", stored, src)
+	key, size, err := h.Svc.Storage.Save("announcements", stored, bytes.NewReader(buf))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}

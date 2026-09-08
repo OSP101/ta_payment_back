@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -621,6 +623,55 @@ type SignatureItem struct {
 	// Responsible is the person's name — one name now, not a joined list.
 	Responsible string  `json:"responsible"`
 	SignedAt    *string `json:"signed_at,omitempty"`
+}
+
+// PublicSignatureItem คือ SignatureItem ที่ตัด signer_id ออก
+//
+// บอร์ดสาธารณะตั้งใจให้เห็นชื่อ (ลิงก์ถูกแปะในกลุ่ม LINE เพื่อให้ดูว่าเอกสาร
+// ไปถึงไหนแล้ว) แต่ users.id ไม่ได้ตั้งใจ และมันคือ join key ของ endpoint
+// ที่ต้องล็อกอิน · SignerRef เป็น hash สั้น ๆ พอให้ UI จัดกลุ่มแถวของคนเดียวกัน
+// ได้ โดยไม่เผย id จริง
+//
+// Deliberately NOT `SignatureItem` embedded with a shadowing `SignerID
+// struct{} json:"-"` field — that looks like it should shadow the promoted
+// field, but encoding/json drops "-"-tagged fields before the shadowing
+// comparison ever runs, so the embedded signer_id would still serialise.
+// Listing every field explicitly is the only way that is actually correct.
+type PublicSignatureItem struct {
+	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
+	Code             string    `json:"code"`
+	NameTH           string    `json:"name_th"`
+	Exported         bool      `json:"exported"`
+	Role             string    `json:"role"`
+	RoleLabel        string    `json:"role_label"`
+	SignerRef        string    `json:"signer_ref,omitempty"`
+	Responsible      string    `json:"responsible"`
+	SignedAt         *string   `json:"signed_at,omitempty"`
+}
+
+// ToPublicSignatureItems maps the authenticated checklist rows down to the
+// public projection. SignerRef is hex(sha256(signerID || termID))[:12] —
+// bound to the term so the same person's ref does not carry across terms,
+// which would let a public viewer link one person's rows across boards.
+func ToPublicSignatureItems(items []SignatureItem, termID uuid.UUID) []PublicSignatureItem {
+	out := make([]PublicSignatureItem, len(items))
+	for i, it := range items {
+		out[i] = PublicSignatureItem{
+			TeachingCourseID: it.TeachingCourseID,
+			Code:             it.Code,
+			NameTH:           it.NameTH,
+			Exported:         it.Exported,
+			Role:             it.Role,
+			RoleLabel:        it.RoleLabel,
+			Responsible:      it.Responsible,
+			SignedAt:         it.SignedAt,
+		}
+		if it.SignerID != nil {
+			sum := sha256.Sum256(append([]byte(it.SignerID.String()), termID[:]...))
+			out[i].SignerRef = hex.EncodeToString(sum[:])[:12]
+		}
+	}
+	return out
 }
 
 // signatureRoles maps a stage number to the role signing at it. Stages 4 and 5

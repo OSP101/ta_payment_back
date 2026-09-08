@@ -142,7 +142,12 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 			        u.totp_enabled_at,
 			        s.revoked_at, s.revoke_reason, s.last_activity_at, s.selected_enrollment_id
 			 FROM users u
-			 LEFT JOIN sessions s ON s.id = $2
+			 -- s.user_id = u.id ไม่ใช่ของฟุ่มเฟือย: ถ้าไม่มี สิ่งเดียวที่ผูก
+			 -- session เข้ากับผู้ใช้คือลายเซ็น JWT · การเติมเงื่อนไขนี้ทำให้
+			 -- ความผูกพันนั้นเป็น invariant ของฐานข้อมูล ซึ่งอยู่รอดได้แม้จะมี
+			 -- เส้นทางออกโทเคนใหม่ (เช่น SSOCallback ที่ยังเป็น stub) ที่ลืม
+			 -- ตรวจอะไรบางอย่าง
+			 LEFT JOIN sessions s ON s.id = $2 AND s.user_id = u.id
 			 WHERE u.id = $1 AND u.deleted_at IS NULL`,
 			uid, sid).Scan(&isActive, &mustChange, &isExecutive, &totpEnabledAt,
 			&sessRevokedAt, &sessRevokeReason, &sessLastActivity, &selectedEnrollmentID)

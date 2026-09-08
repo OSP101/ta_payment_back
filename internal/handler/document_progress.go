@@ -234,5 +234,8 @@ func (h *DocProgressHandler) PublicListChecklist(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(out)
+	// PDPA-03: signer_id (users.id) is a join key for authenticated endpoints
+	// (/users/:id/avatar and friends) — it must not ride along on the
+	// anonymous board just because the same struct is reused internally.
+	return c.JSON(service.ToPublicSignatureItems(out, termID))
 }

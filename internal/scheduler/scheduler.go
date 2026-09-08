@@ -41,11 +41,20 @@ func (s *Scheduler) loop(ctx context.Context) {
 	// Do one immediate sweep so restarts don't miss a due window that only
 	// has a few hours left; then settle into hourly cadence.
 	s.tick(ctx)
+	// เรียกทันทีตอนเริ่ม ด้วยเหตุผลเดียวกับ s.tick ข้างบน: ticker 24 ชม.
+	// เดิมยิงครั้งแรกที่ชั่วโมงที่ 24 และรีเซ็ตทุกครั้งที่โปรเซสรีสตาร์ท ⇒
+	// deployment ที่ deploy ถี่กว่าวันละครั้งจะไม่เคยรัน dailyClose เลยแม้แต่
+	// ครั้งเดียว (นโยบายเก็บ audit 5 ปี, การล้าง session/challenge, และการตั้ง
+	// is_closed ทั้งหมดอยู่ในนี้) — shouldRunDaily เช็ค DB เอง จึงเรียกได้ที่นี่
+	// อย่างปลอดภัยแม้ dailyClose เพิ่งรันไปเมื่อไม่กี่นาทีก่อนรีสตาร์ท
+	if s.shouldRunDaily(ctx) {
+		s.dailyClose(ctx)
+	}
 
+	// เก็บวันที่รันล่าสุดใน DB แล้วเช็คทุกชั่วโมงว่าวันนี้รันไปหรือยัง —
+	// ทนต่อการรีสตาร์ทได้จริง ต่างจาก ticker แบบเดิมที่นับจากเวลา boot
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
-	dailyCheck := time.NewTicker(24 * time.Hour)
-	defer dailyCheck.Stop()
 
 	for {
 		select {
@@ -53,10 +62,29 @@ func (s *Scheduler) loop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.tick(ctx)
-		case <-dailyCheck.C:
-			s.dailyClose(ctx)
+			if s.shouldRunDaily(ctx) {
+				s.dailyClose(ctx)
+			}
 		}
 	}
+}
+
+// shouldRunDaily reports whether dailyClose has not yet run today (Bangkok
+// calendar day — the process and DB both run TZ=Asia/Bangkok, see
+// deploy/docker-compose.yml). Checking the DB rather than an in-memory
+// timestamp is what survives a restart: an in-memory "last ran at" resets to
+// zero on every boot, which is the exact bug this replaces.
+func (s *Scheduler) shouldRunDaily(ctx context.Context) bool {
+	var upToDate bool
+	err := s.svc.Pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM scheduler_daily_close_state WHERE last_run_at::date = CURRENT_DATE
+		)`).Scan(&upToDate)
+	if err != nil {
+		log.Printf("scheduler: shouldRunDaily check failed, skipping this hour: %v", err)
+		return false
+	}
+	return !upToDate
 }
 
 func (s *Scheduler) tick(ctx context.Context) {
@@ -65,6 +93,28 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// hour, and without a sweep a long-lived process keeps every one of them
 	// for the life of the process. See handler/audit_read.go.
 	handler.SweepReadAudit(time.Now())
+
+	// AUTH-01: unknownAttempts is keyed by an open key space (any email
+	// string anyone submits), unlike loginAttempts which is bounded by real
+	// user count — see login_gate.go.
+	service.SweepLoginGate(time.Now())
+
+	// PDPA-01: retry document/avatar deletion for any approved erasure
+	// request whose files did not finish deleting the first time. Hourly,
+	// not daily — a scrub failure left sitting is exactly the state a PDPA
+	// erasure guarantee is not supposed to have.
+	if n, err := s.svc.DataDeletion.SweepPendingScrubs(ctx); err != nil {
+		log.Printf("scheduler: sweep_pending_scrubs err=%v", err)
+	} else if n > 0 {
+		log.Printf("scheduler: completed %d pending PDPA scrub(s)", n)
+	}
+
+	// OPS-03: zipTokens is keyed by a fresh random token every mint, unlike
+	// loginAttempts/pwAttempts which are bounded by real user count — an
+	// unconsumed token (staff clicked "prepare download" then navigated
+	// away, or the download failed) sits in the map for the life of the
+	// process without this.
+	s.svc.Docs.SweepZipTokens(time.Now())
 
 	// Safety net for the deferred TA-request decision. The primary trigger runs
 	// when a TA saves their timetable; this catches anything that trigger
@@ -137,5 +187,17 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 		log.Printf("scheduler: mfa_challenge_cleanup err=%v", err)
 	} else if n > 0 {
 		log.Printf("scheduler: cleaned up %d expired mfa challenge(s)", n)
+	}
+
+	// Recorded LAST, unconditionally: even a run where every step above
+	// logged an error still counts as "attempted today" — shouldRunDaily's
+	// job is to guarantee at least one attempt per day, not to guarantee
+	// every step succeeded (each step already logs its own failure).
+	// Retrying the same day's work every hour on a transient error would
+	// just repeat whatever already failed.
+	if _, err := s.svc.Pool.Exec(ctx, `
+		INSERT INTO scheduler_daily_close_state (id, last_run_at) VALUES (TRUE, NOW())
+		ON CONFLICT (id) DO UPDATE SET last_run_at = NOW()`); err != nil {
+		log.Printf("scheduler: recording dailyClose run failed: %v", err)
 	}
 }

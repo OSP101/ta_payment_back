@@ -17,6 +17,10 @@ import (
 // own actor must not leak into the next one.
 func loginGateReset(userID uuid.UUID) { loginAttempts.Delete(userID) }
 
+// unknownGateReset is loginGateReset's counterpart for the AUTH-01 gate keyed
+// by email hash rather than user id.
+func unknownGateReset(email string) { unknownAttempts.Delete(unknownKey(email)) }
+
 func TestLogin_LocksOutAfterRepeatedWrongPasswords(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	t.Cleanup(func() { loginGateReset(f.StaffID) })
@@ -81,23 +85,27 @@ func TestLogin_OnlyConsecutiveFailuresCount(t *testing.T) {
 	}
 }
 
-// A nonexistent email must never lock — see login_gate.go's doc comment on
-// loginAttempts for why the map is keyed on the resolved user id rather than
-// the raw email string. Repeated attempts against an address with no account
-// behind it should just keep answering the ordinary "wrong credentials" 401,
-// never a 429.
-func TestLogin_UnknownEmailNeverLocksOut(t *testing.T) {
+// AUTH-01: a nonexistent email used to NEVER lock, while a real account
+// locked at loginMaxFails — that asymmetry is a clean oracle for "does this
+// address have an account" (see login_gate.go's doc comment on
+// unknownAttempts). Fixed: unresolved emails now lock the same way, keyed by
+// a hash of the email instead of a user id.
+func TestLogin_UnknownEmailAlsoLocksOutAfterRepeatedFailures(t *testing.T) {
+	const email = "no-such-account@example.test"
 	f := newFixture(t, fixtureOpts{})
+	t.Cleanup(func() { unknownGateReset(email) })
 
-	for i := 1; i <= loginMaxFails+3; i++ {
-		_, err := f.users().Authenticate(f.ctx, "no-such-account@example.test", "whatever", "127.0.0.1", "test")
+	for i := 1; i <= loginMaxFails; i++ {
+		_, err := f.users().Authenticate(f.ctx, email, "whatever", "127.0.0.1", "test")
 		ue, ok := err.(*UserError)
-		if !ok {
-			t.Fatalf("attempt #%d: want a UserError, got %#v", i, err)
+		if !ok || ue.Status != 401 {
+			t.Fatalf("attempt #%d: want a plain 401, got %#v", i, err)
 		}
-		if ue.Status != 401 {
-			t.Fatalf("attempt #%d: unknown email must stay a plain 401, got %d", i, ue.Status)
-		}
+	}
+	_, err := f.users().Authenticate(f.ctx, email, "whatever", "127.0.0.1", "test")
+	ue, ok := err.(*UserError)
+	if !ok || ue.Status != 429 {
+		t.Fatalf("after %d failed attempts against an unresolved email, want 429, got %#v", loginMaxFails+1, err)
 	}
 }
 

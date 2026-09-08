@@ -19,6 +19,10 @@ type Container struct {
 	Mailer  *mail.Mailer
 	Auditor *audit.Auditor
 	Cfg     config.Config
+	// AV is the ONE antivirus scanner instance for the whole process — see
+	// ScanUpload (upload_scan.go). Exported so it is shared, not one scanner
+	// per service each independently deciding whether to bother calling it.
+	AV antivirus.Scanner
 
 	Sessions          *SessionService
 	Appointment       *AppointmentOrderService
@@ -62,6 +66,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	if !av.Enabled() {
 		log.Printf("WARNING: CLAMAV_ADDR is not set — uploaded documents are NOT virus-scanned")
 	}
+	c.AV = av
 	c.Docs = &DocsService{pool: pool, aud: auditor, store: store, av: av, pii: piiCipher}
 	// Workload holds a back-reference to TARequest so saving a TA timetable can
 	// finalise the requests that were waiting for it (deferred-decision model).

@@ -1,0 +1,1 @@
+DROP TABLE scheduler_daily_close_state;

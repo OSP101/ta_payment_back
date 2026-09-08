@@ -102,10 +102,17 @@ func AddAuthorizedTester(ctx context.Context, pool *pgxpool.Pool, email string, 
 	return err
 }
 
-// RemoveAuthorizedTester revokes email's access outright. Anyone currently
-// sitting in a demo session under that email loses the ability to log into
-// ANY account on their very next request — see Manager.TierForSlotIndex,
-// which looks this up fresh rather than trusting a token's own claims.
+// RemoveAuthorizedTester revokes email's access outright.
+//
+// This alone does NOT end an in-progress demo session — TierForSlotIndex is
+// only consulted at login (LoginHandler.Login), never by DemoAuthenticated
+// or AccountGuard on later requests, so a token already issued keeps working
+// until it expires (JWT_LIFETIME, 12h default) or something else revokes the
+// underlying sessions row. The caller (admin.go's DELETE handler) is
+// responsible for that: it also calls Manager.Release, which — as of
+// DEMO-02 — revokes every live session in the tester's slot as part of
+// releasing it, so removal DOES take effect immediately in practice; it is
+// Release doing that work, not this function.
 func RemoveAuthorizedTester(ctx context.Context, pool *pgxpool.Pool, email string) error {
 	email = normalizeEmail(email)
 	_, err := pool.Exec(ctx, `DELETE FROM demo_authorized_testers WHERE email = $1`, email)

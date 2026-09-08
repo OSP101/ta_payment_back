@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
+
+	"ta-payment-back/internal/rbac"
 )
 
 // Profile pictures (รูปโปรไฟล์).
@@ -57,6 +59,20 @@ func (h *UserHandler) UploadAvatarFor(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// lecturer ตั้งรูปให้คนอื่นได้เฉพาะบัญชี TA ที่ตัวเองเพิ่งสร้าง — เข้าคู่กับ
+	// UserHandler.Create ที่จำกัด lecturer ไว้ให้สร้างได้แค่บัญชี TA เท่านั้น
+	// เดิมไม่มีการตรวจตรงนี้เลย lecturer จึงเปลี่ยนรูปโปรไฟล์ของ admin ได้
+	// ด้วย POST เดียว
+	if rbac.Has(Roles(c), rbac.RoleLecturer) && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		targetRoles, err := h.Svc.Users.RolesOf(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		if !rbac.Has(targetRoles, rbac.RoleTA) ||
+			rbac.Has(targetRoles, rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer) {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+	}
 	return h.uploadAvatarFor(c, id)
 }
 
@@ -81,6 +97,12 @@ func (h *UserHandler) uploadAvatarFor(c *fiber.Ctx, id uuid.UUID) error {
 		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 8MB")
 	}
 
+	// PDPA-02: NOT run through Container.ScanUpload, unlike the other upload
+	// paths — normalizeAvatar decodes the source into pixels and re-encodes a
+	// brand new JPEG from them, which destroys any payload smuggled in
+	// EXIF/trailing chunks/polyglot bytes before the result ever touches
+	// storage. A virus scan of the pre-decode bytes would still be scanning
+	// something that can never reach disk.
 	jpg, err := normalizeAvatar(raw)
 	if err != nil {
 		return err

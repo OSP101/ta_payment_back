@@ -24,6 +24,27 @@ func checkpointSchemaName(slot *Slot) string {
 	return slot.SchemaName + "_checkpoint"
 }
 
+// checkpointExcludedTables lists tables that must never be saved into, or
+// restored from, a checkpoint.
+//
+// ตารางที่ไม่ควรเข้า checkpoint: สถานะการล็อกอินเป็นของ "ตอนนี้" ไม่ใช่ของ
+// "จุดที่บันทึกไว้" · ย้อน sessions กลับไปด้วยแปลว่าคนที่กดปุ่มย้อนกลับจะโดน
+// เตะออกจากระบบทันที ซึ่งขัดกับที่ UI สัญญาไว้ว่า restore ไม่ต้อง login ใหม่
+// (คอมเมนต์เดิมของ RestoreCheckpoint บอกแบบนั้น แต่โค้ดจริงย้อนทุกตารางรวม
+// sessions ด้วย — ดู DEMO-04) mfa_challenges ไปด้วยเหตุผลเดียวกัน: มันคือ
+// สถานะของ 2FA challenge ที่กำลังเปิดอยู่ตอนนี้ ไม่ใช่ข้อมูลของฉาก
+var checkpointExcludedTables = map[string]bool{"sessions": true, "mfa_challenges": true}
+
+func withoutCheckpointExcludedTables(tables []string) []string {
+	out := make([]string, 0, len(tables))
+	for _, t := range tables {
+		if !checkpointExcludedTables[t] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // SaveCheckpoint overwrites this slot's one checkpoint with its current
 // data. CREATE TABLE ... AS TABLE carries no constraints, indexes, or
 // defaults into the copy — irrelevant here, since checkpoint tables are only
@@ -34,6 +55,7 @@ func (m *Manager) SaveCheckpoint(ctx context.Context, slot *Slot) error {
 	if err != nil {
 		return err
 	}
+	tables = withoutCheckpointExcludedTables(tables)
 	cp := checkpointSchemaName(slot)
 	if _, err := slot.Pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+quoteIdent(cp)+` CASCADE`); err != nil {
 		return fmt.Errorf("demo: clearing previous checkpoint: %w", err)

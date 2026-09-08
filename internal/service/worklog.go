@@ -2007,7 +2007,14 @@ func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID
 	var capBaht float64
 	if err := s.pool.QueryRow(ctx,
 		`SELECT daily_pay_cap_baht FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&capBaht); err != nil {
-		return nil // no pay_rates → skip cap
+		// เฉพาะ "ไม่มีแถว pay_rates เลย" เท่านั้นที่แปลว่ายังไม่ตั้งเพดาน
+		// error อื่น (connection reset, timeout, context cancelled) แปลว่า
+		// "อ่านไม่ได้" ไม่ใช่ "ไม่มีเพดาน" — เดิมกลืนรวมกันหมด ⇒ DB สะดุด
+		// ครั้งเดียวก็บันทึกงานเกิน ฿300/วัน ได้ถาวร โดยไม่มีใครรู้
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("อ่านเพดานค่าตอบแทนรายวันไม่สำเร็จ: %w", err)
 	}
 	if capBaht <= 0 {
 		return nil

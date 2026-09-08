@@ -410,9 +410,15 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	// stays the combined figure for display.
 	var budgetMax float64
 	if s.budget != nil {
-		if snap, err := s.budget.Compute(ctx, teachingCourseID); err == nil {
-			budgetMax = snap.PerCourseMaxBaht
+		// เดิม `if err == nil` กลืน error ทิ้งแล้วปล่อย budgetMax ค้างที่ 0 —
+		// ผลตรงไปยัง CoursePreview.OverBudget (`budgetMax > 0 && ...`) ซึ่งเป็น
+		// บั๊กเดียวกับ PAY-01 ใน budget_settlement.go: DB สะดุดครั้งเดียว ⇒
+		// หน้า preview รายงานว่าไม่เกินงบทั้งที่จริงอาจเกินแล้ว
+		snap, err := s.budget.Compute(ctx, teachingCourseID)
+		if err != nil {
+			return nil, fmt.Errorf("buildExportRows %s: อ่านเพดานงบไม่สำเร็จ: %w", teachingCourseID, err)
 		}
+		budgetMax = snap.PerCourseMaxBaht
 	}
 	// Month cutoff replaces pro-rata (04/08/2026). Instead of scaling everyone
 	// down by a factor nobody can derive from the claim form, whole months are

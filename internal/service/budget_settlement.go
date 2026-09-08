@@ -597,9 +597,15 @@ func (s *ExportService) settleAs(
 	}
 	var capRegular, capSpecial float64
 	if s.budget != nil {
-		if snap, err := s.budget.Compute(ctx, courseID); err == nil {
-			capRegular, capSpecial = snap.TermPayRegular, snap.TermPaySpecial
+		// เดิมเป็น `if err == nil` เฉย ๆ ซึ่งกลืน error ทิ้ง แล้วปล่อยให้ cap
+		// ค้างที่ 0 — ซึ่ง settleTrack อ่านว่า "ไม่จำกัด" ตรงข้ามกับความจริง
+		// ที่ว่าเราแค่อ่านเพดานไม่ได้ ⇒ DB สะดุดครั้งเดียว = จ่ายเกินงบเงียบ ๆ
+		// ทั้งคอร์ส "ยังไม่ตั้งค่า" กับ "อ่านไม่ได้" ต้องไม่ลงเอยที่ผลลัพธ์เดียวกัน
+		snap, err := s.budget.Compute(ctx, courseID)
+		if err != nil {
+			return nil, fmt.Errorf("settle %s: อ่านเพดานงบไม่สำเร็จ: %w", courseID, err)
 		}
+		capRegular, capSpecial = snap.TermPayRegular, snap.TermPaySpecial
 	}
 
 	// Cost per (month, pool) under the SAME pricing the claim document prints —

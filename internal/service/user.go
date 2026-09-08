@@ -278,6 +278,32 @@ func (s *UserService) SetAvatar(ctx context.Context, actor, id uuid.UUID, key st
 	return *avatarURL(id, &key, &at), replaced, nil
 }
 
+// RolesOf answers what roles a user holds, including the synthetic
+// "executive" role — same query rbac.RBAC.Roles runs, duplicated here because
+// UserService has no dependency on the rbac package (it would be circular:
+// rbac.Has is what callers use to interpret the result). Used by
+// UploadAvatarFor (AUTHZ-01) to check the TARGET's roles, not the caller's.
+func (s *UserService) RolesOf(ctx context.Context, userID uuid.UUID) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT role::text FROM user_roles WHERE user_id = $1
+		 UNION ALL
+		 SELECT 'executive' FROM admin_officers WHERE user_id = $1 AND is_active
+		 ORDER BY 1`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ClearAvatar removes the picture and returns the key to delete from the store.
 func (s *UserService) ClearAvatar(ctx context.Context, id uuid.UUID) (string, error) {
 	var old *string
@@ -320,6 +346,16 @@ func (s *UserService) Authenticate(ctx context.Context, email, password, ip, use
 	u, hash, err := s.FindByEmail(ctx, email)
 	if err != nil || u == nil || hash == "" {
 		auth.DummyCompare(password)
+		// AUTH-01: ก่อนหน้านี้อีเมลที่หาบัญชีไม่เจอไม่เคยถูก lock เลย ขณะที่
+		// อีเมลจริงถูก lock ที่ครั้งที่ 8 ด้วย 429 — ความต่างนั้นเป็น oracle ที่
+		// สะอาดมากสำหรับนับว่าอีเมลไหนมีบัญชีจริง (เดิมคอมเมนต์ที่นี่บอกว่า
+		// "บัญชีที่ไม่มีอยู่จริงไม่มีอะไรต้องปกป้อง" ซึ่งข้ามเรื่องนี้ไป) —
+		// unknownGateCheck/unknownGateFail ให้ผลลัพธ์และข้อความเดียวกันทุก
+		// ประการกับเส้นทางบัญชีจริงที่ถูก lock ดู login_gate.go
+		if gateErr := unknownGateCheck(email); gateErr != nil {
+			return nil, gateErr
+		}
+		unknownGateFail(email)
 		// An attempt against an address that is not an account used to leave NO
 		// trace whatsoever — no audit row, nothing but a 401. That is the exact
 		// shape of credential stuffing and of someone guessing at staff

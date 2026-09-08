@@ -86,13 +86,32 @@ func DemoDownloadWatermark() fiber.Handler {
 	}
 }
 
-// prefixDispositionFilenames adds "ตัวอย่าง-" to both filename parameters in
-// a Content-Disposition header built by handler.contentDisposition — a
+// prefixDispositionFilenames adds a demo prefix to both filename parameters
+// in a Content-Disposition header built by handler.contentDisposition — a
 // plain string replace rather than a general RFC 6266 parser, since this
 // package controls (and tests against) the exact two-parameter shape that
 // function always produces: `filename="…"; filename*=UTF-8”…`.
+//
+// The two parameters use DIFFERENT prefixes on purpose:
+//
+//	filename=   must be ASCII — HTTP header values are ISO-8859-1, and
+//	            content_disposition.go's own asciiFilenameFallback comment
+//	            explains why raw UTF-8 bytes written straight into this
+//	            parameter get reinterpreted one byte at a time by any client
+//	            that reads this parameter instead of filename* (a simple
+//	            parser, `curl -OJ`, an email gateway). This file used to put
+//	            "ตัวอย่าง-" here too, which is exactly the mistake
+//	            asciiFilenameFallback exists to prevent — reintroduced by
+//	            this middleware. ⇒ "SAMPLE-".
+//	filename*=  RFC 5987 percent-encoded UTF-8 — Thai is fine here.
+//
+// This matters most for .docx/.xlsx: this package's own doc comment above
+// (watermarkAll) admits those formats carry no in-content watermark, so the
+// filename prefix is the ONLY signal that distinguishes a demo document from
+// a real appointment order — and it must not land corrupted on the one
+// parameter plain clients actually read.
 func prefixDispositionFilenames(cd string) string {
-	cd = strings.Replace(cd, `filename="`, `filename="ตัวอย่าง-`, 1)
+	cd = strings.Replace(cd, `filename="`, `filename="SAMPLE-`, 1)
 	cd = strings.Replace(cd, `filename*=UTF-8''`, `filename*=UTF-8''`+prefixEscaped, 1)
 	return cd
 }

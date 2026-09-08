@@ -98,19 +98,13 @@ func Mount(app *fiber.App, m *Manager) {
 		})
 	})
 
-	root.Post("/reset", enterLimiter, func(c *fiber.Ctx) error {
-		var in struct {
-			Email string `json:"email" validate:"required,email"`
-		}
-		if err := handler.Bind(c, &in); err != nil {
-			return err
-		}
-		slot, err := m.Reset(c.Context(), in.Email)
-		if err != nil {
-			return err
-		}
-		return c.JSON(fiber.Map{"base_path": slotBasePath(slot.Index)})
-	})
+	// เอา /reset ที่ไม่มี auth ออก — ปุ่ม "เริ่มใหม่ทั้งหมด" ใช้
+	// <base_path>/scenario/reset ซึ่งอยู่หลัง DemoAuthenticated + AccountGuard
+	// อยู่แล้ว · endpoint เดิมรับแค่ {"email": "..."} แล้ว TRUNCATE ทุกตาราง
+	// ในสคีมาของคนนั้น โดยไม่พิสูจน์อะไรเลยว่าผู้เรียกเป็นเจ้าของอีเมล และ
+	// ไม่เช็ค demo_authorized_testers ด้วยซ้ำ (ต่างจาก /enter ที่เช็คผ่าน
+	// LookupTier) — ใครก็เดาอีเมลสถาบันแล้วล้าง sandbox ของคนอื่นได้
+	// root.Post("/reset", ...) — ลบทิ้ง
 
 	tokens := m.Tokens()
 	for _, slot := range m.Slots() {
@@ -200,9 +194,15 @@ func Mount(app *fiber.App, m *Manager) {
 		})
 		// Unlike /scenario/reset, a restore does NOT touch the users table
 		// (checkpoint tables are restored as-is, same rows/passwords that
-		// existed when saved) — the current session stays valid, so this
-		// does not need the frontend to treat every response as "log in
-		// again" the way reset does.
+		// existed when saved) and, since DEMO-04, does not touch `sessions`
+		// or `mfa_challenges` either (see checkpointExcludedTables in
+		// checkpoint.go) — the current session stays valid, so this does not
+		// need the frontend to treat every response as "log in again" the
+		// way reset does. (Before DEMO-04, `sessions` WAS restored along
+		// with everything else, which silently logged out anyone whose jti
+		// did not match a row from the moment the checkpoint was saved —
+		// exactly the account-switch-then-restore sequence the panel is
+		// built around.)
 		scenario.Post("/scenario/checkpoint/restore", func(c *fiber.Ctx) error {
 			if err := m.RestoreCheckpoint(c.Context(), slot); err != nil {
 				return err

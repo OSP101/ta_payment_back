@@ -390,9 +390,27 @@ func (m *Manager) TouchSlotActivity(ctx context.Context, idx int) error {
 // response — not an error either way if ownerEmail held nothing.
 func (m *Manager) Release(ctx context.Context, ownerEmail string) (bool, error) {
 	ownerEmail = strings.ToLower(strings.TrimSpace(ownerEmail))
+	// หา slot ก่อน เพื่อจะ revoke session ที่ยังเปิดอยู่ในนั้น — ไม่ใช่แค่
+	// ปลด owner_email · TierForSlotIndex ถูกเช็คตอน login เท่านั้น ดังนั้น
+	// ถ้าไม่ revoke ตรงนี้ คุกกี้เดิมของคนที่เพิ่งถูกเพิกถอนสิทธิ์จะยังใช้ได้
+	// ต่ออีกจนหมดอายุ JWT (ค่าเริ่มต้น 12 ชม.) ซึ่งขัดกับสิ่งที่คอมเมนต์ของ
+	// RemoveAuthorizedTester สัญญาไว้
+	var idx *int
+	_ = m.mainPool.QueryRow(ctx,
+		`SELECT slot_index FROM demo_workspaces WHERE owner_email = $1`, ownerEmail).Scan(&idx)
+
 	tag, err := m.mainPool.Exec(ctx, `UPDATE demo_workspaces SET owner_email=NULL WHERE owner_email=$1`, ownerEmail)
 	if err != nil {
 		return false, err
+	}
+	if idx != nil {
+		if slot, serr := m.slotByIndex(*idx); serr == nil {
+			if _, rerr := slot.Pool.Exec(ctx,
+				`UPDATE sessions SET revoked_at = NOW(), revoke_reason = 'demo_access_revoked'
+				 WHERE revoked_at IS NULL`); rerr != nil {
+				log.Printf("demo: revoking sessions in slot %d: %v", *idx, rerr)
+			}
+		}
 	}
 	return tag.RowsAffected() > 0, nil
 }
@@ -432,36 +450,11 @@ func (m *Manager) TierForSlotIndex(ctx context.Context, idx int) (Tier, error) {
 	return tier, nil
 }
 
-// Reset wipes and reseeds ownerEmail's own slot ("เริ่มใหม่ทั้งหมด" — see the
-// plan doc's simulator panel). Ownership and slot assignment are untouched;
-// only the data inside it changes. Used by the unauthenticated /api/demo/reset
-// endpoint, where email is the only identity available.
-func (m *Manager) Reset(ctx context.Context, ownerEmail string) (*Slot, error) {
-	ownerEmail = strings.ToLower(strings.TrimSpace(ownerEmail))
-	var idx int
-	if err := m.mainPool.QueryRow(ctx,
-		`SELECT slot_index FROM demo_workspaces WHERE owner_email = $1`, ownerEmail,
-	).Scan(&idx); err != nil {
-		if isNoRows(err) {
-			return nil, errors.New("demo: no workspace claimed for this email")
-		}
-		return nil, err
-	}
-	slot, err := m.slotByIndex(idx)
-	if err != nil {
-		return nil, err
-	}
-	if err := m.ResetSlot(ctx, slot); err != nil {
-		return nil, err
-	}
-	return slot, nil
-}
-
-// ResetSlot does the same wipe-and-reseed as Reset, keyed by an
-// already-resolved Slot instead of an email — what the simulator panel's own
-// in-session "เริ่มใหม่ทั้งหมด" route uses (handlers.go), since a request
-// already inside a slot's authed routes has no reason to look its owner's
-// email back up just to find the slot it is already standing in.
+// ResetSlot wipes and reseeds a slot ("เริ่มใหม่ทั้งหมด" — see the plan doc's
+// simulator panel). Keyed by an already-resolved, authenticated Slot rather
+// than an owner email: a request already inside a slot's authed routes
+// (handlers.go's scenario.Post("/scenario/reset")) has no reason to trust a
+// caller-supplied email as proof of ownership.
 func (m *Manager) ResetSlot(ctx context.Context, slot *Slot) error {
 	if err := m.resetSlotData(ctx, slot); err != nil {
 		return err

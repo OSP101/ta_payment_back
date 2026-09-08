@@ -1,7 +1,9 @@
 package service
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,4 +90,74 @@ func loginGateFail(userID uuid.UUID) {
 // accumulate their way into a lockout.
 func loginGateSucceed(userID uuid.UUID) {
 	loginAttempts.Delete(userID)
+}
+
+// unknownAttempts นับความล้มเหลวของอีเมลที่ FindByEmail หาไม่เจอ
+//
+// เดิมไม่มีตัวนี้ และคอมเมนต์เก่าสรุปว่า "บัญชีที่ไม่มีอยู่จริงไม่มีอะไรต้องปกป้อง
+// จึงไม่ต้อง lock" — ข้อสรุปนั้นผิด เพราะความ "ไม่เคย lock" ของอีเมลมั่ว เทียบกับ
+// "lock ได้" ของอีเมลจริง คือคำตอบว่าอีเมลไหนมีบัญชีอยู่ ซึ่งเป็นสิ่งเดียวกับที่
+// dummyHash ใน auth/password.go มีไว้เพื่อปิด
+//
+// key เป็น SHA-256 ของอีเมล ไม่ใช่ตัวอีเมลเอง: เก็บอีเมลของบุคคลที่สามไว้ใน
+// หน่วยความจำโดยไม่จำเป็นคือปัญหา PDPA และ hash ก็ยังจัดกลุ่มความพยายามซ้ำได้
+// เท่ากัน · มี sweeper กันโตไม่จำกัด (ดู SweepLoginGate)
+var unknownAttempts sync.Map // [32]byte -> *loginAttemptEntry
+
+func unknownKey(email string) [32]byte {
+	return sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
+}
+
+// unknownGateCheck is loginGateCheck's counterpart for emails FindByEmail
+// could not resolve to a real account — same lockout shape, keyed by the
+// email's hash instead of a user id.
+func unknownGateCheck(email string) error {
+	v, ok := unknownAttempts.Load(unknownKey(email))
+	if !ok {
+		return nil
+	}
+	e := v.(*loginAttemptEntry)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.until.IsZero() {
+		return nil
+	}
+	if remain := time.Until(e.until); remain > 0 {
+		mins := int(remain/time.Minute) + 1
+		return &UserError{Status: 429, Msg: fmt.Sprintf(
+			"เข้าสู่ระบบผิดพลาดหลายครั้งเกินไป กรุณารออีก %d นาทีแล้วลองใหม่", mins)}
+	}
+	e.fails = 0
+	e.until = time.Time{}
+	return nil
+}
+
+// unknownGateFail is loginGateFail's counterpart for unresolved emails.
+func unknownGateFail(email string) {
+	v, _ := unknownAttempts.LoadOrStore(unknownKey(email), &loginAttemptEntry{})
+	e := v.(*loginAttemptEntry)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.fails++
+	if e.fails >= loginMaxFails {
+		e.until = time.Now().Add(loginLockout)
+	}
+}
+
+// SweepLoginGate ลบ entry ที่หมดอายุแล้วออกจาก unknownAttempts — เรียกจาก
+// scheduler.tick เหมือน handler.SweepReadAudit เพราะ key space ของ map นี้
+// เปิดกว้าง (ใครก็ส่งอีเมลใหม่มาได้) ต่างจาก loginAttempts ที่ผูกกับจำนวน
+// ผู้ใช้จริง
+func SweepLoginGate(now time.Time) {
+	unknownAttempts.Range(func(k, v any) bool {
+		if e, ok := v.(*loginAttemptEntry); ok {
+			e.mu.Lock()
+			expired := !e.until.IsZero() && now.After(e.until)
+			e.mu.Unlock()
+			if expired {
+				unknownAttempts.Delete(k)
+			}
+		}
+		return true
+	})
 }

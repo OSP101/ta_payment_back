@@ -309,7 +309,10 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 		k := strings.TrimSpace(*in.CoverImageKey)
 		if k == "" {
 			in.CoverImageKey = nil
-		} else if !strings.HasPrefix(k, "announcements/") {
+		} else if !strings.HasPrefix(k, "announcements/") || strings.Contains(k, "..") {
+			// ตรวจสองอย่างเหมือน saveAttachments (announce_media.go) — key
+			// ชนิดเดียวกันต้องใช้กฎเดียวกัน · prefix อย่างเดียวไม่พอ เพราะ
+			// "announcements/../.." ก็ผ่าน prefix
 			return uuid.Nil, errors.New("cover_image_key ไม่ถูกต้อง")
 		} else {
 			in.CoverImageKey = &k

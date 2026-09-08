@@ -1,0 +1,25 @@
+# มิเรอร์ .gitignore — Docker ไม่อ่าน .gitignore เอง
+# ห้ามลบไฟล์นี้: COPY . . ใน Dockerfile จะดูด .env และ backup/ เข้า build layer ทันที
+
+# --- ความลับ ---
+.env
+.env.*
+!.env.example
+
+# --- ข้อมูล runtime (PDPA) ---
+/data/
+/backup/
+
+# --- ของที่ไม่จำเป็นต่อ build (ลดขนาด context ด้วย) ---
+.git/
+.gitignore
+*_test.go
+/api
+/seed
+/out/
+*.exe
+*.test
+*.out
+.DS_Store
+*.log
+docs/
