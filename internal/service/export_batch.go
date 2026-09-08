@@ -192,8 +192,18 @@ type PayoutDashboard struct {
 func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, export *ExportService, termID uuid.UUID) (*PayoutDashboard, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT tc.id, tc.code, tc.name_th,
-		       COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', '
-		                                   ORDER BY tl.is_primary DESC, u.first_name)
+		       -- Named with their ตำแหน่งทางวิชาการ (users.title, e.g. "รศ. ดร."),
+		       -- the way the claim documents name them: this card is what an
+		       -- officer reads before picking up the phone, and a bare given name
+		       -- is not how anyone addresses a lecturer here.
+		       --
+		       -- Still ORDERED on the bare first_name — gluing the title on and
+		       -- sorting the result would file every รศ. above every ผศ., which is
+		       -- rank order, not a list anyone is looking something up in.
+		       COALESCE((SELECT string_agg(
+		                            COALESCE(NULLIF(u.title,''),'') ||
+		                            u.first_name || ' ' || u.last_name, ', '
+		                            ORDER BY tl.is_primary DESC, u.first_name)
 		                 FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
 		                 WHERE tl.teaching_course_id = tc.id), ''),
 		       t.academic_year || ' ' ||

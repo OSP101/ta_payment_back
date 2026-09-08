@@ -310,3 +310,53 @@ func TestReviewQueue_StillIncludesGradRegular(t *testing.T) {
 		t.Fatal("grad-regular assignment must still appear in the staff review queue")
 	}
 }
+
+// The staff payout grid names each TA in its left-hand column, and that column
+// is read side by side with the claim documents the same names are printed on.
+// A bare "ธัญญลักษณ์ สาเสน" against a form that says "นางสาวธัญญลักษณ์ สาเสน" is
+// one more thing to reconcile by eye, so the queue carries the คำนำหน้า.
+//
+// The second half of this test is the part that matters: the prefix must not
+// become the sort key. Gluing it on and ordering by the result files every
+// นางสาว above every นาย, which is not an order anyone reading a class list is
+// looking for — the same trap the transfer cover hit.
+func TestReviewQueue_NamesCarryThePrefixButSortByGivenName(t *testing.T) {
+	f, _ := reviewFixture(t)
+	other := f.secondTAOnSameCourse()
+	// addAppointmentOrder only names f.TAID; the second TA needs their own item
+	// or the appointment gate keeps them out of the queue entirely.
+	orderID := f.addAppointmentOrder()
+	f.exec(`INSERT INTO appointment_order_items
+	          (id, appointment_order_id, teaching_course_id, ta_id)
+	        VALUES (gen_random_uuid(), $1, $2, $3)`, orderID, f.CourseID, other)
+
+	// The first TA sorts LAST by given name but FIRST by prefix, so the two
+	// orderings disagree and the assertion can tell them apart.
+	f.exec(`UPDATE users SET first_name='ขวัญ', last_name='ก' WHERE id=$1`, other)
+	f.exec(`INSERT INTO ta_profiles (user_id, prefix, status, current_round)
+	        VALUES ($1,'นาย','pending',1)
+	        ON CONFLICT (user_id) DO UPDATE SET prefix = EXCLUDED.prefix`, other)
+	f.exec(`UPDATE users SET first_name='อรอนงค์', last_name='ฮ' WHERE id=$1`, f.TAID)
+	f.exec(`INSERT INTO ta_profiles (user_id, prefix, status, current_round)
+	        VALUES ($1,'นางสาว','pending',1)
+	        ON CONFLICT (user_id) DO UPDATE SET prefix = EXCLUDED.prefix`, f.TAID)
+
+	rows, err := f.Periods.ListReviewQueue(f.ctx, f.TermID)
+	if err != nil {
+		t.Fatalf("ListReviewQueue: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("queue has %d rows, want 2", len(rows))
+	}
+	var names []string
+	for _, r := range rows {
+		names = append(names, r.TAName)
+	}
+	if names[0] != "นายขวัญ ก" {
+		t.Errorf("first row = %q, want %q — the prefix prints, and ordering stays "+
+			"on the given name", names[0], "นายขวัญ ก")
+	}
+	if names[1] != "นางสาวอรอนงค์ ฮ" {
+		t.Errorf("second row = %q, want %q", names[1], "นางสาวอรอนงค์ ฮ")
+	}
+}

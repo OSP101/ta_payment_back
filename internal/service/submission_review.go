@@ -159,7 +159,14 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		    GROUP BY sp.id, a.ta_id, tc.id, RIGHT(sp.year_month, 2)
 		)
 		SELECT sp.id, sp.label, sp.year_month,
-		       u.id, u.first_name || ' ' || u.last_name,
+		       u.id,
+		       -- Names carry the คำนำหน้า, as everywhere a person is named to
+		       -- staff: this grid is read next to the claim documents, and a
+		       -- name that reads differently there than on the form staff are
+		       -- checking it against is one more thing to reconcile by eye.
+		       -- ta_profiles.prefix is the TA's own, users.title the account's.
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''),
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
 		       COALESCE(ms.approved_hours, 0),
@@ -175,6 +182,7 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		      AND ms.mm = ml.mm
 		JOIN submission_periods sp ON sp.id = ml.period_id
 		JOIN users u               ON u.id = ml.ta_id
+		LEFT JOIN ta_profiles tp   ON tp.user_id = u.id
 		JOIN teaching_courses tc   ON tc.id = ml.tc_id
 		LEFT JOIN submission_period_status st
 		       ON st.submission_period_id = sp.id

@@ -544,7 +544,13 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	                    AND NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id=sx.id)) AS has_missing_schedule,
 	             (SELECT COUNT(*) FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='regular') AS n_sec_regular,
 	             (SELECT COUNT(*) FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS n_sec_special,
-	             COALESCE((SELECT string_agg(u.first_name || ' ' || u.last_name, ', ' ORDER BY tl.is_primary DESC, u.first_name)
+	             -- With the ตำแหน่งทางวิชาการ, matching the payout list and the
+	             -- claim documents. Ordered on the bare first_name so the title
+	             -- does not turn the list into rank order.
+	             COALESCE((SELECT string_agg(
+	                                 COALESCE(NULLIF(u.title,''),'') ||
+	                                 u.first_name || ' ' || u.last_name, ', '
+	                                 ORDER BY tl.is_primary DESC, u.first_name)
 	                       FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
 	                       WHERE tl.teaching_course_id = tc.id), '') AS lecturer_names,
 	             -- คาบที่ตรงวันหยุดและยังไม่มีวันชดเชย see UnresolvedMakeupsSQL.

@@ -53,7 +53,12 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 	rows, err := s.pool.Query(ctx, `
 		WITH months AS (
 		    SELECT a.ta_id,
+		           COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
 		           COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,'') AS ta_name,
+		           -- Sorted on separately: gluing the คำนำหน้า onto the display
+		           -- name would sort every นางสาว above every นาย, which is not
+		           -- an order anyone reading this list is looking for.
+		           COALESCE(u.first_name,'') AS sort_name,
 		           sp.year_month,
 		           COALESCE(st.status,'pending') AS staff_status,
 		           COUNT(*) FILTER (WHERE `+waitingTASQL("wl")+`)       AS waiting_ta,
@@ -65,6 +70,7 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN users u ON u.id = a.ta_id
+		    LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		    JOIN work_logs wl ON wl.assignment_id = a.id
 		     AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
 		    LEFT JOIN submission_period_status st
@@ -80,13 +86,13 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		      -- approves them), so counting them here would block this course's
 		      -- export forever.
 		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
-		    GROUP BY 1, 2, 3, 4
+		    GROUP BY 1, 2, 3, 4, 5
 		)
 		SELECT ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
 		   OR (approved > 0 AND staff_status NOT IN ('staff_reviewed','exported','finance_sent'))
-		ORDER BY ta_name, year_month`, courseID, months)
+		ORDER BY sort_name, ta_name, year_month`, courseID, months)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +292,12 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		WITH months AS (
 		    SELECT tc.code AS course_code,
 		           a.ta_id,
+		           COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
 		           COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,'') AS ta_name,
+		           -- Sorted on separately: gluing the คำนำหน้า onto the display
+		           -- name would sort every นางสาว above every นาย, which is not
+		           -- an order anyone reading this list is looking for.
+		           COALESCE(u.first_name,'') AS sort_name,
 		           sp.year_month,
 		           COALESCE(st.status,'pending') AS staff_status,
 		           COUNT(*) FILTER (WHERE `+waitingTASQL("wl")+`)       AS waiting_ta,
@@ -298,6 +309,7 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN users u ON u.id = a.ta_id
+		    LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		    JOIN work_logs wl ON wl.assignment_id = a.id
 		     AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
 		    LEFT JOIN submission_period_status st
@@ -312,13 +324,13 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		      AND CASE WHEN $3 = 'graduate' THEN a.level::text IN ('master','phd')
 		               ELSE a.level::text = 'undergrad' END
-		    GROUP BY 1, 2, 3, 4, 5
+		    GROUP BY 1, 2, 3, 4, 5, 6
 		)
 		SELECT course_code, ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
 		   OR (approved > 0 AND staff_status NOT IN ('exported','finance_sent'))
-		ORDER BY course_code, ta_name, year_month`, termID, months, level)
+		ORDER BY course_code, sort_name, ta_name, year_month`, termID, months, level)
 	if err != nil {
 		return nil, err
 	}
