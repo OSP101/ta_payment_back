@@ -479,6 +479,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/teaching-courses/:tcId/budget-settlement", eh.BudgetSettlement)
 	// TA planner facts — the lecturer teaching the course (service-checked) or staff.
 	authed.Get("/teaching-courses/:tcId/ta-plan", eh.PlanFacts)
+	// The lecturer's unsent request form, kept server-side so it survives a
+	// refresh, a timed-out session or a change of machine.
+	authed.Get("/teaching-courses/:tcId/request-draft", eh.GetRequestDraft)
+	authed.Put("/teaching-courses/:tcId/request-draft", eh.PutRequestDraft)
+	authed.Delete("/teaching-courses/:tcId/request-draft", eh.DeleteRequestDraft)
 	// Same reasoning, and the service checks the caller teaches the course: which
 	// months of the term get paid is the lecturer's call, not staff's alone.
 	authed.Patch("/teaching-courses/:tcId/settlement-mode", eh.SetSettlementMode)

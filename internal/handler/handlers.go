@@ -2863,6 +2863,47 @@ func (h *ExportHandler) PlanFacts(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// Unsent request-form drafts: the lecturer's own, keyed by course. The body
+// is stored verbatim; the service only checks ownership, size and JSON-ness.
+func (h *ExportHandler) GetRequestDraft(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	d, err := h.Svc.Export.GetRequestDraft(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	if d == nil {
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+	return c.JSON(d)
+}
+
+func (h *ExportHandler) PutRequestDraft(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	body := append([]byte(nil), c.Body()...)
+	d, err := h.Svc.Export.SaveRequestDraft(c.Context(), UserID(c), id, body)
+	if err != nil {
+		return err
+	}
+	return c.JSON(d)
+}
+
+func (h *ExportHandler) DeleteRequestDraft(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	if err := h.Svc.Export.DeleteRequestDraft(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 // SetSettlementMode switches a course between paying คาบ in date order until the
 // budget runs out and spreading the budget across every month.
 //
