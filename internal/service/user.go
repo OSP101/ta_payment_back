@@ -181,7 +181,11 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	err := s.pool.QueryRow(ctx,
 		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password,
 		        EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = users.id AND ao.is_active),
-		        admin_position, avatar_key, avatar_updated_at, totp_enabled_at,
+		        -- The executive seat is the source of truth for the title;
+		        -- users.admin_position is a free-text fallback for people
+		        -- who hold a post without a seat here.
+		        COALESCE((SELECT NULLIF(ao.title, '') FROM admin_officers ao WHERE ao.user_id = users.id AND ao.is_active LIMIT 1), NULLIF(admin_position, '')),
+		        avatar_key, avatar_updated_at, totp_enabled_at,
 		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL),
 		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = 1)
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
@@ -509,7 +513,8 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 	// else appeared on none.
 	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password,
 	             EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = u.id AND ao.is_active),
-	             u.admin_position, u.avatar_key, u.avatar_updated_at, u.totp_enabled_at IS NOT NULL
+	             COALESCE((SELECT NULLIF(ao.title, '') FROM admin_officers ao WHERE ao.user_id = u.id AND ao.is_active LIMIT 1), NULLIF(u.admin_position, '')),
+	             u.avatar_key, u.avatar_updated_at, u.totp_enabled_at IS NOT NULL
 	      FROM users u WHERE ` + where + ` ORDER BY ` + f.orderBy() + `, u.id
 		  LIMIT $` + itoa(i) + ` OFFSET $` + itoa(i+1)
 	args = append(args, limit, offset)

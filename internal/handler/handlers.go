@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -879,11 +880,40 @@ func (h *TeachingHandler) ImportExcel(c *fiber.Ctx) error {
 			}
 		}
 	}
-	res, err := h.Svc.Teaching.CommitImport(c.Context(), UserID(c), termID, fh.Filename, body, skipCodes)
+	// merges: JSON [{"primary":"CP353301","codes":["SC313302"]}] — staff's
+	// answers to the preview's same-name groups.
+	var merges []service.ImportMerge
+	if raw := c.FormValue("merges"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &merges); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "merges must be JSON")
+		}
+	}
+	res, err := h.Svc.Teaching.CommitImport(c.Context(), UserID(c), termID, fh.Filename, body, skipCodes, merges)
 	if err != nil {
 		return err
 	}
 	return c.JSON(res)
+}
+
+// MergeCourseCode folds a second registrar code (with its sections) into an
+// existing course — the manual open-course form's answer to "this name is
+// already open under another code".
+func (h *TeachingHandler) MergeCourseCode(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.MergeCodeInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.MergeCourseCode(c.Context(), UserID(c), tcID, in); err != nil {
+		if errors.Is(err, service.ErrCourseLocked) {
+			return fiber.NewError(fiber.StatusConflict, "รายวิชานี้ถูกล็อกหลังส่งออกไฟล์แล้ว")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 func (h *TeachingHandler) Budget(c *fiber.Ctx) error {
@@ -2811,6 +2841,21 @@ func (h *ExportHandler) BudgetSettlement(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	out, err := h.Svc.Export.SettlementForViewer(
+		c.Context(), UserID(c), id, rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff))
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// PlanFacts feeds the lecturer's TA planner: real class counts per section from
+// the calendar, the two pools, and what approved TAs already commit. Read-only.
+func (h *ExportHandler) PlanFacts(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Export.PlanFactsForViewer(
 		c.Context(), UserID(c), id, rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff))
 	if err != nil {
 		return err

@@ -57,7 +57,14 @@ type PayRate struct {
 	// New (migration 0040) — ประกาศระบุ ป.ตรี ภาคพิเศษ "50 ฿/ชม. หรือ 2,000 ฿/เดือน":
 	// จ่ายรายชั่วโมงตามจริง แต่ไม่เกินเพดานนี้ต่อเดือน/คน/วิชา.
 	UGSpecialMonthlyCap float64 `json:"ug_special_monthly_cap" validate:"gte=0"`
-	Note                *string `json:"note,omitempty" validate:"omitempty,max=500"`
+	// TA planning ratios (migration 0112) — the planner's guideline (one TA per
+	// N students), its density ceiling (never more than one per M), and the
+	// guideline's headcount cap (0 = none). Staff-editable so the college can
+	// move them without a release.
+	PlanStudentsPerTA    int     `json:"plan_students_per_ta" validate:"gte=0"`
+	PlanMinStudentsPerTA int     `json:"plan_min_students_per_ta" validate:"gte=0"`
+	PlanSuggestedTACap   int     `json:"plan_suggested_ta_cap" validate:"gte=0"`
+	Note                 *string `json:"note,omitempty" validate:"omitempty,max=500"`
 }
 
 func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
@@ -71,7 +78,8 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		       ug_max_hours_per_day, max_courses_per_student,
 		       graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
 		       ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
-		       ug_special_monthly_cap, note
+		       ug_special_monthly_cap,
+		       plan_students_per_ta, plan_min_students_per_ta, plan_suggested_ta_cap, note
 		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
 		&pr.ID, &pr.EffectiveFrom, &pr.UndergradRegular, &pr.UndergradSpecial,
 		&pr.GraduateRegular, &pr.GraduateSpecialLumpsum,
@@ -81,7 +89,8 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		&pr.UGMaxHoursPerDay, &pr.MaxCoursesPerStudent,
 		&pr.GraduateRegularHourly, &pr.GradSpecialTermCap, &pr.DailyPayCapBaht,
 		&pr.UGRegularDailyHourCap, &pr.UGSpecialDailyHourCap, &pr.GradRegularDailyHourCap,
-		&pr.UGSpecialMonthlyCap, &pr.Note)
+		&pr.UGSpecialMonthlyCap,
+		&pr.PlanStudentsPerTA, &pr.PlanMinStudentsPerTA, &pr.PlanSuggestedTACap, &pr.Note)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +109,20 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		in.TermMonths < 0 || in.UGMaxHoursPerDay < 0 || in.MaxCoursesPerStudent < 0 ||
 		in.GraduateRegularHourly < 0 || in.GradSpecialTermCap < 0 || in.DailyPayCapBaht < 0 ||
 		in.UGRegularDailyHourCap < 0 || in.UGSpecialDailyHourCap < 0 || in.GradRegularDailyHourCap < 0 ||
-		in.UGSpecialMonthlyCap < 0 {
+		in.UGSpecialMonthlyCap < 0 ||
+		in.PlanStudentsPerTA < 0 || in.PlanMinStudentsPerTA < 0 || in.PlanSuggestedTACap < 0 {
 		return nil, Invalid("ค่าตัวเลขต้องไม่ติดลบ")
+	}
+	// Planning ratios: 0 means "use the default" for the two divisors (a zero
+	// divisor is not a policy); the cap's 0 genuinely means uncapped.
+	if in.PlanStudentsPerTA == 0 {
+		in.PlanStudentsPerTA = 25
+	}
+	if in.PlanMinStudentsPerTA == 0 {
+		in.PlanMinStudentsPerTA = 15
+	}
+	if in.PlanMinStudentsPerTA > in.PlanStudentsPerTA {
+		return nil, Invalid("เพดานความหนาแน่น TA (นศ. ขั้นต่ำต่อ TA) ต้องไม่มากกว่าเกณฑ์ นศ. ต่อ TA")
 	}
 	// Actual payment rates have no default — a 0 rate breaks payroll.
 	if in.UndergradRegular <= 0 || in.UndergradSpecial <= 0 ||
@@ -187,8 +208,8 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		    ug_max_hours_per_day, max_courses_per_student,
 		    graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
 		    ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
-		    ug_special_monthly_cap, note)
-		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+		    ug_special_monthly_cap, plan_students_per_ta, plan_min_students_per_ta, plan_suggested_ta_cap, note)
+		 VALUES ($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 				in.ID, in.EffectiveFrom, in.UndergradRegular, in.UndergradSpecial,
 				in.GraduateRegular, in.GraduateSpecialLumpsum,
 				in.UGLectureHoursPerCredit, in.UGLabHoursPerCredit,
@@ -197,7 +218,7 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 				in.UGMaxHoursPerDay, in.MaxCoursesPerStudent,
 				in.GraduateRegularHourly, in.GradSpecialTermCap, in.DailyPayCapBaht,
 				in.UGRegularDailyHourCap, in.UGSpecialDailyHourCap, in.GradRegularDailyHourCap,
-				in.UGSpecialMonthlyCap, in.Note)
+				in.UGSpecialMonthlyCap, in.PlanStudentsPerTA, in.PlanMinStudentsPerTA, in.PlanSuggestedTACap, in.Note)
 			return err
 		}); err != nil {
 		return nil, err

@@ -168,7 +168,19 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	if totalStudents == 0 {
 		totalStudents = snap.NumStudents
 	}
-	snap.SuggestedTAs.Undergrad = min(3, (totalStudents+24)/25)
+	// Ratios come from pay_rates (0112) so staff can move them; the historical
+	// defaults were one per 25 capped at 3.
+	var perTA, capTA int
+	_ = s.pool.QueryRow(ctx, `SELECT plan_students_per_ta, plan_suggested_ta_cap
+	                          FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&perTA, &capTA)
+	if perTA <= 0 {
+		perTA = 25
+	}
+	ug := (totalStudents + perTA - 1) / perTA
+	if capTA > 0 {
+		ug = min(capTA, ug)
+	}
+	snap.SuggestedTAs.Undergrad = ug
 	snap.SuggestedTAs.Graduate = min(2, totalStudents/60)
 
 	// Used baht — reflects post-2026 payment model (ประกาศ 731/2565 + 1080/2565):

@@ -25,11 +25,15 @@ type TeachingCourse struct {
 	TermID uuid.UUID `json:"term_id"`
 	// Course identity — denormalized per-term from the imported registrar file
 	// (no central catalog). A course code is unique within a term.
-	Code    string  `json:"code"`
-	NameTH  string  `json:"name_th"`
-	NameEN  *string `json:"name_en,omitempty"`
-	Level   string  `json:"level"` // "undergrad" | "graduate"
-	Credits int     `json:"credits"`
+	Code string `json:"code"`
+	// AltCodes are the other registrar codes this course is also open under
+	// (staff merged them at import — see MergeCourseCode). Always present,
+	// usually empty; every screen that names the course prints them after Code.
+	AltCodes []string `json:"alt_codes"`
+	NameTH   string   `json:"name_th"`
+	NameEN   *string  `json:"name_en,omitempty"`
+	Level    string   `json:"level"` // "undergrad" | "graduate"
+	Credits  int      `json:"credits"`
 	// Credit hours — surfaced so the request-form UI can derive its default
 	// reimburse_scope (Q&A rule 3): lecture-only → "lecture", lab-only → "lab",
 	// both → "both" (user can still override).
@@ -84,6 +88,10 @@ type Section struct {
 	// Programme group served (CS/IT/GIS/AI/CY, OTHER = another faculty),
 	// derived from the import file's ReservedFor; nil = not yet known.
 	Curriculum *string `json:"curriculum,omitempty"`
+	// CourseCode is the registrar code the section was opened under when it is
+	// not the course's own — set only on sections merged in from an alternate
+	// code (their sec_no is already prefixed with it, e.g. "SC313302-01").
+	CourseCode *string `json:"course_code,omitempty"`
 	// Set when a lecturer filled in a missing timetable — they get one such
 	// write per section and the UI uses this to explain why the row is now
 	// read-only to them. See ReplaceSectionSchedules.
@@ -158,31 +166,36 @@ type CreateTeachingCourseInput struct {
 	// rejects an empty Code outright but fills a blank NameTH in from NameEN or
 	// Code itself — a struct tag can't express "required unless X", so that
 	// fallback stays exactly where it is.
-	Code        string      `json:"code" validate:"required"`
-	NameTH      string      `json:"name_th"`
-	NameEN      *string     `json:"name_en,omitempty"`
-	Level       string      `json:"level" validate:"omitempty,oneof=undergrad graduate"`
-	Credits     int         `json:"credits" validate:"gte=0"`
-	LectureHrs  int         `json:"lecture_hrs" validate:"gte=0"`
-	LabHrs      int         `json:"lab_hrs" validate:"gte=0"`
-	SelfHrs     int         `json:"self_hrs" validate:"gte=0"`
-	StartsOn    *string     `json:"starts_on,omitempty"`
-	EndsOn      *string     `json:"ends_on,omitempty"`
-	NumStudents int         `json:"num_students" validate:"gte=0"`
-	LecturerIDs []uuid.UUID `json:"lecturer_ids"`
-	Sections    []struct {
-		SecNo       string  `json:"sec_no"`
-		Track       string  `json:"track"`
-		Room        *string `json:"room,omitempty"`
-		NumStudents int     `json:"num_students"`
-		// Curriculum is optional and only meaningful for the manual "add course"
-		// form — the Excel import path derives it from the registrar's ReservedFor
-		// column instead (see curriculumFromReserved). Validated against the same
-		// CHECK constraint as UpdateSection's Curriculum field.
-		Curriculum *string           `json:"curriculum,omitempty"`
-		Schedules  []SectionSchedule `json:"schedules,omitempty"`
-		Exams      []ExamSchedule    `json:"exams,omitempty"`
-	} `json:"sections"`
+	Code        string               `json:"code" validate:"required"`
+	NameTH      string               `json:"name_th"`
+	NameEN      *string              `json:"name_en,omitempty"`
+	Level       string               `json:"level" validate:"omitempty,oneof=undergrad graduate"`
+	Credits     int                  `json:"credits" validate:"gte=0"`
+	LectureHrs  int                  `json:"lecture_hrs" validate:"gte=0"`
+	LabHrs      int                  `json:"lab_hrs" validate:"gte=0"`
+	SelfHrs     int                  `json:"self_hrs" validate:"gte=0"`
+	StartsOn    *string              `json:"starts_on,omitempty"`
+	EndsOn      *string              `json:"ends_on,omitempty"`
+	NumStudents int                  `json:"num_students" validate:"gte=0"`
+	LecturerIDs []uuid.UUID          `json:"lecturer_ids"`
+	Sections    []CourseSectionInput `json:"sections"`
+}
+
+// CourseSectionInput is one section as the manual "add course" form sends it
+// — shared by Create and MergeCourseCode, which both turn a typed roster into
+// section rows.
+type CourseSectionInput struct {
+	SecNo       string  `json:"sec_no"`
+	Track       string  `json:"track"`
+	Room        *string `json:"room,omitempty"`
+	NumStudents int     `json:"num_students"`
+	// Curriculum is optional and only meaningful for the manual "add course"
+	// form — the Excel import path derives it from the registrar's ReservedFor
+	// column instead (see curriculumFromReserved). Validated against the same
+	// CHECK constraint as UpdateSection's Curriculum field.
+	Curriculum *string           `json:"curriculum,omitempty"`
+	Schedules  []SectionSchedule `json:"schedules,omitempty"`
+	Exams      []ExamSchedule    `json:"exams,omitempty"`
 }
 
 // Sanitize + validate the manually-typed course code. Accepted forms follow
@@ -237,6 +250,13 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 		if sec.Curriculum != nil && *sec.Curriculum != "" && !validCurriculum(*sec.Curriculum) {
 			return uuid.Nil, Invalid("หลักสูตรไม่ถูกต้อง")
 		}
+	}
+	// Unique within the term across BOTH code columns: a code that was merged
+	// into another course as an alternate must not be opened again on its own.
+	if taken, err := codeTakenInTerm(ctx, s.pool, in.TermID, in.Code, uuid.Nil); err != nil {
+		return uuid.Nil, err
+	} else if taken {
+		return uuid.Nil, Conflict(fmt.Sprintf("รหัสวิชา %s มีอยู่แล้วในภาคเรียนนี้", in.Code))
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -410,7 +430,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		// Effective term dates fall back to the parent academic_term when the
 		// course itself doesn't override them — the UI (month grouper,
 		// auto-generator) treats these as the canonical range for the course.
-		`SELECT tc.id, tc.term_id, tc.code, tc.name_th, tc.name_en, tc.level,
+		`SELECT tc.id, tc.term_id, tc.code, tc.alt_codes, tc.name_th, tc.name_en, tc.level,
 		        tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		        TO_CHAR(COALESCE(tc.starts_on, at.starts_on), 'YYYY-MM-DD'),
 		        TO_CHAR(COALESCE(tc.ends_on,   at.ends_on),   'YYYY-MM-DD'),
@@ -427,7 +447,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		                                    WHERE sch.section_id = sx.id))
 		 FROM teaching_courses tc
 		 JOIN academic_terms  at ON at.id = tc.term_id
-		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.NameTH, &tc.NameEN, &tc.Level,
+		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.AltCodes, &tc.NameTH, &tc.NameEN, &tc.Level,
 		&tc.Credits, &tc.LectureHrs, &tc.LabHrs, &tc.SelfHrs,
 		&tc.StartsOn, &tc.EndsOn,
 		&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
@@ -437,7 +457,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	}
 	// Sections
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, sec_no, track::text, room, num_students, curriculum,
+		`SELECT id, sec_no, track::text, room, num_students, curriculum, course_code,
 		        TO_CHAR(schedule_set_by_lecturer_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		   FROM sections WHERE teaching_course_id=$1 ORDER BY sec_no`, id)
 	if err != nil {
@@ -446,7 +466,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	for rows.Next() {
 		var sec Section
 		if err := rows.Scan(&sec.ID, &sec.SecNo, &sec.Track, &sec.Room, &sec.NumStudents,
-			&sec.Curriculum, &sec.ScheduleSetByLecturerAt); err != nil {
+			&sec.Curriculum, &sec.CourseCode, &sec.ScheduleSetByLecturerAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -562,7 +582,7 @@ func (s *TeachingService) ClassKinds(ctx context.Context, termID uuid.UUID) ([]C
 }
 
 func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerID *uuid.UUID) ([]TeachingCourse, error) {
-	q := `SELECT tc.id, tc.term_id, tc.code, tc.name_th, tc.level,
+	q := `SELECT tc.id, tc.term_id, tc.code, tc.alt_codes, tc.name_th, tc.name_en, tc.level,
 	             tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 	             tc.num_students, tc.num_students_regular, tc.num_students_special,
 	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS has_special,
@@ -612,7 +632,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	out := []TeachingCourse{}
 	for rows.Next() {
 		var tc TeachingCourse
-		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.NameTH, &tc.Level,
+		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.AltCodes, &tc.NameTH, &tc.NameEN, &tc.Level,
 			&tc.Credits, &tc.LectureHrs, &tc.LabHrs, &tc.SelfHrs,
 			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
 			&tc.HasSpecial, &tc.HasMissingSchedule,
@@ -628,7 +648,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 // ListForTA returns teaching courses where the given TA is assigned via an
 // approved TA request. Optionally filtered by term.
 func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID *uuid.UUID) ([]TeachingCourse, error) {
-	q := `SELECT DISTINCT tc.id, tc.term_id, tc.code, tc.name_th,
+	q := `SELECT DISTINCT tc.id, tc.term_id, tc.code, tc.alt_codes, tc.name_th,
 	             tc.num_students, tc.num_students_regular, tc.num_students_special
 	      FROM ta_request_assignments a
 	      JOIN sections s ON s.id = a.section_id
@@ -652,7 +672,7 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 	out := []TeachingCourse{}
 	for rows.Next() {
 		var tc TeachingCourse
-		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.NameTH,
+		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.AltCodes, &tc.NameTH,
 			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial); err != nil {
 			return nil, err
 		}
@@ -1008,13 +1028,13 @@ func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.U
 		}
 		// Unique within the term — the same code opened twice would make every
 		// per-course figure ambiguous.
-		var clash bool
-		if err := s.pool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM teaching_courses tc
-				WHERE tc.code = $1 AND tc.id <> $2
-				  AND tc.term_id = (SELECT term_id FROM teaching_courses WHERE id = $2))`,
-			code, id).Scan(&clash); err != nil {
+		var termID uuid.UUID
+		if err := s.pool.QueryRow(ctx,
+			`SELECT term_id FROM teaching_courses WHERE id = $1`, id).Scan(&termID); err != nil {
+			return err
+		}
+		clash, err := codeTakenInTerm(ctx, s.pool, termID, code, id)
+		if err != nil {
 			return err
 		}
 		if clash {
@@ -1996,8 +2016,11 @@ type ImportResult struct {
 	// staff decision or because the course already exists in this term. Not an
 	// error.
 	SkippedCodes []string `json:"skipped_codes,omitempty"`
-	ErrorCount   int      `json:"error_count"`
-	Errors       []string `json:"errors,omitempty"`
+	// MergedCodes lists codes folded into another course on staff's say-so,
+	// as "SC313302 → CP353301". Neither created nor skipped.
+	MergedCodes []string `json:"merged_codes,omitempty"`
+	ErrorCount  int      `json:"error_count"`
+	Errors      []string `json:"errors,omitempty"`
 }
 
 type ImportPreviewCourse struct {
@@ -2019,6 +2042,9 @@ type ImportPreview struct {
 	NewCount      int                   `json:"new_count"`
 	ExistingCount int                   `json:"existing_count"`
 	BlockedCount  int                   `json:"blocked_count"`
+	// MergeGroups are the same-name / different-code groups staff are asked
+	// about before the commit (see teaching_merge.go). Empty when none.
+	MergeGroups []ImportMergeGroup `json:"merge_groups"`
 }
 
 type parsedSchedule struct {
@@ -2675,7 +2701,7 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 		// is "existing" only when it was already imported into THIS term.
 		var existingID uuid.UUID
 		err := s.pool.QueryRow(ctx,
-			`SELECT id FROM teaching_courses WHERE term_id = $1 AND code = $2`, termID, c.code).Scan(&existingID)
+			`SELECT id FROM teaching_courses WHERE term_id = $1 AND (code = $2 OR $2 = ANY(alt_codes))`, termID, c.code).Scan(&existingID)
 		if err == nil {
 			row.Status = "existing"
 			out.ExistingCount++
@@ -2700,6 +2726,15 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 		}
 		out.Courses = append(out.Courses, row)
 	}
+	statusOf := make(map[string]string, len(out.Courses))
+	for _, row := range out.Courses {
+		statusOf[row.Code] = row.Status
+	}
+	groups, err := s.detectImportMergeGroups(ctx, termID, courses, statusOf)
+	if err != nil {
+		return nil, err
+	}
+	out.MergeGroups = groups
 	return out, nil
 }
 
@@ -2707,7 +2742,7 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 // course is written in its own tx: one failed course never blocks the rest of
 // the file. Codes listed in skipCodes are ignored, letting staff resolve
 // unmatched-officer rows preview-side.
-func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte, skipCodes []string) (*ImportResult, error) {
+func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte, skipCodes []string, merges []ImportMerge) (*ImportResult, error) {
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
 		return nil, err
@@ -2727,11 +2762,29 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		}
 	}
 
+	// Staff's merge decisions: code → the primary it folds into. A code that
+	// is also skipped stays skipped (an unmatched-officer member staff chose
+	// not to import is not imported anywhere).
+	mergeInto := map[string]string{}
+	for _, m := range merges {
+		primary := strings.ToUpper(strings.TrimSpace(m.Primary))
+		for _, c := range m.Codes {
+			code := strings.ToUpper(strings.TrimSpace(c))
+			if code == "" || code == primary {
+				continue
+			}
+			mergeInto[code] = primary
+		}
+	}
+	createdByCode := map[string]uuid.UUID{}
 	for _, c := range courses {
 		res.RowCount++
 		if _, skip := skipSet[c.code]; skip {
 			res.SkippedCodes = append(res.SkippedCodes, c.code)
 			continue
+		}
+		if _, merged := mergeInto[c.code]; merged {
+			continue // folded into its primary below
 		}
 		id, err := s.commitOneCourse(ctx, actor, termID, c)
 		if err != nil {
@@ -2745,13 +2798,46 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", c.code, err))
 			continue
 		}
+		createdByCode[c.code] = id
 		res.CreatedIDs = append(res.CreatedIDs, id)
+	}
+	// Second pass: merges, once every primary that comes from the file exists.
+	// A primary already open in the term (or one created by an earlier run)
+	// is looked up by code. File order keeps the result deterministic.
+	for _, c := range courses {
+		primary, merged := mergeInto[c.code]
+		if !merged {
+			continue
+		}
+		if _, skip := skipSet[c.code]; skip {
+			continue
+		}
+		targetID, ok := createdByCode[primary]
+		if !ok {
+			err := s.pool.QueryRow(ctx,
+				`SELECT id FROM teaching_courses WHERE term_id = $1 AND (code = $2 OR $2 = ANY(alt_codes))`,
+				termID, primary).Scan(&targetID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				res.ErrorCount++
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: รวมกับ %s ไม่ได้ ไม่พบวิชาหลัก", c.code, primary))
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+		}
+		if err := s.mergeParsedCourse(ctx, actor, termID, targetID, c); err != nil {
+			res.ErrorCount++
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: รวมกับ %s ไม่ได้: %v", c.code, primary, err))
+			continue
+		}
+		res.MergedCodes = append(res.MergedCodes, c.code+" → "+primary)
 	}
 
 	summary := map[string]any{
 		"row_count":     res.RowCount,
 		"created_count": len(res.CreatedIDs),
 		"skipped_count": len(res.SkippedCodes),
+		"merged_count":  len(res.MergedCodes),
 		"error_count":   res.ErrorCount,
 	}
 	// The import ledger row and its audit entry describe the same run, so they
@@ -2780,7 +2866,7 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 	// Identity comes from the file; a course is unique within a term by code.
 	var existing uuid.UUID
 	err := s.pool.QueryRow(ctx,
-		`SELECT id FROM teaching_courses WHERE term_id = $1 AND code = $2`, termID, c.code).Scan(&existing)
+		`SELECT id FROM teaching_courses WHERE term_id = $1 AND (code = $2 OR $2 = ANY(alt_codes))`, termID, c.code).Scan(&existing)
 	if err == nil {
 		// The course itself is untouched, but a re-import is the designated way
 		// to BACKFILL sections.curriculum for terms imported before the column
@@ -2911,7 +2997,7 @@ func emptyToNil(s string) *string {
 // should use PreviewImport + CommitImport. The wrapper commits without any
 // skip list — equivalent to "import all novel courses, skip everything else".
 func (s *TeachingService) ImportScheduleExcel(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte) (*ImportResult, error) {
-	return s.CommitImport(ctx, actor, termID, filename, body, nil)
+	return s.CommitImport(ctx, actor, termID, filename, body, nil, nil)
 }
 
 // Terms

@@ -1544,7 +1544,7 @@ func rateFor(pr PayRate, level, track string) float64 {
 // is billed for them twice.
 func (s *ExportService) claimLogsAllMonths(ctx context.Context, taID, courseID uuid.UUID, months []string) ([]claimLogRow, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT sec.sec_no, sec.track::text, wl.work_date,
+		SELECT `+PrintSecNoSQL("sec")+`, sec.track::text, wl.work_date,
 		       EXTRACT(HOUR FROM wl.start_time)*60 + EXTRACT(MINUTE FROM wl.start_time),
 		       EXTRACT(HOUR FROM wl.end_time)*60 + EXTRACT(MINUTE FROM wl.end_time),
 		       wl.activity, COALESCE(wl.note,'') LIKE '%ชดเชย%'

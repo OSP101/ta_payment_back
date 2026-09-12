@@ -218,7 +218,7 @@ func (s *ExportService) claimTemplatePath() string {
 // and the export gate upstream decides what may leave the building.
 func (s *ExportService) claimLogs(ctx context.Context, taID, courseID uuid.UUID, year, month int) ([]claimLogRow, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT sec.sec_no, sec.track::text, wl.work_date,
+		SELECT `+PrintSecNoSQL("sec")+`, sec.track::text, wl.work_date,
 		       EXTRACT(HOUR FROM wl.start_time)*60 + EXTRACT(MINUTE FROM wl.start_time),
 		       EXTRACT(HOUR FROM wl.end_time)*60 + EXTRACT(MINUTE FROM wl.end_time),
 		       wl.activity, COALESCE(wl.note,'') LIKE '%ชดเชย%'
@@ -354,7 +354,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		SELECT DISTINCT tc.code, ss.kind, ss.day_of_week,
 		       EXTRACT(HOUR FROM ss.start_time)*60+EXTRACT(MINUTE FROM ss.start_time),
 		       EXTRACT(HOUR FROM ss.end_time)*60+EXTRACT(MINUTE FROM ss.end_time),
-		       sec.sec_no, sec.track::text
+		       `+PrintSecNoSQL("sec")+`, sec.track::text
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
 		JOIN sections sec ON sec.id=a.section_id
@@ -435,7 +435,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		SELECT tc.code, rs.day_of_week,
 		       EXTRACT(HOUR FROM rs.start_time)*60+EXTRACT(MINUTE FROM rs.start_time),
 		       EXTRACT(HOUR FROM rs.end_time)*60+EXTRACT(MINUTE FROM rs.end_time),
-		       sec.sec_no, sec.track::text, rs.kind
+		       `+PrintSecNoSQL("sec")+`, sec.track::text, rs.kind
 		FROM ta_review_schedules rs
 		JOIN ta_request_assignments a ON a.id=rs.assignment_id
 		JOIN sections sec ON sec.id=a.section_id
@@ -488,7 +488,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		SELECT DISTINCT tc.code, wl.activity, EXTRACT(DOW FROM wl.work_date)::int,
 		       EXTRACT(HOUR FROM wl.start_time)*60+EXTRACT(MINUTE FROM wl.start_time),
 		       EXTRACT(HOUR FROM wl.end_time)*60+EXTRACT(MINUTE FROM wl.end_time),
-		       sec.sec_no, sec.track::text
+		       `+PrintSecNoSQL("sec")+`, sec.track::text
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id=wl.assignment_id
 		JOIN sections sec ON sec.id=a.section_id
@@ -535,7 +535,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		SELECT DISTINCT tc.code, ss.kind, ss.day_of_week,
 		       EXTRACT(HOUR FROM ss.start_time)*60+EXTRACT(MINUTE FROM ss.start_time),
 		       EXTRACT(HOUR FROM ss.end_time)*60+EXTRACT(MINUTE FROM ss.end_time),
-		       sec.sec_no, sec.track::text
+		       `+PrintSecNoSQL("sec")+`, sec.track::text
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN sections sec ON sec.id = a.section_id AND sec.track = 'special'

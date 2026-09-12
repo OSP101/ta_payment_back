@@ -135,7 +135,7 @@ func (s *TeachingService) BuildTimetableForm(
 
 	// TA duties across every course they assist this term.
 	dutyRows, err := s.pool.Query(ctx, `
-		SELECT sch.kind, tc.code, tc.name_th, sec.sec_no, sec.track::text,
+		SELECT sch.kind, tc.code, tc.name_th, `+PrintSecNoSQL("sec")+`, sec.track::text,
 		       sch.day_of_week, sch.start_time::text, sch.end_time::text, sch.room
 		  FROM ta_request_assignments a
 		  JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
@@ -165,7 +165,7 @@ func (s *TeachingService) BuildTimetableForm(
 	// has to come along: drawing an "อื่น ๆ" slot as ตรวจงาน would put the wrong
 	// label on the signed form.
 	revRows, err := s.pool.Query(ctx, `
-		SELECT tc.code, tc.name_th, sec.sec_no, sec.track::text, rs.kind,
+		SELECT tc.code, tc.name_th, `+PrintSecNoSQL("sec")+`, sec.track::text, rs.kind,
 		       rs.day_of_week, rs.start_time::text, rs.end_time::text, rs.room
 		  FROM ta_review_schedules rs
 		  JOIN ta_request_assignments a ON a.id = rs.assignment_id
@@ -267,7 +267,7 @@ func (s *TeachingService) fillMonthCounts(
 	rows, err := s.pool.Query(ctx, `
 		SELECT EXTRACT(DOW FROM wl.work_date)::int, wl.start_time::text, wl.end_time::text,
 		       wl.activity, TO_CHAR(wl.work_date,'YYYY-MM-DD'), wl.hours,
-		       tc.code, sec.sec_no, wl.note, wl.source
+		       tc.code, `+PrintSecNoSQL("sec")+`, wl.note, wl.source
 		  FROM work_logs wl
 		  JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		  JOIN sections sec ON sec.id = a.section_id
