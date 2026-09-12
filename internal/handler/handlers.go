@@ -989,6 +989,45 @@ func (h *TARequestHandler) Cancel(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// ListAssignmentWorkloadsForTA — GET /teaching-courses/:tcId/ta/:taId/workload
+// Staff/admin only (see router.go). Lists every assignment a TA holds in one
+// course with its current declared workload, so the staff correction UI can
+// resolve which assignment(s) to edit and pre-fill their values.
+func (h *TARequestHandler) ListAssignmentWorkloadsForTA(c *fiber.Ctx) error {
+	tcID, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid teaching course id")
+	}
+	taID, err := uuid.Parse(c.Params("taId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid ta id")
+	}
+	out, err := h.Svc.TARequest.ListAssignmentsForTAInCourse(c.Context(), taID, tcID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// UpdateAssignmentWorkload — PATCH /assignments/:id/workload
+// Staff/admin only (see router.go). The correction path
+// TARequestService.Cancel's own error message points at
+// ("กรุณาติดต่อเจ้าหน้าที่เพื่อดำเนินการ") but that, until now, had no tool.
+func (h *TARequestHandler) UpdateAssignmentWorkload(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.WorkloadInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := h.Svc.TARequest.UpdateAssignmentWorkload(c.Context(), UserID(c), id, in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // PreviewConflicts previews the schedule-conflict verdict for a TA against
 // every section of a teaching course. Used by the lecturer's request form to
 // flag conflicts inline at TA-picking time (instead of at submit time).

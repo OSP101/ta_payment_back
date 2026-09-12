@@ -453,27 +453,49 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		sec.TeachingCourseID = id
 		tc.Sections = append(tc.Sections, sec)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 	for i := range tc.Sections {
 		sid := tc.Sections[i].ID
-		schRows, _ := s.pool.Query(ctx,
+		schRows, err := s.pool.Query(ctx,
 			`SELECT id, kind, day_of_week, start_time::text, end_time::text, room
 			 FROM section_schedules WHERE section_id=$1 ORDER BY day_of_week, start_time`, sid)
+		if err != nil {
+			return nil, err
+		}
 		for schRows.Next() {
 			var sch SectionSchedule
-			if err := schRows.Scan(&sch.ID, &sch.Kind, &sch.DayOfWeek, &sch.StartTime, &sch.EndTime, &sch.Room); err == nil {
-				tc.Sections[i].Schedules = append(tc.Sections[i].Schedules, sch)
+			if err := schRows.Scan(&sch.ID, &sch.Kind, &sch.DayOfWeek, &sch.StartTime, &sch.EndTime, &sch.Room); err != nil {
+				schRows.Close()
+				return nil, err
 			}
+			tc.Sections[i].Schedules = append(tc.Sections[i].Schedules, sch)
+		}
+		if err := schRows.Err(); err != nil {
+			schRows.Close()
+			return nil, err
 		}
 		schRows.Close()
-		exRows, _ := s.pool.Query(ctx,
+		exRows, err := s.pool.Query(ctx,
 			`SELECT id, kind::text, TO_CHAR(exam_date,'YYYY-MM-DD'), start_time::text, end_time::text, room
 			 FROM exam_schedules WHERE section_id=$1 ORDER BY exam_date`, sid)
+		if err != nil {
+			return nil, err
+		}
 		for exRows.Next() {
 			var e ExamSchedule
-			if err := exRows.Scan(&e.ID, &e.Kind, &e.ExamDate, &e.StartTime, &e.EndTime, &e.Room); err == nil {
-				tc.Sections[i].Exams = append(tc.Sections[i].Exams, e)
+			if err := exRows.Scan(&e.ID, &e.Kind, &e.ExamDate, &e.StartTime, &e.EndTime, &e.Room); err != nil {
+				exRows.Close()
+				return nil, err
 			}
+			tc.Sections[i].Exams = append(tc.Sections[i].Exams, e)
+		}
+		if err := exRows.Err(); err != nil {
+			exRows.Close()
+			return nil, err
 		}
 		exRows.Close()
 	}
@@ -600,7 +622,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 		}
 		out = append(out, tc)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ListForTA returns teaching courses where the given TA is assigned via an
@@ -636,7 +658,7 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 		}
 		out = append(out, tc)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // TAAssignment is one section-level slot the TA holds on an approved TA request.
@@ -783,6 +805,9 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 			return nil, err
 		}
 		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	// Term-hour ceiling per row = weekly workload total × weeks-in-term. For
 	// grad, help_teach is a shared lecture+lab figure so it must not be counted
@@ -1809,9 +1834,15 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 	}
 	for nrows.Next() {
 		var taID uuid.UUID
-		if err := nrows.Scan(&taID); err == nil {
-			notifyTargets = append(notifyTargets, taID)
+		if err := nrows.Scan(&taID); err != nil {
+			nrows.Close()
+			return err
 		}
+		notifyTargets = append(notifyTargets, taID)
+	}
+	if err := nrows.Err(); err != nil {
+		nrows.Close()
+		return err
 	}
 	nrows.Close()
 
@@ -2587,6 +2618,10 @@ func (s *TeachingService) matchOfficers(ctx context.Context, names []string) (ma
 			}
 			ids = append(ids, id)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
 		rows.Close()
 		if len(ids) == 1 {
 			if _, dup := seen[ids[0]]; !dup {
@@ -2940,7 +2975,7 @@ func (s *TeachingService) ListTerms(ctx context.Context, f TermFilter) ([]Term, 
 		}
 		out = append(out, t)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // TermYearsCount returns the total number of distinct academic years. The

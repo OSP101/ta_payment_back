@@ -257,6 +257,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// สรุปรายวิชาที่ขอใช้ TA — the budget-request workbook staff assembled by
 	// hand at the start of every term.
 	authed.Get("/exports/terms/:id/course-summary/warnings", adminOrStaff, th.CourseSummaryWarnings)
+	authed.Get("/exports/terms/:id/course-summary/months", adminOrStaff, th.CourseSummaryMonths)
 	authed.Get("/exports/terms/:id/course-summary.xlsx", adminOrStaff, heavyLimiter, th.CourseSummaryXLSX)
 	authed.Get("/exports/terms/:id/course-summary/preview", adminOrStaff,
 		AuditRead(aud, "export.course_summary.preview", "term", "id"), th.CourseSummaryPreview)
@@ -318,6 +319,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), rh.Detail)
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer), rh.Create)
 	authed.Post("/ta-requests/:id/cancel", RequireRole(rbac.RoleLecturer), rh.Cancel)
+	// Workload correction — staff/admin only. Cancel above refuses once
+	// work_logs exist and its own error message says "contact staff"; this is
+	// the tool that message used to point at without one existing.
+	authed.Get("/teaching-courses/:tcId/ta/:taId/workload", adminOrStaff, rh.ListAssignmentWorkloadsForTA)
+	authed.Patch("/assignments/:id/workload", adminOrStaff, rh.UpdateAssignmentWorkload)
 
 	// Docs (TA)
 	dh := &DocsHandler{Svc: svc}

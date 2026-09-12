@@ -65,6 +65,7 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		           COUNT(*) FILTER (WHERE `+waitingLecturerSQL("wl")+`) AS waiting_lecturer,
 		           COUNT(*) FILTER (WHERE wl.status = 'approved')       AS approved
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm ON trm.id = tc.term_id
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
 		    JOIN sections sec          ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
@@ -72,7 +73,7 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		    JOIN users u ON u.id = a.ta_id
 		    LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		    JOIN work_logs wl ON wl.assignment_id = a.id
-		     AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		     AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		    LEFT JOIN submission_period_status st
 		      ON st.submission_period_id = sp.id
 		     AND st.ta_id = a.ta_id
@@ -243,12 +244,13 @@ func (s *ExportService) TermMonthsNotReady(ctx context.Context, termID uuid.UUID
 		           COUNT(*) FILTER (WHERE `+waitingLecturerSQL("wl")+`) AS waiting_lecturer,
 		           COUNT(*) FILTER (WHERE wl.status = 'approved')       AS approved
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm ON trm.id = tc.term_id
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
 		    JOIN sections sec          ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN work_logs wl ON wl.assignment_id = a.id
-		     AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		     AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		    LEFT JOIN submission_period_status st
 		      ON st.submission_period_id = sp.id
 		     AND st.ta_id = a.ta_id
@@ -304,6 +306,7 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		           COUNT(*) FILTER (WHERE `+waitingLecturerSQL("wl")+`) AS waiting_lecturer,
 		           COUNT(*) FILTER (WHERE wl.status = 'approved')       AS approved
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm ON trm.id = tc.term_id
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
 		    JOIN sections sec          ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
@@ -311,7 +314,7 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		    JOIN users u ON u.id = a.ta_id
 		    LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		    JOIN work_logs wl ON wl.assignment_id = a.id
-		     AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		     AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		    LEFT JOIN submission_period_status st
 		      ON st.submission_period_id = sp.id
 		     AND st.ta_id = a.ta_id

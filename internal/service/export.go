@@ -320,6 +320,9 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 			agg.hasGradSpecial = true
 		}
 	}
+	if err := assignRows.Err(); err != nil {
+		return nil, err
+	}
 
 	// One pricing source for every hourly baht (merged sittings, B2 overlap off
 	// the special side, monthly cap) — shared with SettleCourse and
@@ -355,29 +358,21 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}
-	// Flat per term, so a month filter cannot select it — apportioned by this
-	// course's own regular-track class-schedule share of the selected months
-	// (falls back to an even per-month share if no schedule exists yet), which
-	// keeps the slices summing to the undivided lump.
-	gradShare := monthShare
-	if weights, werr := gradSpecialMonthShares(ctx, s.pool, teachingCourseID); werr != nil {
-		return nil, werr
-	} else if weights != nil {
-		gradShare = 0
-		if len(months) == 0 {
-			gradShare = 1
-		} else {
-			for _, ym := range months {
-				gradShare += weights[ym]
-			}
-		}
-	}
-	gradLump *= gradShare
+	// Flat per term, so a month filter cannot select it — each holder's lump
+	// is dated by their own approved special-track hours (gradLumpByMonth) and
+	// the selected months' slices are what this document carries, so the
+	// slices always sum back to the undivided lump.
+	_ = monthShare
 	for _, taID := range order {
 		agg := byTA[taID]
-		if agg.hasGradSpecial {
-			agg.paySpecial += gradLump
+		if !agg.hasGradSpecial {
+			continue
 		}
+		byMonth, err := s.gradLumpByMonth(ctx, teachingCourseID, taID, gradLump, true)
+		if err != nil {
+			return nil, err
+		}
+		agg.paySpecial += sumMonths(byMonth, months)
 	}
 
 	// Look up the current term for old/new detection.
@@ -420,10 +415,9 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 		}
 		budgetMax = snap.PerCourseMaxBaht
 	}
-	// Month cutoff replaces pro-rata (04/08/2026). Instead of scaling everyone
-	// down by a factor nobody can derive from the claim form, whole months are
-	// paid in order until the pool runs out and the rest are paid nothing —
-	// see budget_settlement.go. Two TAs with the same hours are paid the same.
+	// A short pool is shared between the TAs in proportion to what each is owed
+	// (11/09/2026) — see budget_settlement.go. Two TAs with the same hours are
+	// paid the same, and the claim form's ขอเบิกจ่ายเพียง carries the figure.
 	settlement, serr := s.SettleCourse(ctx, teachingCourseID)
 	if serr != nil {
 		return nil, serr

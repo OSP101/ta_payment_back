@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strconv"
@@ -15,104 +16,114 @@ import (
 	"ta-payment-back/internal/audit"
 )
 
-// budget_settlement.go decides which WORK of a course gets paid when it costs
-// more than the course's budget.
+// budget_settlement.go decides how much of a course's work gets paid when it
+// costs more than the course's budget.
 //
-// Until 04/08/2026 the answer was pro-rata: everyone scaled down by the same
-// factor at export time. Two things were wrong with it. The lecturer could not
-// approve at all once the cap was reached — Approve refused outright, so work
-// that had already happened had no way into the system. And the scaling itself
-// was invisible: it ran at export, and the resulting figure could not be derived
-// from the claim form, which multiplies hours × rate with no factor in it.
+// The rule (college decision, 11/09/2026):
 //
-// The rule now (college decision, 07/09/2026):
+//	The pool is divided between the TAs in proportion to what each is owed —
+//	as MONEY, not as คาบ. Each person's share is rounded down to a whole baht
+//	and that figure is what the claim form's ขอเบิกจ่ายเพียง carries.
 //
-//	The pool is divided between the TAs in proportion to what each is owed, and
-//	each person's share is then spent along their own คาบ in date order, buying
-//	every คาบ it can still afford and skipping the ones it cannot.
+// Nothing is cut at a คาบ any more. The printed claim already lists every hour
+// taught and states the funded figure on one line, so there was never a reason
+// for that figure to be a sum of whole คาบ — and making it one had two costs the
+// college would not carry (see the probe of 11/09/2026): two TAs with identical
+// hours came out a whole คาบ apart, and every pool left change in the account
+// that a TA was owed. Proportional money fixes both: equal work is paid equally
+// to the baht, and the pool is spent to within the rounding.
 //
-// Skipping (07/09/2026) is what stops the budget being underspent: without it a
-// remainder too small for the next class bought nothing at all, even when a
-// cheaper คาบ stood later in the same timetable. Nothing is left behind now that
-// any remaining คาบ could have paid for.
+// What the lecturer still chooses is WHERE in the calendar each person's share
+// lands (SettlementMode), because the monthly documents — the per-slice ปะหน้า
+// จ่ายตรง and the course summary's เบิกจ่ายเดือน — need a figure per month:
 //
-// So everyone is short by the same PROPORTION: equal work is paid equally, no
-// matter which days of the week somebody happened to be timetabled on.
+//   - chronological: months are paid in full in date order; the month the money
+//     runs out in gets what is left; later months get nothing.
+//   - spread: every month is cut by the same proportion, so none is paid nothing.
 //
-// From 04/08/2026 to 07/09/2026 the cut was made on the คาบ itself — one (date,
-// start time) across the whole course, paid or unpaid for everybody who taught
-// it. That guaranteed something real, that two people were never treated
-// differently for the same class, but it guaranteed nothing about the two
-// people: with the cutoff falling at a moment in the term, whoever was
-// timetabled late in the week lost hours that their colleague, working the same
-// number of hours earlier in the week, was paid for. Asked to choose between
-// "the same class is treated alike" and "the same work is paid alike", the
-// college chose the latter — the comparison TAs actually make is with each
-// other's payslip, not with each other's timetable.
+// Both place the same per-person total; only its distribution over months
+// differs. Inside a month the amount is spread over that month's คาบ in
+// proportion to their cost, so per-คาบ figures exist for the slicing arithmetic
+// without any คาบ being singled out.
 //
-// It was whole MONTHS until 04/08/2026, and the waste was severe: a pool that
-// could not afford the next month dropped all of it, so a 4,000฿ pool facing
-// months of 400/800/3,600 paid only 1,200 and left 2,800 — 70% of the budget —
-// unclaimed. Cutting at the คาบ instead leaves under one slot's cost behind.
-//
-// Still no scaling, and still no skipping ahead: once one คาบ fails to fit,
-// every later one is unpaid even if it were cheap enough. Paying a November
-// class but not an October one is impossible to explain to somebody who taught
-// both, and it would make the outcome depend on the shape of the timetable
-// rather than on the calendar.
+// History, for anyone reading an old document: whole months until 04/08/2026,
+// whole คาบ course-wide until 07/09/2026, whole คาบ per person until 11/09/2026.
 
-// SlotSettlement is one (date, start time) of one pool: what that คาบ costs
-// across every TA who taught it, and whether the budget reached it.
+// SlotSettlement is one person's คาบ — one (TA, date, start time) of one pool —
+// with what it costs and how much of that the budget funds.
 type SlotSettlement struct {
-	// TA owns this คาบ. The ledger is per PERSON as well as per คาบ: the budget
-	// is shared out between people first (see settleTrack), so who worked a คาบ
-	// decides whether it is paid.
 	TA        uuid.UUID `json:"-"`
 	Date      string    `json:"date"`       // "2026-10-20"
 	StartTime string    `json:"start_time"` // "15:00"
 	YearMonth string    `json:"year_month"` // "2026-10", Gregorian — for rollups
 	Baht      float64   `json:"baht"`
-	Paid      bool      `json:"paid"`
+	// PaidBaht is the funded part of Baht, in [0, Baht]. It is a share of the
+	// person's money placed on this คาบ for the month arithmetic, not a verdict
+	// on the คาบ: a partly funded month has every คาบ partly funded.
+	PaidBaht float64 `json:"paid_baht"`
 }
 
-// MonthSettlement is one month of one pool: what it costs and whether the
-// budget reached it.
+// MonthSettlement is one month of one pool: what it costs and how much of that
+// the budget reached.
 type MonthSettlement struct {
 	YearMonth string  `json:"year_month"` // "2026-06", Gregorian
 	Baht      float64 `json:"baht"`
 	PaidBaht  float64 `json:"paid_baht"`
-	// Paid means the month was covered IN FULL. With a คาบ-level cutoff one
-	// month per pool can land in between — see PaidBaht.
+	// Paid means the month was covered IN FULL.
 	Paid bool `json:"paid"`
+}
+
+// PersonSettlement is one TA's outcome inside one pool: what their work in
+// each month costs and how much of it the budget funds. This is the figure the
+// lecturer is shown per person per month, so the split is never explained from
+// a course total that nobody can check against their own payslip.
+type PersonSettlement struct {
+	TAID  uuid.UUID `json:"ta_id"`
+	Name  string    `json:"name"`
+	Level string    `json:"level"` // "undergrad" | "master" | "phd"
+	// Months carries this person's own monthly figures; Baht/PaidBaht are their
+	// sums. Empty for a grad-special lump holder, who has no monthly work.
+	Months   []MonthSettlement `json:"months"`
+	Baht     float64           `json:"baht"`
+	PaidBaht float64           `json:"paid_baht"`
+	// LumpBaht is the graduate-special flat term lump this person holds, taken
+	// off the top of the special pool — not monthly, not cut.
+	LumpBaht float64 `json:"lump_baht,omitempty"`
 }
 
 // TrackSettlement is one budget pool's outcome. The pools are separate by
 // ประกาศ — regular-track work draws only on the regular budget — so a course
-// with both tracks can have two different cutoff months.
+// with both tracks can be short on one and whole on the other.
 type TrackSettlement struct {
 	Track string  `json:"track"` // "regular" | "special"
 	Cap   float64 `json:"cap"`
-	// Committed is spending that is not monthly and is taken off the top:
-	// the graduate-special lump sum, which is a flat term figure.
+	// Committed is spending that is taken off the top of the pool before the
+	// shares are cut: the graduate-special lump sums, flat term figures.
 	Committed float64 `json:"committed"`
-	// Months is the rollup the screens read; Slots is what the cutoff actually
-	// ran on and what the printed claim is filtered by.
-	Slots       []SlotSettlement  `json:"-"`
-	Months      []MonthSettlement `json:"months"`
-	PaidBaht    float64           `json:"paid_baht"`
-	DroppedBaht float64           `json:"dropped_baht"`
-	// CutoffMonth/CutoffDate/CutoffStart name the FIRST คาบ that went unpaid, and
-	// nothing more than that. They are a label for the screens and the shortfall
-	// notice, never a rule: since the fill skips คาบ it cannot afford, paid and
-	// unpaid ones interleave and no single date divides them. unpaidFor is the
-	// only thing that may be asked whether a given คาบ is paid.
+	// CommittedByMonth dates the same money: each holder's lump laid on the
+	// months by their own logged hours (gradLumpByMonth), summed over holders.
+	// The monthly documents read this; Committed alone cannot say which month
+	// a lump is paid in.
+	CommittedByMonth map[string]float64 `json:"committed_by_month,omitempty"`
+	// Months is the rollup the screens read; Slots is what the shares were
+	// placed on and what the printed documents sum.
+	Slots  []SlotSettlement  `json:"-"`
+	Months []MonthSettlement `json:"months"`
+	// People is the same ledger rolled up per TA — see PersonSettlement.
+	People      []PersonSettlement `json:"people"`
+	PaidBaht    float64            `json:"paid_baht"`
+	DroppedBaht float64            `json:"dropped_baht"`
+	// CutoffMonth/CutoffDate/CutoffStart name the FIRST คาบ that was not funded
+	// in full, and nothing more than that. They are a label for the screens and
+	// the shortfall notice, never a rule: fundedShare is the only thing that may
+	// be asked how much of a given คาบ is paid.
 	CutoffMonth string `json:"cutoff_month,omitempty"`
 	CutoffDate  string `json:"cutoff_date,omitempty"`
 	CutoffStart string `json:"cutoff_start,omitempty"`
-	// paidIndex is Slots keyed for lookup — see unpaidFrom. Unexported and
+	// shareIndex is Slots keyed for lookup — see fundedShare. Unexported and
 	// untagged: it is a view of Slots, never a second source of truth, and it
 	// must not cross the API boundary where it could drift from them.
-	paidIndex map[slotKey]bool
+	shareIndex map[slotKey]float64
 }
 
 // slotKey identifies one person's คาบ the way the ledger and the claim rows both
@@ -122,17 +133,21 @@ type slotKey struct {
 	date, start string
 }
 
-// SettlementMode is how a course's budget is cut when the work costs more than
-// the money. Stored on teaching_courses (migration 0105) and chosen by the
+// SettlementMode is where in the calendar a person's share of a short budget
+// lands. Stored on teaching_courses (migration 0105) and chosen by the
 // lecturer, who is the one who knows whether the budget can carry the spread.
+//
+// The mode never changes how much anybody is paid — that is the proportional
+// share — only which months carry it.
 type SettlementMode string
 
 const (
-	// SettleChronological pays คาบ in date order until the pool runs out. The
-	// original and default rule: the tail of the term is paid nothing.
+	// SettleChronological pays months in full in date order until the share
+	// runs out. The original and default rule: the tail of the term is paid
+	// nothing.
 	SettleChronological SettlementMode = "chronological"
-	// SettleSpread divides the pool equally between the months that have work so
-	// every one of them is paid something.
+	// SettleSpread cuts every month by the same proportion so each one is paid
+	// something.
 	SettleSpread SettlementMode = "spread"
 )
 
@@ -140,30 +155,20 @@ func (m SettlementMode) valid() bool {
 	return m == SettleChronological || m == SettleSpread
 }
 
-// unpaidFrom reports whether a คาบ at this (date, start) falls on the unpaid
-// side of the cutoff — the question the printed document asks of every row it
-// is about to include.
+// fundedShare reports what fraction of a person's คาบ at (date, start) the
+// budget funds, in [0, 1] — the question every document asks of each cost row
+// it is about to sum.
 //
-// It reads the settled ledger rather than re-deriving the rule. There is no
-// rule left to re-derive: the fill pays whatever each person's share can afford
-// and skips what it cannot, so paid and unpaid คาบ interleave and no comparison
-// of dates can reproduce the answer. settleTrack already wrote it onto every
-// slot; this looks it up.
+// It reads the settled ledger rather than re-deriving the rule. The claim rows
+// can carry several cost lines for one คาบ (different end times or levels), so
+// callers multiply their own row's baht by this fraction rather than adding a
+// slot figure that would then be counted twice.
 //
-// The date comparison survives only as a fallback for a คาบ that is not in the
-// ledger at all — slotLedger drops zero-baht costs, and an unknown key must
+// A คาบ that is not in the ledger at all is funded at 0 — slotLedger drops
+// zero-baht costs, which contribute nothing either way, and an unknown key must
 // never be assumed paid.
-func (t TrackSettlement) unpaidFor(ta uuid.UUID, date, start string) bool {
-	if paid, ok := t.paidIndex[slotKey{ta, date, start}]; ok {
-		return !paid
-	}
-	if t.CutoffDate == "" {
-		return false
-	}
-	if date != t.CutoffDate {
-		return date > t.CutoffDate
-	}
-	return start >= t.CutoffStart
+func (t TrackSettlement) fundedShare(ta uuid.UUID, date, start string) float64 {
+	return t.shareIndex[slotKey{ta, date, start}]
 }
 
 // CourseSettlement answers "what will actually be paid, and what falls off".
@@ -173,9 +178,8 @@ type CourseSettlement struct {
 	// UnpaidMonths is the union across pools, ascending — what the screens
 	// name to the lecturer and the TA.
 	UnpaidMonths []string `json:"unpaid_months,omitempty"`
-	// PartialMonths get some of their คาบ paid and some not — possible only
-	// since the cutoff moved off the month boundary. Named separately because
-	// "ได้บางส่วน" and "ไม่ได้เลย" are different sentences to a TA.
+	// PartialMonths are paid something but not everything. Named separately
+	// because "ได้บางส่วน" and "ไม่ได้เลย" are different sentences to a TA.
 	PartialMonths []string `json:"partial_months,omitempty"`
 	// TrackUnpaidMonths refines PartialMonths: the months in it where a whole
 	// budget pool was paid nothing while another was paid. "ได้บางส่วน" is the
@@ -259,28 +263,20 @@ func classifyMonths(tracks ...TrackSettlement) (unpaid, partial []string, zeroed
 	return unpaid, partial, zeroed
 }
 
-// settleTrack decides which of one pool's คาบ the money reaches.
+// settleTrack decides how much of one pool's work the money reaches.
 //
-// The pool is shared out BETWEEN PEOPLE first, in proportion to what each is
-// owed, and only then spent along each person's own timetable. So two TAs owed
-// the same amount are paid the same amount, whatever days they happened to work
-// — which is the fairness the college asked for (07/09/2026): "ต่อให้งบขาด
-// เงินไม่พอ ก็ต้องได้เท่า ๆ กัน ... ถ้าทำงานเวลาเท่า ๆ กัน".
+// The pool is shared out BETWEEN PEOPLE in proportion to what each is owed —
+// "ใครทำมาก ก็ได้มาก", and two TAs owed the same amount are paid the same
+// amount, whatever days they happened to work (the college's ask of
+// 07/09/2026: "ต่อให้งบขาด เงินไม่พอ ก็ต้องได้เท่า ๆ กัน ... ถ้าทำงานเวลา
+// เท่า ๆ กัน"). The share is money, rounded DOWN to a whole baht (11/09/2026):
+// the figure goes on a claim form as a single amount, and a form that says
+// ฿1,333 is one finance can transfer. What the rounding leaves — under one baht
+// per person — stays in the pool; it is the only money this rule does not
+// spend.
 //
-// This REPLACES the rule that stood from 04/08/2026, under which a คาบ was paid
-// or unpaid for everybody who taught it. That rule guaranteed something real —
-// two people could never be treated differently for the same class — but it
-// guaranteed nothing at all about the two people themselves: with the cutoff
-// falling at a moment in the term, a TA who taught Monday was paid and a TA who
-// taught Thursday was not, for the same hours in the same week. Between "the
-// same class is treated alike" and "the same work is paid alike", the college
-// chose the person.
-//
-// The cost is real and is not hidden: two claim forms for one co-taught คาบ can
-// now differ, because the two TAs' own quotas ran out at different points. What
-// each form says of its owner stays true — these are the hours we could pay you
-// for — and every TA is short by the same proportion, which is the sentence that
-// has to survive being read out loud in a room with all of them in it.
+// A pool that covers everything pays everything as costed, satang included:
+// rounding is a consequence of being short, not a haircut on a funded course.
 func settleTrack(mode SettlementMode, track string, cap, committed float64, slots []SlotSettlement) TrackSettlement {
 	out := TrackSettlement{Track: track, Cap: cap, Committed: committed, Slots: slots}
 	// A cap of 0 means "not configured" rather than "no money" — the student
@@ -288,10 +284,7 @@ func settleTrack(mode SettlementMode, track string, cap, committed float64, slot
 	// would be a silent zeroing. Treated as unlimited; the export's own
 	// student-count gate is what stops a course in that state.
 	if cap <= 0 {
-		for i := range out.Slots {
-			out.Slots[i].Paid = true
-		}
-		return finishTrack(out)
+		return finishTrack(payInFull(out))
 	}
 
 	people, byTA := taOrder(out.Slots)
@@ -303,140 +296,107 @@ func settleTrack(mode SettlementMode, track string, cap, committed float64, slot
 		}
 		totalOwed += owed[ta]
 	}
-	if totalOwed <= 0 {
-		return finishTrack(out)
-	}
-
-	// Everyone's share is the same FRACTION of what they are owed, so the split
-	// is equal in the only sense money can be equal between people who worked
-	// different amounts.
 	pool := cap - committed
-	spare := 0.0
-	for _, ta := range people {
-		share := pool * owed[ta] / totalOwed
-		spare += fillPerson(mode, out.Slots, byTA[ta], share)
+	if totalOwed <= pool+0.005 {
+		return finishTrack(payInFull(out)) // an exact fit is a fit
 	}
-	spendSpare(out.Slots, people, byTA, owed, spare)
+	pool = math.Max(0, pool) // the lump alone can exceed the cap; nothing is left then
+
+	for _, ta := range people {
+		if owed[ta] <= 0 {
+			continue
+		}
+		share := math.Floor(pool * owed[ta] / totalOwed)
+		placeShare(mode, out.Slots, byTA[ta], share)
+	}
 	return finishTrack(out)
 }
 
-// fillPerson spends one person's share along their own คาบ and returns what it
-// could not spend.
-func fillPerson(mode SettlementMode, slots []SlotSettlement, idxs []int, budget float64) float64 {
-	if mode == SettleSpread {
-		return fillSpread(slots, idxs, budget)
+// payInFull funds every คาบ at its cost.
+func payInFull(out TrackSettlement) TrackSettlement {
+	for i := range out.Slots {
+		out.Slots[i].PaidBaht = out.Slots[i].Baht
 	}
-	return fillChronological(slots, idxs, budget)
+	return out
 }
 
-// fillChronological walks a person's คาบ in date order and pays every one the
-// remaining budget can still afford.
-//
-// A คาบ that does not fit is SKIPPED rather than treated as a full stop, so a
-// remainder too small for the next class can still buy a cheaper one later.
-// Until 07/09/2026 the fill stopped dead at the first คาบ it could not afford,
-// which kept each person's unpaid คาบ a tidy suffix of their timetable — and
-// left up to one คาบ's worth of real money unspent per person, per pool. Asked
-// which mattered more, the college chose the money: "เงินสำคัญกว่า".
-//
-// The visible cost is a claim form that can read paid / unpaid / paid. What
-// makes that defensible is that the gap is never arbitrary — it is always a คาบ
-// that cost more than what was left of that person's share.
-func fillChronological(slots []SlotSettlement, idxs []int, budget float64) float64 {
-	for _, i := range idxs {
-		if slots[i].Baht > budget+0.01 {
-			continue // too dear for what is left; a cheaper คาบ later may still fit
-		}
-		slots[i].Paid = true
-		budget -= slots[i].Baht
-	}
-	return budget
-}
-
-// fillSpread gives every month this person worked an equal slice of their share,
-// so none of their months is paid nothing.
-//
-// Two passes. The first spends each month's slice inside that month, in date
-// order — the same "no skipping ahead" rule as the chronological fill, applied
-// per month instead of across the term, so what a month loses is still a suffix
-// of it. The second hands back what the first could not spend; without it this
-// rule would pay LESS than the one it replaces, because every month stops just
-// short of its slice and those near-misses add up to real money.
-func fillSpread(slots []SlotSettlement, idxs []int, budget float64) float64 {
+// placeShare lays one person's share over their months under the chosen rule.
+// idxs are that person's คาบ in chronological order (slotLedger's order).
+func placeShare(mode SettlementMode, slots []SlotSettlement, idxs []int, share float64) {
 	months, byMonth := monthOrder(slots, idxs)
-	if len(months) == 0 {
-		return budget
-	}
-	share := budget / float64(len(months))
-	spare := 0.0
-	for _, ym := range months {
-		left := share
+	cost := make([]float64, len(months))
+	for m, ym := range months {
 		for _, i := range byMonth[ym] {
-			if slots[i].Baht > left+0.01 {
-				continue
-			}
-			slots[i].Paid = true
-			left -= slots[i].Baht
-		}
-		spare += left
-	}
-	// The person's own leftovers, offered back earliest month first.
-	for _, ym := range months {
-		for _, i := range byMonth[ym] {
-			if slots[i].Paid || slots[i].Baht > spare+0.01 {
-				continue
-			}
-			slots[i].Paid = true
-			spare -= slots[i].Baht
+			cost[m] += slots[i].Baht
 		}
 	}
-	return spare
+	var allot []float64
+	if mode == SettleSpread {
+		allot = spreadOverMonths(share, cost)
+	} else {
+		allot = fillMonthsInOrder(share, cost)
+	}
+	for m, ym := range months {
+		placeInMonth(slots, byMonth[ym], allot[m], cost[m])
+	}
 }
 
-// spendSpare hands out what nobody's own share could reach, always to whoever is
-// currently furthest behind.
-//
-// Whole คาบ cannot be split, so every share strands a few baht, and left alone
-// those add up to money withheld from people who are already short. Giving the
-// next คาบ to the LOWEST-paid fraction spends it without undoing the equality
-// the shares just bought: each handout narrows the widest gap rather than
-// widening it. Ties break on the person who comes first, so the outcome does not
-// depend on map iteration order.
-func spendSpare(slots []SlotSettlement, people []uuid.UUID, byTA map[uuid.UUID][]int, owed map[uuid.UUID]float64, spare float64) {
-	paid := map[uuid.UUID]float64{}
-	for _, ta := range people {
-		for _, i := range byTA[ta] {
-			if slots[i].Paid {
-				paid[ta] += slots[i].Baht
-			}
-		}
+// fillMonthsInOrder pays months in full, earliest first, until the share can
+// no longer cover the next one; that month takes whatever is left and the
+// months after it take nothing. The full months carry their exact cost, so the
+// partial month's figure is what keeps the person's total at the whole-baht
+// share.
+func fillMonthsInOrder(share float64, cost []float64) []float64 {
+	allot := make([]float64, len(cost))
+	left := share
+	for m, c := range cost {
+		pay := math.Min(c, left)
+		allot[m] = pay
+		left -= pay
 	}
-	for {
-		best, bestIdx, bestFrac := uuid.Nil, -1, math.Inf(1)
-		for _, ta := range people {
-			// The earliest คาบ this person could still be paid for out of what is
-			// left — not merely their next unpaid one, which may be too dear while
-			// a later one fits.
-			next := -1
-			for _, i := range byTA[ta] {
-				if !slots[i].Paid && slots[i].Baht <= spare+0.01 {
-					next = i
-					break
-				}
-			}
-			if next < 0 || owed[ta] <= 0 {
-				continue
-			}
-			if frac := paid[ta] / owed[ta]; frac < bestFrac {
-				best, bestIdx, bestFrac = ta, next, frac
-			}
+	return allot
+}
+
+// spreadOverMonths cuts every month by the same proportion. Each month's figure
+// is rounded down to a whole baht so the per-month documents carry whole
+// amounts too, and the baht the rounding strands are handed back to the
+// earliest months that still have room — so the person's total is exactly
+// their share and no month is paid more than it cost.
+func spreadOverMonths(share float64, cost []float64) []float64 {
+	var total float64
+	for _, c := range cost {
+		total += c
+	}
+	allot := make([]float64, len(cost))
+	if total <= 0 {
+		return allot
+	}
+	placed := 0.0
+	for m, c := range cost {
+		allot[m] = math.Floor(share * c / total)
+		placed += allot[m]
+	}
+	left := share - placed
+	for m := range cost {
+		if left <= 0 {
+			break
 		}
-		if bestIdx < 0 {
-			return
-		}
-		slots[bestIdx].Paid = true
-		spare -= slots[bestIdx].Baht
-		paid[best] += slots[bestIdx].Baht
+		room := cost[m] - allot[m]
+		add := math.Min(room, left)
+		allot[m] += add
+		left -= add
+	}
+	return allot
+}
+
+// placeInMonth spreads a month's allotment over its คาบ in proportion to what
+// each costs, so a partly funded month is partly funded everywhere in it.
+func placeInMonth(slots []SlotSettlement, idxs []int, allot, cost float64) {
+	if cost <= 0 {
+		return
+	}
+	for _, i := range idxs {
+		slots[i].PaidBaht = allot * slots[i].Baht / cost
 	}
 }
 
@@ -472,30 +432,52 @@ func monthOrder(slots []SlotSettlement, idxs []int) ([]string, map[string][]int)
 	return months, byMonth
 }
 
-// finishTrack totals what the fill decided and derives the views built on it.
+// finishTrack totals what the shares placed and derives the views built on it.
 // Every figure here is read off Slots, so no rule can report a total its own
 // คาบ do not add up to.
 func finishTrack(out TrackSettlement) TrackSettlement {
-	out.paidIndex = make(map[slotKey]bool, len(out.Slots))
+	out.shareIndex = make(map[slotKey]float64, len(out.Slots))
 	for i := range out.Slots {
 		sl := out.Slots[i]
-		if sl.Paid {
-			out.PaidBaht += sl.Baht
-		} else {
-			out.DroppedBaht += sl.Baht
-			// The first shortfall, whichever rule produced it. Under the spread
-			// rule this names the earliest month that fell short rather than the
-			// point everything after went unpaid — unpaidFrom is what the
-			// document asks, and it reads the slots.
-			if out.CutoffDate == "" {
-				out.CutoffDate, out.CutoffStart, out.CutoffMonth = sl.Date, sl.StartTime, sl.YearMonth
-			}
+		out.PaidBaht += sl.PaidBaht
+		out.DroppedBaht += sl.Baht - sl.PaidBaht
+		// The first shortfall, whichever rule produced it. Under the spread rule
+		// this is simply the earliest คาบ — a label, not a boundary.
+		if out.CutoffDate == "" && sl.PaidBaht < sl.Baht-0.005 {
+			out.CutoffDate, out.CutoffStart, out.CutoffMonth = sl.Date, sl.StartTime, sl.YearMonth
 		}
-		out.paidIndex[slotKey{sl.TA, sl.Date, sl.StartTime}] = sl.Paid
+		share := 0.0
+		if sl.Baht > 0 {
+			share = sl.PaidBaht / sl.Baht
+		}
+		out.shareIndex[slotKey{sl.TA, sl.Date, sl.StartTime}] = share
 	}
 	out.PaidBaht = round2(out.PaidBaht)
 	out.DroppedBaht = round2(out.DroppedBaht)
 	out.Months = rollUpMonths(out.Slots)
+	out.People = rollUpPeople(out.Slots)
+	return out
+}
+
+// rollUpPeople turns the คาบ ledger into one row per TA, each with their own
+// months. Names and levels are filled in by the caller that has the database;
+// here there are only ids, in a stable order.
+func rollUpPeople(slots []SlotSettlement) []PersonSettlement {
+	people, byTA := taOrder(slots)
+	out := make([]PersonSettlement, 0, len(people))
+	for _, ta := range people {
+		own := make([]SlotSettlement, 0, len(byTA[ta]))
+		for _, i := range byTA[ta] {
+			own = append(own, slots[i])
+		}
+		p := PersonSettlement{TAID: ta, Months: rollUpMonths(own)}
+		for _, m := range p.Months {
+			p.Baht += m.Baht
+			p.PaidBaht += m.PaidBaht
+		}
+		p.Baht, p.PaidBaht = round2(p.Baht), round2(p.PaidBaht)
+		out = append(out, p)
+	}
 	return out
 }
 
@@ -512,9 +494,7 @@ func rollUpMonths(slots []SlotSettlement) []MonthSettlement {
 			out = append(out, MonthSettlement{YearMonth: sl.YearMonth})
 		}
 		out[i].Baht += sl.Baht
-		if sl.Paid {
-			out[i].PaidBaht += sl.Baht
-		}
+		out[i].PaidBaht += sl.PaidBaht
 	}
 	for i := range out {
 		out[i].Baht = round2(out[i].Baht)
@@ -688,6 +668,36 @@ func (s *ExportService) settleAs(
 	out.DroppedBaht = round2(out.Regular.DroppedBaht + out.Special.DroppedBaht)
 	out.OverBudget = out.DroppedBaht > 0
 
+	// The grad-special lump holders have no คาบ and so no row yet; they are the
+	// people the Committed figure is made of, listed so the screen can name
+	// them beside everybody else instead of showing one unattributed sum.
+	if gradSpecialTAs > 0 {
+		holders, err := s.gradSpecialTAIDs(ctx, courseID)
+		if err != nil {
+			return nil, err
+		}
+		out.Special.CommittedByMonth = map[string]float64{}
+		for _, ta := range holders {
+			// Dated by the holder's own approved special-track hours (or the
+			// forecast's not-yet-rejected ones), never by the settlement mode.
+			byMonth, err := s.gradLumpByMonth(ctx, courseID, ta, gradLump,
+				sittingsCTE != mergedSittingsForecastCTE)
+			if err != nil {
+				return nil, err
+			}
+			p := PersonSettlement{TAID: ta, LumpBaht: gradLump, Months: []MonthSettlement{}}
+			for ym, amt := range byMonth {
+				p.Months = append(p.Months, MonthSettlement{YearMonth: ym, Baht: amt, PaidBaht: amt, Paid: true})
+				out.Special.CommittedByMonth[ym] += amt
+			}
+			sort.Slice(p.Months, func(i, j int) bool { return p.Months[i].YearMonth < p.Months[j].YearMonth })
+			out.Special.People = append(out.Special.People, p)
+		}
+	}
+	if err := s.namePeople(ctx, courseID, out); err != nil {
+		return nil, err
+	}
+
 	// "ไม่ได้เลย" and "ได้บางส่วน" are separated here rather than at the screen:
 	// a month that lost one คาบ and one that lost all of them are different news
 	// for the person who worked them, and only the settlement knows which is
@@ -708,6 +718,56 @@ func (s *ExportService) settleAs(
 	// what was missing was code that carried it out.
 	out.UnpaidMonths, out.PartialMonths, out.TrackUnpaidMonths = classifyMonths(out.Regular, out.Special)
 	return out, nil
+}
+
+// namePeople fills Name and Level on every PersonSettlement of both pools from
+// the course's approved assignments. Level is per (TA, track): the assignment
+// that put them on that pool. A TA the query no longer returns (dropped after
+// logging) keeps an empty name rather than failing the settlement — the money
+// figures do not depend on it.
+func (s *ExportService) namePeople(ctx context.Context, courseID uuid.UUID, c *CourseSettlement) error {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT a.ta_id, sec.track::text, a.level::text,
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       u.first_name || ' ' || u.last_name
+		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		JOIN sections sec  ON sec.id = a.section_id AND sec.teaching_course_id = $1
+		JOIN users u       ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id`, courseID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type key struct {
+		ta    uuid.UUID
+		track string
+	}
+	level := map[key]string{}
+	name := map[uuid.UUID]string{}
+	for rows.Next() {
+		var k key
+		var lvl, n string
+		if err := rows.Scan(&k.ta, &k.track, &lvl, &n); err != nil {
+			return err
+		}
+		level[k] = lvl
+		name[k.ta] = n
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	fill := func(t *TrackSettlement) {
+		for i := range t.People {
+			p := &t.People[i]
+			p.Name = name[p.TAID]
+			p.Level = level[key{p.TAID, t.Track}]
+		}
+		sort.SliceStable(t.People, func(i, j int) bool { return t.People[i].Name < t.People[j].Name })
+	}
+	fill(&c.Regular)
+	fill(&c.Special)
+	return nil
 }
 
 // EarnedBaht is what the course's work is worth under the claim rules, before
@@ -750,13 +810,14 @@ func (c *CourseSettlement) unpaidMonthSet(track string) map[string]bool {
 	return out
 }
 
-// dropUnpaidWork rewrites each TA's actualPaid to cover only the คาบ the budget
-// reached.
+// dropUnpaidWork rewrites each TA's actualPaid to cover only what the budget
+// funds of their work.
 //
 // payBaht stays as earned — the two figures are what the preview compares, and
-// the gap between them is precisely the money the cutoff took away. Recomputed
-// per TA from their own สittings rather than scaled from the total, because
-// scaling is the thing this rule exists to avoid.
+// the gap between them is precisely the money the shortfall took away.
+// Recomputed per TA from their own sittings through fundedShare rather than
+// scaled from the record's total, so the payout and the claim document sum the
+// same rows the same way.
 // months (Gregorian "YYYY-MM", empty = all) must match the scope the records
 // were built with: a มิ.ย.–ก.ย. document never contained October's คาบ, so
 // deducting October's dropped ones from it would understate the slice.
@@ -787,9 +848,7 @@ func (s *ExportService) dropUnpaidWork(
 		if c.Track == "special" {
 			t = settlement.Special
 		}
-		if t.unpaidFor(c.TA, c.Date, c.StartTime) {
-			lost[c.TA] += c.Baht
-		}
+		lost[c.TA] += c.Baht * (1 - t.fundedShare(c.TA, c.Date, c.StartTime))
 	}
 
 	for i := range records {
@@ -1127,10 +1186,10 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 	}
 	link := "/ta/courses/" + courseID.String() + "/worklog"
 	body := "อาจารย์เปลี่ยนวิธีแบ่งงบเป็น “เฉลี่ยให้ได้ครบทุกเดือน” " +
-		"เดือนที่เคยไม่ได้รับค่าตอบแทนจะได้รับบางส่วน และเดือนอื่นอาจได้ไม่เต็ม"
+		"ทุกเดือนจะถูกหักเป็นสัดส่วนเท่ากัน ยอดรวมที่ได้รับไม่เปลี่ยน"
 	if mode == SettleChronological {
-		body = "อาจารย์เปลี่ยนวิธีแบ่งงบกลับเป็นแบบเดิม (จ่ายเรียงตามวันจนงบหมด) " +
-			"เดือนต้นเทอมจะได้เต็ม ส่วนเดือนท้ายอาจไม่ได้รับ"
+		body = "อาจารย์เปลี่ยนวิธีแบ่งงบกลับเป็นแบบเดิม (จ่ายเรียงเดือนจนงบหมด) " +
+			"เดือนต้นเทอมจะได้เต็ม ส่วนเดือนท้ายอาจไม่ได้รับ ยอดรวมที่ได้รับไม่เปลี่ยน"
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT a.ta_id
@@ -1144,9 +1203,13 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 	for rows.Next() {
 		var ta uuid.UUID
 		if err := rows.Scan(&ta); err != nil {
+			log.Printf("notifySettlementModeChanged scan %s: %v", courseID, err)
 			return
 		}
 		s.notify.Send(ctx, ta, "วิธีแบ่งงบของ "+code+" เปลี่ยนแปลงแล้ว", body, link)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("notifySettlementModeChanged rows %s: %v", courseID, err)
 	}
 }
 
@@ -1218,17 +1281,18 @@ func (s *ExportService) NotifyBudgetShortfall(ctx context.Context, courseID uuid
 	_ = s.pool.QueryRow(ctx,
 		`SELECT code, name_th FROM teaching_courses WHERE id = $1`, courseID).Scan(&code, &nameTH)
 	title := "งบไม่พอ " + code
-	// Two different sentences: a month that lost some คาบ still pays something,
-	// and saying "จะไม่ได้รับค่าตอบแทน" about it would be wrong.
+	// Two different sentences: a month paid part of its worth still pays
+	// something, and saying "จะไม่ได้รับค่าตอบแทน" about it would be wrong.
 	var what []string
 	if len(forecast.PartialMonths) > 0 {
-		what = append(what, "เดือน "+strings.Join(thaiMonthLabels(forecast.PartialMonths), ", ")+" ได้ไม่ครบทุกคาบ")
+		what = append(what, "เดือน "+strings.Join(thaiMonthLabels(forecast.PartialMonths), ", ")+" ได้ไม่เต็มจำนวน")
 	}
 	if len(forecast.UnpaidMonths) > 0 {
 		what = append(what, "เดือน "+strings.Join(thaiMonthLabels(forecast.UnpaidMonths), ", ")+" ไม่ได้รับค่าตอบแทน")
 	}
 	body := fmt.Sprintf(
-		"%s %s\nงบรายวิชาไม่พอจ่ายทั้งหมด %s (รวม %.0f บาท)\n"+
+		"%s %s\nงบรายวิชาไม่พอจ่ายทั้งหมด %s (ขาดรวม %.0f บาท "+
+			"TA ทุกคนถูกหักเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่ควรได้)\n"+
 			"ชั่วโมงยังถูกบันทึกไว้ครบ และอาจารย์ยังอนุมัติได้ตามปกติ",
 		code, nameTH, strings.Join(what, " และ"), forecast.DroppedBaht)
 
@@ -1251,10 +1315,14 @@ func (s *ExportService) NotifyBudgetShortfall(ctx context.Context, courseID uuid
 	for rows.Next() {
 		var ta uuid.UUID
 		if err := rows.Scan(&ta); err != nil {
+			log.Printf("NotifyBudgetShortfall scan %s: %v", courseID, err)
 			return
 		}
 		s.notify.Send(ctx, ta, title, body,
 			"/ta/courses/"+courseID.String()+"/worklog")
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("NotifyBudgetShortfall rows %s: %v", courseID, err)
 	}
 }
 
@@ -1324,9 +1392,21 @@ func b2StatusFilter(sittingsCTE string) string {
 // co-taught sittings. Exposes b2_overlap(ta_id, ym, hours); meant to be
 // appended after another CTE with a leading comma.
 func b2OverlapCTE(statusFilter string) string {
+	return b2OverlapScopedCTE(statusFilter, "s1.teaching_course_id = $1 AND s2.teaching_course_id = $1")
+}
+
+// b2OverlapTermCTE is the same chain over every course of term $1 — for the
+// staff review queue, which is read a term at a time. b2_blocks and b2_overlap
+// carry teaching_course_id so a TA on two courses is not paired across them.
+func b2OverlapTermCTE(statusFilter string) string {
+	return b2OverlapScopedCTE(statusFilter,
+		"s1.teaching_course_id = s2.teaching_course_id AND s1.teaching_course_id IN (SELECT id FROM teaching_courses WHERE term_id = $1)")
+}
+
+func b2OverlapScopedCTE(statusFilter, scope string) string {
 	return `
 	b2_pairs AS (
-	    SELECT a1.ta_id, w1.work_date,
+	    SELECT a1.ta_id, s1.teaching_course_id, w1.work_date,
 	           GREATEST(w1.start_time, w2.start_time) AS starts_at,
 	           LEAST(w1.end_time, w2.end_time)        AS ends_at
 	    FROM work_logs w1
@@ -1335,14 +1415,14 @@ func b2OverlapCTE(statusFilter string) string {
 	    JOIN ta_request_assignments a2 ON a2.ta_id = a1.ta_id
 	    JOIN sections s2 ON s2.id = a2.section_id AND s2.track = 'special'
 	    JOIN work_logs w2 ON w2.assignment_id = a2.id AND w2.work_date = w1.work_date
-	    WHERE s1.teaching_course_id = $1 AND s2.teaching_course_id = $1
+	    WHERE ` + scope + `
 	      AND ` + statusFilter + `
 	      AND w1.start_time < w2.end_time AND w2.start_time < w1.end_time
 	),
 	b2_marked AS (
 	    SELECT *,
 	           CASE WHEN starts_at <= MAX(ends_at) OVER (
-	                    PARTITION BY ta_id, work_date
+	                    PARTITION BY ta_id, teaching_course_id, work_date
 	                    ORDER BY starts_at, ends_at
 	                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
 	                THEN 0 ELSE 1 END AS starts_new
@@ -1351,19 +1431,20 @@ func b2OverlapCTE(statusFilter string) string {
 	b2_grouped AS (
 	    SELECT *,
 	           SUM(starts_new) OVER (
-	               PARTITION BY ta_id, work_date
+	               PARTITION BY ta_id, teaching_course_id, work_date
 	               ORDER BY starts_at, ends_at
 	               ROWS UNBOUNDED PRECEDING) AS block
 	    FROM b2_marked
 	),
 	b2_blocks AS (
-	    SELECT ta_id, work_date, MIN(starts_at) AS starts_at, MAX(ends_at) AS ends_at
-	    FROM b2_grouped GROUP BY ta_id, work_date, block
+	    SELECT ta_id, teaching_course_id, work_date,
+	           MIN(starts_at) AS starts_at, MAX(ends_at) AS ends_at
+	    FROM b2_grouped GROUP BY ta_id, teaching_course_id, work_date, block
 	),
 	b2_overlap AS (
-	    SELECT ta_id, to_char(work_date, 'YYYY-MM') AS ym,
+	    SELECT ta_id, teaching_course_id, to_char(work_date, 'YYYY-MM') AS ym,
 	           SUM(EXTRACT(EPOCH FROM (ends_at - starts_at)) / 3600.0) AS hours
-	    FROM b2_blocks GROUP BY 1, 2
+	    FROM b2_blocks GROUP BY 1, 2, 3
 	)`
 }
 
@@ -1422,7 +1503,7 @@ func (s *ExportService) claimCostByTASlot(
 ) ([]taSlotCost, error) {
 	rows, err := s.pool.Query(ctx, `WITH`+sittingsCTE+`,`+b2OverlapCTE(b2StatusFilter(sittingsCTE))+`,
 	sit AS (
-	    SELECT ta_id,
+	    SELECT ta_id, work_date, start_time, end_time,
 	           to_char(work_date, 'YYYY-MM-DD') AS d,
 	           to_char(start_time, 'HH24:MI')   AS st,
 	           to_char(end_time, 'HH24:MI')     AS et,
@@ -1430,26 +1511,34 @@ func (s *ExportService) claimCostByTASlot(
 	           track, level, SUM(hours) AS hrs
 	    FROM sittings
 	    WHERE teaching_course_id = $1
-	    GROUP BY 1, 2, 3, 4, 5, 6, 7
+	    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 	),
-	-- Raw (uncapped, B2-adjusted) value per คาบ, and the month total it belongs
-	-- to, so the cap can be turned into a per-คาบ factor below.
+	-- Raw (uncapped, B2-adjusted) value per คาบ. The B2 clock time is clipped
+	-- out of the special คาบ it actually falls in — the same cut the printed
+	-- special sheet makes (clipSpecialOverlap) — so a lecture taught to both
+	-- tracks at once is worth 0 on the special side and the คาบ around it keep
+	-- their whole value. Smearing the month's overlap across every special คาบ
+	-- pro-rata gave the same month total but fractional คาบ (฿199.99 months)
+	-- and a per-คาบ split the claim sheet could not reproduce.
 	priced AS (
 	    SELECT sit.*,
 	           CASE
 	               WHEN sit.level = 'undergrad' AND sit.track = 'regular' THEN sit.hrs * $2
 	               WHEN sit.level IN ('master','phd') AND sit.track = 'regular' THEN sit.hrs * $4
 	               WHEN sit.level = 'undergrad' AND sit.track = 'special' THEN
-	                   GREATEST(sit.hrs - COALESCE(o.hours, 0) * (sit.hrs / NULLIF(mo.month_hrs, 0)), 0) * $3
+	                   GREATEST(sit.hrs - COALESCE(ov.hours, 0), 0) * $3
 	               ELSE 0
 	           END AS raw_baht
 	    FROM sit
-	    LEFT JOIN (
-	        SELECT ta_id, ym, track, SUM(hrs) AS month_hrs
-	        FROM sit GROUP BY 1, 2, 3
-	    ) mo ON mo.ta_id = sit.ta_id AND mo.ym = sit.ym AND mo.track = sit.track
-	    LEFT JOIN b2_overlap o
-	           ON o.ta_id = sit.ta_id AND o.ym = sit.ym AND sit.track = 'special'
+	    LEFT JOIN LATERAL (
+	        SELECT SUM(EXTRACT(EPOCH FROM (
+	                   LEAST(b.ends_at, sit.end_time) - GREATEST(b.starts_at, sit.start_time)
+	               )) / 3600.0) AS hours
+	        FROM b2_blocks b
+	        WHERE sit.track = 'special'
+	          AND b.ta_id = sit.ta_id AND b.work_date = sit.work_date
+	          AND b.starts_at < sit.end_time AND b.ends_at > sit.start_time
+	    ) ov ON TRUE
 	)
 	SELECT p.ta_id, p.d, p.st, p.et, p.ym, p.track, p.level,
 	       CASE

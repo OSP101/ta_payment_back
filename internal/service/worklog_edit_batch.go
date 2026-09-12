@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/google/uuid"
@@ -294,6 +295,9 @@ func (s *WorkLogService) notifyEditBatch(ctx context.Context, in EditBatchInput,
 		s.notify.Send(ctx, id, title, body,
 			"/lecturer/courses/"+in.TeachingCourseID.String())
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("notifyEditBatch rows %s: %v", in.TeachingCourseID, err)
+	}
 }
 
 // errText pulls the Thai message out of a UserError, falling back to the raw
@@ -366,11 +370,16 @@ func (s *WorkLogService) ListEditBatches(
 		}
 		for frows.Next() {
 			var name, key string
-			if err := frows.Scan(&name, &key); err == nil {
-				out[i].Files = append(out[i].Files, EditBatchFile{
-					Filename: name, URL: "/api/v1/worklog-edit-files/" + key,
-				})
+			if err := frows.Scan(&name, &key); err != nil {
+				log.Printf("ListEditBatches files for %s: %v", out[i].ID, err)
+				break
 			}
+			out[i].Files = append(out[i].Files, EditBatchFile{
+				Filename: name, URL: "/api/v1/worklog-edit-files/" + key,
+			})
+		}
+		if err := frows.Err(); err != nil {
+			log.Printf("ListEditBatches files rows for %s: %v", out[i].ID, err)
 		}
 		frows.Close()
 	}

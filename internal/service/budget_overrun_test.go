@@ -54,9 +54,9 @@ func TestApprove_NoLongerRefusedWhenItWouldExceedTheBudget(t *testing.T) {
 	}
 }
 
-// The cutoff is by month and shared by the whole course, so the same hours are
-// worth the same to everyone regardless of who submitted first.
-func TestSettleCourse_CutsWholeMonthsNotPeople(t *testing.T) {
+// Chronological placement end to end: the first month is paid in full, the
+// second takes what is left of the pool and reads as partly paid.
+func TestSettleCourse_ChronologicalPaysTheFirstMonthAndSplitsTheSecond(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	// Two months of identical work: 2 hours in each.
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
@@ -64,7 +64,8 @@ func TestSettleCourse_CutsWholeMonthsNotPeople(t *testing.T) {
 	f.mustUpsert(f.entry(next, "09:00", "11:00", 2))
 	f.exec(`UPDATE work_logs SET status='approved' WHERE assignment_id=$1`, f.AssignmentID)
 
-	// Budget buys ~1.4 months of the 2 h/month above → the second month falls off.
+	// Budget buys ~1.4 months of the 2 h/month above → the second month is
+	// paid for the remaining 0.4.
 	squeezeBudget(t, f, 1.4, 2)
 
 	got, err := exportSvcFor(f).SettleCourse(f.ctx, f.CourseID)
@@ -77,13 +78,16 @@ func TestSettleCourse_CutsWholeMonthsNotPeople(t *testing.T) {
 	if len(got.Regular.Months) != 2 {
 		t.Fatalf("months = %d, want 2", len(got.Regular.Months))
 	}
-	if !got.Regular.Months[0].Paid || got.Regular.Months[1].Paid {
-		t.Errorf("paid = [%v %v], want the first month only",
-			got.Regular.Months[0].Paid, got.Regular.Months[1].Paid)
+	m0, m1 := got.Regular.Months[0], got.Regular.Months[1]
+	if !m0.Paid || m1.Paid || m1.PaidBaht <= 0 {
+		t.Errorf("months = %+v, want the first in full and the second partly", got.Regular.Months)
 	}
-	if len(got.UnpaidMonths) != 1 || got.UnpaidMonths[0] != got.Regular.Months[1].YearMonth {
-		t.Errorf("unpaid months = %v, want just %q — this is the list the screens name "+
-			"to the lecturer and the TA", got.UnpaidMonths, got.Regular.Months[1].YearMonth)
+	if want := math.Floor(got.Regular.Cap); got.Regular.PaidBaht != want {
+		t.Errorf("paid %.2f, want the pool %.2f spent to the baht", got.Regular.PaidBaht, want)
+	}
+	if len(got.UnpaidMonths) != 0 || len(got.PartialMonths) != 1 || got.PartialMonths[0] != m1.YearMonth {
+		t.Errorf("unpaid = %v partial = %v, want only %q partial — this is what the screens "+
+			"name to the lecturer and the TA", got.UnpaidMonths, got.PartialMonths, m1.YearMonth)
 	}
 }
 
@@ -102,9 +106,9 @@ func TestSettleCourse_UnderBudgetChangesNothing(t *testing.T) {
 	}
 }
 
-// The money a TA actually receives drops by exactly the cut months' worth —
-// not by a scaling factor, so it still reconciles against the claim form.
-func TestBuildExportRows_DropsTheCutMonthsFromActualPaid(t *testing.T) {
+// The money a TA actually receives drops by exactly what the settlement
+// dropped, so the payout reconciles against the claim form's ขอเบิกจ่ายเพียง.
+func TestBuildExportRows_DropsTheShortfallFromActualPaid(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
 	next := monthStart().AddDate(0, 1, 9).Format("2006-01-02")
@@ -124,10 +128,7 @@ func TestBuildExportRows_DropsTheCutMonthsFromActualPaid(t *testing.T) {
 		t.Fatalf("actualPaid %.2f is not below payBaht %.2f — the cut month was still paid",
 			r.actualPaid, r.payBaht)
 	}
-	// The exact invariant: what a TA loses is the cut months' own cost, not a
-	// share of some scaled total. Compared against the settlement rather than
-	// against "half", because the two months are priced independently and a
-	// scaling factor would also land near half.
+	// The exact invariant: what a TA loses is what the settlement dropped.
 	settlement, err := exportSvcFor(f).SettleCourse(f.ctx, f.CourseID)
 	if err != nil {
 		t.Fatal(err)

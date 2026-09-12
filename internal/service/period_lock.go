@@ -34,6 +34,24 @@ import (
 // term: academic_year::text || '-' || to_char(work_date, 'MM'). Never derive
 // the year from the work_date itself.
 
+// workLogInPeriodSQL คืนเงื่อนไข join ระหว่าง work_logs กับ submission_periods
+//
+// มีที่เดียว เพราะ ~15 query เคยเขียนซ้ำกันเองด้วย MM อย่างเดียว
+// (to_char(work_date,'MM') = RIGHT(sp.year_month, 2)) ซึ่งทิ้งปีทิ้ง และ
+// ปลอดภัยเฉพาะโดยบังเอิญที่ subquery ทุกอันถูกจำกัดด้วย teaching_course_id
+// เดียว (คอร์สหนึ่งอยู่ในเทอมเดียวซึ่งสั้นกว่า 12 เดือน จึงไม่มีเดือนซ้ำ) —
+// มันจะพังทันทีที่มีคอร์สข้ามปีปฏิทิน, แถว teaching_courses ถูกใช้ซ้ำ, หรือมี
+// ภาคฤดูร้อนต่อท้ายคอร์สเดิม
+//
+// year_month เป็นปีการศึกษาพุทธศักราช ไม่ใช่ปีปฏิทิน (ดูคอมเมนต์ข้างบนเรื่อง
+// year_month mapping) จึงเทียบกับ to_char(work_date,'YYYY-MM') ตรง ๆ ไม่ได้ —
+// ต้องประกอบจากปีการศึกษาของเทอมเหมือนที่ resolvePeriodState/financeLockedMonths
+// ทำอยู่แล้ว
+func workLogInPeriodSQL(wlAlias, termAlias, spAlias string) string {
+	return fmt.Sprintf("%s.academic_year::text || '-' || to_char(%s.work_date,'MM') = %s.year_month",
+		termAlias, wlAlias, spAlias)
+}
+
 // periodState is the resolved submission-period condition covering one
 // (teaching_course, ta, work_date). Found=false when the term simply has no
 // period defined for that month — treated as unrestricted for backward

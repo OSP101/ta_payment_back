@@ -66,17 +66,33 @@ type ExecutiveSummary struct {
 
 // TACourseStatus is one row on the TA landing dashboard: for a course the TA
 // is assigned to, what stage the workflow is at + estimated pay so far.
+//
+// One row per COURSE. It used to be one per (course, track), and a TA helping
+// both ภาคปกติ and ภาคพิเศษ of one course then reached the screen as two rows
+// that a lookup by course id collapsed to one — half their hours simply gone
+// (SC362005, 11/09/2026). The split is carried as fields instead, so the
+// screen can say "ปกติ 144 · พิเศษ 12" rather than a total that mixes two rates
+// and two budgets.
 type TACourseStatus struct {
 	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
 	CourseCode       string    `json:"course_code"`
 	CourseNameTH     string    `json:"course_name_th"`
 	TermLabel        string    `json:"term_label"`
 	Stage            string    `json:"stage"` // draft/submitted/approved/exported
-	HoursApproved    float64   `json:"hours_approved"`
-	HoursPending     float64   `json:"hours_pending"`
-	EstimatedBaht    float64   `json:"estimated_baht"` // approved-hours × per-track rate (grad-special = flat)
-	Level            string    `json:"level"`
-	Track            string    `json:"track"`
+	// Hours are counted as SITTINGS: a คาบ logged against two co-taught
+	// sections is one คาบ of work, and one shared with a special section is
+	// regular work (rule B2 bills it once, on the regular side).
+	HoursApproved        float64 `json:"hours_approved"`
+	HoursApprovedRegular float64 `json:"hours_approved_regular"`
+	HoursApprovedSpecial float64 `json:"hours_approved_special"`
+	HoursPending         float64 `json:"hours_pending"`
+	HoursPendingRegular  float64 `json:"hours_pending_regular"`
+	HoursPendingSpecial  float64 `json:"hours_pending_special"`
+	// approved-hours × per-track rate (grad-special = flat, not counted here).
+	EstimatedBaht        float64 `json:"estimated_baht"`
+	EstimatedBahtRegular float64 `json:"estimated_baht_regular"`
+	EstimatedBahtSpecial float64 `json:"estimated_baht_special"`
+	Level                string  `json:"level"`
 }
 
 // TaOverview aggregates every course the TA is on. Read-only. Meant for the
@@ -99,33 +115,63 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 		args = append(args, *enrollmentID)
 	}
 	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT tc.id, tc.code, tc.name_th,
-		       t.academic_year || '/' || t.semester,
-		       a.level, sec.track,
-		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN wl.hours END),0) AS hrs_approved,
-		       COALESCE(SUM(CASE WHEN wl.status IN ('draft','submitted') THEN wl.hours END),0) AS hrs_pending,
-		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN
-		           wl.hours * CASE
-		               WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
-		               WHEN a.level='undergrad' AND sec.track='special' THEN pr.undergrad_special
-		               WHEN a.level IN ('master','phd') AND sec.track='regular' THEN pr.graduate_regular_hourly
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		assign AS (
+		    SELECT tc.id AS tc_id, tc.code, tc.name_th, tc.exported_at,
+		           t.academic_year, t.semester,
+		           a.id AS assignment_id, a.level::text AS level,
+		           COALESCE(a.cotaught_group::text, a.id::text) AS grp,
+		           sec.track::text AS track
+		    FROM ta_request_assignments a
+		    JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
+		    JOIN sections sec ON sec.id=a.section_id
+		    JOIN teaching_courses tc ON tc.id=sec.teaching_course_id
+		    JOIN academic_terms t ON t.id=tc.term_id
+		    WHERE a.ta_id = $1`+filter+`
+		),
+		-- One sitting per co-taught group: the same คาบ written against two
+		-- sections is one คาบ. Regular if any regular section shares it.
+		sitting AS (
+		    SELECT s.tc_id, s.level, s.grp, wl.status, wl.work_date, wl.start_time, wl.end_time,
+		           MAX(wl.hours) AS hours,
+		           BOOL_OR(s.track = 'regular') AS regular
+		    FROM assign s
+		    JOIN work_logs wl ON wl.assignment_id = s.assignment_id
+		    GROUP BY 1, 2, 3, 4, 5, 6, 7
+		),
+		priced AS (
+		    SELECT st.*,
+		           st.hours * CASE
+		               WHEN st.level='undergrad' AND st.regular     THEN pr.undergrad_regular
+		               WHEN st.level='undergrad' AND NOT st.regular THEN pr.undergrad_special
+		               WHEN st.level IN ('master','phd') AND st.regular THEN pr.graduate_regular_hourly
 		               ELSE 0
-		           END
-		       END),0) AS baht_approved,
-		       COALESCE(BOOL_OR(wl.status='approved'),  FALSE) AS any_approved,
-		       COALESCE(BOOL_OR(wl.status='submitted'), FALSE) AS any_submitted,
-		       tc.exported_at IS NOT NULL AS exported
-		FROM ta_request_assignments a
-		JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
-		JOIN sections sec ON sec.id=a.section_id
-		JOIN teaching_courses tc ON tc.id=sec.teaching_course_id
-		JOIN academic_terms t ON t.id=tc.term_id
-		LEFT JOIN work_logs wl ON wl.assignment_id=a.id
-		CROSS JOIN latest pr
-		WHERE a.ta_id = $1`+filter+`
-		GROUP BY tc.id, tc.code, tc.name_th, t.academic_year, t.semester, a.level, sec.track, tc.exported_at
-		ORDER BY t.academic_year DESC, t.semester DESC, tc.code`, args...)
+		           END AS baht
+		    FROM sitting st CROSS JOIN latest pr
+		)
+		SELECT c.tc_id, c.code, c.name_th,
+		       c.academic_year || '/' || c.semester,
+		       c.level,
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='approved'),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='approved' AND p.regular),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='approved' AND NOT p.regular),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status IN ('draft','submitted')),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status IN ('draft','submitted') AND p.regular),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status IN ('draft','submitted') AND NOT p.regular),0),
+		       COALESCE(SUM(p.baht) FILTER (WHERE p.status='approved'),0),
+		       COALESCE(SUM(p.baht) FILTER (WHERE p.status='approved' AND p.regular),0),
+		       COALESCE(SUM(p.baht) FILTER (WHERE p.status='approved' AND NOT p.regular),0),
+		       COALESCE(BOOL_OR(p.status='approved'),  FALSE) AS any_approved,
+		       COALESCE(BOOL_OR(p.status='submitted'), FALSE) AS any_submitted,
+		       c.exported_at IS NOT NULL AS exported
+		FROM (SELECT DISTINCT tc_id, code, name_th, exported_at, academic_year, semester,
+		             -- A TA holds one level per course; MIN only settles ties
+		             -- that cannot happen.
+		             MIN(level) OVER (PARTITION BY tc_id) AS level
+		      FROM assign) c
+		LEFT JOIN priced p ON p.tc_id = c.tc_id
+		GROUP BY c.tc_id, c.code, c.name_th, c.academic_year, c.semester, c.level, c.exported_at
+		ORDER BY c.academic_year DESC, c.semester DESC, c.code`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -135,8 +181,10 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 		var r TACourseStatus
 		var anyApproved, anySubmitted, exported bool
 		if err := rows.Scan(&r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
-			&r.TermLabel, &r.Level, &r.Track,
-			&r.HoursApproved, &r.HoursPending, &r.EstimatedBaht,
+			&r.TermLabel, &r.Level,
+			&r.HoursApproved, &r.HoursApprovedRegular, &r.HoursApprovedSpecial,
+			&r.HoursPending, &r.HoursPendingRegular, &r.HoursPendingSpecial,
+			&r.EstimatedBaht, &r.EstimatedBahtRegular, &r.EstimatedBahtSpecial,
 			&anyApproved, &anySubmitted, &exported); err != nil {
 			return nil, err
 		}
@@ -164,11 +212,17 @@ type LecturerCourseStatus struct {
 	TermLabel        string    `json:"term_label"`
 	TACount          int       `json:"ta_count"`
 	TAsPending       int       `json:"ta_pending_count"`
-	HoursPending     float64   `json:"hours_pending_approval"`
-	HoursApproved    float64   `json:"hours_approved"`
-	EstimatedBaht    float64   `json:"estimated_baht"`
-	BudgetMax        float64   `json:"budget_max"`
-	BudgetUsed       float64   `json:"budget_used"`
+	// Hours are sittings, split by the track they are billed on — the same
+	// counting as the TA's own card (TaOverview) and the approval queue.
+	HoursPending         float64 `json:"hours_pending_approval"`
+	HoursPendingRegular  float64 `json:"hours_pending_regular"`
+	HoursPendingSpecial  float64 `json:"hours_pending_special"`
+	HoursApproved        float64 `json:"hours_approved"`
+	HoursApprovedRegular float64 `json:"hours_approved_regular"`
+	HoursApprovedSpecial float64 `json:"hours_approved_special"`
+	EstimatedBaht        float64 `json:"estimated_baht"`
+	BudgetMax            float64 `json:"budget_max"`
+	BudgetUsed           float64 `json:"budget_used"`
 }
 
 // LecturerOverview lists every course the lecturer teaches this term with
@@ -181,32 +235,66 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		args = append(args, *termID)
 	}
 	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-		SELECT tc.id, tc.code, tc.name_th,
-		       t.academic_year || '/' || t.semester,
-		       COUNT(DISTINCT a.ta_id) FILTER (WHERE a.ta_id IS NOT NULL),
-		       COUNT(DISTINCT a.ta_id) FILTER (WHERE wl.status='submitted'),
-		       COALESCE(SUM(CASE WHEN wl.status='submitted' THEN wl.hours END),0),
-		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN wl.hours END),0),
-		       COALESCE(SUM(CASE WHEN wl.status='approved' THEN
-		           wl.hours * CASE
-		               WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
-		               WHEN a.level='undergrad' AND sec.track='special' THEN pr.undergrad_special
-		               WHEN a.level IN ('master','phd') AND sec.track='regular' THEN pr.graduate_regular_hourly
+		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		course AS (
+		    SELECT tc.id, tc.code, tc.name_th, t.academic_year, t.semester
+		    FROM teaching_courses tc
+		    JOIN academic_terms t ON t.id=tc.term_id
+		    JOIN teaching_lecturers tl ON tl.teaching_course_id=tc.id
+		    WHERE tl.lecturer_id = $1`+termFilter+`
+		),
+		assign AS (
+		    SELECT sec.teaching_course_id AS tc_id, a.id AS assignment_id, a.ta_id,
+		           a.level::text AS level, sec.track::text AS track,
+		           COALESCE(a.cotaught_group::text, a.id::text) AS grp
+		    FROM ta_requests r
+		    JOIN ta_request_assignments a ON a.request_id=r.id
+		    JOIN sections sec ON sec.id=a.section_id
+		    WHERE r.status='approved' AND sec.teaching_course_id IN (SELECT id FROM course)
+		),
+		-- One sitting per co-taught group (a คาบ written against two sections
+		-- is one คาบ), regular if any regular section shares it — rule B2.
+		sitting AS (
+		    SELECT s.tc_id, s.ta_id, s.level, s.grp, wl.status, wl.work_date, wl.start_time, wl.end_time,
+		           MAX(wl.hours) AS hours,
+		           BOOL_OR(s.track = 'regular') AS regular
+		    FROM assign s
+		    JOIN work_logs wl ON wl.assignment_id = s.assignment_id
+		    -- Grad-special (master/phd on a special-track section) no longer
+		    -- logs work_logs at all — pay is computed automatically from the
+		    -- regular track's class schedule (2026 meeting). Same exclusion as
+		    -- worklog.go's ListPending/ListByCourse and every other queue this
+		    -- lecturer sees: without it, a leftover 'submitted' row from before
+		    -- that change creates a "ต้องดำเนินการ" card on the homepage that can
+		    -- never be resolved — nothing ever approves or rejects it.
+		    WHERE (s.level NOT IN ('master','phd') OR s.track <> 'special')
+		    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+		),
+		priced AS (
+		    SELECT st.*,
+		           st.hours * CASE
+		               WHEN st.level='undergrad' AND st.regular     THEN pr.undergrad_regular
+		               WHEN st.level='undergrad' AND NOT st.regular THEN pr.undergrad_special
+		               WHEN st.level IN ('master','phd') AND st.regular THEN pr.graduate_regular_hourly
 		               ELSE 0
-		           END
-		       END),0)
-		FROM teaching_courses tc
-		JOIN academic_terms t ON t.id=tc.term_id
-		JOIN teaching_lecturers tl ON tl.teaching_course_id=tc.id
-		LEFT JOIN ta_requests r ON r.teaching_course_id=tc.id AND r.status='approved'
-		LEFT JOIN ta_request_assignments a ON a.request_id=r.id
-		LEFT JOIN sections sec ON sec.id=a.section_id
-		LEFT JOIN work_logs wl ON wl.assignment_id=a.id
-		CROSS JOIN latest pr
-		WHERE tl.lecturer_id = $1`+termFilter+`
-		GROUP BY tc.id, tc.code, tc.name_th, t.academic_year, t.semester
-		ORDER BY t.academic_year DESC, t.semester DESC, tc.code`, args...)
+		           END AS baht
+		    FROM sitting st CROSS JOIN latest pr
+		)
+		SELECT c.id, c.code, c.name_th,
+		       c.academic_year || '/' || c.semester,
+		       (SELECT COUNT(DISTINCT ta_id) FROM assign WHERE tc_id = c.id),
+		       COUNT(DISTINCT p.ta_id) FILTER (WHERE p.status='submitted'),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='submitted'),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='submitted' AND p.regular),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='submitted' AND NOT p.regular),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='approved'),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='approved' AND p.regular),0),
+		       COALESCE(SUM(p.hours) FILTER (WHERE p.status='approved' AND NOT p.regular),0),
+		       COALESCE(SUM(p.baht) FILTER (WHERE p.status='approved'),0)
+		FROM course c
+		LEFT JOIN priced p ON p.tc_id = c.id
+		GROUP BY c.id, c.code, c.name_th, c.academic_year, c.semester
+		ORDER BY c.academic_year DESC, c.semester DESC, c.code`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -216,10 +304,15 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		var r LecturerCourseStatus
 		if err := rows.Scan(&r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
 			&r.TermLabel, &r.TACount, &r.TAsPending,
-			&r.HoursPending, &r.HoursApproved, &r.EstimatedBaht); err != nil {
+			&r.HoursPending, &r.HoursPendingRegular, &r.HoursPendingSpecial,
+			&r.HoursApproved, &r.HoursApprovedRegular, &r.HoursApprovedSpecial,
+			&r.EstimatedBaht); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	for i := range out {
 		if snap, err := budget.Compute(ctx, out[i].TeachingCourseID); err == nil {
@@ -337,12 +430,13 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 		SELECT COUNT(*) FROM (
 		    SELECT sp.id AS period_id, a.ta_id, tc.id AS tc_id
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm       ON trm.id = tc.term_id
 		    JOIN submission_periods sp    ON sp.term_id = tc.term_id
 		    JOIN sections sec             ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN work_logs wl             ON wl.assignment_id = a.id
-		                                 AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                                 AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		                                 AND wl.status = 'approved'
 		    LEFT JOIN submission_period_status st
 		           ON st.submission_period_id = sp.id
@@ -383,12 +477,13 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 		           COALESCE(st.status, 'pending') AS status,
 		           COUNT(*) FILTER (WHERE wl.status <> 'approved') AS open_rows
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm       ON trm.id = tc.term_id
 		    JOIN submission_periods sp    ON sp.term_id = tc.term_id
 		    JOIN sections sec             ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN work_logs wl             ON wl.assignment_id = a.id
-		                                 AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                                 AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		    LEFT JOIN submission_period_status st
 		           ON st.submission_period_id = sp.id
 		          AND st.ta_id = a.ta_id

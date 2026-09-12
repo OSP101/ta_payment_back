@@ -200,9 +200,13 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	defer rows.Close()
 	for rows.Next() {
 		var r string
-		if err := rows.Scan(&r); err == nil {
-			u.Roles = append(u.Roles, r)
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
 		}
+		u.Roles = append(u.Roles, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	// Banking details are deliberately not returned: they are not stored
 	// (PDPA, migration 0047). Staff read them from the creditor-form PDF the
@@ -525,17 +529,28 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 		u.AvatarURL = avatarURL(u.ID, avatarKey, avatarAt)
 		out = append(out, u)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
 	// bulk-load roles
 	for k := range out {
-		if r, err := s.pool.Query(ctx, `SELECT role::text FROM user_roles WHERE user_id=$1`, out[k].ID); err == nil {
-			for r.Next() {
-				var s string
-				if err := r.Scan(&s); err == nil {
-					out[k].Roles = append(out[k].Roles, s)
-				}
-			}
-			r.Close()
+		r, err := s.pool.Query(ctx, `SELECT role::text FROM user_roles WHERE user_id=$1`, out[k].ID)
+		if err != nil {
+			return nil, 0, err
 		}
+		for r.Next() {
+			var s string
+			if err := r.Scan(&s); err != nil {
+				r.Close()
+				return nil, 0, err
+			}
+			out[k].Roles = append(out[k].Roles, s)
+		}
+		if err := r.Err(); err != nil {
+			r.Close()
+			return nil, 0, err
+		}
+		r.Close()
 	}
 	// Auto-derive study_year from the student id so it stays current without
 	// manual edits every academic year.

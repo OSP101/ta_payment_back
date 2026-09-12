@@ -161,8 +161,10 @@ func courseAccess(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID
 // declare this TA doing" gate, derived from ta_workload_forms:
 //   - undergrad: attendance_hrs → lecture, lab_hrs → lab,
 //     check_work_hrs → review, ug_other_hrs → other
-//   - grad (master/phd): help_teach_hrs → lecture+lab,
-//     grade_hrs → review, other_hrs → other
+//   - grad (master/phd): help_teach_hrs → lecture+lab, grade_hrs → review.
+//     AllowOther is always false — other_hrs/prep_hrs exist only to satisfy
+//     the graduate school's 10-12h/week regulation total on the request
+//     form and are never loggable or payable (see loadAssignmentContext).
 //
 // If no workload form exists yet (older data or partial setup) all flags
 // default to true so existing flows don't break — the scope gate above is
@@ -282,10 +284,15 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		ac.AllowLecture = help > 0
 		ac.AllowLab = help > 0
 		ac.AllowReview = grade > 0
-		// Grad "อื่นๆ" and "เตรียมการสอน" both fall under activity=other
-		// (prep happens off-site but is billable time); either being > 0
-		// authorizes the TA to log "other".
-		ac.AllowOther = other > 0 || prep > 0
+		// other_hrs/prep_hrs ("อื่นๆ"/"เตรียมการสอน") are declared purely to
+		// satisfy the graduate school's 10-12 ชม./สัปดาห์ regulation total on
+		// the lecturer's request form — confirmed with the office
+		// (2026-09-11) that they must NOT translate into anything loggable
+		// or payable. AllowOther is hardcoded false (not other>0||prep>0) so
+		// neither the worklog duty-schedule system (declaredDutyHours,
+		// worklog.go, already grad-review-only) nor a manual "เพิ่มรายการ"
+		// entry can ever create an "other"-activity work_log for a grad TA.
+		ac.AllowOther = false
 		// help_teach is a combined cap: lecture + lab weekly total must stay
 		// under it (not each independently). WeeklyLectureLabShared=true tells
 		// enforcement to sum the two activities before comparing.
@@ -293,10 +300,11 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		ac.WeeklyCapLab = help
 		ac.AttendanceDutyHrs = attendanceDutyHours
 		ac.WeeklyCapReview = grade
-		ac.WeeklyCapOther = other + prep
+		ac.WeeklyCapOther = 0
 		ac.WeeklyLectureLabShared = true
-		// help_teach covers lecture+lab (one figure, not double-counted).
-		ac.WeeklyTotalHours = help + grade + other + prep
+		// other/prep excluded — they're not loggable, so they must not
+		// inflate the term ceiling that bounds total logged hours either.
+		ac.WeeklyTotalHours = help + grade
 	}
 	return &ac, nil
 }

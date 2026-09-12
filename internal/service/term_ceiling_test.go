@@ -69,19 +69,35 @@ func TestTermCeiling_DisplayedMatchesEnforced(t *testing.T) {
 	}
 }
 
-// THE SAFETY NET. Generate must stop at the ceiling instead of walking the
-// calendar past it.
+// THE SAFETY NET, in its ORIGINAL form: generation must never let the TOTAL
+// walk past the term ceiling. This still holds, but a later session (see
+// weeklyCapBuckets/weeklyCapReserve in worklog.go, added the same day a
+// graduate TA's system-generated ช่วยสอน hours could never be approved) added
+// a STRICTER, per-week check ahead of this one — and proved that once every
+// bucket individually respects weeks × its own weekly cap, their sum can
+// never exceed weeklyTotal × weeks (the term ceiling) either. So the
+// scenario this test used to build — 1h/week declared against a 3h lab
+// session, letting hours accumulate past a 17h ceiling — is no longer
+// reachable: the weekly check now refuses EVERY such lab row (0 of the 3h
+// fits inside a 1h budget, and a class session cannot be billed
+// fractionally), so generation produces 0 lab hours, not "up to 17h". That
+// is the correct behavior (an under-declared weekly cap should refuse to
+// generate at all, the same principle as the grad ช่วยสอน fix, not silently
+// truncate to whatever fits the term total) — this test now pins THAT, and
+// TestGenerate_GradWeeklySharedCapStopsLectureLabOvercommit (a different
+// file) pins the weekly check itself. TestGenerate_FullTimetableFitsUnderTheRealCeiling
+// below still exercises the term ceiling's original purpose (a full,
+// honestly-declared timetable must not be cut) — it just can no longer be
+// the mechanism doing any cutting, in this test file, since honest
+// per-bucket declarations never approach it.
 func TestGenerate_StopsAtTermCeiling(t *testing.T) {
 	f := termFixtureWeeks(t, 17)
 	ctx := context.Background()
 
-	// A deliberately tiny allowance: 1 hour of LAB a week and nothing else, so
-	// the ceiling (17h) bites long before the timetable runs out. Lab, not
-	// lecture, on purpose: a lab session is worked whole (the fixture's is 3h),
-	// so generation overshoots the weekly declaration and the ceiling has
-	// something to stop. Lecture duty can no longer overshoot at all — it is
-	// narrowed to the declared attendance window (see the เช็คชื่อ rule in
-	// Generate), which would make this test vacuous.
+	// Same deliberately tiny allowance as before: 1 hour of LAB a week
+	// against a 3h lab session. Lecture duty can no longer overshoot at all —
+	// it is narrowed to the declared attendance window (see the เช็คชื่อ rule
+	// in Generate) — which is why only lab is used here.
 	f.exec(`UPDATE ta_workload_forms
 	           SET attendance_hrs = 0, lab_hrs = 1, check_work_hrs = 0, ug_other_hrs = 0
 	         WHERE assignment_id = $1`, f.AssignmentID)
@@ -102,9 +118,23 @@ func TestGenerate_StopsAtTermCeiling(t *testing.T) {
 		t.Errorf("generated %.1f hours against a %.1f-hour ceiling — the generator "+
 			"walked past the limit the TA is paid against", total, ceiling)
 	}
-	if !res.StoppedAtTermCeiling {
-		t.Error("stopped_at_term_ceiling is false, so the TA is given fewer rows than " +
-			"their timetable with no reason shown")
+	// The weekly cap now catches this before a single lab hour is generated
+	// (3h can't fit an indivisible session into a 1h/week budget), so the
+	// term ceiling itself is never actually reached — SkippedWeeklyCap is
+	// the mechanism that fired, not StoppedAtTermCeiling.
+	weeklySkipped := 0
+	for _, sg := range res.SkippedWeeklyCap {
+		if sg.Reason == "ปฏิบัติการ" {
+			weeklySkipped = sg.Count
+		}
+	}
+	if weeklySkipped == 0 {
+		t.Errorf("expected the ปฏิบัติการ weekly cap to refuse every lab row (declared "+
+			"1h/week, session is 3h), got SkippedWeeklyCap=%+v", res.SkippedWeeklyCap)
+	}
+	if total > 0.01 {
+		t.Errorf("an under-declared weekly cap (1h) against a whole 3h session must refuse "+
+			"the row entirely, not generate any of it — got %.1f hours", total)
 	}
 	if math.Abs(res.TermHourCeiling-ceiling) > 0.01 {
 		t.Errorf("reported ceiling = %.1f, want %.1f", res.TermHourCeiling, ceiling)

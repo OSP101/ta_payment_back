@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"math"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -137,4 +139,134 @@ func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.U
 		out[ym] = hrs / total
 	}
 	return out, nil
+}
+
+// gradLumpByMonth places ONE graduate-special TA's flat term lump on the
+// term's months (11/09/2026 rule): in proportion to the hours that TA logged
+// on the course's special-track section(s) in each month. The lump is a
+// whole-term figure but it is paid monthly, and the college wants each month
+// to carry the share of the term that was actually worked in it. This split
+// does not depend on the lecturer's settlement mode — it is not a shortfall
+// being placed, it is a fixed sum being dated.
+//
+// approvedOnly selects which logs count: the documents and the settled
+// figures read approved work only; the forecast reads everything not
+// rejected, the same way the rest of the settlement does.
+//
+// A TA with no qualifying hours yet falls back to the course's regular-track
+// schedule estimate (gradSpecialMonthShares, the 2026 meeting rule), and a
+// course with no schedule to an even split over its term months — so the lump
+// always lands somewhere and the slices always sum back to it.
+//
+// Each month's figure is a whole baht; what the rounding strands goes to the
+// earliest month, exactly as spreadOverMonths does for hourly pay.
+func (s *ExportService) gradLumpByMonth(
+	ctx context.Context, courseID, taID uuid.UUID, lump float64, approvedOnly bool,
+) (map[string]float64, error) {
+	if lump <= 0 {
+		return map[string]float64{}, nil
+	}
+	status := "w.status = 'approved'"
+	if !approvedOnly {
+		status = "w.status <> 'rejected'"
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT to_char(w.work_date, 'YYYY-MM'), SUM(w.hours)
+		FROM work_logs w
+		JOIN ta_request_assignments a ON a.id = w.assignment_id
+		JOIN sections sec ON sec.id = a.section_id
+		WHERE sec.teaching_course_id = $1 AND sec.track = 'special' AND a.ta_id = $2
+		  AND `+status+`
+		GROUP BY 1`, courseID, taID)
+	if err != nil {
+		return nil, err
+	}
+	weights := map[string]float64{}
+	var total float64
+	for rows.Next() {
+		var ym string
+		var hrs float64
+		if err := rows.Scan(&ym, &hrs); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if hrs > 0 {
+			weights[ym] = hrs
+			total += hrs
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if total <= 0 {
+		// Nothing logged yet: the regular-track schedule estimate.
+		weights, err = gradSpecialMonthShares(ctx, s.pool, courseID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(weights) == 0 {
+		// No schedule either: evenly over the term's months.
+		weights = map[string]float64{}
+		all, err := s.CourseTermMonths(ctx, courseID)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range all {
+			weights[m.YearMonth] = 1
+		}
+		if len(weights) == 0 {
+			cal, err := courseCalendarMonths(ctx, s.pool, courseID)
+			if err != nil {
+				return nil, err
+			}
+			for _, ym := range cal {
+				weights[ym] = 1
+			}
+		}
+	}
+	return placeLump(lump, weights), nil
+}
+
+// placeLump divides a lump over months by weight, whole baht each, remainder
+// to the earliest month.
+func placeLump(lump float64, weights map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	months := make([]string, 0, len(weights))
+	var total float64
+	for ym, w := range weights {
+		if w > 0 {
+			months = append(months, ym)
+			total += w
+		}
+	}
+	if len(months) == 0 || total <= 0 {
+		return out
+	}
+	sort.Strings(months)
+	placed := 0.0
+	for _, ym := range months {
+		out[ym] = math.Floor(lump * weights[ym] / total)
+		placed += out[ym]
+	}
+	out[months[0]] += round2(lump - placed)
+	return out
+}
+
+// sumMonths totals a per-month allocation over a selection; an empty
+// selection means the whole thing.
+func sumMonths(byMonth map[string]float64, months []string) float64 {
+	if len(months) == 0 {
+		var t float64
+		for _, v := range byMonth {
+			t += v
+		}
+		return t
+	}
+	var t float64
+	for _, ym := range months {
+		t += byMonth[ym]
+	}
+	return t
 }

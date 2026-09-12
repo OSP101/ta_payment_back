@@ -176,18 +176,21 @@ func TestTermExportBlockers_ScopedToSelectedMonths(t *testing.T) {
 	}
 }
 
-// The graduate-special lump is a flat TERM figure with no คาบ behind it, so a
-// month filter cannot select it. Staff chose to apportion it by the share of
-// months a document covers (10/08/2026) — which keeps the slice-sum invariant
-// and stops a TA's ตุลาคม document reading 0.00 for work they did do.
-func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
+// The graduate-special lump is a flat TERM figure, but it is paid monthly:
+// each holder's lump is dated by their OWN approved special-track hours
+// (11/09/2026 rule), so a month slice carries the share of the term that was
+// actually worked in it — and the slices always sum back to the whole lump.
+func TestTransferCoverMonthSlices_GradLumpFollowsTheHoldersOwnHours(t *testing.T) {
 	f := newTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP303", Curriculum: "CY", LectureHrs: 100})
 	grad := f.newTA("บัณฑิต เหมาจ่าย", "master")
-	f.assignTAOn(grad, courseID, specSec, "master", []string{"2026-09-14"})
+	// Three 1-hour คาบ in September, one in October: 3/4 of the term's work
+	// in September.
+	f.assignTAOn(grad, courseID, specSec, "master",
+		[]string{"2026-09-07", "2026-09-14", "2026-09-21", "2026-10-05"})
 
 	whole, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, "graduate")
 	if err != nil {
@@ -201,9 +204,6 @@ func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
 		t.Fatalf("fixture bug: whole-term grad lump = %.2f, want 1000", lump)
 	}
 
-	// This course has no regular-track class schedule, so the apportionment
-	// falls back to an even per-calendar-month share: five months in the
-	// term, so a four-month slice carries 4/5 of the lump.
 	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
 		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}, "graduate")
 	if err != nil {
@@ -213,14 +213,44 @@ func TestTransferCoverMonthSlices_GradLumpProRated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := sheetsTotal(before); got != 750 {
+		t.Errorf("มิ.ย.–ก.ย. lump = %.2f, want 750 (3 of the 4 hours were in September)", got)
+	}
+	if got := sheetsTotal(after); got != 250 {
+		t.Errorf("ต.ค. lump = %.2f, want 250 (1 of the 4 hours)", got)
+	}
+	if sum := round2(sheetsTotal(before) + sheetsTotal(after)); sum != lump {
+		t.Errorf("slices sum to %.2f, want the undivided %.2f", sum, lump)
+	}
+}
+
+// A holder with no approved hours yet still has their lump dated — by the
+// course's regular-track schedule when there is one, else evenly over the
+// term — so no month's document ever loses a real payment.
+func TestTransferCoverMonthSlices_GradLumpWithoutHoursFallsBackToAnEvenSplit(t *testing.T) {
+	f := newTCFixture(t)
+	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
+		f.addPeriod(ym)
+	}
+	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP304", Curriculum: "CY", LectureHrs: 100})
+	grad := f.newTA("บัณฑิต ยังไม่ลงเวลา", "master")
+	f.assignTAOn(grad, courseID, specSec, "master", nil)
+
+	before, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID,
+		[]string{"2026-06", "2026-07", "2026-08", "2026-09"}, "graduate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, []string{"2026-10"}, "graduate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No regular-track schedule on this course: five term months, 200 each.
 	if got := sheetsTotal(before); got != 800 {
 		t.Errorf("มิ.ย.–ก.ย. lump = %.2f, want 800 (4/5 of 1000)", got)
 	}
 	if got := sheetsTotal(after); got != 200 {
 		t.Errorf("ต.ค. lump = %.2f, want 200 (1/5 of 1000)", got)
-	}
-	if sum := round2(sheetsTotal(before) + sheetsTotal(after)); sum != lump {
-		t.Errorf("pro-rated lump sums to %.2f, want the undivided %.2f", sum, lump)
 	}
 }
 

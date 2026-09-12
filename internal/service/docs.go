@@ -701,7 +701,7 @@ func (s *DocsService) queryDocs(ctx context.Context, sql string, args ...any) ([
 		d.FileDeletedAt = fileDeletedAt
 		out = append(out, d)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // OpenStored fetches the file bytes plus the owner user_id so callers can
@@ -1101,7 +1101,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ProfileSubmission is one immutable snapshot of a profile submission round.
@@ -1151,6 +1151,10 @@ func (s *DocsService) GetHistory(ctx context.Context, userID uuid.UUID) (*Histor
 			return nil, err
 		}
 		h.Submissions = append(h.Submissions, sub)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 

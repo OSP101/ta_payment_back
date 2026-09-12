@@ -129,6 +129,9 @@ func (s *TeachingService) BuildTimetableForm(
 		out.HasOwnClasses = true
 		out.Blocks = append(out.Blocks, b)
 	}
+	if err := ownRows.Err(); err != nil {
+		return nil, err
+	}
 
 	// TA duties across every course they assist this term.
 	dutyRows, err := s.pool.Query(ctx, `
@@ -152,6 +155,9 @@ func (s *TeachingService) BuildTimetableForm(
 			return nil, err
 		}
 		out.Blocks = append(out.Blocks, b)
+	}
+	if err := dutyRows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Duty slots the TA set for themselves — grading and other work. They
@@ -188,6 +194,9 @@ func (s *TeachingService) BuildTimetableForm(
 		}
 		out.Blocks = append(out.Blocks, b)
 	}
+	if err := revRows.Err(); err != nil {
+		return nil, err
+	}
 
 	// Signature blocks: the lecturer who SUBMITTED each request, grouped so a
 	// lecturer covering two of the TA's courses signs once.
@@ -221,6 +230,9 @@ func (s *TeachingService) BuildTimetableForm(
 		}
 		out.Signers[idx].Courses = append(out.Signers[idx].Courses, code)
 		out.Signers[idx].CourseNames = append(out.Signers[idx].CourseNames, cname)
+	}
+	if err := sigRows.Err(); err != nil {
+		return nil, err
 	}
 
 	if yearMonth == "" {

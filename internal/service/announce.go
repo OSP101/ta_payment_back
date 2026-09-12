@@ -541,9 +541,14 @@ func (s *AnnounceService) tryFanoutDue(ctx context.Context) {
 	ids := []uuid.UUID{}
 	for rows.Next() {
 		var id uuid.UUID
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
+		if err := rows.Scan(&id); err != nil {
+			log.Printf("announce.fanout scan: %v", err)
+			continue
 		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("announce.fanout rows: %v", err)
 	}
 	for _, id := range ids {
 		if err := s.materializeAudience(ctx, id); err != nil {

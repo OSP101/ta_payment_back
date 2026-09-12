@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -329,6 +330,10 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			// inside autoDecide.
 			if level == "undergrad" {
 				if err := validateUndergradSectionCaps(w, name, secNo, weekly[secID]); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := validateGradWorkloadCaps(w, name, secNo); err != nil {
 					return nil, err
 				}
 			}
@@ -667,6 +672,181 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 	return tx.Commit(ctx)
 }
 
+// workloadFormColumns is the exact SELECT-column-order both
+// ListAssignmentsForTAInCourse and UpdateAssignmentWorkload's before-image
+// read use, so the two can never drift apart.
+// The *_desc columns are nullable (older rows, and this fixture family, may
+// never have set them) but WorkloadInput's Desc fields are plain strings —
+// COALESCE to ” the same way every numeric column here already is
+// elsewhere in this file (see loadAssignmentContext, declaredDutyHours),
+// otherwise a NULL fails the scan outright.
+const workloadFormColumns = `COALESCE(help_teach_hrs,0), COALESCE(help_teach_desc,''),
+	COALESCE(prep_hrs,0), COALESCE(prep_desc,''), COALESCE(grade_hrs,0), COALESCE(grade_desc,''),
+	COALESCE(other_hrs,0), COALESCE(other_desc,''), COALESCE(check_work_hrs,0), COALESCE(attendance_hrs,0),
+	COALESCE(ug_other_hrs,0), COALESCE(ug_other_desc,''), COALESCE(lab_hrs,0), COALESCE(lab_other_hrs,0),
+	COALESCE(lab_other_desc,'')`
+
+func scanWorkloadForm(row pgx.Row) (WorkloadInput, error) {
+	var w WorkloadInput
+	err := row.Scan(
+		&w.HelpTeachHrs, &w.HelpTeachDesc, &w.PrepHrs, &w.PrepDesc, &w.GradeHrs, &w.GradeDesc,
+		&w.OtherHrs, &w.OtherDesc, &w.CheckWorkHrs, &w.AttendanceHrs, &w.UGOtherHrs, &w.UGOtherDesc,
+		&w.LabHrs, &w.LabOtherHrs, &w.LabOtherDesc)
+	return w, err
+}
+
+// AssignmentWorkloadSummary is one assignment's current declared workload,
+// for the staff/admin correction UI — see UpdateAssignmentWorkload.
+type AssignmentWorkloadSummary struct {
+	AssignmentID uuid.UUID     `json:"assignment_id"`
+	SectionNo    string        `json:"section_no"`
+	Level        string        `json:"level"`
+	Workload     WorkloadInput `json:"workload"`
+}
+
+// ListAssignmentsForTAInCourse returns every assignment a TA holds within one
+// teaching course, with its current declared workload — the staff-facing
+// counterpart to TeachingService.ListAssignmentsForTA (teaching.go), which is
+// scoped to the CALLING TA and so cannot be reused here: staff needs to look
+// up an arbitrary TA's assignments to correct them (see
+// UpdateAssignmentWorkload for why that correction path didn't exist before).
+func (s *TARequestService) ListAssignmentsForTAInCourse(ctx context.Context, taID, tcID uuid.UUID) ([]AssignmentWorkloadSummary, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.id, sec.sec_no, a.level::text, `+workloadFormColumns+`
+		FROM ta_request_assignments a
+		JOIN sections sec ON sec.id = a.section_id
+		JOIN ta_requests r ON r.id = a.request_id
+		LEFT JOIN ta_workload_forms wf ON wf.assignment_id = a.id
+		WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
+		  AND r.status IN ('approved','submitted')
+		ORDER BY sec.sec_no`, taID, tcID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AssignmentWorkloadSummary{}
+	for rows.Next() {
+		var s2 AssignmentWorkloadSummary
+		w, err := scanWorkloadFormWithHeader(rows, &s2)
+		if err != nil {
+			return nil, err
+		}
+		s2.Workload = w
+		out = append(out, s2)
+	}
+	return out, rows.Err()
+}
+
+// scanWorkloadFormWithHeader scans one row shaped like
+// ListAssignmentsForTAInCourse's query (id, sec_no, level, then the
+// workload columns) into s2's header fields and returns the workload part.
+func scanWorkloadFormWithHeader(rows pgx.Rows, s2 *AssignmentWorkloadSummary) (WorkloadInput, error) {
+	var w WorkloadInput
+	err := rows.Scan(&s2.AssignmentID, &s2.SectionNo, &s2.Level,
+		&w.HelpTeachHrs, &w.HelpTeachDesc, &w.PrepHrs, &w.PrepDesc, &w.GradeHrs, &w.GradeDesc,
+		&w.OtherHrs, &w.OtherDesc, &w.CheckWorkHrs, &w.AttendanceHrs, &w.UGOtherHrs, &w.UGOtherDesc,
+		&w.LabHrs, &w.LabOtherHrs, &w.LabOtherDesc)
+	return w, err
+}
+
+// UpdateAssignmentWorkload lets staff/admin correct a workload declaration
+// after the request has already been created. Before this, Cancel's own
+// error message ("...กรุณาติดต่อเจ้าหน้าที่เพื่อดำเนินการ") pointed at a tool
+// that didn't exist — ta_workload_forms was written once at Create and never
+// again, so a wrong declared value (the same failure shape as CP363205,
+// fixed 2026-09-07) had no correction path at all, only a dead end.
+//
+// Reuses the EXACT validation Create uses (validateWorkloadFields,
+// validateUndergradSectionCaps / validateGradWorkloadCaps) so a correction
+// can never introduce a value Create itself would have refused. Existing
+// work_logs are untouched — this only changes what a FUTURE Generate run or
+// approval recheck reads; already-approved historical rows stay as they are,
+// matching this project's append-only-history handling elsewhere (see the
+// enrollment-history and audit-trail work).
+func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, assignmentID uuid.UUID, in WorkloadInput) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var taID, sectionID uuid.UUID
+	var level string
+	if err := tx.QueryRow(ctx, `
+		SELECT ta_id, section_id, level::text FROM ta_request_assignments WHERE id = $1 FOR UPDATE`,
+		assignmentID).Scan(&taID, &sectionID, &level); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.New("ไม่พบ assignment นี้")
+		}
+		return err
+	}
+	name := s.taName(ctx, taID)
+	secNo := s.sectionLabel(ctx, sectionID)
+
+	if err := validateWorkloadFields(in, name); err != nil {
+		return err
+	}
+	if level == "undergrad" {
+		weekly, err := s.sectionWeeklyHours(ctx, []uuid.UUID{sectionID})
+		if err != nil {
+			return err
+		}
+		if err := validateUndergradSectionCaps(in, name, secNo, weekly[sectionID]); err != nil {
+			return err
+		}
+	} else {
+		if err := validateGradWorkloadCaps(in, name, secNo); err != nil {
+			return err
+		}
+	}
+
+	before, err := scanWorkloadForm(tx.QueryRow(ctx,
+		`SELECT `+workloadFormColumns+` FROM ta_workload_forms WHERE assignment_id = $1`, assignmentID))
+	hadBefore := true
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		hadBefore = false
+	}
+
+	if hadBefore {
+		if _, err := tx.Exec(ctx, `
+			UPDATE ta_workload_forms SET
+			  help_teach_hrs=$2, help_teach_desc=$3, prep_hrs=$4, prep_desc=$5,
+			  grade_hrs=$6, grade_desc=$7, other_hrs=$8, other_desc=$9,
+			  check_work_hrs=$10, attendance_hrs=$11, ug_other_hrs=$12, ug_other_desc=$13,
+			  lab_hrs=$14, lab_other_hrs=$15, lab_other_desc=$16
+			WHERE assignment_id=$1`,
+			assignmentID, in.HelpTeachHrs, in.HelpTeachDesc, in.PrepHrs, in.PrepDesc,
+			in.GradeHrs, in.GradeDesc, in.OtherHrs, in.OtherDesc,
+			in.CheckWorkHrs, in.AttendanceHrs, in.UGOtherHrs, in.UGOtherDesc,
+			in.LabHrs, in.LabOtherHrs, in.LabOtherDesc); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ta_workload_forms (id, assignment_id, help_teach_hrs, help_teach_desc, prep_hrs, prep_desc,
+				grade_hrs, grade_desc, other_hrs, other_desc, check_work_hrs, attendance_hrs, ug_other_hrs, ug_other_desc,
+				lab_hrs, lab_other_hrs, lab_other_desc)
+			VALUES (gen_random_uuid(), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+			assignmentID, in.HelpTeachHrs, in.HelpTeachDesc, in.PrepHrs, in.PrepDesc, in.GradeHrs, in.GradeDesc,
+			in.OtherHrs, in.OtherDesc, in.CheckWorkHrs, in.AttendanceHrs, in.UGOtherHrs, in.UGOtherDesc,
+			in.LabHrs, in.LabOtherHrs, in.LabOtherDesc); err != nil {
+			return err
+		}
+	}
+
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
+		ActorID: &actor, Action: "ta_request.update_workload", Entity: "ta_request_assignment",
+		EntityID: assignmentID.String(), Before: before, After: in,
+		Note: fmt.Sprintf("%s (Sec %s)", name, secNo),
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // notifyDecision fans out approval / rejection notifications. Best-effort:
 // failures here must not roll back the decision itself.
 func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, verdict, reason string) {
@@ -715,6 +895,9 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 		}
 		s.notify.Send(ctx, taID, "คำขอแต่งตั้งผู้ช่วยสอนไม่ผ่านการอนุมัติ",
 			fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ที่ระบุชื่อคุณไม่ผ่านการอนุมัติ: %s", code, nameTH, reason), "/ta")
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("notifyDecision rows %s: %v", reqID, err)
 	}
 }
 
@@ -865,6 +1048,43 @@ func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, hrs se
 					"(%.0f เท่าของชั่วโมงสอนจริง %.2f ชม.)",
 				t.label, name, secLabel, t.v, limit, float64(sectionTotalMultiplier), t.hrs)
 		}
+	}
+	return nil
+}
+
+// gradReviewHourCap is the permanent, system-wide ceiling on a graduate TA's
+// ตรวจการบ้าน (grade_hrs) duty — confirmed with the office (2026-09-11):
+// grad TAs should only ever be able to log homework-checking through the
+// worklog system, mirroring undergrad's simplicity, and never more than this
+// per week regardless of what a lecturer might try to declare.
+const gradReviewHourCap = 2.0
+
+// validateGradWorkloadCaps enforces the graduate-TA equivalent of
+// validateUndergradSectionCaps: grade_hrs (ตรวจการบ้าน) is capped at a flat
+// gradReviewHourCap ชม./สัปดาห์ system-wide.
+//
+// grade_hrs used to share a duty-schedule pool with other_hrs/prep_hrs that
+// the worklog UI then displayed as TWO independent "งานอื่นๆ" cards, each
+// showing the full pool value as if it were its own budget — letting a TA
+// nominate up to 2× the real combined cap, a self-inconsistency that could
+// block approval of hours the system itself generated. The fix removes the
+// "other" duty concept from the WORKLOG system for grad TAs entirely
+// (declaredDutyHours, worklog.go, and AllowOther/WeeklyCapOther in
+// loadAssignmentContext, authz.go) rather than just correcting the display
+// math.
+//
+// other_hrs/prep_hrs themselves stay accepted here and uncapped — confirmed
+// with the office (2026-09-11) that lecturers still need them to reach the
+// graduate school's 10-12 ชม./สัปดาห์ regulation total on the request form,
+// they're just administrative from this point on: never turned into a
+// worklog duty card, a loggable activity, or a pay calculation. Only
+// grade_hrs (the one field that DOES stay loggable, via DutyReview) needs a
+// cap here.
+func validateGradWorkloadCaps(w WorkloadInput, name, secLabel string) error {
+	if w.GradeHrs > gradReviewHourCap+0.001 {
+		return fmt.Errorf(
+			"ภาระงาน 'ตรวจการบ้าน' ของ %s (Sec %s) อยู่ที่ %.2f ชม./สัปดาห์ เกินเพดาน %.1f ชม./สัปดาห์ สำหรับ TA บัณฑิตศึกษา",
+			name, secLabel, w.GradeHrs, gradReviewHourCap)
 	}
 	return nil
 }
@@ -2105,7 +2325,7 @@ func (s *TARequestService) ListWindows(ctx context.Context, termID *uuid.UUID) (
 		}
 		out = append(out, w)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *TARequestService) DeleteWindow(ctx context.Context, actor, id uuid.UUID) error {

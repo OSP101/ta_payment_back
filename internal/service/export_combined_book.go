@@ -253,6 +253,58 @@ func (st *claimStyles) id(c cellSpec) (int, error) {
 // test file, and this file must not depend on test code.
 func claimStr(s string) *string { return &s }
 
+// enablePageFit turns on the sheet's "Fit to page" print option.
+//
+// SetPageLayout's FitToWidth/FitToHeight only WRITE the numbers — Excel
+// still prints at the sheet's scale% (default 100, unset here) unless
+// sheetPr/pageSetUpPr's fitToPage flag is separately on. Every sheet in this
+// package set the numbers and never this flag, so every one of them printed
+// at 100% and overflowed however many columns actually fit A4 — caught by
+// staff physically printing the ใบเบิกเวลา sheet (11/09/2026), where a wide
+// F column plus J's remark text push well past 1 page at 100%.
+func enablePageFit(f *excelize.File, sheet string) error {
+	enable := true
+	return f.SetSheetProps(sheet, &excelize.SheetPropsOptions{FitToPage: &enable})
+}
+
+// enablePrintTitles repeats rows 1..lastRow at the top of every physically
+// printed page of sheet (the OOXML "_xlnm.Print_Titles" defined name) — the
+// actual table header cells, not page-margin text. Staff's first ask
+// (11/09/2026) was answered with a margin header/footer (claimPageHeaderFooter
+// below); staff pushed back with a screenshot of the college's printed form
+// showing the real table header repeating on every page, which a margin
+// header/footer cannot reproduce (it can't carry merges, borders or the
+// checkbox marks the actual header cells have). This is what real Thai
+// government paperwork does when a table runs past one page — Excel's
+// native mechanism for exactly that, applied to the claim sheet (rows 1-8,
+// written once by writeClaimSheetHeader rather than per claimant), the
+// evidence sheets and the grad evidence sheets (rows 1-9 in both, already
+// written once at the top).
+func enablePrintTitles(f *excelize.File, sheet string, lastRow int) error {
+	return f.SetDefinedName(&excelize.DefinedName{
+		Name:     "_xlnm.Print_Titles",
+		RefersTo: fmt.Sprintf("'%s'!$1:$%d", sheet, lastRow),
+		Scope:    sheet,
+	})
+}
+
+// claimPageHeaderFooter builds the margin header/footer used only by
+// BuildTimetableWorkbook now — that file is genuinely one-per-TA and a
+// single page (a fixed weekly grid), so "page X of Y" and the TA's name in
+// the margin still earn their keep there. The claim/evidence/grad-evidence
+// sheets moved to enablePrintTitles above (11/09/2026) instead: see its
+// comment for why staff didn't want this approach for a table that can run
+// past one page.
+func claimPageHeaderFooter(left, center string) *excelize.HeaderFooterOptions {
+	right := "&8หน้า &P จาก &N"
+	head := "&L&8" + left + "&C&8" + center + "&R" + right
+	foot := "&C&8พิมพ์จากระบบจ่ายค่าตอบแทน TA &D &T"
+	return &excelize.HeaderFooterOptions{
+		OddHeader: head, EvenHeader: head,
+		OddFooter: foot, EvenFooter: foot,
+	}
+}
+
 // claimBlockMinRows keeps every block the same height when a TA has only a
 // handful of sittings, so the printed pages line up.
 const claimBlockMinRows = 16
@@ -276,9 +328,19 @@ func writeClaimSheet(f *excelize.File, st *claimStyles, sheet, trackTH string,
 			return err
 		}
 	}
-	// One block per printed page: fit the width, and break between people so a
-	// claim never straddles two sheets of paper. A4, with the narrow margins
-	// the college's file prints with.
+	// Fit the width to one page, and break between people so a new claimant
+	// always starts a fresh page. A4, with the narrow margins the college's
+	// file prints with.
+	//
+	// This does NOT guarantee one page per person — a claimant with a long
+	// enough term (many logged sittings) still overflows onto a second
+	// physical page. Rather than a margin header/footer (tried first, and
+	// rejected by staff: it's not what a Thai government form does when a
+	// table runs long), rows 1-8 below carry the ACTUAL document/table
+	// header staff expect, and Print Titles (set at the end of this
+	// function) repeats those exact cells at the top of every physical page
+	// — including a claimant's own overflow page — the same way the printed
+	// column headers repeat in Word or any office table.
 	fitWidth, fitHeight := 1, 0
 	paperA4 := 9
 	if err := f.SetPageLayout(sheet, &excelize.PageLayoutOptions{
@@ -289,14 +351,23 @@ func writeClaimSheet(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	}); err != nil {
 		return err
 	}
+	if err := enablePageFit(f, sheet); err != nil {
+		return err
+	}
 	left, right, top, bottom := 0.31496, 0.11811, 0.39370, 0.39370
 	if err := f.SetPageMargins(sheet, &excelize.PageLayoutMarginsOptions{
 		Left: &left, Right: &right, Top: &top, Bottom: &bottom,
 	}); err != nil {
 		return err
 	}
+	if err := writeClaimSheetHeader(f, st, sheet, trackTH, d); err != nil {
+		return err
+	}
+	if err := enablePrintTitles(f, sheet, claimHeaderRows); err != nil {
+		return err
+	}
 
-	row := 1
+	row := claimHeaderRows + 1
 	for i := range people {
 		next, err := writeClaimBlock(f, st, sheet, trackTH, d, &people[i], i+1, row)
 		if err != nil {
@@ -308,6 +379,133 @@ func writeClaimSheet(f *excelize.File, st *claimStyles, sheet, trackTH string,
 			}
 		}
 		row = next
+	}
+	return nil
+}
+
+// claimHeaderRows is how many rows writeClaimSheetHeader occupies (1-8):
+// the four-line title, the course/level/track lines, and the two-row table
+// header. Named so writeClaimSheet's Print Titles range and its first
+// claimant's starting row can't drift apart from what the header actually
+// writes.
+const claimHeaderRows = 8
+
+// writeClaimSheetHeader writes the document title, course/level/track lines
+// and table column header ONCE, at the top of the sheet (rows 1-8) — moved
+// out of writeClaimBlock (11/09/2026), which used to re-print this same
+// content at the top of every claimant's own block. That looked right for
+// the common case (one claimant, one page) but left a claimant's OVERFLOW
+// page — and, worse, gave Print Titles nothing sheet-wide and constant to
+// repeat, since each block wrote its own copy at a different row.
+// LevelTH/ugMark is fixed ป.ตรี for the whole sheet: this book excludes
+// graduate TAs entirely (see collectCombinedBook), so there is no claimant
+// whose own row would need a different tick than the one written here.
+func writeClaimSheetHeader(f *excelize.File, st *claimStyles, sheet, trackTH string, d *combinedBookData) error {
+	set := func(cell string, v any) error { return f.SetCellValue(sheet, cell, v) }
+	at := func(col string, r int) string { return fmt.Sprintf("%s%d", col, r) }
+	sty := func(from, to string, c cellSpec) error {
+		c.size = claimFontSize
+		id, err := st.id(c)
+		if err != nil {
+			return err
+		}
+		return f.SetCellStyle(sheet, from, to, id)
+	}
+
+	semMark := func(n int) string {
+		if d.Semester == n {
+			return "( / )"
+		}
+		return "(   )"
+	}
+	regMark, spMark := "( / )", "(    )"
+	if trackTH != "ภาคปกติ" {
+		regMark, spMark = "(    )", "( / )"
+	}
+
+	// ── heading: four bold centred lines ─────────────────────────────────
+	for i, line := range []string{
+		"แบบใบเบิกค่าตอบแทนผู้ช่วยสอนและผู้ช่วยปฏิบัติงาน",
+		"วิทยาลัยการคอมพิวเตอร์  มหาวิทยาลัยขอนแก่น ",
+		fmt.Sprintf("ภาคการศึกษา  %s  ต้น     %s  ปลาย     %s  ฤดูร้อน     ปีการศึกษา  %d",
+			semMark(1), semMark(2), semMark(3), d.AcademicYear),
+		"ประจำเดือน  " + d.MonthRange + "  ",
+	} {
+		r := i + 1
+		if err := set(at("A", r), line); err != nil {
+			return err
+		}
+		if err := f.MergeCell(sheet, at("A", r), at("J", r)); err != nil {
+			return err
+		}
+		if err := sty(at("A", r), at("J", r), cellSpec{bold: true, h: "center"}); err != nil {
+			return err
+		}
+	}
+
+	// ── course / level / track lines, all bold ───────────────────────────
+	r := 5
+	for _, c := range []struct {
+		col  string
+		row  int
+		text string
+		spec cellSpec
+	}{
+		{"B", r, "รายวิชาระดับ", cellSpec{bold: true, h: "center"}},
+		{"C", r, "( / ) ปริญญาตรี", cellSpec{bold: true}},
+		{"G", r, "(    ) บัณฑิตศึกษา", cellSpec{bold: true}},
+		{"I", r, "รหัสวิชา ", cellSpec{bold: true, h: "right"}},
+		{"J", r, d.CourseCode, cellSpec{bold: true, h: "left"}},
+		{"C", r + 1, regMark + "  ภาคปกติ  ", cellSpec{bold: true}},
+		{"G", r + 1, spMark + " โครงการพิเศษ  ", cellSpec{bold: true}},
+	} {
+		if err := set(at(c.col, c.row), c.text); err != nil {
+			return err
+		}
+		if err := sty(at(c.col, c.row), at(c.col, c.row), c.spec); err != nil {
+			return err
+		}
+	}
+
+	// ── table header ─────────────────────────────────────────────────────
+	h1, h2 := 7, 8
+	for _, hc := range []struct{ cell, text string }{
+		{at("A", h1), "ลำดับ"}, {at("B", h1), "ชื่อ-สกุล"}, {at("C", h1), "ระดับ"},
+		{at("D", h1), "ระยะเวลาที่สอน"}, {at("H", h1), "จำนวนชั่วโมงที่สอน"}, {at("J", h1), "หมายเหตุ"},
+		{at("A", h2), "ที่"}, {at("D", h2), "วัน"}, {at("E", h2), "ว/ด/ป"},
+		{at("F", h2), "กลุ่มเรียน"}, {at("G", h2), "เวลาสอน"},
+		{at("H", h2), "บรรยาย"}, {at("I", h2), "ปฏิบัติการ"},
+	} {
+		if err := set(hc.cell, hc.text); err != nil {
+			return err
+		}
+	}
+	for _, m := range [][2]string{
+		{at("B", h1), at("B", h2)}, {at("C", h1), at("C", h2)}, {at("J", h1), at("J", h2)},
+		{at("D", h1), at("G", h1)}, {at("H", h1), at("I", h1)},
+	} {
+		if err := f.MergeCell(sheet, m[0], m[1]); err != nil {
+			return err
+		}
+	}
+	head := cellSpec{bold: true, h: "center", v: "center", wrap: true,
+		bl: "thin", br: "thin", bt: "thin", bb: "thin"}
+	if err := sty(at("A", h1), at("J", h2), head); err != nil {
+		return err
+	}
+	// ลำดับ/ที่ read as ONE box in the college's file: no rule between them.
+	headA1, headA2 := head, head
+	headA1.bb, headA2.bt = "", ""
+	if err := sty(at("A", h1), at("A", h1), headA1); err != nil {
+		return err
+	}
+	if err := sty(at("A", h2), at("A", h2), headA2); err != nil {
+		return err
+	}
+	for rr := 1; rr <= claimHeaderRows; rr++ {
+		if err := f.SetRowHeight(sheet, rr, 23.25); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -342,107 +540,18 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	}
 	styAt := func(col string, r int, c cellSpec) error { return sty(at(col, r), at(col, r), c) }
 
-	semMark := func(n int) string {
-		if d.Semester == n {
-			return "( / )"
-		}
-		return "(   )"
-	}
-	ugMark, gradMark := "( / )", "(    )"
-	if p.LevelTH != "ป.ตรี" {
-		ugMark, gradMark = "(    )", "( / )"
-	}
-	regMark, spMark := "( / )", "(    )"
-	if trackTH != "ภาคปกติ" {
-		regMark, spMark = "(    )", "( / )"
-	}
-
-	// ── heading: four bold centred lines ─────────────────────────────────
-	for i, line := range []string{
-		"แบบใบเบิกค่าตอบแทนผู้ช่วยสอนและผู้ช่วยปฏิบัติงาน",
-		"วิทยาลัยการคอมพิวเตอร์  มหาวิทยาลัยขอนแก่น ",
-		fmt.Sprintf("ภาคการศึกษา  %s  ต้น     %s  ปลาย     %s  ฤดูร้อน     ปีการศึกษา  %d",
-			semMark(1), semMark(2), semMark(3), d.AcademicYear),
-		"ประจำเดือน  " + d.MonthRange + "  ",
-	} {
-		r := top + i
-		if err := set(at("A", r), line); err != nil {
-			return 0, err
-		}
-		if err := f.MergeCell(sheet, at("A", r), at("J", r)); err != nil {
-			return 0, err
-		}
-		if err := sty(at("A", r), at("J", r), cellSpec{bold: true, h: "center"}); err != nil {
-			return 0, err
-		}
-	}
-
-	// ── course / level / track lines, all bold ───────────────────────────
-	r := top + 4
-	for _, c := range []struct {
-		col  string
-		row  int
-		text string
-		spec cellSpec
-	}{
-		{"B", r, "รายวิชาระดับ", cellSpec{bold: true, h: "center"}},
-		{"C", r, ugMark + " ปริญญาตรี", cellSpec{bold: true}},
-		{"G", r, gradMark + " บัณฑิตศึกษา", cellSpec{bold: true}},
-		{"I", r, "รหัสวิชา ", cellSpec{bold: true, h: "right"}},
-		{"J", r, d.CourseCode, cellSpec{bold: true, h: "left"}},
-		{"C", r + 1, regMark + "  ภาคปกติ  ", cellSpec{bold: true}},
-		{"G", r + 1, spMark + " โครงการพิเศษ  ", cellSpec{bold: true}},
-	} {
-		if err := set(at(c.col, c.row), c.text); err != nil {
-			return 0, err
-		}
-		if err := styAt(c.col, c.row, c.spec); err != nil {
-			return 0, err
-		}
-	}
-
-	// ── table header ─────────────────────────────────────────────────────
-	h1, h2 := top+6, top+7
-	for _, hc := range []struct{ cell, text string }{
-		{at("A", h1), "ลำดับ"}, {at("B", h1), "ชื่อ-สกุล"}, {at("C", h1), "ระดับ"},
-		{at("D", h1), "ระยะเวลาที่สอน"}, {at("H", h1), "จำนวนชั่วโมงที่สอน"}, {at("J", h1), "หมายเหตุ"},
-		{at("A", h2), "ที่"}, {at("D", h2), "วัน"}, {at("E", h2), "ว/ด/ป"},
-		{at("F", h2), "กลุ่มเรียน"}, {at("G", h2), "เวลาสอน"},
-		{at("H", h2), "บรรยาย"}, {at("I", h2), "ปฏิบัติการ"},
-	} {
-		if err := set(hc.cell, hc.text); err != nil {
-			return 0, err
-		}
-	}
-	for _, m := range [][2]string{
-		{at("B", h1), at("B", h2)}, {at("C", h1), at("C", h2)}, {at("J", h1), at("J", h2)},
-		{at("D", h1), at("G", h1)}, {at("H", h1), at("I", h1)},
-	} {
-		if err := f.MergeCell(sheet, m[0], m[1]); err != nil {
-			return 0, err
-		}
-	}
-	head := cellSpec{bold: true, h: "center", v: "center", wrap: true,
-		bl: "thin", br: "thin", bt: "thin", bb: "thin"}
-	if err := sty(at("A", h1), at("J", h2), head); err != nil {
-		return 0, err
-	}
-	// ลำดับ/ที่ read as ONE box in the college's file: no rule between them.
-	headA1, headA2 := head, head
-	headA1.bb, headA2.bt = "", ""
-	if err := styAt("A", h1, headA1); err != nil {
-		return 0, err
-	}
-	if err := styAt("A", h2, headA2); err != nil {
-		return 0, err
-	}
-
 	// ── data rows ────────────────────────────────────────────────────────
 	// The grid rules the college's file draws: thin verticals, a hair line
 	// between rows, and a thin line closing the last row. Nothing is merged
 	// vertically — the ordinal, name and level sit in the first row and the
 	// hair rules run unbroken beneath them, exactly as their file has it.
-	first := top + 8
+	//
+	// The document title, course/level/track lines and table column header
+	// used to be re-written HERE, at the top of every block — moved out to
+	// writeClaimSheetHeader (11/09/2026) so it exists once, at rows 1-8, and
+	// Print Titles can repeat those exact cells on every physical page
+	// instead of nothing appearing on a claimant's own overflow page.
+	first := top
 	slots := len(p.Rows)
 	if slots < claimBlockMinRows {
 		slots = claimBlockMinRows
@@ -540,6 +649,16 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	}
 	if err := styAt("C", tot+1, cellSpec{bold: true, h: "center", bl: "thin", br: "thin", bb: "thin"}); err != nil {
 		return 0, err
+	}
+	// The data grid's own left rule (column A) ends at `last`; without this,
+	// the table's outer left edge breaks for exactly these two rows before
+	// the จำนวนเงินที่ขอเบิก section below picks it back up — a gap staff
+	// spotted in a printed page (11/09/2026). The reference file carries only
+	// the left rule here (no top/bottom/right), so that's all this adds.
+	for _, row := range []int{tot, tot + 1} {
+		if err := styAt("A", row, cellSpec{bl: "thin"}); err != nil {
+			return 0, err
+		}
 	}
 	box := cellSpec{bold: true, h: "center", bl: "thin", br: "thin", bt: "thin", bb: "thin"}
 	for _, row := range []int{tot, tot + 1} {
@@ -767,11 +886,14 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	if err := set(at("A", rule), "ลงชื่อ…………....…...……………….....…"); err != nil {
 		return 0, err
 	}
-	// The performer's name is LINKED to the block's own name cell, as the
-	// college's file does (=B9): the signature line cannot drift from the
-	// claim it signs. Parenthesised, which is what marks it as the printed
-	// reading of the signature written above rather than a second name.
-	if err := set(at("A", rule+1), fmt.Sprintf(`="("&B%d&")"`, first)); err != nil {
+	// The performer's name is LINKED to the block's own name cell — a plain
+	// reference, no parentheses, exactly as the college's file has it (=B9):
+	// the signature line cannot drift from the claim it signs. Staff asked
+	// (11/09/2026) for the parenthesised form this used to print removed —
+	// unlike the lecturer/certifier names on the หลักฐาน sheet, which stay
+	// parenthesised, this line is the TA's own name, not a printed reading
+	// of someone else's signature.
+	if err := set(at("A", rule+1), fmt.Sprintf(`=B%d`, first)); err != nil {
 		return 0, err
 	}
 	if err := set(at("A", rule+2), "วันที่….เดือน…………..…พ.ศ…..……"); err != nil {
@@ -779,24 +901,26 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	}
 	bottom := rule + 2
 	for rr := sig; rr <= bottom; rr++ {
-		if err := f.MergeCell(sheet, at("A", rr), at("C", rr)); err != nil {
+		// A:J, not A:C — this box used to be the LEFT THIRD of three side by
+		// side (ผู้ปฏิบัติงาน/อาจารย์ผู้สอน/ผู้รับรอง). Now that the other two
+		// are gone (ส.ค. 2569, see the comment above), it kept the old A:C
+		// merge — which centres its text within that narrow slice, not
+		// across the row, so on the printed page it reads as pinned to the
+		// left rather than centred (staff, 11/09/2026, against the
+		// college's original three-box layout where each box WAS centred in
+		// its own share of the row). Widened to span the full table width.
+		if err := f.MergeCell(sheet, at("A", rr), at("J", rr)); err != nil {
 			return 0, err
 		}
-		// Header row: bold label boxed top and bottom. Below: the verticals of
-		// the box run to the block's last row, which closes it.
-		for col, spec := range map[string]cellSpec{
-			"A": {bl: "thin"}, "C": {br: "thin"}, "B": {},
-		} {
-			spec.h = "center"
-			if rr == sig {
-				spec.bold, spec.bt, spec.bb = true, "thin", "thin"
-			}
-			if rr == bottom {
-				spec.bb = "thin"
-			}
-			if err := styAt(col, rr, spec); err != nil {
-				return 0, err
-			}
+		spec := cellSpec{h: "center", bl: "thin", br: "thin"}
+		if rr == sig {
+			spec.bold, spec.bt, spec.bb = true, "thin", "thin"
+		}
+		if rr == bottom {
+			spec.bb = "thin"
+		}
+		if err := sty(at("A", rr), at("J", rr), spec); err != nil {
+			return 0, err
 		}
 	}
 
@@ -868,12 +992,24 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 	}); err != nil {
 		return err
 	}
+	if err := enablePageFit(f, sheet); err != nil {
+		return err
+	}
 	mLeft, mRight, mTop, mBottom := 0.51181, 0.39370, 0.39370, 0.39370
 	if err := f.SetPageMargins(sheet, &excelize.PageLayoutMarginsOptions{
 		Left: &mLeft, Right: &mRight, Top: &mTop, Bottom: &mBottom,
 	}); err != nil {
 		return err
 	}
+	// Rows 1-9 (preamble + course/level/track lines + the two-row table
+	// header) repeat at the top of every physical page via Print Titles, so
+	// a list long enough to spill past one A4 page still carries its column
+	// header on the continuation page — not a margin header/footer, staff
+	// asked for the actual table header (11/09/2026).
+	if err := enablePrintTitles(f, sheet, 9); err != nil {
+		return err
+	}
+	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ภาคฤดูร้อน"}[d.Semester]
 
 	set := func(cell string, v any) error {
 		if str, ok := v.(string); ok && strings.HasPrefix(str, "=") {
@@ -892,7 +1028,6 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 	}
 	styAt := func(col string, r int, c cellSpec) error { return sty(at(col, r), at(col, r), c) }
 
-	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ภาคฤดูร้อน"}[d.Semester]
 	for i, line := range []string{
 		"หลักฐานการจ่ายเงินอื่น ๆ",
 		"เบิกตามฎีกาที่...................................... วันที่..................... เดือน ...................................... พ.ศ. .......................",
@@ -1227,9 +1362,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 		}
 		k := taTrackKey{c.TA, c.Track}
 		fullCost[k] += c.Baht
-		if !t.unpaidFor(c.TA, c.Date, c.StartTime) {
-			funded[k] += c.Baht
-		}
+		funded[k] += c.Baht * t.fundedShare(c.TA, c.Date, c.StartTime)
 	}
 
 	// Grad-special is a flat term lump, priced at 0 by claimCostByTASlot (it
@@ -1246,25 +1379,18 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}
-	gradShare := 1.0
-	if weights, werr := gradSpecialMonthShares(ctx, s.pool, courseID); werr != nil {
-		return nil, werr
-	} else if weights != nil {
-		if len(months) == 0 {
-			gradShare = 1
-		} else {
-			gradShare = 0
-			for _, ym := range months {
-				gradShare += weights[ym]
-			}
-		}
-	}
-	gradLump = round2(gradLump * gradShare)
 	for _, taID := range gradSpecialTAs {
 		gradSpecialSet[taID] = true
 		k := taTrackKey{taID, "special"}
-		funded[k] += gradLump
-		fullCost[k] += gradLump
+		// This holder's lump, dated by their own approved hours, sliced to the
+		// months this document covers.
+		byMonth, err := s.gradLumpByMonth(ctx, courseID, taID, gradLump, true)
+		if err != nil {
+			return nil, err
+		}
+		slice := sumMonths(byMonth, months)
+		funded[k] += slice
+		fullCost[k] += slice
 	}
 
 	// Every UNDERGRAD TA on the course, with the level their assignment was
@@ -1510,6 +1636,23 @@ func (s *ExportService) BuildTimetableWorkbook(ctx context.Context, taID, termID
 		taID, termID).Scan(&returning)
 	if returning {
 		f.SetCellValue(tt, "AA1", "TA เดิม")
+	}
+	// The template leaves paperSize unset, which some viewers resolve to
+	// Letter rather than A4 depending on locale; pin it explicitly. Only
+	// Size is touched — orientation and the template's own print scale stay
+	// as the college's file set them (see setPageSetUp: unset fields are
+	// left alone, not zeroed).
+	paperA4 := 9
+	if err := f.SetPageLayout(tt, &excelize.PageLayoutOptions{Size: &paperA4}); err != nil {
+		return nil, err
+	}
+	// This sheet already ships one file per TA, so unlike the combined
+	// claim/evidence sheets, the header can name the person directly.
+	if err := f.SetHeaderFooter(tt, claimPageHeaderFooter(
+		fmt.Sprintf("%s  %s ปีการศึกษา %d", fullName, semTH, acadYear),
+		"ตารางเรียนและตารางปฏิบัติงาน (TA)",
+	)); err != nil {
+		return nil, err
 	}
 	if err := s.fillTimetableGrid(ctx, f, taID, termID); err != nil {
 		return nil, err

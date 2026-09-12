@@ -104,28 +104,44 @@ func combinedFixture(t *testing.T) (*excelize.File, *combinedBookData, []claiman
 	return f, d, people
 }
 
+// blockStarts locates each person's block by their own name cell (column B)
+// rather than the document title: the title/course/table-header now write
+// ONCE at the top of the sheet (writeClaimSheetHeader, rows 1-claimHeaderRows)
+// and repeat on every printed page via Print Titles, not per block, so it can
+// no longer be used to find where a block begins.
+func blockStarts(t *testing.T, f *excelize.File, sheet string, people []claimant) []int {
+	t.Helper()
+	rows, err := f.GetRows(sheet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, p := range people {
+		names[p.Name] = true
+	}
+	var starts []int
+	for i, r := range rows {
+		if len(r) > 1 && names[r[1]] {
+			starts = append(starts, i+1)
+		}
+	}
+	return starts
+}
+
 // Two people, two blocks, stacked — the point of the whole change.
 func TestCombinedSheet_StacksOneBlockPerPerson(t *testing.T) {
 	f, _, people := combinedFixture(t)
 
-	rows, err := f.GetRows(sheetClaimRegular)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var starts []int
-	for i, r := range rows {
-		if len(r) > 0 && strings.HasPrefix(r[0], "แบบใบเบิก") {
-			starts = append(starts, i+1)
-		}
-	}
+	starts := blockStarts(t, f, sheetClaimRegular, people)
 	if len(starts) != 2 {
 		t.Fatalf("found %d blocks, want one per person", len(starts))
 	}
-	if starts[0] != 1 {
-		t.Errorf("first block starts at row %d, want 1", starts[0])
+	if starts[0] != claimHeaderRows+1 {
+		t.Errorf("first block's data starts at row %d, want %d right after the "+
+			"shared header", starts[0], claimHeaderRows+1)
 	}
 	for i, p := range people {
-		got, err := f.GetCellValue(sheetClaimRegular, cellAt("B", starts[i]+8))
+		got, err := f.GetCellValue(sheetClaimRegular, cellAt("B", starts[i]))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,21 +155,15 @@ func TestCombinedSheet_StacksOneBlockPerPerson(t *testing.T) {
 // A block's SUM must cover ITS OWN rows. Get this wrong and the second person's
 // claim silently totals the first person's hours.
 func TestCombinedSheet_TotalsCoverOnlyTheirOwnBlock(t *testing.T) {
-	f, _, _ := combinedFixture(t)
-	rows, _ := f.GetRows(sheetClaimRegular)
-	var starts []int
-	for i, r := range rows {
-		if len(r) > 0 && strings.HasPrefix(r[0], "แบบใบเบิก") {
-			starts = append(starts, i+1)
-		}
-	}
+	f, _, people := combinedFixture(t)
+	starts := blockStarts(t, f, sheetClaimRegular, people)
 	if len(starts) < 2 {
 		t.Fatal("need two blocks")
 	}
 
-	// Block 2's first data row is below block 1's last, so its SUM must not
-	// reach back above its own header.
-	first2 := starts[1] + 8
+	// Block 2's first data row is its own name row, so its SUM must not
+	// reach back above it into block 1.
+	first2 := starts[1]
 	for r := starts[1]; r < starts[1]+60; r++ {
 		v, err := f.GetCellFormula(sheetClaimRegular, cellAt("H", r))
 		// excelize stores formulas without the leading "="; accept either so the
@@ -315,8 +325,8 @@ func TestCombinedSheet_FundedAmountPrintsOnlyWhenBudgetStopsShort(t *testing.T) 
 	f, _, _ := combinedFixture(t)
 	raw := excelize.Options{RawCellValue: true}
 
-	// Block 1 (underfunded, 150 of 200): top=1 → grand total row 32,
-	// ขอเบิกจ่ายเพียง row 33.
+	// Block 1 (underfunded, 150 of 200): data starts row 9 (right after the
+	// shared header) → grand total row 32, ขอเบิกจ่ายเพียง row 33.
 	got, err := f.GetCellValue(sheetClaimRegular, "C33", raw)
 	if err != nil {
 		t.Fatal(err)
@@ -328,8 +338,8 @@ func TestCombinedSheet_FundedAmountPrintsOnlyWhenBudgetStopsShort(t *testing.T) 
 	if formula, _ := f.GetCellFormula(sheetClaimRegular, "C32"); formula == "" {
 		t.Error("C32 must keep the full-amount formula — the budget must not touch it")
 	}
-	// Block 2 (funded in full): top=40 → ขอเบิกจ่ายเพียง row 72 stays blank.
-	if got, _ := f.GetCellValue(sheetClaimRegular, "C72", raw); got != "" {
+	// Block 2 (funded in full): top=40 → ขอเบิกจ่ายเพียง row 64 stays blank.
+	if got, _ := f.GetCellValue(sheetClaimRegular, "C64", raw); got != "" {
 		t.Errorf("fully funded block prints ขอเบิกจ่ายเพียง %q, want blank", got)
 	}
 
@@ -366,19 +376,20 @@ func TestCombinedSheet_FundedAmountCarriesUnitAndBahtText(t *testing.T) {
 			formula)
 	}
 
-	// Block 2 is funded in full, so row 72 is blank — and a unit standing
+	// Block 2 is funded in full, so row 64 is blank — and a unit standing
 	// against an empty amount would read as a claim for zero baht.
-	for _, cell := range []string{"E72", "G72"} {
+	for _, cell := range []string{"E64", "G64"} {
 		if got, _ := f.GetCellValue(sheetClaimRegular, cell, raw); strings.TrimSpace(got) != "" {
 			t.Errorf("%s = %q, want blank when ขอเบิกจ่ายเพียง prints no figure", cell, got)
 		}
 	}
 }
 
-// The name under the signature rule is the printed reading OF that signature,
-// which is what the parentheses say. Without them it reads as a second name
-// sitting loose on the form.
-func TestCombinedSheet_PerformerNameIsParenthesised(t *testing.T) {
+// The name under the signature rule is a plain link to the claimant's own
+// name cell — no parentheses (staff, 11/09/2026: this is the TA's own name,
+// not a printed reading of someone else's signature) — so it cannot drift
+// from the claim it signs.
+func TestCombinedSheet_PerformerNameLinksToTheirOwnNameCell(t *testing.T) {
 	f, _, _ := combinedFixture(t)
 	// Block 1: grand total 32 → signature box 34, rule 36, name 37.
 	formula, err := f.GetCellFormula(sheetClaimRegular, "A37")
@@ -386,9 +397,78 @@ func TestCombinedSheet_PerformerNameIsParenthesised(t *testing.T) {
 		t.Fatal(err)
 	}
 	// GetCellFormula returns the expression without its leading "=".
-	if want := `"("&B9&")"`; formula != want {
-		t.Errorf("A37 = %q, want %q — parenthesised and still linked to the claim's own name cell",
+	if want := "B9"; formula != want {
+		t.Errorf("A37 = %q, want %q — a plain link to the claim's own name cell, no parentheses",
 			formula, want)
+	}
+}
+
+// The ผู้ปฏิบัติงาน box used to span only A:C — the leftover width of ONE of
+// the three side-by-side boxes the college's original form has, from before
+// the lecturer's and certifier's boxes were dropped (ส.ค. 2569). Centring
+// text inside that narrow leftover slice reads as "stuck to the left" on a
+// full-width printed page (staff, 11/09/2026) — the box must span the whole
+// table width, same as the title lines above it.
+func TestCombinedSheet_SignatureBoxSpansTheFullTableWidth(t *testing.T) {
+	f, _, _ := combinedFixture(t)
+	merges, err := f.GetMergeCells(sheetClaimRegular)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Block 1's signature box: sig=34, rule=36, name=37, date=38.
+	want := map[string]bool{"A34:J34": false, "A35:J35": false, "A36:J36": false, "A37:J37": false, "A38:J38": false}
+	for _, m := range merges {
+		rng := m.GetStartAxis() + ":" + m.GetEndAxis()
+		if _, ok := want[rng]; ok {
+			want[rng] = true
+		}
+		if strings.HasSuffix(rng, ":C34") || strings.HasSuffix(rng, ":C37") {
+			t.Errorf("signature box still merges only to column C (%s) — must span to J", rng)
+		}
+	}
+	for rng, found := range want {
+		if !found {
+			t.Errorf("expected merge %s not found — signature box is not spanning the full width", rng)
+		}
+	}
+}
+
+// hasLeftBorder reports whether a cell's style carries a left border.
+func hasLeftBorder(t *testing.T, f *excelize.File, sheet, cell string) bool {
+	t.Helper()
+	styleID, err := f.GetCellStyle(sheet, cell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	style, err := f.GetStyle(styleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range style.Border {
+		if b.Type == "left" && b.Style > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// The table's outer left edge (column A) ran continuously down the data
+// grid, then dropped for exactly the two รวมเวลา/ที่สอน summary rows before
+// picking back up at จำนวนเงินที่ขอเบิก below — spotted by staff on a printed
+// page (11/09/2026). Every row from the first data row through the bottom
+// of the signature box must carry it, no gaps.
+func TestCombinedSheet_LeftEdgeHasNoGapDownTheWholeBlock(t *testing.T) {
+	f, _, people := combinedFixture(t)
+	starts := blockStarts(t, f, sheetClaimRegular, people)
+	if len(starts) < 1 {
+		t.Fatal("need at least one block")
+	}
+	// Block 1 runs from its name row (9) through the signature box (38) —
+	// see the row math pinned by the other tests in this file.
+	for r := starts[0]; r <= 38; r++ {
+		if !hasLeftBorder(t, f, sheetClaimRegular, cellAt("A", r)) {
+			t.Errorf("row %d: column A has no left border — the table's outer edge has a gap", r)
+		}
 	}
 }
 

@@ -45,8 +45,15 @@ type ReviewQueueRow struct {
 	CourseNameTH     string    `json:"course_name_th"`
 	Status           string    `json:"status"`
 	// Hours/baht already approved by the lecturer for this month.
-	ApprovedHours float64 `json:"approved_hours"`
-	ApprovedBaht  float64 `json:"approved_baht"`
+	//
+	// The split is by the track the hour is BILLED on, matching the claim
+	// sheets: a คาบ an undergrad worked for a regular and a special section at
+	// once is regular (rule B2, clipSpecialOverlap), so ApprovedHoursSpecial is
+	// only what the special section had on its own.
+	ApprovedHours        float64 `json:"approved_hours"`
+	ApprovedHoursRegular float64 `json:"approved_hours_regular"`
+	ApprovedHoursSpecial float64 `json:"approved_hours_special"`
+	ApprovedBaht         float64 `json:"approved_baht"`
 	// Rows still in the TA's or lecturer's hands. Non-zero means the month is
 	// not ready for staff to sign off, and the queue says so rather than
 	// letting staff approve a moving target.
@@ -105,17 +112,25 @@ func (r ReviewQueueRow) needsStaff() bool {
 // list would be dominated by history.
 func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uuid.UUID) ([]ReviewQueueRow, error) {
 	rows, err := s.pool.Query(ctx, `
-		WITH`+mergedSittingsCTE+`,
+		WITH`+mergedSittingsCTE+`,`+b2OverlapTermCTE("w1.status = 'approved' AND w2.status = 'approved'")+`,
 		-- Approved hours are counted as SITTINGS, matching the signed claim form:
-		-- two sections taught in one sitting are paid once (billable_hours.go).
+		-- two sections taught in one sitting are paid once (billable_hours.go),
+		-- and a special sitting shared with a regular one is billed regular
+		-- (rule B2) — the overlap comes off the special side, as on the sheet.
 		-- The open/waiting counts below stay row-based — they are workload, not
 		-- money, and an officer chasing four unsubmitted rows wants four.
 		month_sittings AS (
 		    SELECT ta_id, teaching_course_id,
 		           to_char(work_date, 'MM') AS mm,
-		           SUM(hours) AS approved_hours
+		           COALESCE(SUM(hours) FILTER (WHERE track = 'regular'), 0) AS regular_hours,
+		           COALESCE(SUM(hours) FILTER (WHERE track = 'special'), 0) AS special_hours
 		    FROM sittings
 		    GROUP BY ta_id, teaching_course_id, to_char(work_date, 'MM')
+		),
+		month_overlap AS (
+		    SELECT ta_id, teaching_course_id, RIGHT(ym, 2) AS mm, SUM(hours) AS hours
+		    FROM b2_overlap
+		    GROUP BY ta_id, teaching_course_id, RIGHT(ym, 2)
 		),
 		month_logs AS (
 		    SELECT sp.id   AS period_id,
@@ -135,12 +150,13 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		           COUNT(*)      FILTER (WHERE wl.status = 'approved')                        AS row_count,
 		           COUNT(*)      FILTER (WHERE wl.status = 'approved' AND wl.source = 'manual') AS manual_count
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm    ON trm.id = tc.term_id
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
 		    JOIN sections sec          ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN work_logs wl          ON wl.assignment_id = a.id
-		                              AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                              AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		    WHERE tc.term_id = $1
 		      -- Nothing to review until the appointment order is printed: the
 		      -- work is not yet payable, and signing it off here would release
@@ -169,7 +185,8 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		       COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,''),
 		       tc.id, tc.code, tc.name_th,
 		       COALESCE(st.status, 'pending'),
-		       COALESCE(ms.approved_hours, 0),
+		       COALESCE(ms.regular_hours, 0),
+		       GREATEST(COALESCE(ms.special_hours, 0) - COALESCE(mo.hours, 0), 0),
 		       COALESCE(ml.forfeited, 0),
 		       COALESCE(ml.open_rows, 0),
 		       COALESCE(ml.waiting_ta, 0),
@@ -180,6 +197,9 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		LEFT JOIN month_sittings ms
 		       ON ms.ta_id = ml.ta_id AND ms.teaching_course_id = ml.tc_id
 		      AND ms.mm = ml.mm
+		LEFT JOIN month_overlap mo
+		       ON mo.ta_id = ml.ta_id AND mo.teaching_course_id = ml.tc_id
+		      AND mo.mm = ml.mm
 		JOIN submission_periods sp ON sp.id = ml.period_id
 		JOIN users u               ON u.id = ml.ta_id
 		LEFT JOIN ta_profiles tp   ON tp.user_id = u.id
@@ -200,11 +220,12 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		var r ReviewQueueRow
 		if err := rows.Scan(&r.PeriodID, &r.PeriodLabel, &r.YearMonth,
 			&r.TAID, &r.TAName, &r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
-			&r.Status, &r.ApprovedHours, &r.Forfeited, &r.OpenRows,
+			&r.Status, &r.ApprovedHoursRegular, &r.ApprovedHoursSpecial, &r.Forfeited, &r.OpenRows,
 			&r.WaitingTA, &r.WaitingLecturer,
 			&r.RowCount, &r.ManualCount); err != nil {
 			return nil, err
 		}
+		r.ApprovedHours = r.ApprovedHoursRegular + r.ApprovedHoursSpecial
 		r.NeedsStaff = r.needsStaff()
 		out = append(out, r)
 	}
@@ -240,12 +261,13 @@ func (s *SubmissionPeriodService) CountAwaitingAppointment(ctx context.Context, 
 		SELECT COUNT(*) FROM (
 		    SELECT sp.id, a.ta_id, tc.id
 		    FROM teaching_courses tc
+		    JOIN academic_terms trm    ON trm.id = tc.term_id
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
 		    JOIN sections sec          ON sec.teaching_course_id = tc.id
 		    JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		    JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
 		    JOIN work_logs wl          ON wl.assignment_id = a.id
-		                              AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                              AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		    LEFT JOIN submission_period_status st
 		           ON st.submission_period_id = sp.id
 		          AND st.ta_id = a.ta_id
@@ -363,12 +385,13 @@ func (s *SubmissionPeriodService) UnreviewedCourseNames(ctx context.Context, tcI
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT sp.label
 		FROM teaching_courses tc
+		JOIN academic_terms trm    ON trm.id = tc.term_id
 		JOIN submission_periods sp ON sp.term_id = tc.term_id
 		JOIN sections sec          ON sec.teaching_course_id = tc.id
 		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
 		JOIN work_logs wl          ON wl.assignment_id = a.id
-		                          AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		                          AND wl.status = 'approved'
 		LEFT JOIN submission_period_status st
 		       ON st.submission_period_id = sp.id

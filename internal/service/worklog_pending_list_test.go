@@ -253,3 +253,69 @@ func TestListPending_StaysScopedToTheLecturersOwnCourses(t *testing.T) {
 		t.Errorf("a lecturer who teaches none of these courses got %d rows", len(rows))
 	}
 }
+
+// The queue's hours are split the way the money is split. On SC362005 one TA
+// helps sec 1–2 (ภาคปกติ) and sec 3 (ภาคพิเศษ) in one room: the lecture the three
+// share is regular work — rule B2 bills it once, on the regular side — and only
+// the review hour the special section had alone is special. Reporting 4h
+// special there would tell the lecturer the special budget carries work it does
+// not, which is the confusion the split exists to end.
+func TestListPending_SplitsGroupHoursByTheTrackTheyAreBilledOn(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	special := f.cotaughtSiblingAssignment("special")
+
+	// Shared sitting: written against both sections.
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	shared := f.entry(day(10), "09:00", "11:00", 2)
+	shared.AssignmentID = special
+	f.mustUpsert(shared)
+	// The regular section alone, and the special section alone.
+	f.mustUpsert(f.entry(day(11), "09:00", "10:00", 1))
+	own := f.entry(day(12), "13:00", "14:00", 1)
+	own.AssignmentID = special
+	f.mustUpsert(own)
+
+	f.exec(`UPDATE work_logs SET status='submitted', submitted_at=now()
+	        WHERE assignment_id IN ($1, $2)`, f.AssignmentID, special)
+
+	rows, err := f.Svc.ListPending(f.ctx, f.LecturerID, false)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for _, r := range rows {
+		if r.GroupHours != 4 {
+			t.Errorf("sec %s group_hours = %.1f, want 4", r.SecNo, r.GroupHours)
+		}
+		if r.GroupRegularHours != 3 {
+			t.Errorf("sec %s group_regular_hours = %.1f, want 3 (the shared 2h + 1h alone)",
+				r.SecNo, r.GroupRegularHours)
+		}
+		if r.GroupSpecialHours != 1 {
+			t.Errorf("sec %s group_special_hours = %.1f, want 1 — only the hour the "+
+				"special section worked on its own", r.SecNo, r.GroupSpecialHours)
+		}
+	}
+}
+
+// A lone section's split is simply its own hours on its own track.
+func TestListPending_LoneSectionHoursLandOnItsOwnTrack(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Track: "special"})
+	f.mustUpsert(f.entry(day(10), "09:00", "12:00", 3))
+	f.exec(`UPDATE work_logs SET status='submitted', submitted_at=now()
+	        WHERE assignment_id = $1`, f.AssignmentID)
+
+	rows, err := f.Svc.ListPending(f.ctx, f.LecturerID, false)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].GroupRegularHours != 0 || rows[0].GroupSpecialHours != 3 {
+		t.Errorf("split = %.1f regular / %.1f special, want 0 / 3",
+			rows[0].GroupRegularHours, rows[0].GroupSpecialHours)
+	}
+}

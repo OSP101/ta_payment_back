@@ -2,18 +2,13 @@ package service
 
 import (
 	"fmt"
-	"math"
 	"testing"
 )
 
-// The spread rule: the pool is divided equally between the months that have
-// work, each month is filled chronologically out of its own share, and the
-// remainder nobody could spend is handed back out in calendar order.
-//
-// What it buys is the promise in its name — every month with work is paid
-// something. What it must not cost is money: a rule that guarantees each month
-// a share but leaves more in the account than the rule it replaced has taken
-// from the TAs to buy a nicer-looking calendar.
+// The spread rule: every month a person worked is cut by the same proportion,
+// so none of them is paid nothing. It changes only WHERE a share lands, never
+// how big it is — the per-person total is the same as under the chronological
+// rule, to the baht.
 
 // monthOf builds n คาบ of equal cost inside one named month.
 func monthOf(ym string, n int, baht float64) []SlotSettlement {
@@ -44,9 +39,10 @@ func monthPaid(tr TrackSettlement) map[string]float64 {
 	return out
 }
 
-// THE PROMISE. Under the old rule this exact course pays June through August in
-// full and October nothing; under the spread rule every month is paid.
-func TestSpread_EveryMonthWithWorkIsPaidSomething(t *testing.T) {
+// THE PROMISE. Under the chronological rule this course pays June through
+// August in full and October nothing; under the spread rule every month gets
+// the same 60%.
+func TestSpread_EveryMonthIsCutByTheSameProportion(t *testing.T) {
 	// Five months × 10 คาบ × 100฿ = 5,000฿ of work against a 3,000฿ pool.
 	ledger := concat(
 		monthOf("2026-06", 10, 100),
@@ -56,73 +52,58 @@ func TestSpread_EveryMonthWithWorkIsPaidSomething(t *testing.T) {
 		monthOf("2026-10", 10, 100),
 	)
 
-	chrono := settleTrack(SettleChronological, "regular", 3000, 0, ledger)
+	chrono := settleTrack(SettleChronological, "regular", 3000, 0, cloneSlots(ledger))
 	if got := monthPaid(chrono)["2026-10"]; got != 0 {
 		t.Fatalf("the case is not set up: October should be unpaid under the old rule, got %.0f", got)
 	}
 
 	spread := settleTrack(SettleSpread, "regular", 3000, 0, cloneSlots(ledger))
 	for ym, paid := range monthPaid(spread) {
-		if paid <= 0 {
-			t.Errorf("%s was paid nothing — the spread rule exists to prevent exactly this", ym)
+		if paid != 600 {
+			t.Errorf("%s was paid %.2f, want 600 — every month carries the same 60%%", ym, paid)
 		}
 	}
-}
-
-// THE MONEY THAT USED TO BE LEFT BEHIND.
-//
-// A remainder of 500฿ facing คาบ of 700 then 300 bought nothing until
-// 07/09/2026, because the fill stopped at the first คาบ it could not afford and
-// never reached past it. The college chose the money over the tidier claim
-// form — "เงินสำคัญกว่า" — so the 300฿ คาบ must now be paid.
-//
-// The visible cost, pinned here too: the form reads unpaid-then-paid. The gap is
-// never arbitrary — it is always a คาบ dearer than what was left.
-func TestSettle_SkipsAheadToSpendTheLastOfThePool(t *testing.T) {
-	ledger := []SlotSettlement{
-		{Date: "2026-06-01", StartTime: "09:00", YearMonth: "2026-06", Baht: 700},
-		{Date: "2026-06-02", StartTime: "09:00", YearMonth: "2026-06", Baht: 300},
-	}
-	got := settleTrack(SettleChronological, "regular", 500, 0, ledger)
-
-	if got.PaidBaht != 300 {
-		t.Errorf("paid %.0f, want 300 — the 700฿ คาบ does not fit but the 300฿ one "+
-			"does, and leaving the whole 500฿ unspent is money owed to a TA that "+
-			"simply never left the account", got.PaidBaht)
-	}
-	if got.Slots[0].Paid || !got.Slots[1].Paid {
-		t.Errorf("paid flags %v %v, want the dear คาบ skipped and the cheap one bought",
-			got.Slots[0].Paid, got.Slots[1].Paid)
+	if spread.PaidBaht != chrono.PaidBaht {
+		t.Errorf("spread paid %.2f, chronological %.2f — the rule moves money between "+
+			"months, it must not change the total", spread.PaidBaht, chrono.PaidBaht)
 	}
 }
 
-// The promise that skipping buys: after settling, no unpaid คาบ anywhere is
-// cheap enough to have been afforded. This is the strong form — the one the
-// old rule could not honour.
-func TestSettle_LeavesNothingAnyKapCouldHaveBought(t *testing.T) {
+// Months of different sizes are cut by the same PROPORTION, not given the same
+// baht — a month with twice the work carries twice the money.
+func TestSpread_BigMonthsCarryMoreOfTheShare(t *testing.T) {
 	ledger := concat(
-		monthOf("2026-06", 3, 700),
-		monthOf("2026-07", 5, 300),
-		monthOf("2026-08", 4, 550),
-		monthOf("2026-09", 6, 250),
+		monthOf("2026-06", 2, 500), // 1,000
+		monthOf("2026-07", 4, 500), // 2,000
 	)
-	for _, mode := range []SettlementMode{SettleChronological, SettleSpread} {
-		got := settleTrack(mode, "regular", 4000, 0, cloneSlots(ledger))
-		left := 4000 - got.PaidBaht
-		cheapest := math.Inf(1)
-		for _, sl := range got.Slots {
-			if !sl.Paid && sl.Baht < cheapest {
-				cheapest = sl.Baht
-			}
-		}
-		if left >= cheapest {
-			t.Errorf("[%s] %.2f฿ left while an unpaid คาบ costs %.2f฿", mode, left, cheapest)
-		}
+	got := settleTrack(SettleSpread, "regular", 1500, 0, ledger)
+	paid := monthPaid(got)
+	if paid["2026-06"] != 500 || paid["2026-07"] != 1000 {
+		t.Errorf("paid June %.2f July %.2f, want 500 and 1,000 — half of each", paid["2026-06"], paid["2026-07"])
 	}
 }
 
-// The pool is a hard ceiling under either rule. Guaranteeing every month a share
-// must not become a licence to overspend the budget the lecturer approved.
+// Every month's figure is a whole baht, and the baht the rounding strands go
+// back to the earliest month, so the person's total is exactly their share.
+func TestSpread_MonthFiguresAreWholeBahtAndSumToTheShare(t *testing.T) {
+	ledger := concat(
+		monthOf("2026-06", 1, 100),
+		monthOf("2026-07", 1, 100),
+		monthOf("2026-08", 1, 100),
+	)
+	// 200 of 300: 66.67 a month → 66 + 66 + 66 = 198, 2 left → June 68.
+	got := settleTrack(SettleSpread, "regular", 200, 0, ledger)
+	paid := monthPaid(got)
+	if paid["2026-06"] != 68 || paid["2026-07"] != 66 || paid["2026-08"] != 66 {
+		t.Errorf("paid %v, want June 68, July 66, August 66", paid)
+	}
+	if got.PaidBaht != 200 {
+		t.Errorf("paid %.2f, want the whole 200", got.PaidBaht)
+	}
+}
+
+// The pool is a hard ceiling under either rule, and every baht of work is on
+// one side of the line or the other.
 func TestSpread_NeverSpendsMoreThanThePool(t *testing.T) {
 	ledger := concat(
 		monthOf("2026-06", 4, 900),
@@ -133,22 +114,20 @@ func TestSpread_NeverSpendsMoreThanThePool(t *testing.T) {
 	if got.PaidBaht > 5000+0.01 {
 		t.Errorf("paid %.2f against a 5,000 pool", got.PaidBaht)
 	}
-	if math.Abs(got.PaidBaht+got.DroppedBaht-10800) > 0.01 {
-		t.Errorf("paid + dropped = %.2f, want the full 10,800 of work — "+
-			"every คาบ must be accounted for on one side or the other",
-			got.PaidBaht+got.DroppedBaht)
+	if !near(got.PaidBaht+got.DroppedBaht, 10800) {
+		t.Errorf("paid + dropped = %.2f, want the full 10,800 of work", got.PaidBaht+got.DroppedBaht)
 	}
 }
 
-// The committed lump (graduate-special) comes off the top before the months are
-// given their shares — it is not monthly money and cannot be spread.
+// The committed lump (graduate-special) comes off the top before the share is
+// spread — it is not monthly money.
 func TestSpread_DividesOnlyWhatIsLeftAfterTheCommittedLump(t *testing.T) {
 	ledger := concat(
 		monthOf("2026-06", 2, 500),
 		monthOf("2026-07", 2, 500),
 	)
 	got := settleTrack(SettleSpread, "special", 3000, 2000, ledger)
-	// 3,000 − 2,000 committed = 1,000 to divide, so 500 a month: one คาบ each.
+	// 3,000 − 2,000 committed = 1,000 to divide over 2,000 of work: half.
 	if got.PaidBaht != 1000 {
 		t.Errorf("paid %.2f, want 1,000 — the 2,000 lump is spent already", got.PaidBaht)
 	}
@@ -156,16 +135,6 @@ func TestSpread_DividesOnlyWhatIsLeftAfterTheCommittedLump(t *testing.T) {
 		if paid != 500 {
 			t.Errorf("%s paid %.2f, want 500", ym, paid)
 		}
-	}
-}
-
-// Inside a month the fill skips too: 1,000฿ against 600 + 500 + 100 buys the
-// 600 and the 100, and leaves the 500 it cannot afford.
-func TestSpread_SkipsPastAnExpensiveKapInsideAMonth(t *testing.T) {
-	got := settleTrack(SettleSpread, "regular", 1000, 0, slots(600, 500, 100))
-	if want := []bool{true, false, true}; !equalBools(slotPaidFlags(got), want) {
-		t.Errorf("paid flags %v, want %v — 600 + 100 fits in 1,000 and the 500 "+
-			"does not; leaving the 100 unpaid strands money", slotPaidFlags(got), want)
 	}
 }
 
@@ -196,40 +165,28 @@ func TestSpread_UnconfiguredCapPaysEverything(t *testing.T) {
 	}
 }
 
-// The document asks unpaidFrom, one คาบ at a time. Under the spread rule the
-// unpaid คาบ are no longer a suffix in time, so an answer derived from the
-// cutoff date alone would print คาบ the settlement did not pay for — money out
-// of the door against a budget that had already run out.
-func TestSpread_UnpaidFromMatchesTheSettledSlots(t *testing.T) {
+// The documents sum cost rows × fundedShare. Under the spread rule every คาบ
+// is part-funded, and the ledger's answer must reproduce the month figures.
+func TestSpread_FundedShareReproducesTheMonths(t *testing.T) {
 	ledger := concat(
 		monthOf("2026-06", 4, 400),
 		monthOf("2026-07", 4, 400),
 		monthOf("2026-08", 4, 400),
 	)
 	got := settleTrack(SettleSpread, "regular", 3000, 0, ledger)
-
-	sawUnpaidBeforePaid := false
-	unpaidSeen := false
+	sum := map[string]float64{}
 	for _, sl := range got.Slots {
-		if got.unpaidFor(sl.TA, sl.Date, sl.StartTime) != !sl.Paid {
-			t.Fatalf("unpaidFrom disagrees with the ledger at %s %s: "+
-				"the printed document and the settlement would pay different people",
-				sl.Date, sl.StartTime)
-		}
-		if !sl.Paid {
-			unpaidSeen = true
-		} else if unpaidSeen {
-			sawUnpaidBeforePaid = true
-		}
+		sum[sl.YearMonth] += sl.Baht * got.fundedShare(sl.TA, sl.Date, sl.StartTime)
 	}
-	if !sawUnpaidBeforePaid {
-		t.Error("this case never puts a paid คาบ after an unpaid one, so it does " +
-			"not actually exercise what makes the spread rule different")
+	for ym, paid := range monthPaid(got) {
+		if !near(sum[ym], paid) {
+			t.Errorf("%s: rows × fundedShare = %.2f, ledger month = %.2f", ym, sum[ym], paid)
+		}
 	}
 }
 
 // cloneSlots keeps one ledger reusable across two settlements — settleTrack
-// writes Paid onto the slice it is handed.
+// writes PaidBaht onto the slice it is handed.
 func cloneSlots(in []SlotSettlement) []SlotSettlement {
 	out := make([]SlotSettlement, len(in))
 	copy(out, in)

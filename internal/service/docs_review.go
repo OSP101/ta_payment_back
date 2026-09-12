@@ -108,6 +108,10 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		}
 		docs = append(docs, d)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 	if len(docs) < len(requiredDocKinds) {
 		return nil, Invalid("เอกสารบังคับยังไม่ครบ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)")
@@ -484,6 +488,9 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 		}
 		ids = append(ids, id)
 	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
 	if len(ids) == 0 {
 		return "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน"}
 	}
@@ -827,6 +834,10 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 		}
 		entries = append(entries, e)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, "", err
+	}
 	rows.Close()
 	if len(entries) == 0 {
 		return nil, "", &UserError{Status: 404, Msg: "ไม่พบเอกสารที่จะดาวน์โหลด"}
@@ -1064,6 +1075,11 @@ func (s *DocsService) sweepExpired(ctx context.Context) {
 			}
 			batch = append(batch, p)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			log.Printf("retention: rows failed: %v", err)
+			return
+		}
 		rows.Close()
 		if len(batch) == 0 {
 			return
@@ -1124,6 +1140,15 @@ func (s *DocsService) ScrubUserDocuments(ctx context.Context, actor, userID uuid
 			return err
 		}
 		batch = append(batch, p)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		// QUAL-01 + PDPA-01: a truncated SELECT here must not read as "this
+		// user has no more documents" — ScrubUserDocuments returning nil is
+		// exactly the signal ReviewDeletion's caller trusts to mark the PDPA
+		// erasure request scrub_completed_at. A silently partial batch would
+		// leave real files on disk while the request reports done.
+		return err
 	}
 	rows.Close()
 

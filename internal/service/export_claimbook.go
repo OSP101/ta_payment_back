@@ -382,6 +382,10 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		sits[k].secs = append(sits[k].secs, secNo)
 		sits[k].tracks[track] = true
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	rows.Close()
 	for k, v := range sits {
 		kindLbl := "Lect."
@@ -415,6 +419,10 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		blocks = append(blocks, gridBlock{
 			Row: claimDayRow[day], StartMin: int(sm), EndMin: int(em), Label: label,
 		})
+	}
+	if err := ownRows.Err(); err != nil {
+		ownRows.Close()
+		return err
 	}
 	ownRows.Close()
 
@@ -455,6 +463,10 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		}
 		revSits[k].secs = append(revSits[k].secs, secNo)
 		revSits[k].tracks[track] = true
+	}
+	if err := revRows.Err(); err != nil {
+		revRows.Close()
+		return err
 	}
 	revRows.Close()
 	for k, v := range revSits {
@@ -510,6 +522,10 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		}
 		dutySits[k].secs = append(dutySits[k].secs, secNo)
 		dutySits[k].tracks[track] = true
+	}
+	if err := dutyRows.Err(); err != nil {
+		dutyRows.Close()
+		return err
 	}
 	dutyRows.Close()
 

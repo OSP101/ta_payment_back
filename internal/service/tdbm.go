@@ -488,5 +488,5 @@ func (s *TDBMService) RecentSyncLog(ctx context.Context, limit int) ([]TDBMSyncL
 		e.FinishedAt = finished
 		out = append(out, e)
 	}
-	return out, nil
+	return out, rows.Err()
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -184,7 +185,7 @@ func (s *WorkLogService) loadHolidaysInRange(ctx context.Context, start, end tim
 		}
 		out[d] = append(out[d], w)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // loadMakeupIndex loads every filed makeup for a section into both direction
@@ -705,6 +706,14 @@ type SkipGroup struct {
 type GenerateResult struct {
 	Entries         []WorkLog   `json:"entries"`
 	SkippedOwnClass []SkipGroup `json:"skipped_own_class"`
+	// SkippedWeeklyCap groups rows generation left out because inserting them
+	// would have exceeded a weekly hour-cap bucket (see weeklyCapBuckets) —
+	// e.g. a graduate TA whose lecture+lab share one ช่วยสอน budget and whose
+	// timetable has both in the same week. Without this the TA (or the
+	// lecturer trying to approve) would just see fewer hours than the
+	// timetable implies, with no visible reason and no data to fix — the row
+	// was never wrong, the system just declined to create it.
+	SkippedWeeklyCap []SkipGroup `json:"skipped_weekly_cap,omitempty"`
 	// StoppedAtTermCeiling is set when generation stopped early because the next
 	// class occurrence would exceed the TA's total hours for the term. Without it
 	// the TA just gets fewer rows than their timetable has, with no reason given.
@@ -937,9 +946,15 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	}
 	for rows.Next() {
 		var s sch
-		if err := rows.Scan(&s.kind, &s.day, &s.start, &s.end, &s.hours); err == nil {
-			schs = append(schs, s)
+		if err := rows.Scan(&s.kind, &s.day, &s.start, &s.end, &s.hours); err != nil {
+			rows.Close()
+			return nil, err
 		}
+		schs = append(schs, s)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 
@@ -970,6 +985,39 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	// Counted per clashing class rather than per occurrence, so the TA reads
 	// "ข้ามไป 14 คาบ เพราะตรงกับ X" instead of fourteen identical lines.
 	skippedByClass := map[string]int{}
+	// Weekly hour-cap buckets (see weeklyCapBuckets) — the same grouping
+	// enforceWeeklyActivityCap and recheckCapsForApproval use, so generation
+	// can never mint a row the approval-time recheck would then reject for a
+	// reason the TA had no way to see coming. bucketByActivity looks up a
+	// row's bucket by its activity kind; weeklyHrs tracks what THIS run has
+	// already committed per (week, bucket); skippedByWeeklyCap counts what
+	// got left out, reported back the same way skippedByClass is.
+	bucketByActivity := map[string]weeklyCapBucket{}
+	for _, b := range weeklyCapBuckets(ac) {
+		for _, a := range b.acts {
+			bucketByActivity[a] = b
+		}
+	}
+	weeklyHrs := map[string]float64{}
+	skippedByWeeklyCap := map[string]int{}
+	// weeklyCapReserve reports whether adding hrs of actType on date d would
+	// push that activity's weekly bucket past its cap; on success it also
+	// commits the hours against that week's running total, since a row this
+	// call approves is the row about to be inserted (no separate "add after
+	// insert" step, unlike dailyHrs/termHours, to keep the three call sites
+	// below from being able to insert without reserving).
+	weeklyCapReserve := func(actType string, d time.Time, hrs float64) (blocked bool, label string) {
+		b, ok := bucketByActivity[actType]
+		if !ok || b.cap <= 0 {
+			return false, ""
+		}
+		wk := weekStart(d).Format("2006-01-02") + "|" + b.label
+		if weeklyHrs[wk]+hrs > b.cap+0.01 {
+			return true, b.label
+		}
+		weeklyHrs[wk] += hrs
+		return false, b.label
+	}
 
 	out := []WorkLog{}
 	dailyHrs := map[string]float64{}
@@ -1150,6 +1198,10 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if termBlocks(rowHours) {
 				continue
 			}
+			if blocked, label := weeklyCapReserve(sc.kind, useDate, rowHours); blocked {
+				skippedByWeeklyCap[label]++
+				continue
+			}
 			id := uuid.New()
 			// Detect whether this row landed on a makeup date so the note
 			// picks up the "(ชดเชย)" suffix. A same-day makeup with a new time
@@ -1222,6 +1274,12 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if termBlocks(hrs) {
 				continue
 			}
+			if dd, perr := time.Parse("2006-01-02", dstr); perr == nil {
+				if blocked, label := weeklyCapReserve("review", dd, hrs); blocked {
+					skippedByWeeklyCap[label]++
+					continue
+				}
+			}
 			id := uuid.New()
 			note := autoNoteFor("review", false)
 			if _, err := tx.Exec(ctx,
@@ -1237,6 +1295,10 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			dailyHrs[dstr] += hrs
 			dailyBaht[dstr] += hrs * genRate
 			termHours += hrs
+		}
+		if err := reviewRows.Err(); err != nil {
+			reviewRows.Close()
+			return nil, err
 		}
 		reviewRows.Close()
 
@@ -1344,6 +1406,10 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				if termBlocks(r.hours) {
 					continue
 				}
+				if blocked, label := weeklyCapReserve(r.activity, d, r.hours); blocked {
+					skippedByWeeklyCap[label]++
+					continue
+				}
 				id := uuid.New()
 				note := autoNoteFor(r.activity, false)
 				if _, err := tx.Exec(ctx,
@@ -1381,9 +1447,20 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		}
 		return skips[i].Reason < skips[j].Reason
 	})
+	weeklyCapSkips := make([]SkipGroup, 0, len(skippedByWeeklyCap))
+	for reason, n := range skippedByWeeklyCap {
+		weeklyCapSkips = append(weeklyCapSkips, SkipGroup{Reason: reason, Count: n})
+	}
+	sort.Slice(weeklyCapSkips, func(i, j int) bool {
+		if weeklyCapSkips[i].Count != weeklyCapSkips[j].Count {
+			return weeklyCapSkips[i].Count > weeklyCapSkips[j].Count
+		}
+		return weeklyCapSkips[i].Reason < weeklyCapSkips[j].Reason
+	})
 	return &GenerateResult{
 		Entries:              out,
 		SkippedOwnClass:      skips,
+		SkippedWeeklyCap:     weeklyCapSkips,
 		StoppedAtTermCeiling: stoppedAtCeiling,
 		TermHourCeiling:      termCeiling,
 	}, nil
@@ -1497,8 +1574,9 @@ type TAReviewScheduleList struct {
 }
 
 // declaredDutyHours maps each duty kind to the weekly hours the lecturer
-// declared for this assignment. Undergrad only — grad TAs declare a single
-// grade_hrs / other_hrs pair, mapped onto the same duties.
+// declared for this assignment. Grad TAs only ever get DutyReview (from
+// grade_hrs, capped at gradReviewHourCap by validateGradWorkloadCaps) — see
+// the grad branch below for why other/prep are read but unused.
 func (s *WorkLogService) declaredDutyHours(ctx context.Context, assignmentID uuid.UUID) (map[string]float64, error) {
 	var level string
 	var grade, other, prep, check, ugOther, labOther float64
@@ -1518,12 +1596,15 @@ func (s *WorkLogService) declaredDutyHours(ctx context.Context, assignmentID uui
 		return nil, err
 	}
 	if level == "master" || level == "phd" {
-		// Grad has no lecture/lab split for other-work; both flavours draw on
-		// the one pool so the TA can place it wherever it belongs.
+		// Grad TAs no longer get an "other" duty at all (confirmed with the
+		// office, 2026-09-11): other_hrs/prep_hrs are now rejected at
+		// creation time (validateGradWorkloadCaps), so other/prep here are
+		// always 0 for new assignments — omitting the keys entirely (rather
+		// than returning 0-valued ones) makes both the worklog page's
+		// declared[k] > 0 card filter and enforceReviewCap's "not declared"
+		// rejection do the right thing with no further changes.
 		return map[string]float64{
-			DutyReview:       grade,
-			DutyOtherLecture: other + prep,
-			DutyOtherLab:     other + prep,
+			DutyReview: grade,
 		}, nil
 	}
 	return map[string]float64{
@@ -1669,6 +1750,10 @@ func (s *WorkLogService) ScheduleBusyBlocks(ctx context.Context, actor, assignme
 		b.Kind = "class"
 		out = append(out, b)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 
 	// (b) classes the TA help-teaches across all approved assignments.
@@ -1693,6 +1778,10 @@ func (s *WorkLogService) ScheduleBusyBlocks(ctx context.Context, actor, assignme
 		}
 		b.Kind = "teaching"
 		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 
@@ -1719,6 +1808,10 @@ func (s *WorkLogService) ScheduleBusyBlocks(ctx context.Context, actor, assignme
 		b.Kind = "review"
 		b.ReviewID = &id
 		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 
@@ -2256,6 +2349,51 @@ func (s *WorkLogService) enforceNoOverlap(ctx context.Context, taID uuid.UUID, w
 	return Invalid(fmt.Sprintf("ช่วงเวลาซ้อนกับรายการเดิม (%s %s–%s) แก้ไขเวลาให้ไม่ทับกัน", code, st, en))
 }
 
+// weeklyCapBucket is one weekly hour-cap grouping: grad's shared
+// lecture+lab pool (or undergrad's two separate ones), plus review and
+// other. weeklyCapBuckets is the single place that decides this grouping —
+// used by recheckCapsForApproval (the approval-time gate) AND by Generate
+// (see weekStart/weeklyCapReserve below), so the two can never disagree
+// about what counts as a week's worth of one activity. They used to: Generate
+// only checked daily/baht/term ceilings, so it could mint rows that
+// individually looked fine but together blew a weekly bucket — a graduate
+// TA's system-generated ช่วยสอน (lecture+lab share one cap) is the case that
+// surfaced it, every week of the term stuck "รอพิจารณา" with no way to fix
+// data the TA never typed.
+type weeklyCapBucket struct {
+	cap   float64
+	acts  []string
+	label string
+}
+
+func weeklyCapBuckets(ac *assignmentContext) []weeklyCapBucket {
+	var buckets []weeklyCapBucket
+	if ac.WeeklyLectureLabShared {
+		buckets = append(buckets, weeklyCapBucket{ac.WeeklyCapLecture, []string{"lecture", "lab"}, "ช่วยสอน (บรรยาย+ปฏิบัติการ)"})
+	} else {
+		buckets = append(buckets,
+			weeklyCapBucket{ac.WeeklyCapLecture, []string{"lecture"}, "เช็คชื่อบรรยาย"},
+			weeklyCapBucket{ac.WeeklyCapLab, []string{"lab"}, "ปฏิบัติการ"})
+	}
+	buckets = append(buckets,
+		weeklyCapBucket{ac.WeeklyCapReview, []string{"review"}, "ตรวจงาน"},
+		weeklyCapBucket{ac.WeeklyCapOther, []string{"other"}, "อื่นๆ"})
+	return buckets
+}
+
+// weekStart returns the Monday of the ISO week containing d, matching
+// PostgreSQL's date_trunc('week', ...) — the grouping enforceWeeklyActivityCap
+// and recheckCapsForApproval both use. Generate builds its rows in Go before
+// a single batch insert, so it needs the same week boundary computed here
+// rather than in SQL.
+func weekStart(d time.Time) time.Time {
+	wd := int(d.Weekday()) // time.Sunday=0 ... time.Saturday=6
+	if wd == 0 {
+		wd = 7 // ISO: Sunday is the LAST day of the week, not the first
+	}
+	return d.AddDate(0, 0, -(wd - 1))
+}
+
 // recheckCapsForApproval re-validates the per-day and per-week hour caps over
 // the assignment's submitted+approved rows inside the approval transaction.
 // The caps are normally enforced at Upsert time, but staff edits or workload
@@ -2294,23 +2432,7 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 	if !ac.HasWorkloadForm {
 		return nil
 	}
-	type bucket struct {
-		cap   float64
-		acts  []string
-		label string
-	}
-	var buckets []bucket
-	if ac.WeeklyLectureLabShared {
-		buckets = append(buckets, bucket{ac.WeeklyCapLecture, []string{"lecture", "lab"}, "ช่วยสอน (บรรยาย+ปฏิบัติการ)"})
-	} else {
-		buckets = append(buckets,
-			bucket{ac.WeeklyCapLecture, []string{"lecture"}, "เช็คชื่อบรรยาย"},
-			bucket{ac.WeeklyCapLab, []string{"lab"}, "ปฏิบัติการ"})
-	}
-	buckets = append(buckets,
-		bucket{ac.WeeklyCapReview, []string{"review"}, "ตรวจงาน"},
-		bucket{ac.WeeklyCapOther, []string{"other"}, "อื่นๆ"})
-	for _, b := range buckets {
+	for _, b := range weeklyCapBuckets(ac) {
 		if b.cap <= 0 {
 			continue
 		}
@@ -2388,7 +2510,7 @@ func (s *WorkLogService) List(ctx context.Context, actor, assignmentID uuid.UUID
 		}
 		out = append(out, w)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // assertOwnClassScheduleFilled blocks worklog writes until the TA has entered
@@ -3177,6 +3299,16 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	}
 	defer tx.Rollback(ctx)
 
+	// The before-image is the set of rows this statement is about to move —
+	// same pattern as ApproveMany/Reject, and needed for the same reason: the
+	// approval-history panel used to be "purely informational" (no way to see
+	// what was actually approved) because this snapshot didn't exist yet for
+	// the single-month path, only the batch/reject ones.
+	moving, hours, err := worklogSetSnapshot(ctx, tx, assignmentID, yearMonth, "submitted")
+	if err != nil {
+		return err
+	}
+
 	// Serialize concurrent approvals on the same course so two reviewers cannot
 	// both push the course over budget.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 42))`, ac.TeachingCourseID); err != nil {
@@ -3207,7 +3339,12 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	// left: the hours are approved and the record says they never were, or we
 	// report a failure for something that did happen and the lecturer retries
 	// into "ไม่มีรายการที่รออนุมัติ". Here the two land together or neither does.
-	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "worklog.approve", Entity: "assignment", EntityID: assignmentID.String(), Note: yearMonth}); err != nil {
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
+		ActorID: &actor, Action: "worklog.approve", Entity: "assignment", EntityID: assignmentID.String(),
+		Note:   yearMonth,
+		Before: map[string]any{"status": "submitted", "rows": moving},
+		After:  map[string]any{"status": "approved", "count": tag.RowsAffected(), "hours": hours},
+	}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -3258,9 +3395,15 @@ type PendingReport struct {
 	// sections are not copies of each other. On CP321002 the pair holds 98 rows
 	// but only 82 distinct sittings, so the honest total is 164h — not 196
 	// (adding them) and not 98 (assuming one is a duplicate of the other).
-	TotalHours  float64 `json:"total_hours"`
-	GroupHours  float64 `json:"group_hours"`
-	PeriodLabel string  `json:"period_label,omitempty"`
+	TotalHours float64 `json:"total_hours"`
+	GroupHours float64 `json:"group_hours"`
+	// GroupHours split the way the money is split. A sitting logged against a
+	// regular section is regular even when a special section shares it (rule
+	// B2 bills the shared hour once, on the regular side); only hours worked
+	// for a special section alone are special. Same on every row of the group.
+	GroupRegularHours float64 `json:"group_regular_hours"`
+	GroupSpecialHours float64 `json:"group_special_hours"`
+	PeriodLabel       string  `json:"period_label,omitempty"`
 	// FirstDate / LastDate are the same span as PeriodLabel, unformatted, so the
 	// client can render it in Thai like every other date in the app.
 	FirstDate string `json:"first_date,omitempty"`
@@ -3274,7 +3417,7 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 	rows, err := s.pool.Query(ctx, `
 		WITH pend AS (
 		    SELECT a.id AS assignment_id, a.ta_id, a.cotaught_group,
-		           sec.teaching_course_id,
+		           sec.teaching_course_id, sec.track::text AS track,
 		           wl.work_date, wl.start_time, wl.end_time, wl.hours
 		    FROM work_logs wl
 		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
@@ -3283,15 +3426,21 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		),
 		-- One sitting taught to several sections is ONE thing to review and one
 		-- thing to pay (export rule B2). Count it once per co-taught group
-		-- before the group's hours are reported.
+		-- before the group's hours are reported. A sitting any regular section
+		-- shares is regular — that is the side B2 bills it on.
 		sitting AS (
-		    SELECT DISTINCT ON (ta_id, teaching_course_id, cotaught_group,
-		                        work_date, start_time, end_time)
-		           ta_id, teaching_course_id, cotaught_group, hours
+		    SELECT ta_id, teaching_course_id, cotaught_group,
+		           MAX(hours) AS hours,
+		           BOOL_OR(track = 'regular') AS regular
 		    FROM pend
+		    GROUP BY ta_id, teaching_course_id, cotaught_group,
+		             work_date, start_time, end_time
 		),
 		grp AS (
-		    SELECT ta_id, teaching_course_id, cotaught_group, SUM(hours) AS hours
+		    SELECT ta_id, teaching_course_id, cotaught_group,
+		           SUM(hours) AS hours,
+		           COALESCE(SUM(hours) FILTER (WHERE regular), 0)     AS regular_hours,
+		           COALESCE(SUM(hours) FILTER (WHERE NOT regular), 0) AS special_hours
 		    FROM sitting
 		    GROUP BY ta_id, teaching_course_id, cotaught_group
 		)
@@ -3306,6 +3455,10 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		       a.cotaught_group,
 		       COALESCE(SUM(wl.hours), 0),
 		       COALESCE(MAX(g.hours), SUM(wl.hours), 0),
+		       CASE WHEN a.cotaught_group IS NOT NULL THEN COALESCE(MAX(g.regular_hours), 0)
+		            WHEN sec.track = 'regular' THEN COALESCE(SUM(wl.hours), 0) ELSE 0 END,
+		       CASE WHEN a.cotaught_group IS NOT NULL THEN COALESCE(MAX(g.special_hours), 0)
+		            WHEN sec.track = 'special' THEN COALESCE(SUM(wl.hours), 0) ELSE 0 END,
 		       MIN(wl.work_date),
 		       MAX(wl.work_date),
 		       MIN(wl.submitted_at)
@@ -3347,7 +3500,8 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		)
 		if err := rows.Scan(&p.ID, &p.TAID, &p.TAName, &p.StudyLevel, &p.CourseCode, &p.TeachingCourseID,
 			&p.SecNo, &p.Track, &p.CoTaughtGroup,
-			&p.TotalHours, &p.GroupHours, &minD, &maxD, &submittedAt); err != nil {
+			&p.TotalHours, &p.GroupHours, &p.GroupRegularHours, &p.GroupSpecialHours,
+			&minD, &maxD, &submittedAt); err != nil {
 			return nil, err
 		}
 		p.FirstDate = minD.Format("2006-01-02")
@@ -3376,33 +3530,81 @@ type ApprovalHistoryEntry struct {
 	Track        string    `json:"track"`
 	// Note holds the reject reason for reject actions; empty for approvals.
 	Note string `json:"note,omitempty"`
+	// ActorName/ActorRole identify who performed the action — staff/admin can
+	// approve or reject on a course they don't teach (RequireRole below), and
+	// the lecturer who owns that course needs to see that it happened and by
+	// whom, not just their own actions. ActorName is empty if the acting
+	// account has since been deleted (audit_logs.actor_id survives that; the
+	// join to users does not).
+	ActorName string `json:"actor_name"`
+	ActorRole string `json:"actor_role"`
+	// Rows is the snapshot of work_log rows this action actually moved,
+	// captured into audit_logs.before at the moment it happened (see
+	// worklogSetSnapshot) — a frozen record, not a live query, so it still
+	// shows what was approved/rejected even if those rows are later edited
+	// or deleted. Empty for entries written before this snapshot existed
+	// (older audit rows have no "rows" key in before).
+	Rows []ApprovalHistoryRow `json:"rows"`
 }
 
-// ListApprovalHistory returns the lecturer's own approve/reject actions on
-// worklog batches within one teaching course, newest first. Authorization:
-// the lecturer must currently teach the course — otherwise a rotated-off
-// lecturer could still read history for courses they no longer own.
+// ApprovalHistoryRow is one work_log row as it existed at the moment an
+// approve/reject action moved it — see ApprovalHistoryEntry.Rows. Shaped to
+// match WorkLog's fields (worklog.go's List response) so the frontend can
+// feed this straight into the same MonthTable component the pending queue
+// uses, rather than a second, differently-designed detail view.
+type ApprovalHistoryRow struct {
+	WorkDate   string  `json:"work_date"`
+	StartTime  string  `json:"start_time"`
+	EndTime    string  `json:"end_time"`
+	Hours      float64 `json:"hours"`
+	Activity   string  `json:"activity"`
+	ParentKind *string `json:"parent_kind,omitempty"`
+	Note       string  `json:"note,omitempty"`
+}
+
+// ListApprovalHistory returns every approve/reject action on worklog batches
+// within one teaching course, newest first — including actions staff/admin
+// took on the lecturer's behalf, not just the viewer's own. It used to filter
+// WHERE al.actor_id = $1 (only the viewer's own actions), which meant a
+// lecturer had no way to learn staff had approved or rejected a month for
+// them: the queue would simply empty out with no visible reason. Course
+// ownership (or the privileged role RequireRole already checked) is what
+// gates WHO may call this, not who acted — see assertLecturerOrPrivileged's
+// pattern elsewhere in this package.
+//
+// Authorization: the lecturer must currently teach the course, or the actor
+// must be staff/admin — otherwise a rotated-off lecturer could still read
+// history for courses they no longer own.
 func (s *WorkLogService) ListApprovalHistory(ctx context.Context, actor, tcID uuid.UUID) ([]ApprovalHistoryEntry, error) {
 	owns, err := lecturerOwnsCourse(ctx, s.pool, actor, tcID)
 	if err != nil {
 		return nil, err
 	}
 	if !owns {
-		return nil, ErrForbidden
+		privileged, err := isPrivileged(ctx, s.pool, actor)
+		if err != nil {
+			return nil, err
+		}
+		if !privileged {
+			return nil, ErrForbidden
+		}
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT al.id, al.at, al.action, a.id, sec.sec_no, sec.track::text,
-		       u.first_name || ' ' || u.last_name, COALESCE(al.note, '')
+		       u.first_name || ' ' || u.last_name, COALESCE(al.note, ''),
+		       COALESCE(au.first_name || ' ' || au.last_name, ''),
+		       COALESCE(al.actor_role::text, ''),
+		       COALESCE(al.before -> 'rows', '[]'::jsonb)
 		FROM audit_logs al
 		JOIN ta_request_assignments a ON a.id::text = al.entity_id
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN users u ON u.id = a.ta_id
-		WHERE al.actor_id = $1
-		  AND al.entity = 'assignment'
+		LEFT JOIN users au ON au.id = al.actor_id
+		WHERE al.entity = 'assignment'
 		  AND al.action IN ('worklog.approve','worklog.reject')
-		  AND sec.teaching_course_id = $2
+		  AND sec.teaching_course_id = $1
 		ORDER BY al.at DESC
-		LIMIT 100`, actor, tcID)
+		LIMIT 100`, tcID)
 	if err != nil {
 		return nil, err
 	}
@@ -3410,8 +3612,13 @@ func (s *WorkLogService) ListApprovalHistory(ctx context.Context, actor, tcID uu
 	out := make([]ApprovalHistoryEntry, 0)
 	for rows.Next() {
 		var e ApprovalHistoryEntry
+		var rowsJSON []byte
 		if err := rows.Scan(&e.ID, &e.At, &e.Action, &e.AssignmentID,
-			&e.SecNo, &e.Track, &e.TAName, &e.Note); err != nil {
+			&e.SecNo, &e.Track, &e.TAName, &e.Note,
+			&e.ActorName, &e.ActorRole, &rowsJSON); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(rowsJSON, &e.Rows); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -3761,7 +3968,8 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 // meantime.
 func worklogSetSnapshot(ctx context.Context, tx pgx.Tx, assignmentID uuid.UUID, yearMonth, status string) ([]map[string]any, float64, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT id, TO_CHAR(work_date,'YYYY-MM-DD'), hours, activity, status::text
+		SELECT id, TO_CHAR(work_date,'YYYY-MM-DD'), start_time::text, end_time::text,
+		       hours, activity, parent_kind, COALESCE(note,''), status::text
 		FROM work_logs
 		WHERE assignment_id = $1 AND status::text = $2
 		  AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)
@@ -3774,13 +3982,21 @@ func worklogSetSnapshot(ctx context.Context, tx pgx.Tx, assignmentID uuid.UUID, 
 	var total float64
 	for rows.Next() {
 		var id uuid.UUID
-		var date, activity, st string
+		var date, startTime, endTime, activity, note, st string
+		var parentKind *string
 		var hours float64
-		if err := rows.Scan(&id, &date, &hours, &activity, &st); err != nil {
+		if err := rows.Scan(&id, &date, &startTime, &endTime, &hours, &activity, &parentKind, &note, &st); err != nil {
 			return nil, 0, err
 		}
+		// Same reasoning as the frontend's MonthTable, which this snapshot is
+		// shaped to feed (approval-history detail — decided 11/09/2026 to
+		// reuse that exact view rather than a second, differently-designed
+		// one): start_time/end_time/parent_kind/note round out the columns
+		// it already renders, so a history entry looks identical to the
+		// pending queue the lecturer already knows how to read.
 		out = append(out, map[string]any{
-			"id": id, "work_date": date, "hours": hours, "activity": activity, "status": st,
+			"id": id, "work_date": date, "start_time": startTime[:5], "end_time": endTime[:5],
+			"hours": hours, "activity": activity, "parent_kind": parentKind, "note": note, "status": st,
 		})
 		total += hours
 	}

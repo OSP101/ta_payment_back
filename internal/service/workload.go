@@ -125,7 +125,7 @@ func (s *WorkloadService) ListClasses(ctx context.Context, userID, termID uuid.U
 		b.CourseLabel = classLabelOf(b)
 		out = append(out, b)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // ScheduleLockedReason returns a non-empty Thai reason when the TA may no

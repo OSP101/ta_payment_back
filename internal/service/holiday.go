@@ -76,7 +76,7 @@ func (s *HolidayService) List(ctx context.Context, year int) ([]Holiday, error) 
 		}
 		out = append(out, h)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 type HolidayInput struct {
@@ -465,6 +465,9 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		}
 		g.AffectedSections = append(g.AffectedSections, sec)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	impacts := make([]HolidayImpact, 0, len(order))
 	for _, k := range order {
 		impacts = append(impacts, *group[k])
@@ -546,6 +549,9 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 			return err
 		}
 		lecturerIDs = append(lecturerIDs, lid)
+	}
+	if err := rows.Err(); err != nil {
+		return err
 	}
 	if len(lecturerIDs) == 0 {
 		return Invalid("ไม่พบอาจารย์ประจำวิชา")

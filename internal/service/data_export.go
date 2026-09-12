@@ -96,9 +96,15 @@ func (s *UserService) ExportMyData(ctx context.Context, userID uuid.UUID) (*MyDa
 	}
 	for rows.Next() {
 		var r string
-		if err := rows.Scan(&r); err == nil {
-			out.Profile.Roles = append(out.Profile.Roles, r)
+		if err := rows.Scan(&r); err != nil {
+			rows.Close()
+			return nil, err
 		}
+		out.Profile.Roles = append(out.Profile.Roles, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
 	rows.Close()
 
@@ -134,6 +140,10 @@ func (s *UserService) ExportMyData(ctx context.Context, userID uuid.UUID) (*MyDa
 		}
 		out.Sessions = append(out.Sessions, sess)
 	}
+	if err := sessRows.Err(); err != nil {
+		sessRows.Close()
+		return nil, err
+	}
 	sessRows.Close()
 
 	docRows, err := s.pool.Query(ctx,
@@ -151,6 +161,10 @@ func (s *UserService) ExportMyData(ctx context.Context, userID uuid.UUID) (*MyDa
 		}
 		out.Docs = append(out.Docs, d)
 	}
+	if err := docRows.Err(); err != nil {
+		docRows.Close()
+		return nil, err
+	}
 	docRows.Close()
 
 	actRows, err := s.pool.Query(ctx,
@@ -166,6 +180,10 @@ func (s *UserService) ExportMyData(ctx context.Context, userID uuid.UUID) (*MyDa
 			return nil, err
 		}
 		out.Activity = append(out.Activity, e)
+	}
+	if err := actRows.Err(); err != nil {
+		actRows.Close()
+		return nil, err
 	}
 	actRows.Close()
 

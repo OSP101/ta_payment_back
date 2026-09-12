@@ -360,3 +360,44 @@ func TestReviewQueue_NamesCarryThePrefixButSortByGivenName(t *testing.T) {
 		t.Errorf("second row = %q, want %q", names[1], "นางสาวอรอนงค์ ฮ")
 	}
 }
+
+// The grid cell says hours by the track they are BILLED on, so it can be read
+// against the two claim sheets. On SC362005 the special section sits in the
+// same room as the regular ones: the shared lecture prints on the regular
+// sheet only (rule B2), and the special sheet shows just the review hour the
+// special section had alone. A cell saying "พิเศษ 3.0" for that month would
+// disagree with the sheet in the officer's other hand.
+func TestReviewQueue_SplitsHoursByBilledTrack(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	special := f.cotaughtSiblingAssignment("special")
+	f.addAppointmentOrder()
+
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	shared := f.entry(day(10), "09:00", "11:00", 2)
+	shared.AssignmentID = special
+	f.mustUpsert(shared)
+	own := f.entry(day(12), "13:00", "14:00", 1)
+	own.AssignmentID = special
+	f.mustUpsert(own)
+	f.exec(`UPDATE work_logs SET status='approved' WHERE assignment_id IN ($1, $2)`,
+		f.AssignmentID, special)
+	f.addSubmissionPeriod(currentMonthMM(), openDueDate(), "", false)
+
+	rows, err := f.Periods.ListReviewQueue(f.ctx, f.TermID)
+	if err != nil {
+		t.Fatalf("ListReviewQueue: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 queued month, got %d", len(rows))
+	}
+	r := rows[0]
+	if r.ApprovedHoursRegular != 2 {
+		t.Errorf("regular hours = %v, want 2 (the shared sitting, once)", r.ApprovedHoursRegular)
+	}
+	if r.ApprovedHoursSpecial != 1 {
+		t.Errorf("special hours = %v, want 1 — the shared 2h is billed regular", r.ApprovedHoursSpecial)
+	}
+	if r.ApprovedHours != 3 {
+		t.Errorf("approved hours = %v, want 3", r.ApprovedHours)
+	}
+}

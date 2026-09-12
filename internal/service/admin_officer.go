@@ -106,7 +106,7 @@ func (s *AdminOfficerService) List(ctx context.Context, includeInactive bool) ([
 		o.IsHead = IsHeadTitle(o.Title)
 		out = append(out, o)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // Upsert reassigns an EXISTING seat — who holds it (UserID) and whether it's

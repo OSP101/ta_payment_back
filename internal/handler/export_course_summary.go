@@ -17,7 +17,7 @@ func (h *TeachingHandler) CourseSummaryWarnings(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	warnings, err := h.Svc.Export.CourseSummaryWarnings(c.Context(), termID)
+	warnings, err := h.Svc.Export.CourseSummaryWarnings(c.Context(), termID, monthsParam(c))
 	if err != nil {
 		return err
 	}
@@ -25,6 +25,27 @@ func (h *TeachingHandler) CourseSummaryWarnings(c *fiber.Ctx) error {
 		warnings = []string{}
 	}
 	return c.JSON(fiber.Map{"warnings": warnings})
+}
+
+// CourseSummaryMonths — GET /exports/terms/:id/course-summary/months — the
+// term's claimable months, for the "ถึงเดือน" picker that scopes
+// เบิกจ่ายเดือน/คงเหลือ. Generic and level-agnostic (unlike
+// TransferCoverCoverage, which also tracks per-month "issued" state this
+// estimate document has no use for), so it's a thin wrapper around
+// ExportService.TermMonths rather than a new query.
+func (h *TeachingHandler) CourseSummaryMonths(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	months, err := h.Svc.Export.TermMonths(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	if months == nil {
+		months = []service.TermMonth{}
+	}
+	return c.JSON(fiber.Map{"months": months})
 }
 
 // CourseSummaryXLSX — GET /exports/terms/:id/course-summary.xlsx — the
@@ -36,7 +57,7 @@ func (h *TeachingHandler) CourseSummaryXLSX(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	body, _, err := h.Svc.Export.BuildCourseSummaryWorkbook(c.Context(), UserID(c), termID)
+	body, _, err := h.Svc.Export.BuildCourseSummaryWorkbook(c.Context(), UserID(c), termID, monthsParam(c))
 	if err != nil {
 		return err
 	}
@@ -60,7 +81,7 @@ func (h *TeachingHandler) CourseSummaryPreview(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	sheets, warnings, err := h.Svc.Export.CourseSummaryPreview(c.Context(), termID)
+	sheets, warnings, months, monthLabels, err := h.Svc.Export.CourseSummaryPreview(c.Context(), termID, monthsParam(c))
 	if err != nil {
 		return err
 	}
@@ -70,7 +91,13 @@ func (h *TeachingHandler) CourseSummaryPreview(c *fiber.Ctx) error {
 	if warnings == nil {
 		warnings = []string{}
 	}
-	return c.JSON(fiber.Map{"sheets": sheets, "warnings": warnings})
+	if months == nil {
+		months = []string{}
+	}
+	return c.JSON(fiber.Map{
+		"sheets": sheets, "warnings": warnings,
+		"months": months, "month_labels": monthLabels,
+	})
 }
 
 // CourseSummaryHistory — GET /exports/terms/:id/course-summary/history — the

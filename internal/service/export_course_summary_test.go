@@ -53,6 +53,15 @@ func newCSFixture(t *testing.T) *csFixture {
 	return f
 }
 
+// addSubmissionPeriod gives the fixture's term a claimable month — needed for
+// anything reading TermMonths (the เบิกจ่ายเดือน/คงเหลือ month picker), which
+// otherwise sees an empty term and treats every course as having settled
+// nothing, no matter what work_logs say.
+func (f *csFixture) addSubmissionPeriod(yearMonth, startsOn, dueDate, label string) {
+	f.exec(`INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label)
+	        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)`, f.termID, yearMonth, startsOn, dueDate, label)
+}
+
 func (f *csFixture) exec(sql string, args ...any) {
 	f.t.Helper()
 	if _, err := f.pool.Exec(f.ctx, sql, args...); err != nil {
@@ -140,7 +149,7 @@ func (f *csFixture) actor() uuid.UUID {
 
 func (f *csFixture) build() ([]byte, []string) {
 	f.t.Helper()
-	body, warnings, err := f.svc.BuildCourseSummaryWorkbook(f.ctx, f.actor(), f.termID)
+	body, warnings, err := f.svc.BuildCourseSummaryWorkbook(f.ctx, f.actor(), f.termID, nil)
 	if err != nil {
 		f.t.Fatalf("BuildCourseSummaryWorkbook: %v", err)
 	}
@@ -162,6 +171,7 @@ func TestBuildCourseSummaryWorkbook_BasicCourseWithMoney(t *testing.T) {
 		Code: "CP100001", NameTH: "Test Course", Credits: 3, LectureHrs: 3, LabHrs: 3, SelfHrs: 6,
 		NumRegular: 60, NumSpecial: 30, Curriculum: "CS",
 	})
+	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
 	f.addApprovedTA(courseID, "สมชาย", "undergrad", 3, 0)
 
 	snap, err := f.svc.budget.Compute(f.ctx, courseID)
@@ -185,29 +195,29 @@ func TestBuildCourseSummaryWorkbook_BasicCourseWithMoney(t *testing.T) {
 	if got, _ := wb.GetCellValue("CS", "C5"); got != "Test Course" {
 		t.Errorf("C5 (name) = %q, want Test Course", got)
 	}
-	if got, _ := wb.GetCellValue("CS", "E5"); got != "3 (3-3-6)" {
-		t.Errorf("E5 (credit text) = %q, want 3 (3-3-6)", got)
+	if got, _ := wb.GetCellValue("CS", "D5"); got != "3 (3-3-6)" {
+		t.Errorf("D5 (credit text) = %q, want 3 (3-3-6)", got)
 	}
-	if got, _ := wb.GetCellValue("CS", "L5"); got != "(Lec.)" {
-		t.Errorf("L5 (claim kind) = %q, want (Lec.) — only attendance_hrs was declared", got)
+	if got, _ := wb.GetCellValue("CS", "K5"); got != "(Lec.)" {
+		t.Errorf("K5 (claim kind) = %q, want (Lec.) — only attendance_hrs was declared", got)
 	}
-	if got, _ := wb.GetCellValue("CS", "G5"); got == "" {
-		t.Error("G5 (TA student id) is empty")
+	if got, _ := wb.GetCellValue("CS", "F5"); got == "" {
+		t.Error("F5 (TA student id) is empty")
 	}
-	if got, _ := wb.GetCellValue("CS", "H5"); got != "สมชาย ทดสอบ" {
-		t.Errorf("H5 (TA name) = %q, want สมชาย ทดสอบ", got)
+	if got, _ := wb.GetCellValue("CS", "G5"); got != "สมชาย ทดสอบ" {
+		t.Errorf("G5 (TA name) = %q, want สมชาย ทดสอบ", got)
 	}
 
-	// ขออนุมัติเบิกจ่าย — the course's BUDGET per track, which is the only
-	// money this document reports (เบิกจ่ายจริง/คงเหลือ were dropped 10/08/2026).
-	assertMoneyCell(t, wb, "CS", "M5", snap.TermPayRegular)
-	assertMoneyCell(t, wb, "CS", "N5", snap.TermPaySpecial)
-	// Nothing is written past N: the sheet ends at the ขออนุมัติเบิกจ่าย pair.
-	for _, cell := range []string{"O2", "O4", "O5", "Q2", "Q4", "Q5"} {
-		if got, _ := wb.GetCellValue("CS", cell); got != "" {
-			t.Errorf("%s = %q, want empty — เบิกจ่ายจริง/คงเหลือ columns were removed", cell, got)
-		}
-	}
+	// ขออนุมัติเบิกจ่าย — the course's BUDGET per track.
+	assertMoneyCell(t, wb, "CS", "L5", snap.TermPayRegular)
+	assertMoneyCell(t, wb, "CS", "M5", snap.TermPaySpecial)
+	// เบิกจ่ายเดือน/คงเหลือ (added back 11/09/2026): no work has been approved
+	// yet for this TA, so nothing has cleared — เบิกจ่ายเดือน reads 0 and
+	// คงเหลือ reads the full budget, unchanged from L/M.
+	assertMoneyCell(t, wb, "CS", "N5", 0)
+	assertMoneyCell(t, wb, "CS", "O5", 0)
+	assertFormulaCell(t, wb, "CS", "P5", "L5-N5")
+	assertFormulaCell(t, wb, "CS", "Q5", "M5-O5")
 }
 
 func assertMoneyCell(t *testing.T, wb *excelize.File, sheet, cell string, want float64) {
@@ -222,6 +232,21 @@ func assertMoneyCell(t *testing.T, wb *excelize.File, sheet, cell string, want f
 	}
 	if diff := got - want; diff > 0.01 || diff < -0.01 {
 		t.Errorf("%s!%s = %v, want %v", sheet, cell, got, want)
+	}
+}
+
+// assertFormulaCell checks that a cell holds a live formula (excelize does
+// not compute a cached result for a cell it wrote itself, so GetCellValue
+// on Q/R reads back empty — the formula text is what's checkable) that
+// matches wantExpr exactly.
+func assertFormulaCell(t *testing.T, wb *excelize.File, sheet, cell, wantExpr string) {
+	t.Helper()
+	got, err := wb.GetCellFormula(sheet, cell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != wantExpr {
+		t.Errorf("%s!%s formula = %q, want %q", sheet, cell, got, wantExpr)
 	}
 }
 
@@ -249,12 +274,12 @@ func TestBuildCourseSummaryWorkbook_TotalRowIsARealFormula(t *testing.T) {
 	defer wb.Close()
 
 	// One course block occupies rows 5-5 (single TA), so the total row is 6.
-	formula, err := wb.GetCellFormula("CS", "M6")
+	formula, err := wb.GetCellFormula("CS", "L6")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if formula == "" || formula[:3] != "SUM" {
-		t.Errorf("M6 formula = %q, want a SUM(...) formula", formula)
+		t.Errorf("L6 formula = %q, want a SUM(...) formula", formula)
 	}
 }
 
@@ -299,14 +324,14 @@ func TestBuildCourseSummaryWorkbook_DualCodeGroupSumsMoney(t *testing.T) {
 	if got, _ := wb.GetCellValue("CS", "B5"); got != "CP200001/SC200001" {
 		t.Errorf("B5 (merged code) = %q, want CP200001/SC200001", got)
 	}
-	assertMoneyCell(t, wb, "CS", "M5", wantRegular)
-	assertMoneyCell(t, wb, "CS", "N5", wantSpecial)
+	assertMoneyCell(t, wb, "CS", "L5", wantRegular)
+	assertMoneyCell(t, wb, "CS", "M5", wantSpecial)
 
 	// Both TAs must appear — merging money must not merge away roster rows.
-	h5, _ := wb.GetCellValue("CS", "G5")
-	h6, _ := wb.GetCellValue("CS", "G6")
-	if h5 == "" || h6 == "" {
-		t.Errorf("expected two TA rows under the merged block, got G5=%q G6=%q", h5, h6)
+	f5, _ := wb.GetCellValue("CS", "F5")
+	f6, _ := wb.GetCellValue("CS", "F6")
+	if f5 == "" || f6 == "" {
+		t.Errorf("expected two TA rows under the merged block, got F5=%q F6=%q", f5, f6)
 	}
 }
 
@@ -349,20 +374,20 @@ func TestBuildCourseSummaryWorkbook_DedupsSameTAAcrossGroupMembers(t *testing.T)
 	wb := openWorkbook(t, body)
 	defer wb.Close()
 
-	g5, _ := wb.GetCellValue("CS", "G5")
-	if g5 == "" {
+	f5, _ := wb.GetCellValue("CS", "F5")
+	if f5 == "" {
 		t.Fatal("expected at least one TA row")
 	}
 	// A single deduped TA row puts the total at row 6 (row 6's "รวมทั้งหมด"
-	// merge is why G6 isn't checked directly — it would read the merge's
+	// merge is why F6 isn't checked directly — it would read the merge's
 	// anchor value regardless). If dedup failed and the TA printed twice, the
-	// total would land at row 7 instead, and M6 would carry no formula at all.
-	formula, err := wb.GetCellFormula("CS", "M6")
+	// total would land at row 7 instead, and L6 would carry no formula at all.
+	formula, err := wb.GetCellFormula("CS", "L6")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if formula == "" {
-		t.Error("expected the total row at M6 (one deduped TA row) — got no formula there, suggesting the TA printed twice")
+		t.Error("expected the total row at L6 (one deduped TA row) — got no formula there, suggesting the TA printed twice")
 	}
 }
 
@@ -448,6 +473,7 @@ func TestBuildCourseSummaryWorkbook_ApplyColumnsAreBudgetNotSpend(t *testing.T) 
 		NumRegular: 40, Curriculum: "CS",
 	})
 	f.insertSubmittedRequest(courseID)
+	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
 	taID := f.addApprovedTA(courseID, "TA1", "undergrad", 2, 0)
 
 	snap, err := f.svc.budget.Compute(f.ctx, courseID)
@@ -478,7 +504,12 @@ func TestBuildCourseSummaryWorkbook_ApplyColumnsAreBudgetNotSpend(t *testing.T) 
 	wb := openWorkbook(t, body)
 	defer wb.Close()
 	// Still the full budget, even though part of it has now been spent.
-	assertMoneyCell(t, wb, "CS", "M5", snap.TermPayRegular)
+	assertMoneyCell(t, wb, "CS", "L5", snap.TermPayRegular)
+	// เบิกจ่ายเดือน (N) is the actual settled spend — same number
+	// SettleCourse itself reports, not a re-derived one — and คงเหลือ (P)
+	// is what's left of the budget after it.
+	assertMoneyCell(t, wb, "CS", "N5", settlement.Regular.PaidBaht)
+	assertFormulaCell(t, wb, "CS", "P5", "L5-N5")
 }
 
 // Phase 4: a graduate-level course tagged curriculum "CS" or "IT" prints
@@ -565,6 +596,7 @@ func TestBuildCourseSummaryWorkbook_GridIsUnbrokenUnderEveryTA(t *testing.T) {
 		Code: "CP100002", NameTH: "Grid Course", Credits: 3, LectureHrs: 3, LabHrs: 3, SelfHrs: 6,
 		NumRegular: 60, NumSpecial: 30, Curriculum: "CS",
 	})
+	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
 	f.addApprovedTA(courseID, "หนึ่ง", "undergrad", 3, 0)
 	f.addApprovedTA(courseID, "สอง", "undergrad", 3, 0)
 	f.addApprovedTA(courseID, "สาม", "undergrad", 3, 0)
@@ -576,7 +608,7 @@ func TestBuildCourseSummaryWorkbook_GridIsUnbrokenUnderEveryTA(t *testing.T) {
 	// Three TAs, so rows 5, 6 and 7 — the last two being the ones that used to
 	// print bare.
 	for r := 5; r <= 7; r++ {
-		for _, col := range []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"} {
+		for _, col := range []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q"} {
 			cell := fmt.Sprintf("%s%d", col, r)
 			s := summaryStyle(t, wb, "CS", cell)
 			for _, side := range []string{"left", "right", "top", "bottom"} {
@@ -604,7 +636,7 @@ func TestBuildCourseSummaryWorkbook_MoneyColumnsKeepTheirTintOnEveryRow(t *testi
 	wb := openWorkbook(t, body)
 	defer wb.Close()
 
-	for _, cell := range []string{"M5", "N5", "M6", "N6"} {
+	for _, cell := range []string{"L5", "M5", "L6", "M6"} {
 		s := summaryStyle(t, wb, "CS", cell)
 		if s.Fill.Type != "pattern" || len(s.Fill.Color) == 0 || s.Fill.Color[0] != csHeaderFill {
 			t.Errorf("%s is not on the header tint (type=%q color=%v)",
@@ -616,10 +648,226 @@ func TestBuildCourseSummaryWorkbook_MoneyColumnsKeepTheirTintOnEveryRow(t *testi
 	// Read raw: the accounting format renders an empty cell as padding, so a
 	// formatted read cannot tell a blank apart from a value.
 	raw := excelize.Options{RawCellValue: true}
-	if got, _ := wb.GetCellValue("CS", "M6", raw); got != "" {
-		t.Errorf("M6 = %q — the course's budget was repeated against a second TA", got)
+	if got, _ := wb.GetCellValue("CS", "L6", raw); got != "" {
+		t.Errorf("L6 = %q — the course's budget was repeated against a second TA", got)
 	}
-	if got, _ := wb.GetCellValue("CS", "M5", raw); got == "" {
-		t.Error("M5 is empty — the block's own budget figure went missing")
+	if got, _ := wb.GetCellValue("CS", "L5", raw); got == "" {
+		t.Error("L5 is empty — the block's own budget figure went missing")
+	}
+}
+
+// findCourseSummaryRow returns the first preview row for courseCode across
+// every sheet — เบิกจ่ายเดือน/คงเหลือ are the same on every one of a block's
+// rows (one per TA), so the first match is enough.
+func findCourseSummaryRow(t *testing.T, sheets []CourseSummaryPreviewSheet, courseCode string) CourseSummaryPreviewRow {
+	t.Helper()
+	for _, sh := range sheets {
+		for _, r := range sh.Rows {
+			if r.CourseCode == courseCode {
+				return r
+			}
+		}
+	}
+	t.Fatalf("no preview row found for course %s", courseCode)
+	return CourseSummaryPreviewRow{}
+}
+
+// เบิกจ่ายเดือน/คงเหลือ were added back 11/09/2026, reversing the 10/08/2026
+// decision to cut the sheet at N — see the package doc comment on
+// courseSummaryBlock. Same day, staff followed up asking that months NOT be
+// pooled into one cumulative figure but shown separately, one column pair
+// per selected month — these tests pin that second revision.
+
+// findMonthAmount returns row's PaidByMonth entry for yearMonth, or fails
+// the test if that month isn't among the ones the row carries.
+func findMonthAmount(t *testing.T, row CourseSummaryPreviewRow, yearMonth string) CourseSummaryMonthAmount {
+	t.Helper()
+	for _, m := range row.PaidByMonth {
+		if m.YearMonth == yearMonth {
+			return m
+		}
+	}
+	t.Fatalf("row for %s has no PaidByMonth entry for %s (got %+v)", row.CourseCode, yearMonth, row.PaidByMonth)
+	return CourseSummaryMonthAmount{}
+}
+
+func TestCourseSummaryPreview_EachSelectedMonthGetsItsOwnFigureNeverSummed(t *testing.T) {
+	f := newCSFixture(t)
+	courseID := f.insertCourse(csCourseOpts{
+		Code: "CP600001", NameTH: "Per-Month Test", Credits: 3, LectureHrs: 2, LabHrs: 0, SelfHrs: 4,
+		NumRegular: 40, Curriculum: "CS",
+	})
+	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
+	f.addSubmissionPeriod("2569-07", "2026-07-01", "2026-08-31", "กรกฎาคม 2569")
+	f.addSubmissionPeriod("2569-08", "2026-08-01", "2026-09-30", "สิงหาคม 2569")
+	taID := f.addApprovedTA(courseID, "TA1", "undergrad", 2, 0)
+
+	var assignID uuid.UUID
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT id FROM ta_request_assignments WHERE ta_id = $1`, taID).Scan(&assignID); err != nil {
+		t.Fatal(err)
+	}
+	// Approved work in June and August, nothing in July.
+	f.exec(`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, status, approved_at)
+	        VALUES (gen_random_uuid(),$1,'2026-06-15','09:00','11:00',2,'lecture','approved',NOW())`, assignID)
+	f.exec(`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, status, approved_at)
+	        VALUES (gen_random_uuid(),$1,'2026-08-15','09:00','11:00',2,'lecture','approved',NOW())`, assignID)
+
+	settled, err := f.svc.SettleCourse(f.ctx, courseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var junePaid, augPaid float64
+	for _, m := range settled.Regular.Months {
+		switch m.YearMonth {
+		case "2026-06":
+			junePaid = m.PaidBaht
+		case "2026-08":
+			augPaid = m.PaidBaht
+		}
+	}
+	if junePaid <= 0 || augPaid <= 0 {
+		t.Fatalf("fixture bug: expected June and August to both settle nonzero, got june=%v aug=%v", junePaid, augPaid)
+	}
+
+	// Selecting June and August (skipping July on purpose) must return
+	// exactly those two months, each with its OWN figure — not a July-less
+	// sum of the two.
+	sheets, _, months, _, err := f.svc.CourseSummaryPreview(f.ctx, f.termID, []string{"2026-06", "2026-08"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMonths := []string{"2026-06", "2026-08"}
+	if len(months) != 2 || months[0] != wantMonths[0] || months[1] != wantMonths[1] {
+		t.Errorf("months echoed back = %v, want %v", months, wantMonths)
+	}
+	row := findCourseSummaryRow(t, sheets, "CP600001")
+	if len(row.PaidByMonth) != 2 {
+		t.Fatalf("PaidByMonth = %+v, want exactly 2 entries (June, August) — no July, no pooling", row.PaidByMonth)
+	}
+	if diff := findMonthAmount(t, row, "2026-06").Regular - junePaid; diff > 0.01 || diff < -0.01 {
+		t.Errorf("June figure = %v, want %v", findMonthAmount(t, row, "2026-06").Regular, junePaid)
+	}
+	if diff := findMonthAmount(t, row, "2026-08").Regular - augPaid; diff > 0.01 || diff < -0.01 {
+		t.Errorf("August figure = %v, want %v", findMonthAmount(t, row, "2026-08").Regular, augPaid)
+	}
+
+	// An empty request means every term month — still separate, so July
+	// (which settled nothing) must show up as its own zero entry, not be
+	// absorbed into June or August.
+	sheetsAll, _, monthsAll, _, err := f.svc.CourseSummaryPreview(f.ctx, f.termID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(monthsAll) != 3 {
+		t.Fatalf("months with no request = %v, want all 3 term months", monthsAll)
+	}
+	rowAll := findCourseSummaryRow(t, sheetsAll, "CP600001")
+	if len(rowAll.PaidByMonth) != 3 {
+		t.Fatalf("PaidByMonth with no request = %+v, want 3 entries (June, July, August)", rowAll.PaidByMonth)
+	}
+	if got := findMonthAmount(t, rowAll, "2026-07").Regular; got != 0 {
+		t.Errorf("July figure = %v, want 0 — nothing was approved that month", got)
+	}
+}
+
+func TestCourseSummaryReprint_PreservesOriginalMonthFigures(t *testing.T) {
+	f := newCSFixture(t)
+	courseID := f.insertCourse(csCourseOpts{
+		Code: "CP600002", NameTH: "Reprint Test", Credits: 3, LectureHrs: 2, LabHrs: 0, SelfHrs: 4,
+		NumRegular: 40, Curriculum: "CS",
+	})
+	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
+	taID := f.addApprovedTA(courseID, "TA1", "undergrad", 2, 0)
+	var assignID uuid.UUID
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT id FROM ta_request_assignments WHERE ta_id = $1`, taID).Scan(&assignID); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, status, approved_at)
+	        VALUES (gen_random_uuid(),$1,'2026-06-15','09:00','11:00',2,'lecture','approved',NOW())`, assignID)
+
+	actor := f.actor()
+	body1, _, err := f.svc.BuildCourseSummaryWorkbook(f.ctx, actor, f.termID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb1 := openWorkbook(t, body1)
+	defer wb1.Close()
+	// One submission period (June) means exactly one เบิกจ่ายเดือน pair, at N:O.
+	orig, _ := wb1.GetCellValue("CS", "N5")
+	if orig == "" || orig == "0.00" {
+		t.Fatalf("fixture bug: expected a nonzero original N5, got %q", orig)
+	}
+
+	// More work is approved AFTER the export — a reprint must not pick it up.
+	f.exec(`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, status, approved_at)
+	        VALUES (gen_random_uuid(),$1,'2026-06-20','09:00','11:00',2,'lecture','approved',NOW())`, assignID)
+
+	var exportID uuid.UUID
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT id FROM course_summary_exports WHERE term_id = $1`, f.termID).Scan(&exportID); err != nil {
+		t.Fatal(err)
+	}
+	body2, err := f.svc.ReprintCourseSummary(f.ctx, actor, exportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb2 := openWorkbook(t, body2)
+	defer wb2.Close()
+	reprinted, _ := wb2.GetCellValue("CS", "N5")
+	if reprinted != orig {
+		t.Errorf("reprint N5 = %q, want original %q — a reprint must not recompute เบิกจ่ายเดือน from today's work_logs",
+			reprinted, orig)
+	}
+}
+
+// Graduate-special TAs (master/phd on a track='special' section) are paid a
+// flat term lump (pay_rates.graduate_special_lumpsum), reserved off the top of
+// the special pool — but paid MONTHLY, dated by the holder's own approved
+// special-track hours (11/09/2026), so the summary's เบิกจ่ายเดือน carries each
+// month's own share rather than the whole lump on the earliest month.
+func TestCourseSummaryPreview_DatesTheGradSpecialLumpByTheHoldersOwnHours(t *testing.T) {
+	f := newCSFixture(t)
+	courseID := f.insertCourse(csCourseOpts{
+		Code: "CP600003", NameTH: "Grad Special Test", Credits: 3, LectureHrs: 2, LabHrs: 0, SelfHrs: 4,
+		NumSpecial: 20, Curriculum: "CS",
+	})
+	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
+	f.addSubmissionPeriod("2569-07", "2026-07-01", "2026-08-31", "กรกฎาคม 2569")
+
+	specialSecID := uuid.New()
+	f.exec(`INSERT INTO sections (id, teaching_course_id, sec_no, track, curriculum)
+	        VALUES ($1, $2, '2', 'special', 'CS')`, specialSecID, courseID)
+
+	taID := f.insertUser("ta", "gradta")
+	f.exec(`UPDATE users SET first_name='GradTA', last_name='ทดสอบ', study_level='master'::study_level WHERE id=$1`, taID)
+	reqID := uuid.New()
+	f.exec(`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, decided_at)
+	        VALUES ($1,$2,$3,'both'::reimburse_scope,'approved'::ta_request_status, NOW(), NOW())`,
+		reqID, courseID, f.lectID)
+	assignID := uuid.New()
+	f.exec(`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
+	        VALUES ($1,$2,$3,$4,'master'::study_level)`, assignID, reqID, specialSecID, taID)
+	for _, d := range []string{"2026-06-08", "2026-06-15", "2026-07-06"} {
+		f.exec(`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, status)
+		        VALUES (gen_random_uuid(), $1, $2::date, '09:00', '10:00', 1, 'lecture', 'approved')`, assignID, d)
+	}
+
+	sheets, _, _, _, err := f.svc.CourseSummaryPreview(f.ctx, f.termID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := findCourseSummaryRow(t, sheets, "CP600003")
+	if len(row.PaidByMonth) != 2 {
+		t.Fatalf("PaidByMonth = %+v, want 2 entries (June, July)", row.PaidByMonth)
+	}
+	// pay_rates.graduate_special_lumpsum is 12000 in this fixture. Two
+	// approved hours in June and one in July: 2/3 of the lump is June's.
+	if got := findMonthAmount(t, row, "2026-06").Special; got != 8000 {
+		t.Errorf("June Special = %v, want 8000 (two of the three hours)", got)
+	}
+	if got := findMonthAmount(t, row, "2026-07").Special; got != 4000 {
+		t.Errorf("July Special = %v, want 4000 (one of the three hours)", got)
 	}
 }

@@ -247,12 +247,22 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	}); err != nil {
 		return err
 	}
+	if err := enablePageFit(f, sheet); err != nil {
+		return err
+	}
 	mLeft, mRight, mTop, mBottom := 0.51181, 0.39370, 0.39370, 0.39370
 	if err := f.SetPageMargins(sheet, &excelize.PageLayoutMarginsOptions{
 		Left: &mLeft, Right: &mRight, Top: &mTop, Bottom: &mBottom,
 	}); err != nil {
 		return err
 	}
+	// Rows 1-9 repeat at the top of every physical page via Print Titles —
+	// see enablePageFit's neighbour enablePrintTitles (export_combined_book.go)
+	// for why this replaced a margin header/footer.
+	if err := enablePrintTitles(f, sheet, 9); err != nil {
+		return err
+	}
+	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ภาคฤดูร้อน"}[d.Semester]
 
 	set := func(cell string, v any) error {
 		if str, ok := v.(string); ok && strings.HasPrefix(str, "=") {
@@ -281,7 +291,6 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	// Rows 1-5: the preamble, merged across the whole table. Same five lines the
 	// undergrad form carries — this is one government form with two layouts, not
 	// two forms.
-	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ภาคฤดูร้อน"}[d.Semester]
 	for i, line := range []string{
 		"หลักฐานการจ่ายเงินอื่น ๆ",
 		"เบิกตามฎีกาที่...................................... วันที่..................... เดือน ...................................... พ.ศ. .......................",
@@ -705,9 +714,20 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}
-	weights, err := gradSpecialMonthShares(ctx, s.pool, courseID)
-	if err != nil {
-		return nil, err
+	// Each holder's lump on the months, by their own approved special-track
+	// hours (gradLumpByMonth). `weights` keeps the union of months any lump
+	// lands on, so the column set below can include them.
+	lumpByTA := map[uuid.UUID]map[string]float64{}
+	weights := map[string]float64{}
+	for _, id := range ids {
+		byMonth, err := s.gradLumpByMonth(ctx, courseID, id, gradLump, true)
+		if err != nil {
+			return nil, err
+		}
+		lumpByTA[id] = byMonth
+		for ym, amt := range byMonth {
+			weights[ym] += amt
+		}
 	}
 
 	// termMonths is the WHOLE term, independent of what is being exported now.
@@ -842,7 +862,7 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 			// claimed on the other fiscal year's document.
 			d.Special = append(d.Special, gradEvidencePerson{
 				Name: p.name, LevelTH: levelTH,
-				ByMonth: distributeLump(gradLump, termMonths, weights),
+				ByMonth: lumpByTA[p.id],
 			})
 		}
 	}
@@ -858,59 +878,6 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 	return d, nil
 }
 
-// distributeLump splits a flat term lump across months, weighted by the
-// regular track's real teaching schedule when there is one and evenly when
-// there is not (gradSpecialMonthShares returns nil weights for a course whose
-// schedule has not been filled in).
-//
-// months MUST be the WHOLE TERM, never the slice being exported. เหมาจ่าย is
-// 4,000 per course per TERM, and ภาคต้น (มิ.ย.–ต.ค.) straddles the 30 กันยายน
-// budget boundary, so it is claimed on two documents. Dividing by the selected
-// months instead would put the entire 4,000 on the มิ.ย.–ก.ย. document and
-// another 4,000 on ตุลาคม's — 8,000 against a 4,000 cap, on two forms that
-// each look correct in isolation. Callers print only the months they are
-// claiming, so the partial document simply totals less than the lump.
-//
-// The last month absorbs the rounding remainder so the columns add back up to
-// the lump EXACTLY. Rounding each month independently is off by a satang or
-// two — 1000/3 prints as 333.33 three times, totalling 999.99 — and this
-// document is reconciled against the actual transfer, where a figure that is
-// one satang short is a figure somebody has to chase.
-func distributeLump(total float64, months []string, weights map[string]float64) map[string]float64 {
-	out := map[string]float64{}
-	if len(months) == 0 || total == 0 {
-		return out
-	}
-	// Only months this export covers can carry weight; a weight outside the
-	// selection would silently shrink the total.
-	var covered []string
-	var weightSum float64
-	for _, ym := range months {
-		if w, ok := weights[ym]; ok && w > 0 {
-			covered = append(covered, ym)
-			weightSum += w
-		}
-	}
-	if len(covered) == 0 || weightSum <= 0 {
-		covered = months
-		weightSum = 0 // fall through to the even split below
-	}
-
-	var running float64
-	for i, ym := range covered {
-		var amount float64
-		if i == len(covered)-1 {
-			amount = round2(total - running) // the remainder, so the sum is exact
-		} else if weightSum > 0 {
-			amount = round2(total * weights[ym] / weightSum)
-		} else {
-			amount = round2(total / float64(len(covered)))
-		}
-		out[ym] = amount
-		running += amount
-	}
-	return out
-}
 
 // courseCalendarMonths lists every "YYYY-MM" the course spans, from its own
 // dates or the term's when the course leaves them blank — the same range

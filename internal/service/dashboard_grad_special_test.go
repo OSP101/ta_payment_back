@@ -32,3 +32,36 @@ func TestDashboardExecutive_ExcludesGradSpecialLeftoverRows(t *testing.T) {
 			sum.PayoutCoursesActionable)
 	}
 }
+
+// Same hazard, on the LECTURER's own homepage this time: LecturerOverview
+// backs the "ต้องดำเนินการ" / "มีบันทึกเวลาของ TA รออนุมัติ" card. It was missed
+// when the grad-special exclusion was rolled out everywhere else in this
+// package (worklog.go's ListPending/ListByCourse, DashboardExecutive above,
+// export_gate.go, submission_review.go) — caught live this session: a real
+// grad-special assignment's leftover 'submitted' row produced a homepage
+// notification that stayed stuck even after every actionable month on the
+// course had been approved, because nothing can ever move a row on an
+// assignment that no longer logs work_logs at all.
+func TestLecturerOverview_ExcludesGradSpecialLeftoverRows(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Level: "master", Track: "special"})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	f.exec(`UPDATE work_logs SET status='submitted' WHERE assignment_id=$1`, f.AssignmentID)
+
+	svc := &DashboardService{pool: f.Pool}
+	budget := &BudgetService{pool: f.Pool}
+
+	out, err := svc.LecturerOverview(f.ctx, f.LecturerID, &f.TermID, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("want 1 course row, got %d", len(out))
+	}
+	c := out[0]
+	if c.TAsPending != 0 {
+		t.Errorf("ta_pending_count = %d, want 0 — grad-special leftover row must not surface", c.TAsPending)
+	}
+	if c.HoursPending != 0 {
+		t.Errorf("hours_pending_approval = %.1f, want 0 — a homepage card the lecturer can never resolve", c.HoursPending)
+	}
+}

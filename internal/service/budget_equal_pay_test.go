@@ -2,19 +2,18 @@ package service
 
 import (
 	"fmt"
-	"math"
 	"testing"
 
 	"github.com/google/uuid"
 )
 
-// Equal work, equal pay — the fairness the college chose on 07/09/2026:
-// "ต่อให้งบขาด เงินไม่พอ ก็ต้องได้เท่า ๆ กัน ... ถ้าทำงานเวลาเท่า ๆ กัน".
+// Equal work, equal pay — the fairness the college chose on 07/09/2026 and
+// tightened to the baht on 11/09/2026: "ต่อให้งบขาด เงินไม่พอ ก็ต้องได้เท่า ๆ
+// กัน ... ถ้าทำงานเวลาเท่า ๆ กัน", and "ใครทำมาก ก็ได้มาก".
 //
-// The rule these tests replaced cut the term at one moment for everybody, which
-// made a TA's pay depend on WHEN they were timetabled. Whoever's work sat before
-// the cutoff was paid in full and whoever's sat after it was not, for the same
-// hours at the same rate.
+// The pool is shared as money in proportion to what each person is owed. The
+// rule this replaced bought whole คาบ out of each share, which left two TAs
+// with identical hours a คาบ apart and stranded change in every pool.
 
 // personSlots builds one TA's คาบ on the given dates, each worth the same.
 func personSlots(ta uuid.UUID, baht float64, dates ...string) []SlotSettlement {
@@ -31,9 +30,7 @@ func personSlots(ta uuid.UUID, baht float64, dates ...string) []SlotSettlement {
 func paidPerTA(tr TrackSettlement) map[uuid.UUID]float64 {
 	out := map[uuid.UUID]float64{}
 	for _, sl := range tr.Slots {
-		if sl.Paid {
-			out[sl.TA] += sl.Baht
-		}
+		out[sl.TA] += sl.PaidBaht
 	}
 	return out
 }
@@ -57,18 +54,9 @@ func ledgerSorted(groups ...[]SlotSettlement) []SlotSettlement {
 }
 
 // THE ONE THAT MATTERS. Two TAs, identical hours, working different stretches of
-// the term. Under the old whole-course cutoff the first one was paid in full and
-// the second got the remainder; they must now come out level.
-//
-// Deliberately a split by PERIOD rather than by day of the week: TAs who
-// alternate days inside the same weeks are interleaved in the ledger, so a
-// chronological cutoff happens to fall evenly between them and the old rule
-// looked fair. It is when one person's work sits mostly before the other's — a
-// TA appointed late, a section that only runs in the second half — that a single
-// cutoff quietly pays one of them and not the other.
+// the term, come out level to the baht — and the pool is spent in full.
 func TestEqualPay_SameHoursInDifferentPartsOfTheTermArePaidTheSame(t *testing.T) {
 	first, second := uuid.New(), uuid.New()
-	// Ten คาบ each at 500฿ = 5,000฿ owed apiece, 10,000฿ of work in all.
 	var firstDates, secondDates []string
 	for d := 1; d <= 10; d++ {
 		firstDates = append(firstDates, fmt.Sprintf("2026-06-%02d", d))
@@ -79,19 +67,32 @@ func TestEqualPay_SameHoursInDifferentPartsOfTheTermArePaidTheSame(t *testing.T)
 		personSlots(second, 500, secondDates...),
 	)
 
-	// A 6,000฿ pool against 10,000฿ of work: everybody should lose 40%.
-	// The old rule paid the June TA all 5,000 and the July TA 1,000.
+	// A 6,000฿ pool against 10,000฿ of work: everybody loses 40%.
 	got := settleTrack(SettleChronological, "regular", 6000, 0, ledger)
 	paid := paidPerTA(got)
 
-	if math.Abs(paid[first]-paid[second]) > 500.01 {
-		t.Errorf("first-half TA paid %.0f, second-half TA paid %.0f — same hours, "+
-			"and the gap is wider than the one คาบ that whole-คาบ billing can "+
-			"strand. Pay is still deciding on WHEN somebody was timetabled",
+	if paid[first] != 3000 || paid[second] != 3000 {
+		t.Errorf("first-half TA paid %.2f, second-half TA paid %.2f — same hours, want 3,000 each",
 			paid[first], paid[second])
 	}
-	if got.PaidBaht > 6000.01 {
-		t.Errorf("paid %.2f against a 6,000 pool", got.PaidBaht)
+	if got.PaidBaht != 6000 {
+		t.Errorf("paid %.2f, want the whole 6,000 pool", got.PaidBaht)
+	}
+}
+
+// The probe that changed the rule (11/09/2026): two TAs × 10 คาบ × 150฿ against
+// 2,000฿ came out 1,050 / 900 with 50฿ unspent under whole-คาบ billing.
+func TestEqualPay_TheProbeCaseComesOutLevel(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	var dates []string
+	for d := 1; d <= 10; d++ {
+		dates = append(dates, fmt.Sprintf("2026-06-%02d", d))
+	}
+	ledger := ledgerSorted(personSlots(a, 150, dates...), personSlots(b, 150, dates...))
+	got := settleTrack(SettleChronological, "regular", 2000, 0, ledger)
+	paid := paidPerTA(got)
+	if paid[a] != 1000 || paid[b] != 1000 || got.PaidBaht != 2000 {
+		t.Errorf("paid a=%.2f b=%.2f total=%.2f, want 1,000 / 1,000 / 2,000", paid[a], paid[b], got.PaidBaht)
 	}
 }
 
@@ -107,61 +108,73 @@ func TestEqualPay_UnequalHoursKeepTheirProportion(t *testing.T) {
 	got := settleTrack(SettleChronological, "regular", 1500, 0, ledger)
 	paid := paidPerTA(got)
 
-	if math.Abs(paid[big]-1000) > 500.01 || math.Abs(paid[small]-500) > 500.01 {
-		t.Errorf("paid big=%.0f small=%.0f, want roughly 1,000 and 500 — "+
-			"the 2:1 ratio of the work they did", paid[big], paid[small])
+	if paid[big] != 1000 || paid[small] != 500 {
+		t.Errorf("paid big=%.2f small=%.2f, want 1,000 and 500 — the 2:1 ratio of the work",
+			paid[big], paid[small])
 	}
 }
 
-// The shares strand small change, and change withheld from people who are
-// already short is money the college owes and did not pay. Whatever no share
-// could reach must be spent — and spent on whoever is furthest behind, so
-// clearing it cannot re-open the gap the shares just closed.
-func TestEqualPay_LeftoverGoesToWhoeverIsFurthestBehind(t *testing.T) {
-	a, b := uuid.New(), uuid.New()
-	// Deliberately awkward: costs that do not divide into either share.
+// The proportion is of MONEY owed, not of hours: a graduate TA's hour costs
+// more and is cut by the same percentage as everyone else's baht.
+func TestEqualPay_ProportionIsOfBahtNotHours(t *testing.T) {
+	ug, grad := uuid.New(), uuid.New()
 	ledger := ledgerSorted(
-		personSlots(a, 700, "2026-06-01", "2026-06-03", "2026-06-05"),
-		personSlots(b, 300, "2026-06-02", "2026-06-04", "2026-06-06", "2026-06-08"),
+		personSlots(ug, 100, "2026-06-01", "2026-06-02"),   // 2 คาบ at 100 = 200
+		personSlots(grad, 300, "2026-06-03", "2026-06-04"), // 2 คาบ at 300 = 600
 	)
-	got := settleTrack(SettleChronological, "regular", 2000, 0, ledger)
+	got := settleTrack(SettleChronological, "regular", 400, 0, ledger) // half of 800
+	paid := paidPerTA(got)
+	if paid[ug] != 100 || paid[grad] != 300 {
+		t.Errorf("paid ug=%.2f grad=%.2f, want 100 and 300 — 50%% of what each is owed",
+			paid[ug], paid[grad])
+	}
+}
 
-	left := 2000 - got.PaidBaht
-	cheapestUnpaid := math.Inf(1)
-	for _, sl := range got.Slots {
-		if !sl.Paid && sl.Baht < cheapestUnpaid {
-			cheapestUnpaid = sl.Baht
+// Each person's share is a whole baht; what the rounding strands stays in the
+// pool and is the only money the rule leaves — under one baht a person.
+func TestEqualPay_SharesAreWholeBahtAndTheChangeStaysInThePool(t *testing.T) {
+	a, b, c := uuid.New(), uuid.New(), uuid.New()
+	ledger := ledgerSorted(
+		personSlots(a, 100, "2026-06-01"),
+		personSlots(b, 100, "2026-06-02"),
+		personSlots(c, 100, "2026-06-03"),
+	)
+	// 200 of 300: 66.67 each → 66 each, 198 paid, 2 left.
+	got := settleTrack(SettleChronological, "regular", 200, 0, ledger)
+	paid := paidPerTA(got)
+	for _, ta := range []uuid.UUID{a, b, c} {
+		if paid[ta] != 66 {
+			t.Errorf("paid %.2f, want 66", paid[ta])
 		}
 	}
-	if left >= cheapestUnpaid {
-		t.Errorf("%.2f฿ left unspent while an unpaid คาบ costs %.2f฿ — that is "+
-			"money owed to somebody who was short and simply not paid", left, cheapestUnpaid)
+	if left := 200 - got.PaidBaht; left >= 3 {
+		t.Errorf("%.2f left unspent, want under one baht a person", left)
 	}
 }
 
-// The document filter must agree with the ledger PER PERSON. Two TAs sharing one
-// co-taught คาบ can now be settled differently, so an answer that ignores who is
-// asking would print คาบ the budget did not pay for.
-func TestEqualPay_UnpaidForIsAnsweredPerPerson(t *testing.T) {
+// The document sums each cost row × fundedShare; that must land on exactly what
+// the ledger paid the person.
+func TestEqualPay_FundedShareIsAnsweredPerPerson(t *testing.T) {
 	a, b := uuid.New(), uuid.New()
 	ledger := ledgerSorted(
 		personSlots(a, 400, "2026-06-01", "2026-06-02", "2026-06-03"),
 		personSlots(b, 400, "2026-06-01", "2026-06-02", "2026-06-03"),
 	)
-	// Enough for four of the six คาบ.
 	got := settleTrack(SettleChronological, "regular", 1600, 0, ledger)
-
+	paid := paidPerTA(got)
+	sum := map[uuid.UUID]float64{}
 	for _, sl := range got.Slots {
-		if got.unpaidFor(sl.TA, sl.Date, sl.StartTime) != !sl.Paid {
-			t.Fatalf("unpaidFor disagrees with the ledger for %s on %s — the "+
-				"printed claim and the settlement would pay different people",
-				sl.TA, sl.Date)
+		sum[sl.TA] += sl.Baht * got.fundedShare(sl.TA, sl.Date, sl.StartTime)
+	}
+	for _, ta := range []uuid.UUID{a, b} {
+		if !near(sum[ta], paid[ta]) || paid[ta] != 800 {
+			t.Errorf("rows × fundedShare = %.2f, ledger = %.2f, want 800", sum[ta], paid[ta])
 		}
 	}
 }
 
 // Spreading across months and sharing between people are independent: turning
-// the month rule on must not undo the person rule.
+// the month rule on must not change anybody's total.
 func TestEqualPay_HoldsUnderTheSpreadRuleToo(t *testing.T) {
 	early, late := uuid.New(), uuid.New()
 	ledger := ledgerSorted(
@@ -171,8 +184,52 @@ func TestEqualPay_HoldsUnderTheSpreadRuleToo(t *testing.T) {
 	got := settleTrack(SettleSpread, "regular", 2400, 0, ledger)
 	paid := paidPerTA(got)
 
-	if math.Abs(paid[early]-paid[late]) > 500.01 {
-		t.Errorf("early %.0f vs late %.0f under the spread rule — equal work must "+
-			"still be equal pay whichever way the months are cut", paid[early], paid[late])
+	if paid[early] != 1200 || paid[late] != 1200 {
+		t.Errorf("early %.2f vs late %.2f under the spread rule, want 1,200 each", paid[early], paid[late])
+	}
+}
+
+// The college's own worked example (11/09/2026): one ป.เอก and three ป.ตรี,
+// identical hours, a 29,900฿ pool — at the live rate table (ป.ตรี 40฿/h,
+// ป.โท/เอก 50฿/h). Everybody works 180 h, so the work costs 30,600฿ and the
+// pool is 700฿ short.
+func TestEqualPay_OnePhdThreeUndergradsAgainst29900(t *testing.T) {
+	const ugRate, gradRate, hours = 40.0, 50.0, 180.0
+	phd := uuid.New()
+	ugs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+
+	// 60 คาบ × 3 h each, spread over the term, same dates for everybody.
+	slotsFor := func(ta uuid.UUID, rate float64) []SlotSettlement {
+		var out []SlotSettlement
+		for i := 0; i < 60; i++ {
+			ym := []string{"2026-06", "2026-07", "2026-08", "2026-09", "2026-10"}[i/12]
+			out = append(out, SlotSettlement{
+				TA: ta, Date: fmt.Sprintf("%s-%02d", ym, i%12+1), StartTime: "09:00",
+				YearMonth: ym, Baht: 3 * rate,
+			})
+		}
+		return out
+	}
+	ledger := ledgerSorted(slotsFor(phd, gradRate),
+		slotsFor(ugs[0], ugRate), slotsFor(ugs[1], ugRate), slotsFor(ugs[2], ugRate))
+
+	got := settleTrack(SettleChronological, "regular", 29900, 0, ledger)
+	paid := paidPerTA(got)
+	t.Logf("pool 29,900: ป.เอก owed %.0f → paid %.0f; each ป.ตรี owed %.0f → paid %.0f; total %.0f, unspent %.0f",
+		hours*gradRate, paid[phd], hours*ugRate, paid[ugs[0]], got.PaidBaht, 29900-got.PaidBaht)
+
+	// Shares: 29,900 × 9,000/30,600 = 8,794.12 → 8,794; 29,900 × 7,200/30,600 = 7,035.29 → 7,035.
+	if paid[phd] != 8794 {
+		t.Errorf("ป.เอก paid %.2f, want 8,794", paid[phd])
+	}
+	for _, ug := range ugs {
+		if paid[ug] != 7035 {
+			t.Errorf("ป.ตรี paid %.2f, want 7,035", paid[ug])
+		}
+	}
+	// Same hours, higher rate → more money, by exactly the rate ratio; and
+	// everyone keeps the same 97.7%.
+	if got.PaidBaht != 8794+3*7035 {
+		t.Errorf("total %.2f, want 29,899 (29,900 less the rounding)", got.PaidBaht)
 	}
 }

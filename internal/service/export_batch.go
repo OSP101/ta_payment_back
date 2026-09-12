@@ -104,7 +104,7 @@ func (s *ExportBatchService) ListByCourse(ctx context.Context, tcID uuid.UUID) (
 		}
 		out = append(out, b)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // CourseSummary is one row on the exports dashboard: a course with its budget,
@@ -248,6 +248,9 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		anySignedOff[s.TeachingCourseID] = signedOff
 		out = append(out, s)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	// Compute budget for each (heavy — done sequentially to avoid pool
 	// contention). Callers can cache the result at HTTP layer if needed.
 	for i := range out {
@@ -281,19 +284,30 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		WHERE ($1::uuid IS NULL OR tc.term_id = $1) AND b.id IS NULL AND sp.is_closed = FALSE
 		ORDER BY sp.due_date`,
 		uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
-	if err == nil {
-		pending := map[uuid.UUID][]string{}
-		for pendingRows.Next() {
-			var tc uuid.UUID
-			var label string
-			if err := pendingRows.Scan(&tc, &label); err == nil {
-				pending[tc] = append(pending[tc], label)
-			}
+	// QUAL-01: เดิม `if err == nil` กลืน error ของ Query ทิ้ง แล้วต่อด้วย
+	// `if err := ...Scan(...); err == nil` กลืน error ของ Scan ทิ้งอีกชั้น
+	// โดยไม่มี rows.Err() เลย — query พังเงียบ ๆ ก็ยังได้ PendingMonths ว่าง
+	// เหมือนกับ "ไม่มีเดือนค้าง" ซึ่งเป็นคนละความหมายกัน
+	if err != nil {
+		return nil, err
+	}
+	pending := map[uuid.UUID][]string{}
+	for pendingRows.Next() {
+		var tc uuid.UUID
+		var label string
+		if err := pendingRows.Scan(&tc, &label); err != nil {
+			pendingRows.Close()
+			return nil, err
 		}
+		pending[tc] = append(pending[tc], label)
+	}
+	if err := pendingRows.Err(); err != nil {
 		pendingRows.Close()
-		for i := range out {
-			out[i].PendingMonths = pending[out[i].TeachingCourseID]
-		}
+		return nil, err
+	}
+	pendingRows.Close()
+	for i := range out {
+		out[i].PendingMonths = pending[out[i].TeachingCourseID]
 	}
 
 	// Months blocked by step 3. One query for the whole term rather than per
@@ -302,12 +316,13 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 	unreviewedRows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT tc.id, sp.label, sp.due_date
 		FROM teaching_courses tc
+		JOIN academic_terms trm    ON trm.id = tc.term_id
 		JOIN submission_periods sp ON sp.term_id = tc.term_id
 		JOIN sections sec          ON sec.teaching_course_id = tc.id
 		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
 		JOIN work_logs wl          ON wl.assignment_id = a.id
-		                          AND to_char(wl.work_date, 'MM') = RIGHT(sp.year_month, 2)
+		                          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		                          AND wl.status = 'approved'
 		LEFT JOIN submission_period_status st
 		       ON st.submission_period_id = sp.id
@@ -329,20 +344,31 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		ORDER BY sp.due_date`,
 		uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
-	if err == nil {
-		unreviewed := map[uuid.UUID][]string{}
-		for unreviewedRows.Next() {
-			var tc uuid.UUID
-			var label string
-			var due time.Time
-			if err := unreviewedRows.Scan(&tc, &label, &due); err == nil {
-				unreviewed[tc] = append(unreviewed[tc], label)
-			}
+	// QUAL-01: เดิมกลืน error สามชั้นในบล็อกเดียว — query พังเงียบ, scan พังเงียบ,
+	// ไม่มี rows.Err() — ผลคือ UnreviewedMonths ว่างเปล่าอ่านเหมือน "ตรวจครบแล้ว"
+	// ทั้งที่จริงคือ "อ่านไม่ได้" ซึ่งปล่อยให้ ReviewComplete/ExportEligible เท็จ
+	// เป็นจริงและปลดล็อกการ export ทั้งที่ยังไม่ได้ตรวจสอบจริง
+	if err != nil {
+		return nil, err
+	}
+	unreviewed := map[uuid.UUID][]string{}
+	for unreviewedRows.Next() {
+		var tc uuid.UUID
+		var label string
+		var due time.Time
+		if err := unreviewedRows.Scan(&tc, &label, &due); err != nil {
+			unreviewedRows.Close()
+			return nil, err
 		}
+		unreviewed[tc] = append(unreviewed[tc], label)
+	}
+	if err := unreviewedRows.Err(); err != nil {
 		unreviewedRows.Close()
-		for i := range out {
-			out[i].UnreviewedMonths = unreviewed[out[i].TeachingCourseID]
-		}
+		return nil, err
+	}
+	unreviewedRows.Close()
+	for i := range out {
+		out[i].UnreviewedMonths = unreviewed[out[i].TeachingCourseID]
 	}
 
 	// Decide eligibility last, once both inputs exist. Both conditions, not

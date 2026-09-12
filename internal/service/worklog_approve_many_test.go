@@ -94,7 +94,7 @@ func TestApproveMany_LeavesNothingApprovedWhenOneSectionFails(t *testing.T) {
 // (04/08/2026). This used to assert the opposite: that a batch pushing the
 // course over its cap was rejected whole. Work that has already happened cannot
 // be un-happened by refusing to record it, so the batch goes through and the
-// shortfall is settled at export by dropping whole months.
+// shortfall is settled at export by sharing the pool out in proportion.
 func TestApproveMany_ApprovesEvenWhenItExceedsTheCourseBudget(t *testing.T) {
 	f, sibling := twoSectionFixture(t, fixtureOpts{
 		Rates: rateOverrides{UGRegularDailyCap: 24},
@@ -117,8 +117,9 @@ func TestApproveMany_ApprovesEvenWhenItExceedsTheCourseBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.OverBudget || len(st.UnpaidMonths) == 0 {
-		t.Errorf("settlement = %+v, want the overrun reported as unpaid months", st)
+	if !st.OverBudget || len(st.PartialMonths) == 0 || st.DroppedBaht <= 0 {
+		t.Errorf("over_budget=%v partial=%v dropped=%.2f, want the overrun reported as a "+
+			"part-paid month with the excess dropped", st.OverBudget, st.PartialMonths, st.DroppedBaht)
 	}
 }
 

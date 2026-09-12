@@ -299,10 +299,10 @@ func TestBuildTransferCoverSheets_DualTrackSplitsAcrossSheets(t *testing.T) {
 	}
 }
 
-// The money on ใบ B must come from the SAME คาบ cutoff SettleCourse applies —
+// The money on ใบ B must come from the SAME settlement SettleCourse applies —
 // never the raw, uncapped hourly total. A mutation that summed claimCostByTASlot
-// directly (skipping unpaidFrom) would pay 150 here instead of the true 50.
-func TestBuildTransferCoverSheets_UsesSettledCutoffNotRawTotal(t *testing.T) {
+// directly (skipping fundedShare) would pay 150 here instead of the true 70.
+func TestBuildTransferCoverSheets_UsesSettledShareNotRawTotal(t *testing.T) {
 	f := newTCFixture(t)
 	// LectureHrs=7, students=30=baseline → weekly=7×1×1=7; monthly=7×10=70;
 	// term_months=4 → regular cap = 70×4 = 280... too big for a small demo,
@@ -316,8 +316,9 @@ func TestBuildTransferCoverSheets_UsesSettledCutoffNotRawTotal(t *testing.T) {
 	// cap = weekly(7) × rate(10) × months(1) = 70.
 
 	ta := f.newTA("สมหญิง เก่งมาก", "undergrad")
-	// Three 1-hour คาบ at 50 baht each: first fits (remaining 70→20), second
-	// (50) does not (20 < 50.01) → cutoff there, third also unpaid.
+	// Three 1-hour คาบ at 50 baht each = 150 of work against a 70 pool: the
+	// TA's share is the whole 70, spread over the คาบ — not 50 for "the one
+	// คาบ that fits".
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1, 2, 3})
 	f.financeSend(courseA)
 
@@ -332,8 +333,8 @@ func TestBuildTransferCoverSheets_UsesSettledCutoffNotRawTotal(t *testing.T) {
 		t.Fatalf("got %d rows, want 1", len(sheets[0].Rows))
 	}
 	got := sheets[0].Rows[0].Baht
-	if got != 50 {
-		t.Errorf("baht = %v, want 50 (only the first คาบ fit the 70-baht cap; raw total would be 150)", got)
+	if got != 70 {
+		t.Errorf("baht = %v, want 70 (the whole pool; raw total would be 150)", got)
 	}
 }
 
@@ -396,7 +397,7 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *tes
 	}
 }
 
-// A row that nets to zero (every คาบ it touched fell off the budget cutoff)
+// A row that nets to zero (the pool has nothing left after the committed lump)
 // must not appear at all — a 0.00 line is not something finance transfers.
 func TestBuildTransferCoverSheets_ZeroNetRowExcluded(t *testing.T) {
 	f := newTCFixture(t)
@@ -405,8 +406,11 @@ func TestBuildTransferCoverSheets_ZeroNetRowExcluded(t *testing.T) {
 	        VALUES ($1, 2569, 2, '2026-06-01', '2026-10-31', FALSE, 1)`, f.termID)
 	f.exec(`INSERT INTO curricula (code, sheet_name, full_name_th, level, sort_order)
 	        VALUES ('CY','CY','ทดสอบหลักสูตร CY','undergrad',1) ON CONFLICT (code) DO NOTHING`)
-	// weekly = 1×1×1 = 1; monthly = 1×10 = 10; cap = 10×1 = 10 — smaller than
-	// even the first 50-baht คาบ, so nothing at all is paid.
+	// A short pool is shared as money, so a 50-baht คาบ against a 10-baht cap
+	// would still pay 10 — to net zero the pool has to round down to nothing.
+	// Workload rate 0.5: weekly = 1×1×1 = 1; cap = 1×0.5×1 = 0.5; the TA's
+	// share is 0.5 and floor(0.5) = 0.
+	f.exec(`UPDATE pay_rates SET ug_workload_rate_regular = 0.5`)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP333", Curriculum: "CY", LectureHrs: 1})
 	ta := f.newTA("นายไม่ได้เงิน สักบาท", "undergrad")
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})

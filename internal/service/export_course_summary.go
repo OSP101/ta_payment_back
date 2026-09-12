@@ -245,16 +245,69 @@ func (s *ExportService) courseSummaryClaimKinds(ctx context.Context, termID uuid
 // courseSummaryBlock is one printed course block: header row + its TAs.
 //
 // ApplyRegular/ApplySpecial are the course's BUDGET per track (the snapshot's
-// term pay), not money anyone has spent. The workbook once carried เบิกจ่ายจริง
-// and คงเหลือ columns beside them, dropped on 10/08/2026: this document is the
-// budget request that opens the term, so actual-spend belongs to the payout
-// screens, and the reference workbook's own grand total only ever summed the
-// ขออนุมัติเบิกจ่าย pair.
+// term pay), not money anyone has spent. PaidRegularByMonth/PaidSpecialByMonth
+// (added back 11/09/2026, reversing the 10/08/2026 decision to drop them —
+// and changed same-day from one cumulative figure to one figure PER selected
+// month, per staff's follow-up request) are what SettleCourse says has
+// actually cleared, keyed by YearMonth ("2026-06") for every month the caller
+// selected — never summed here, so a course with several months shown prints
+// each month's own figure side by side rather than one combined total.
 type courseSummaryBlock struct {
 	Code, NameTH, CreditText, Lecturer, ClaimKind string
 	NumRegular, NumSpecial                        int
-	ApplyRegular, ApplySpecial                    float64 // M, N — ขออนุมัติเบิกจ่าย
-	TAs                                           []courseSummaryTA
+	ApplyRegular, ApplySpecial                    float64            // ขออนุมัติเบิกจ่าย
+	PaidRegularByMonth, PaidSpecialByMonth        map[string]float64 // เบิกจ่ายเดือน, keyed by YearMonth
+	// CommittedRegular/CommittedSpecial is the graduate-special lump sum
+	// (reserved off the top of the pool at term start, not tied to any one
+	// month — grad-special TAs no longer log work_logs at all). It is folded
+	// into the earliest SELECTED month's own PaidRegularByMonth/
+	// PaidSpecialByMonth entry by buildCourseSummaryBlocks once every
+	// member's committed amount is known, rather than kept as a separate
+	// invisible figure — a reader adding up the printed month columns must
+	// land on the same total the total row does.
+	CommittedRegular, CommittedSpecial float64
+	TAs                                []courseSummaryTA
+}
+
+// courseSummaryPaidByMonth returns what SettleCourse says has actually
+// cleared for one course, per track, broken out by month — never summed.
+// SettleCourse already prices approved work and applies the college's budget
+// cutoff (07/09/2026 rule); this is pure aggregation of that, not a new
+// pricing path, so it can never print a number the claim documents would
+// disagree with. Also returns each track's Committed lump sum separately —
+// see courseSummaryBlock's own comment for why the caller folds it into a
+// month rather than this function doing so.
+func (s *ExportService) courseSummaryPaidByMonth(
+	ctx context.Context, courseID uuid.UUID, months []string,
+) (paidRegular, paidSpecial map[string]float64, committedRegular, committedSpecial float64, err error) {
+	settled, err := s.SettleCourse(ctx, courseID)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+	regByMonth := map[string]float64{}
+	for _, m := range settled.Regular.Months {
+		regByMonth[m.YearMonth] = m.PaidBaht
+	}
+	specByMonth := map[string]float64{}
+	for _, m := range settled.Special.Months {
+		specByMonth[m.YearMonth] = m.PaidBaht
+	}
+	paidRegular = map[string]float64{}
+	paidSpecial = map[string]float64{}
+	for _, ym := range months {
+		paidRegular[ym] = regByMonth[ym]
+		paidSpecial[ym] = specByMonth[ym]
+	}
+	// The graduate-special lump is dated by each holder's own hours
+	// (CommittedByMonth, 11/09/2026); the selected months carry their own
+	// slices, and the rest of the lump is claimed on the other months' sheet.
+	// Nothing is left for the caller to fold, so the committed figures return
+	// 0 — the fields survive for the block's own bookkeeping.
+	for _, ym := range months {
+		paidRegular[ym] += settled.Regular.CommittedByMonth[ym]
+		paidSpecial[ym] += settled.Special.CommittedByMonth[ym]
+	}
+	return paidRegular, paidSpecial, 0, 0, nil
 }
 
 // buildBlocks turns the term's courses into printed blocks, keyed by which
@@ -264,7 +317,9 @@ type courseSummaryBlock struct {
 // a course's money is added rather than read once, and it sums each member's
 // OWN BudgetSnapshot/CourseSettlement, never a value recomputed from merged
 // student counts (the staff interview's explicit instruction).
-func (s *ExportService) buildCourseSummaryBlocks(ctx context.Context, termID uuid.UUID) (map[string][]courseSummaryBlock, []string, error) {
+func (s *ExportService) buildCourseSummaryBlocks(
+	ctx context.Context, termID uuid.UUID, months []string,
+) (map[string][]courseSummaryBlock, []string, error) {
 	courses, err := s.courseSummaryCourses(ctx, termID)
 	if err != nil {
 		return nil, nil, err
@@ -342,10 +397,12 @@ func (s *ExportService) buildCourseSummaryBlocks(ctx context.Context, termID uui
 		}
 
 		block := courseSummaryBlock{
-			Code:       strings.Join(codes, "/"),
-			NameTH:     strings.Join(dedupStrings(names), " / "),
-			CreditText: creditText(c.Credits, c.LectureHrs, c.LabHrs, c.SelfHrs),
-			Lecturer:   c.Lecturer,
+			Code:               strings.Join(codes, "/"),
+			NameTH:             strings.Join(dedupStrings(names), " / "),
+			CreditText:         creditText(c.Credits, c.LectureHrs, c.LabHrs, c.SelfHrs),
+			Lecturer:           c.Lecturer,
+			PaidRegularByMonth: map[string]float64{},
+			PaidSpecialByMonth: map[string]float64{},
 		}
 
 		var attendance, lab float64
@@ -365,6 +422,17 @@ func (s *ExportService) buildCourseSummaryBlocks(ctx context.Context, termID uui
 			block.ApplyRegular += snap.TermPayRegular
 			block.ApplySpecial += snap.TermPaySpecial
 
+			paidRegular, paidSpecial, committedReg, committedSpec, err := s.courseSummaryPaidByMonth(ctx, id, months)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, ym := range months {
+				block.PaidRegularByMonth[ym] += paidRegular[ym]
+				block.PaidSpecialByMonth[ym] += paidSpecial[ym]
+			}
+			block.CommittedRegular += committedReg
+			block.CommittedSpecial += committedSpec
+
 			if ck, ok := claimKinds[id]; ok {
 				attendance += ck[0]
 				lab += ck[1]
@@ -383,6 +451,20 @@ func (s *ExportService) buildCourseSummaryBlocks(ctx context.Context, termID uui
 		}
 		block.ClaimKind = claimKindLabel(attendance, lab)
 		sort.Slice(block.TAs, func(i, j int) bool { return block.TAs[i].Name < block.TAs[j].Name })
+
+		// The graduate-special lump is already inside each month's figure
+		// (courseSummaryPaidByMonth adds CommittedByMonth), so the committed
+		// totals here are 0 and this fold is a no-op kept for the shape.
+		if len(months) > 0 {
+			block.PaidRegularByMonth[months[0]] += block.CommittedRegular
+			block.PaidSpecialByMonth[months[0]] += block.CommittedSpecial
+		}
+		for ym := range block.PaidRegularByMonth {
+			block.PaidRegularByMonth[ym] = round2(block.PaidRegularByMonth[ym])
+		}
+		for ym := range block.PaidSpecialByMonth {
+			block.PaidSpecialByMonth[ym] = round2(block.PaidSpecialByMonth[ym])
+		}
 
 		if len(block.TAs) == 0 {
 			warnings = append(warnings, fmt.Sprintf("%s (%s): ยังไม่มี TA ที่อนุมัติ", block.Code, block.NameTH))
@@ -491,32 +573,61 @@ func fmtPtr(s string) *string { return &s }
 
 // summaryBodyColumns is the sheet's body grid, column by column, in the styles
 // the reference gives them: names read from the left, everything countable is
-// centred, and the ขออนุมัติเบิกจ่าย pair carries the header tint down the whole
-// column. D is listed with no value of its own — the reference keeps it ruled
-// and empty, and dropping it from this list is what leaves a gap in the grid.
-func summaryBodyColumns(st *courseSummaryStyles) []struct {
+// centred, and the money columns carry the header tint down the whole
+// column.
+//
+// summaryCol/colWidth are named (rather than anonymous struct literals)
+// because summaryBodyColumns and the column-width table below now both grow
+// a variable, per-term number of entries — one เบิกจ่ายเดือน pair per
+// selected month — built with append() in a loop, which anonymous struct
+// types make awkward to spell out repeatedly.
+type summaryCol struct {
 	col   string
 	style int
-} {
-	return []struct {
-		col   string
-		style int
-	}{
-		{"A", st.bodyCenter}, {"B", st.bodyCenter}, {"C", st.body}, {"D", st.body},
-		{"E", st.bodyCenter}, {"F", st.body}, {"G", st.bodyCenter}, {"H", st.body},
-		{"I", st.bodyCenter}, {"J", st.bodyCenter}, {"K", st.bodyCenter},
-		{"L", st.bodyCenter}, {"M", st.money}, {"N", st.money},
+}
+
+// excelCol turns a 1-based column INDEX (12 → "L", 27 → "AA") into the
+// letter excelize's cell-name API expects. Needed because the sheet's money
+// columns from ขออนุมัติเบิกจ่าย onward no longer sit at a fixed letter — the
+// number of เบิกจ่ายเดือน pairs between them and คงเหลือ depends on how many
+// months staff selected.
+func excelCol(n int) string {
+	s := ""
+	for n > 0 {
+		n--
+		s = string(rune('A'+n%26)) + s
+		n /= 26
 	}
+	return s
+}
+
+// summaryBodyColumns lists every ruled column of the body grid for a sheet
+// with numMonths เบิกจ่ายเดือน pairs: the fixed A:M prefix, then one money
+// pair per selected month, then the final คงเหลือ pair.
+func summaryBodyColumns(st *courseSummaryStyles, numMonths int) []summaryCol {
+	cols := []summaryCol{
+		{"A", st.bodyCenter}, {"B", st.bodyCenter}, {"C", st.body},
+		{"D", st.bodyCenter}, {"E", st.body}, {"F", st.bodyCenter}, {"G", st.body},
+		{"H", st.bodyCenter}, {"I", st.bodyCenter}, {"J", st.bodyCenter},
+		{"K", st.bodyCenter}, {"L", st.money}, {"M", st.money},
+	}
+	idx := 14 // first เบิกจ่ายเดือน column
+	for i := 0; i < numMonths; i++ {
+		cols = append(cols, summaryCol{excelCol(idx), st.money}, summaryCol{excelCol(idx + 1), st.money})
+		idx += 2
+	}
+	cols = append(cols, summaryCol{excelCol(idx), st.money}, summaryCol{excelCol(idx + 1), st.money}) // คงเหลือ
+	return cols
 }
 
 // ruleSummaryBlock draws the grid for one course: one row per TA, or a single
 // row when the course has none on file yet.
-func ruleSummaryBlock(f *excelize.File, st *courseSummaryStyles, sheet string, top, tas int) error {
+func ruleSummaryBlock(f *excelize.File, st *courseSummaryStyles, sheet string, top, tas, numMonths int) error {
 	if tas < 1 {
 		tas = 1
 	}
 	for r := top; r < top+tas; r++ {
-		for _, c := range summaryBodyColumns(st) {
+		for _, c := range summaryBodyColumns(st, numMonths) {
 			cell := fmt.Sprintf("%s%d", c.col, r)
 			if err := f.SetCellStyle(sheet, cell, cell, c.style); err != nil {
 				return err
@@ -532,26 +643,65 @@ func ruleSummaryBlock(f *excelize.File, st *courseSummaryStyles, sheet string, t
 // (settings page, migration 0073's own comment): a later rename must not
 // silently reword a document already handed to someone.
 type courseSummarySheetSnapshot struct {
-	CurriculumCode string                `json:"curriculum_code"`
-	SheetName      string                `json:"sheet_name"`
-	FullNameTH     string                `json:"full_name_th"`
-	Blocks         []courseSummaryBlock  `json:"blocks"`
+	CurriculumCode string               `json:"curriculum_code"`
+	SheetName      string               `json:"sheet_name"`
+	FullNameTH     string               `json:"full_name_th"`
+	Blocks         []courseSummaryBlock `json:"blocks"`
 }
 
 // courseSummarySnapshot is what's frozen into the ledger row: the term-line
 // text plus every sheet's blocks, exactly as BuildCourseSummaryWorkbook
 // resolved them. No PII to exclude here (unlike ปะหน้าจ่ายตรง's PromptPay
 // column), so reprint needs no live re-derivation step at all.
+//
+// Months/MonthLabels are frozen too, same reasoning as FullNameTH/SheetName
+// below: a reprint must reproduce the exact เบิกจ่ายเดือน/คงเหลือ figures and
+// column headers the original generation showed, never recompute against
+// whatever months or work have been approved since.
 type courseSummarySnapshot struct {
-	AcademicYear string                        `json:"academic_year"`
-	SemLabel     string                        `json:"sem_label"`
-	Sheets       []courseSummarySheetSnapshot  `json:"sheets"`
+	AcademicYear string                       `json:"academic_year"`
+	SemLabel     string                       `json:"sem_label"`
+	Months       []string                     `json:"months"`
+	MonthLabels  map[string]string            `json:"month_labels"`
+	Sheets       []courseSummarySheetSnapshot `json:"sheets"`
+}
+
+// resolveMonths validates a caller's requested month selection against the
+// term's own months (normalizeMonthSelection's usual contract — empty means
+// every month, an unknown month is an error rather than a silent drop) and
+// returns, alongside the resolved list, a short single-word Thai label per
+// month ("มิถุนายน") for a narrow column header — distinct from
+// thaiSelectedMonthsLabel's combined range phrasing, which named one pooled
+// "เบิกจ่ายเดือน" column before this became one column PER month.
+func (s *ExportService) resolveMonths(
+	ctx context.Context, termID uuid.UUID, requested []string,
+) (months []string, monthLabels map[string]string, err error) {
+	all, err := s.TermMonths(ctx, termID)
+	if err != nil {
+		return nil, nil, err
+	}
+	months, err = normalizeMonthSelection(all, requested)
+	if err != nil {
+		return nil, nil, err
+	}
+	monthLabels = map[string]string{}
+	for _, m := range all {
+		var y, mm int
+		if _, serr := fmt.Sscanf(m.YearMonth, "%d-%d", &y, &mm); serr == nil && mm >= 1 && mm <= 12 {
+			monthLabels[m.YearMonth] = thaiMonths[mm-1]
+		} else {
+			monthLabels[m.YearMonth] = m.Label
+		}
+	}
+	return months, monthLabels, nil
 }
 
 // renderCourseSummarySnapshot gathers everything writeCourseSummaryWorkbook
 // needs, live from today's tables — the read side shared by a fresh Build and
 // (indirectly, via the ledger) a later Reprint's Build.
-func (s *ExportService) renderCourseSummarySnapshot(ctx context.Context, termID uuid.UUID) (courseSummarySnapshot, []string, error) {
+func (s *ExportService) renderCourseSummarySnapshot(
+	ctx context.Context, termID uuid.UUID, requestedMonths []string,
+) (courseSummarySnapshot, []string, error) {
 	var academicYear, semLabel string
 	if err := s.pool.QueryRow(ctx, `
 		SELECT academic_year::text,
@@ -560,11 +710,16 @@ func (s *ExportService) renderCourseSummarySnapshot(ctx context.Context, termID 
 		return courseSummarySnapshot{}, nil, err
 	}
 
+	months, monthLabels, err := s.resolveMonths(ctx, termID, requestedMonths)
+	if err != nil {
+		return courseSummarySnapshot{}, nil, err
+	}
+
 	curricula, err := s.teaching.ListCurricula(ctx)
 	if err != nil {
 		return courseSummarySnapshot{}, nil, err
 	}
-	bySheet, warnings, err := s.buildCourseSummaryBlocks(ctx, termID)
+	bySheet, warnings, err := s.buildCourseSummaryBlocks(ctx, termID, months)
 	if err != nil {
 		return courseSummarySnapshot{}, nil, err
 	}
@@ -579,7 +734,11 @@ func (s *ExportService) renderCourseSummarySnapshot(ctx context.Context, termID 
 			CurriculumCode: cur.Code, SheetName: cur.SheetName, FullNameTH: cur.FullNameTH, Blocks: blocks,
 		})
 	}
-	return courseSummarySnapshot{AcademicYear: academicYear, SemLabel: semLabel, Sheets: sheets}, warnings, nil
+	return courseSummarySnapshot{
+		AcademicYear: academicYear, SemLabel: semLabel,
+		Months: months, MonthLabels: monthLabels,
+		Sheets: sheets,
+	}, warnings, nil
 }
 
 // writeCourseSummaryWorkbook renders an already-resolved snapshot into an
@@ -605,7 +764,7 @@ func writeCourseSummaryWorkbook(snap courseSummarySnapshot) ([]byte, error) {
 			return nil, err
 		}
 		wrote = true
-		if err := writeCourseSummarySheet(f, st, sheetName, snap.SemLabel, snap.AcademicYear, sh.FullNameTH, sh.Blocks); err != nil {
+		if err := writeCourseSummarySheet(f, st, sheetName, snap.SemLabel, snap.AcademicYear, sh.FullNameTH, snap.Months, snap.MonthLabels, sh.Blocks); err != nil {
 			return nil, err
 		}
 	}
@@ -627,8 +786,12 @@ func writeCourseSummaryWorkbook(snap courseSummarySnapshot) ([]byte, error) {
 // CourseSummaryWarnings answers "what should staff double check" without
 // rendering (and discarding) a whole workbook — the staff screen just needs
 // the count before the download button is even pressed.
-func (s *ExportService) CourseSummaryWarnings(ctx context.Context, termID uuid.UUID) ([]string, error) {
-	_, warnings, err := s.buildCourseSummaryBlocks(ctx, termID)
+func (s *ExportService) CourseSummaryWarnings(ctx context.Context, termID uuid.UUID, requestedMonths []string) ([]string, error) {
+	months, _, err := s.resolveMonths(ctx, termID, requestedMonths)
+	if err != nil {
+		return nil, err
+	}
+	_, warnings, err := s.buildCourseSummaryBlocks(ctx, termID, months)
 	return warnings, err
 }
 
@@ -643,8 +806,10 @@ func (s *ExportService) CourseSummaryWarnings(ctx context.Context, termID uuid.U
 // bytes, mirroring transfer_cover_exports: a student count or TA approval
 // corrected after this file went out must not make the original numbers
 // unrecoverable — see ReprintCourseSummary.
-func (s *ExportService) BuildCourseSummaryWorkbook(ctx context.Context, actor, termID uuid.UUID) ([]byte, []string, error) {
-	snap, warnings, err := s.renderCourseSummarySnapshot(ctx, termID)
+func (s *ExportService) BuildCourseSummaryWorkbook(
+	ctx context.Context, actor, termID uuid.UUID, requestedMonths []string,
+) ([]byte, []string, error) {
+	snap, warnings, err := s.renderCourseSummarySnapshot(ctx, termID, requestedMonths)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -721,6 +886,11 @@ type CourseSummaryExportSummary struct {
 	GeneratedAt string    `json:"generated_at"`
 	GeneratedBy string    `json:"generated_by,omitempty"`
 	CourseCount int       `json:"course_count"`
+	// MonthLabel summarizes which months this generation's เบิกจ่ายเดือน
+	// columns covered — empty for rows generated before 11/09/2026, which
+	// covered the whole term the same way an empty month selection still
+	// does.
+	MonthLabel string `json:"month_label,omitempty"`
 }
 
 // ListCourseSummaryExports returns the generation history for a term, newest
@@ -728,7 +898,7 @@ type CourseSummaryExportSummary struct {
 func (s *ExportService) ListCourseSummaryExports(ctx context.Context, termID uuid.UUID) ([]CourseSummaryExportSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT e.id, e.term_id, TO_CHAR(e.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
-		       COALESCE(u.first_name || ' ' || u.last_name, ''), e.course_count
+		       COALESCE(u.first_name || ' ' || u.last_name, ''), e.course_count, e.document
 		FROM course_summary_exports e
 		LEFT JOIN users u ON u.id = e.generated_by
 		WHERE e.term_id = $1
@@ -740,8 +910,13 @@ func (s *ExportService) ListCourseSummaryExports(ctx context.Context, termID uui
 	out := []CourseSummaryExportSummary{}
 	for rows.Next() {
 		var r CourseSummaryExportSummary
-		if err := rows.Scan(&r.ID, &r.TermID, &r.GeneratedAt, &r.GeneratedBy, &r.CourseCount); err != nil {
+		var raw []byte
+		if err := rows.Scan(&r.ID, &r.TermID, &r.GeneratedAt, &r.GeneratedBy, &r.CourseCount, &raw); err != nil {
 			return nil, err
+		}
+		var snap courseSummarySnapshot
+		if err := json.Unmarshal(raw, &snap); err == nil {
+			r.MonthLabel = thaiSelectedMonthsLabel(snap.Months)
 		}
 		out = append(out, r)
 	}
@@ -750,6 +925,7 @@ func (s *ExportService) ListCourseSummaryExports(ctx context.Context, termID uui
 
 func writeCourseSummarySheet(
 	f *excelize.File, st *courseSummaryStyles, sheet, semLabel, academicYear, curriculumFullName string,
+	months []string, monthLabels map[string]string,
 	blocks []courseSummaryBlock,
 ) error {
 	set := func(cell string, style int, v any) error {
@@ -763,38 +939,49 @@ func writeCourseSummarySheet(
 		return f.SetCellStyle(sheet, cell, cell, style)
 	}
 
-	_ = f.MergeCell(sheet, "A1", "N1")
+	_ = f.MergeCell(sheet, "A1", "M1")
 	if err := set("A1", st.title, fmt.Sprintf("สรุปรายวิชาที่ขอใช้ TA  ประจำ%s ปีการศึกษา %s", semLabel, academicYear)); err != nil {
 		return err
 	}
 	_ = f.SetRowHeight(sheet, 1, 36)
 
-	// Every header label is centred, and the single-level ones (A–I) span rows
-	// 2–3 so no rule cuts through them. The reference gets that look by leaving
-	// the row-2 bottom border off; merging says the same thing structurally and
-	// survives a reader widening a column.
-	//
-	// The sheet ENDS at N, on purpose. The college's own file
-	// (docs/ค่าตอบแทนTAภาคต้น-2569.xlsx) carries two further pairs — O:P
-	// เบิกจ่ายเดือน … and Q:R คงเหลือ — and they are deliberately not
-	// reproduced: this document answers one question, how much each course may
-	// claim, and what was actually paid out is reported by the claim book and
-	// the transfer cover instead. Anyone diffing against the reference will
-	// find those columns missing; that is the decision, not an omission.
+	// Column layout, 1-indexed — the fixed A:M prefix is always the same
+	// (รายวิชา is B:C — the reference's own template ruled an empty filler
+	// column D under that header, but nothing was ever written to it and
+	// nobody could say what it was for, so it was dropped 11/09/2026, staff's
+	// own call), then one เบิกจ่ายเดือน pair PER selected month (11/09/2026,
+	// reversing the SAME DAY's earlier decision to pool every selected month
+	// into one cumulative pair — staff asked to see each month on its own
+	// instead), then a final คงเหลือ pair.
+	const monthStartCol = 14 // N, if no month were ever removed — see excelCol
+	numMonths := len(months)
+	remainCol0 := excelCol(monthStartCol + 2*numMonths)
+	remainCol1 := excelCol(monthStartCol + 2*numMonths + 1)
+
 	headers := []struct {
 		cell, mergeTo, label string
 	}{
 		{"A2", "A3", "ลำดับที่"},
-		{"B2", "D3", "รายวิชา"},
-		{"E2", "E3", "หน่วยกิต"},
-		{"F2", "F3", "ชื่ออาจารย์"},
-		{"G2", "G3", "รหัสนักศึกษา"},
-		{"H2", "H3", "ชื่อ TA"},
-		{"I2", "I3", "ระดับ"},
-		{"J2", "K2", "จำนวน นศ."},
-		{"L2", "", "เบิกจ่าย"},
-		{"M2", "N3", "ขออนุมัติเบิกจ่าย"},
+		{"B2", "C3", "รายวิชา"},
+		{"D2", "D3", "หน่วยกิต"},
+		{"E2", "E3", "ชื่ออาจารย์"},
+		{"F2", "F3", "รหัสนักศึกษา"},
+		{"G2", "G3", "ชื่อ TA"},
+		{"H2", "H3", "ระดับ"},
+		{"I2", "J2", "จำนวน นศ."},
+		{"K2", "", "เบิกจ่าย"},
+		{"L2", "M3", "ขออนุมัติเบิกจ่าย"},
 	}
+	for i, ym := range months {
+		c0, c1 := excelCol(monthStartCol+2*i), excelCol(monthStartCol+2*i+1)
+		label := monthLabels[ym]
+		if label == "" {
+			label = ym
+		}
+		headers = append(headers, struct{ cell, mergeTo, label string }{c0 + "2", c1 + "3", "เบิกจ่ายเดือน " + label})
+	}
+	headers = append(headers, struct{ cell, mergeTo, label string }{remainCol0 + "2", remainCol1 + "3", "คงเหลือ"})
+
 	for _, h := range headers {
 		if err := set(h.cell, st.colHeaderCenter, h.label); err != nil {
 			return err
@@ -803,22 +990,28 @@ func writeCourseSummarySheet(
 			_ = f.MergeCell(sheet, h.cell, h.mergeTo)
 			// Merging keeps only the anchor's style, so the covered cells would
 			// print unfilled and unbordered where the merge is wider than one
-			// column (B2:D3, J2:K2, M2:N3).
+			// column (B2:C3, I2:J2, L2:M3, and every เบิกจ่ายเดือน/คงเหลือ pair).
 			if err := f.SetCellStyle(sheet, h.cell, h.mergeTo, st.colHeaderCenter); err != nil {
 				return err
 			}
 		}
 	}
 	subheaders := map[string]string{
-		"J3": "ปกติ", "K3": "พิเศษ", "L3": "Lec./Lab",
-		"M4": "ปกติ", "N4": "พิเศษ",
+		"I3": "ปกติ", "J3": "พิเศษ", "K3": "Lec./Lab",
+		"L4": "ปกติ", "M4": "พิเศษ",
 	}
+	for i := range months {
+		subheaders[excelCol(monthStartCol+2*i)+"4"] = "ปกติ"
+		subheaders[excelCol(monthStartCol+2*i+1)+"4"] = "พิเศษ"
+	}
+	subheaders[remainCol0+"4"] = "ปกติ"
+	subheaders[remainCol1+"4"] = "พิเศษ"
 	for cell, label := range subheaders {
 		if err := set(cell, st.colHeaderCenter, label); err != nil {
 			return err
 		}
 	}
-	_ = f.MergeCell(sheet, "A4", "L4")
+	_ = f.MergeCell(sheet, "A4", "K4")
 	if err := set("A4", st.sheetHeading, curriculumFullName); err != nil {
 		return err
 	}
@@ -831,13 +1024,12 @@ func writeCourseSummarySheet(
 		//
 		// A course with more than one TA occupies one row per TA, and only the
 		// first of them carries the course's own columns — but the reference
-		// still rules A–N on every one of those rows, so the table reads as a
-		// single grid with the course spanning it. Styling only the cells that
-		// take a value tore that grid open: from the second TA down, everything
-		// outside รหัสนักศึกษา/ชื่อ TA/ระดับ printed with no rules at all, and
-		// column D — which the reference keeps ruled and empty across the whole
-		// sheet — had none on any row.
-		if err := ruleSummaryBlock(f, st, sheet, top, len(b.TAs)); err != nil {
+		// still rules the whole grid on every one of those rows, so the table
+		// reads as a single grid with the course spanning it. Styling only the
+		// cells that take a value tore that grid open: from the second TA down,
+		// everything outside รหัสนักศึกษา/ชื่อ TA/ระดับ printed with no rules at
+		// all.
+		if err := ruleSummaryBlock(f, st, sheet, top, len(b.TAs), numMonths); err != nil {
 			return err
 		}
 		if err := set(fmt.Sprintf("A%d", top), st.bodyCenter, i+1); err != nil {
@@ -851,25 +1043,56 @@ func writeCourseSummarySheet(
 		if err := set(fmt.Sprintf("C%d", top), st.body, b.NameTH); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("E%d", top), st.bodyCenter, b.CreditText); err != nil {
+		if err := set(fmt.Sprintf("D%d", top), st.bodyCenter, b.CreditText); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("F%d", top), st.body, b.Lecturer); err != nil {
+		if err := set(fmt.Sprintf("E%d", top), st.body, b.Lecturer); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("J%d", top), st.bodyCenter, b.NumRegular); err != nil {
+		if err := set(fmt.Sprintf("I%d", top), st.bodyCenter, b.NumRegular); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("K%d", top), st.bodyCenter, b.NumSpecial); err != nil {
+		if err := set(fmt.Sprintf("J%d", top), st.bodyCenter, b.NumSpecial); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("L%d", top), st.bodyCenter, b.ClaimKind); err != nil {
+		if err := set(fmt.Sprintf("K%d", top), st.bodyCenter, b.ClaimKind); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("M%d", top), st.money, b.ApplyRegular); err != nil {
+		if err := set(fmt.Sprintf("L%d", top), st.money, b.ApplyRegular); err != nil {
 			return err
 		}
-		if err := set(fmt.Sprintf("N%d", top), st.money, b.ApplySpecial); err != nil {
+		if err := set(fmt.Sprintf("M%d", top), st.money, b.ApplySpecial); err != nil {
+			return err
+		}
+		regCells := make([]string, 0, numMonths)
+		specCells := make([]string, 0, numMonths)
+		for i, ym := range months {
+			regCell := fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i), top)
+			specCell := fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i+1), top)
+			if err := set(regCell, st.money, b.PaidRegularByMonth[ym]); err != nil {
+				return err
+			}
+			if err := set(specCell, st.money, b.PaidSpecialByMonth[ym]); err != nil {
+				return err
+			}
+			regCells = append(regCells, regCell)
+			specCells = append(specCells, specCell)
+		}
+		// คงเหลือ is a live formula, ขออนุมัติเบิกจ่าย minus every visible
+		// month's own printed cell, so it keeps agreeing with them even if
+		// someone edits a cell by hand after the file is handed over.
+		remainReg := fmt.Sprintf("=L%d", top)
+		for _, c := range regCells {
+			remainReg += "-" + c
+		}
+		remainSpec := fmt.Sprintf("=M%d", top)
+		for _, c := range specCells {
+			remainSpec += "-" + c
+		}
+		if err := set(fmt.Sprintf("%s%d", remainCol0, top), st.money, remainReg); err != nil {
+			return err
+		}
+		if err := set(fmt.Sprintf("%s%d", remainCol1, top), st.money, remainSpec); err != nil {
 			return err
 		}
 
@@ -878,13 +1101,13 @@ func writeCourseSummarySheet(
 		}
 		for j, ta := range b.TAs {
 			r := top + j
-			if err := set(fmt.Sprintf("G%d", r), st.bodyCenter, ta.StudentID); err != nil {
+			if err := set(fmt.Sprintf("F%d", r), st.bodyCenter, ta.StudentID); err != nil {
 				return err
 			}
-			if err := set(fmt.Sprintf("H%d", r), st.body, ta.Name); err != nil {
+			if err := set(fmt.Sprintf("G%d", r), st.body, ta.Name); err != nil {
 				return err
 			}
-			if err := set(fmt.Sprintf("I%d", r), st.bodyCenter, ta.LevelTH); err != nil {
+			if err := set(fmt.Sprintf("H%d", r), st.bodyCenter, ta.LevelTH); err != nil {
 				return err
 			}
 			row = r + 1
@@ -896,27 +1119,50 @@ func writeCourseSummarySheet(
 	}
 
 	totalRow := row
-	_ = f.MergeCell(sheet, fmt.Sprintf("A%d", totalRow), fmt.Sprintf("L%d", totalRow))
+	_ = f.MergeCell(sheet, fmt.Sprintf("A%d", totalRow), fmt.Sprintf("K%d", totalRow))
 	if err := set(fmt.Sprintf("A%d", totalRow), st.totalLabel, "รวมทั้งหมด"); err != nil {
 		return err
 	}
-	for _, col := range []string{"M", "N"} {
+	sumCols := []string{"L", "M"}
+	for i := range months {
+		sumCols = append(sumCols, excelCol(monthStartCol+2*i), excelCol(monthStartCol+2*i+1))
+	}
+	for _, col := range sumCols {
 		cell := fmt.Sprintf("%s%d", col, totalRow)
 		formula := fmt.Sprintf("=SUM(%s5:%s%d)", col, col, lastDataRow)
 		if err := set(cell, st.moneyBold, formula); err != nil {
 			return err
 		}
 	}
+	remainRegTotal := fmt.Sprintf("=L%d", totalRow)
+	remainSpecTotal := fmt.Sprintf("=M%d", totalRow)
+	for i := range months {
+		remainRegTotal += "-" + fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i), totalRow)
+		remainSpecTotal += "-" + fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i+1), totalRow)
+	}
+	if err := set(fmt.Sprintf("%s%d", remainCol0, totalRow), st.moneyBold, remainRegTotal); err != nil {
+		return err
+	}
+	if err := set(fmt.Sprintf("%s%d", remainCol1, totalRow), st.moneyBold, remainSpecTotal); err != nil {
+		return err
+	}
 
-	widths := []struct {
+	type colWidth struct {
 		from, to string
 		w        float64
-	}{
-		{"A", "A", 6.83}, {"B", "B", 22.33}, {"C", "C", 49.33}, {"D", "D", 54.66},
-		{"E", "E", 9.33}, {"F", "F", 25.83}, {"G", "G", 13.33}, {"H", "H", 26.33},
-		{"I", "I", 6.33}, {"J", "K", 11}, {"L", "L", 11.33}, {"M", "M", 13.16},
-		{"N", "N", 15.0},
 	}
+	widths := []colWidth{
+		{"A", "A", 6.83}, {"B", "B", 22.33}, {"C", "C", 49.33},
+		{"D", "D", 9.33}, {"E", "E", 25.83}, {"F", "F", 13.33}, {"G", "G", 26.33},
+		{"H", "H", 6.33}, {"I", "J", 11}, {"K", "K", 11.33}, {"L", "L", 13.16}, {"M", "M", 15.0},
+	}
+	for i := range months {
+		widths = append(widths,
+			colWidth{excelCol(monthStartCol + 2*i), excelCol(monthStartCol + 2*i), 12.66},
+			colWidth{excelCol(monthStartCol + 2*i + 1), excelCol(monthStartCol + 2*i + 1), 10.83},
+		)
+	}
+	widths = append(widths, colWidth{remainCol0, remainCol0, 11.66}, colWidth{remainCol1, remainCol1, 11.5})
 	for _, w := range widths {
 		_ = f.SetColWidth(sheet, w.from, w.to, w.w)
 	}
@@ -931,19 +1177,30 @@ func writeCourseSummarySheet(
 // course's own header fields are repeated on every one of its TA rows (or
 // once, blank, if it has no approved TA yet) rather than merged, since a
 // sortable table has no cell-merge equivalent.
+// CourseSummaryMonthAmount is one course's เบิกจ่ายเดือน figure for ONE
+// selected month — never summed with any other month (11/09/2026, staff's
+// explicit request: show each month on its own, not pooled into a range).
+type CourseSummaryMonthAmount struct {
+	YearMonth string  `json:"year_month"`
+	Label     string  `json:"label"` // "มิถุนายน"
+	Regular   float64 `json:"regular"`
+	Special   float64 `json:"special"`
+}
+
 type CourseSummaryPreviewRow struct {
-	CourseCode   string  `json:"course_code"`
-	CourseNameTH string  `json:"course_name_th"`
-	CreditText   string  `json:"credit_text"`
-	Lecturer     string  `json:"lecturer"`
-	ClaimKind    string  `json:"claim_kind"`
-	NumRegular   int     `json:"num_regular"`
-	NumSpecial   int     `json:"num_special"`
-	ApplyRegular float64 `json:"apply_regular"`
-	ApplySpecial float64 `json:"apply_special"`
-	TAStudentID  string  `json:"ta_student_id,omitempty"`
-	TAName       string  `json:"ta_name,omitempty"`
-	TALevelTH    string  `json:"ta_level_th,omitempty"`
+	CourseCode   string                     `json:"course_code"`
+	CourseNameTH string                     `json:"course_name_th"`
+	CreditText   string                     `json:"credit_text"`
+	Lecturer     string                     `json:"lecturer"`
+	ClaimKind    string                     `json:"claim_kind"`
+	NumRegular   int                        `json:"num_regular"`
+	NumSpecial   int                        `json:"num_special"`
+	ApplyRegular float64                    `json:"apply_regular"`
+	ApplySpecial float64                    `json:"apply_special"`
+	PaidByMonth  []CourseSummaryMonthAmount `json:"paid_by_month"`
+	TAStudentID  string                     `json:"ta_student_id,omitempty"`
+	TAName       string                     `json:"ta_name,omitempty"`
+	TALevelTH    string                     `json:"ta_level_th,omitempty"`
 }
 
 // CourseSummaryPreviewSheet is one curriculum's worth of rows — the web
@@ -958,15 +1215,23 @@ type CourseSummaryPreviewSheet struct {
 // workbook — the on-screen table staff asked for so they can check the
 // numbers without downloading a file first. Same source as
 // BuildCourseSummaryWorkbook (buildCourseSummaryBlocks), so the screen and
-// the file can never show different figures.
-func (s *ExportService) CourseSummaryPreview(ctx context.Context, termID uuid.UUID) ([]CourseSummaryPreviewSheet, []string, error) {
+// the file can never show different figures. Returns months/monthLabels too
+// so the frontend can render one column pair per month without re-deriving
+// the resolved set (an empty request) or the short labels itself.
+func (s *ExportService) CourseSummaryPreview(
+	ctx context.Context, termID uuid.UUID, requestedMonths []string,
+) (sheets []CourseSummaryPreviewSheet, warnings []string, months []string, monthLabels map[string]string, err error) {
 	curricula, err := s.teaching.ListCurricula(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	bySheet, warnings, err := s.buildCourseSummaryBlocks(ctx, termID)
+	months, monthLabels, err = s.resolveMonths(ctx, termID, requestedMonths)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
+	}
+	bySheet, warnings, err := s.buildCourseSummaryBlocks(ctx, termID, months)
+	if err != nil {
+		return nil, nil, nil, nil, err
 	}
 
 	var out []CourseSummaryPreviewSheet
@@ -977,11 +1242,23 @@ func (s *ExportService) CourseSummaryPreview(ctx context.Context, termID uuid.UU
 		}
 		var rows []CourseSummaryPreviewRow
 		for _, b := range blocks {
+			paidByMonth := make([]CourseSummaryMonthAmount, 0, len(months))
+			for _, ym := range months {
+				label := monthLabels[ym]
+				if label == "" {
+					label = ym
+				}
+				paidByMonth = append(paidByMonth, CourseSummaryMonthAmount{
+					YearMonth: ym, Label: label,
+					Regular: b.PaidRegularByMonth[ym], Special: b.PaidSpecialByMonth[ym],
+				})
+			}
 			base := CourseSummaryPreviewRow{
 				CourseCode: b.Code, CourseNameTH: b.NameTH, CreditText: b.CreditText,
 				Lecturer: b.Lecturer, ClaimKind: b.ClaimKind,
 				NumRegular: b.NumRegular, NumSpecial: b.NumSpecial,
 				ApplyRegular: b.ApplyRegular, ApplySpecial: b.ApplySpecial,
+				PaidByMonth: paidByMonth,
 			}
 			if len(b.TAs) == 0 {
 				rows = append(rows, base)
@@ -995,5 +1272,5 @@ func (s *ExportService) CourseSummaryPreview(ctx context.Context, termID uuid.UU
 		}
 		out = append(out, CourseSummaryPreviewSheet{CurriculumCode: cur.Code, Sheet: cur.FullNameTH, Rows: rows})
 	}
-	return out, warnings, nil
+	return out, warnings, months, monthLabels, nil
 }

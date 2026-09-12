@@ -150,7 +150,7 @@ func (s *SubmissionPeriodService) List(ctx context.Context, termID uuid.UUID) ([
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // Upsert creates or updates a single submission period. Only staff/admin.
@@ -463,7 +463,7 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		}
 		out = append(out, s)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // userDisplayName fetches "first last" (falling back to email) so we can
@@ -544,22 +544,30 @@ func (s *SubmissionPeriodService) assertPrivileged(ctx context.Context, actor uu
 }
 
 // monthWorklogReadiness returns the worklog counts for a (TA, course, month),
-// where the month is the MM of the period's year_month matched against
-// work_date. Used to gate the monthly sign step and to enrich the TA reminders
-// list. unapproved counts draft/submitted/rejected rows.
+// where the month is the period's full year_month (Buddhist academic year +
+// MM) matched against work_date via the course's term. Used to gate the
+// monthly sign step and to enrich the TA reminders list. unapproved counts
+// draft/submitted/rejected rows.
+//
+// QUAL-03: used to extract only the MM digits from yearMonth and compare
+// that against to_char(wl.work_date,'MM') alone, throwing the year away —
+// safe only by the accident that this call is already scoped to one
+// teaching_course_id (one term, under 12 months, so no month repeats). A
+// course spanning a calendar-year boundary or a reused teaching_courses row
+// would have silently counted the wrong year's work_logs.
 func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taID, tcID uuid.UUID, yearMonth string) (total, unapproved int, err error) {
-	mm := yearMonth
-	if len(mm) >= 2 {
-		mm = mm[len(mm)-2:]
-	}
 	err = s.pool.QueryRow(ctx, `
 		SELECT COUNT(*),
 		       COUNT(*) FILTER (WHERE wl.status IN ('draft','submitted','rejected'))
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
+		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+		JOIN academic_terms trm ON trm.id = tc.term_id
 		WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
-		  AND to_char(wl.work_date,'MM') = $3
+		  -- เทียบทั้ง year_month (ปีการศึกษา + MM) ตรง ๆ กับพารามิเตอร์ ไม่ใช่
+		  -- แยกเอาแค่ MM มาเทียบแบบเดิม — ดู workLogInPeriodSQL's doc comment
+		  AND trm.academic_year::text || '-' || to_char(wl.work_date,'MM') = $3
 		  -- Grad-special no longer logs work_logs at all — pay is computed
 		  -- automatically from the regular track's class schedule. A TA who
 		  -- also holds a real (grad-regular or undergrad) assignment on this
@@ -568,7 +576,7 @@ func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taI
 		  -- ever move those rows forward, so counting them here would refuse
 		  -- MarkStaffReviewed on the TA's real hours forever.
 		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`,
-		taID, tcID, mm).Scan(&total, &unapproved)
+		taID, tcID, yearMonth).Scan(&total, &unapproved)
 	return
 }
 
@@ -599,6 +607,7 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		     exported_at, exported_by, exported_name)
 		SELECT gen_random_uuid(), sp.id, a.ta_id, tc.id, 'exported', now(), $2, $3
 		FROM teaching_courses tc
+		JOIN academic_terms trm ON trm.id = tc.term_id
 		JOIN submission_periods sp ON sp.term_id = tc.term_id
 		JOIN ta_request_assignments a
 		    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
@@ -621,7 +630,7 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		        JOIN sections s2 ON s2.id = a2.section_id
 		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
-		          AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		          AND wl.status = 'approved'
 		          AND (COALESCE(cardinality($4::text[]), 0) = 0
 		               OR to_char(wl.work_date,'YYYY-MM') = ANY($4::text[])))
@@ -630,7 +639,7 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		        JOIN sections s2 ON s2.id = a2.section_id
 		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
-		          AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		          AND wl.status IN ('draft','submitted','rejected')
 		          -- Same grad-special exclusion as monthWorklogReadiness: a
 		          -- leftover 'submitted' row on a dead grad-special assignment
@@ -966,13 +975,13 @@ func (s *SubmissionPeriodService) GetTimeline(ctx context.Context, actor, period
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $2 AND s2.teaching_course_id = tc.id
-		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')),
 		       (SELECT COUNT(*) FROM work_logs wl
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = $2 AND s2.teaching_course_id = tc.id
-		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl.status IN ('draft','submitted','rejected')),
 		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
@@ -988,7 +997,9 @@ func (s *SubmissionPeriodService) GetTimeline(ctx context.Context, actor, period
 		       st.sent_back_reason
 		FROM submission_periods sp
 		JOIN users u ON u.id = $2
-		JOIN teaching_courses tc ON tc.id = $3		LEFT JOIN submission_period_status st
+		JOIN teaching_courses tc ON tc.id = $3
+		JOIN academic_terms trm ON trm.id = tc.term_id
+		LEFT JOIN submission_period_status st
 		    ON st.submission_period_id = sp.id
 		   AND st.ta_id = $2
 		   AND st.teaching_course_id = $3
@@ -1039,13 +1050,13 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = u.id AND s2.teaching_course_id = tc.id
-		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')),
 		       (SELECT COUNT(*) FROM work_logs wl
 		          JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
 		          JOIN sections s2 ON s2.id = a2.section_id
 		         WHERE a2.ta_id = u.id AND s2.teaching_course_id = tc.id
-		           AND to_char(wl.work_date,'MM') = RIGHT(sp.year_month, 2)
+		           AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
 		           AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special')
 		           AND wl.status IN ('draft','submitted','rejected')),
 		       TO_CHAR(st.exported_at,        'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
@@ -1059,7 +1070,9 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		       st.sent_back_by::text,
 		       st.sent_back_name,
 		       st.sent_back_reason
-		FROM teaching_courses tc		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		FROM teaching_courses tc
+		JOIN academic_terms trm ON trm.id = tc.term_id
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
 		JOIN ta_request_assignments a
 		    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
@@ -1071,7 +1084,7 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		WHERE tc.id = $1`+filter+`
 		GROUP BY sp.id, sp.label, sp.year_month, sp.due_date, sp.is_closed,
 		         u.id, u.first_name, u.last_name,
-		         tc.id, tc.code, tc.name_th,
+		         tc.id, tc.code, tc.name_th, trm.academic_year,
 		         st.status, st.exported_at, st.exported_by, st.exported_name,
 		         st.finance_sent_at, st.finance_sent_by, st.finance_sent_name, st.finance_note,
 		         st.sent_back_at, st.sent_back_by, st.sent_back_name, st.sent_back_reason
@@ -1096,7 +1109,7 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		}
 		out = append(out, t)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // SweepReminders is called from the scheduler daemon every hour: for each
@@ -1150,6 +1163,9 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 			return 0, err
 		}
 		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
 	}
 	for _, it := range items {
 		body := fmt.Sprintf("โปรดบันทึกเวลาปฏิบัติงาน %s วิชา %s (%s) ให้ครบและส่งให้อาจารย์อนุมัติ กำหนดส่งภายในวันที่ %s",

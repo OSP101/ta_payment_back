@@ -233,6 +233,10 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 			}
 			set[taID] = struct{}{}
 		}
+		if err := taRows.Err(); err != nil {
+			taRows.Close()
+			return nil, err
+		}
 		taRows.Close()
 
 		out.Courses = append(out.Courses, CourseSpendStat{
