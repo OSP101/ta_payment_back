@@ -3,9 +3,12 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -535,6 +538,37 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 			break
 		}
 	}
+	// Lecturers — needed by the course settings page (see ReplaceLecturers) to
+	// show who is currently attributed before offering to change it. Until
+	// 15/09/2026 this field existed on the struct but Get never populated it,
+	// so the settings page had no current list to seed its editor with.
+	lecRows, err := s.pool.Query(ctx,
+		`SELECT u.id, COALESCE(u.first_name,''), COALESCE(u.last_name,''), tl.is_primary
+		   FROM teaching_lecturers tl
+		   JOIN users u ON u.id = tl.lecturer_id
+		  WHERE tl.teaching_course_id = $1
+		  ORDER BY tl.is_primary DESC, u.first_name`, id)
+	if err != nil {
+		return nil, err
+	}
+	for lecRows.Next() {
+		var l struct {
+			ID        uuid.UUID `json:"id"`
+			FirstName string    `json:"first_name"`
+			LastName  string    `json:"last_name"`
+			IsPrimary bool      `json:"is_primary"`
+		}
+		if err := lecRows.Scan(&l.ID, &l.FirstName, &l.LastName, &l.IsPrimary); err != nil {
+			lecRows.Close()
+			return nil, err
+		}
+		tc.Lecturers = append(tc.Lecturers, l)
+	}
+	if err := lecRows.Err(); err != nil {
+		lecRows.Close()
+		return nil, err
+	}
+	lecRows.Close()
 	return tc, nil
 }
 
@@ -906,6 +940,168 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 				WHERE id = $4`, total, regular, special, id)
 			return err
 		})
+}
+
+// ReplaceLecturers sets the course's full lecturer list, replacing whatever
+// was there before (never "add one" / "remove one" — a partial edit can't
+// carry a complete before/after in the audit row, and could silently leave the
+// primary flag on nobody). Staff/admin only, unconditionally: lecturers are
+// attributed at import or at course-open time (see Create and CommitImport)
+// with no edit path afterwards, which was a dead end whenever an import left a
+// course unmatched (§3.3), a lecturer left mid-term, or the wrong name got
+// picked — the only way out used to be deleting the course, which Delete
+// itself refuses once any TA, request or export exists. Added 15/09/2026 for
+// TOR §3.2 ข.3.
+func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid.UUID, lecturerIDs []uuid.UUID, primaryID uuid.UUID) error {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return err
+	}
+	if !priv {
+		return ErrForbidden
+	}
+	if len(lecturerIDs) == 0 {
+		return Invalid("ต้องระบุอาจารย์ผู้สอนอย่างน้อย 1 คน")
+	}
+	seen := map[uuid.UUID]bool{}
+	primaryInList := false
+	for _, id := range lecturerIDs {
+		if seen[id] {
+			return Invalid("ระบุอาจารย์คนเดียวกันซ้ำ")
+		}
+		seen[id] = true
+		if id == primaryID {
+			primaryInList = true
+		}
+	}
+	if !primaryInList {
+		return Invalid("อาจารย์ผู้รับผิดชอบหลักต้องอยู่ในรายชื่อที่เลือก")
+	}
+	// Every id must actually be a lecturer account in good standing — nothing
+	// here should let a stray uuid (or a deactivated account) end up attributed
+	// to a course.
+	var validCount int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM users u
+		  WHERE u.id = ANY($1) AND u.is_active
+		    AND EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role::text = 'lecturer')`,
+		lecturerIDs).Scan(&validCount); err != nil {
+		return err
+	}
+	if validCount != len(lecturerIDs) {
+		return Invalid("รายชื่อมีบัญชีที่ไม่ใช่อาจารย์ที่ใช้งานอยู่ปะปนอยู่")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM teaching_courses WHERE id = $1 FOR UPDATE`, tcID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+
+	before, err := lecturerSnapshot(ctx, tx, tcID)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM teaching_lecturers WHERE teaching_course_id = $1`, tcID); err != nil {
+		return err
+	}
+	for _, id := range lecturerIDs {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO teaching_lecturers (teaching_course_id, lecturer_id, is_primary) VALUES ($1,$2,$3)`,
+			tcID, id, id == primaryID); err != nil {
+			return err
+		}
+	}
+
+	after, err := lecturerSnapshot(ctx, tx, tcID)
+	if err != nil {
+		return err
+	}
+
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "teaching_course.lecturers.replace",
+		Entity: "teaching_course", EntityID: tcID.String(), Before: before, After: after}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	// Notify outside the transaction — best-effort, like every other Send call
+	// in this service: a mail failure must not undo a lecturer reassignment
+	// that already committed.
+	if s.notify != nil {
+		var code, name string
+		_ = s.pool.QueryRow(ctx, `SELECT code, name_th FROM teaching_courses WHERE id = $1`, tcID).
+			Scan(&code, &name)
+		beforeIDs, afterIDs := map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
+		for _, l := range before {
+			beforeIDs[l.ID] = true
+		}
+		for _, l := range after {
+			afterIDs[l.ID] = true
+		}
+		link := "/lecturer/courses/" + tcID.String()
+		for _, l := range after {
+			if !beforeIDs[l.ID] {
+				s.notify.Send(ctx, l.ID, "คุณถูกเพิ่มเป็นอาจารย์ผู้สอน "+code,
+					name+" ("+code+")", link)
+			}
+		}
+		for _, l := range before {
+			if !afterIDs[l.ID] {
+				s.notify.Send(ctx, l.ID, "คุณถูกถอดออกจากอาจารย์ผู้สอน "+code,
+					name+" ("+code+")", "/lecturer")
+			}
+		}
+	}
+	return nil
+}
+
+// lecturerSnapshot reads the current teaching_lecturers roster within tx, for
+// the audit before/after and for computing who to notify.
+func lecturerSnapshot(ctx context.Context, tx pgx.Tx, tcID uuid.UUID) ([]struct {
+	ID        uuid.UUID `json:"id"`
+	FirstName string    `json:"first_name"`
+	LastName  string    `json:"last_name"`
+	IsPrimary bool      `json:"is_primary"`
+}, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT u.id, COALESCE(u.first_name,''), COALESCE(u.last_name,''), tl.is_primary
+		   FROM teaching_lecturers tl
+		   JOIN users u ON u.id = tl.lecturer_id
+		  WHERE tl.teaching_course_id = $1
+		  ORDER BY tl.is_primary DESC, u.first_name`, tcID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []struct {
+		ID        uuid.UUID `json:"id"`
+		FirstName string    `json:"first_name"`
+		LastName  string    `json:"last_name"`
+		IsPrimary bool      `json:"is_primary"`
+	}{}
+	for rows.Next() {
+		var l struct {
+			ID        uuid.UUID `json:"id"`
+			FirstName string    `json:"first_name"`
+			LastName  string    `json:"last_name"`
+			IsPrimary bool      `json:"is_primary"`
+		}
+		if err := rows.Scan(&l.ID, &l.FirstName, &l.LastName, &l.IsPrimary); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
 }
 
 // UpdateSettingsInput overrides the course's own date range, which otherwise
@@ -2012,6 +2208,11 @@ func (s *TeachingService) AddReviewDate(ctx context.Context, actor, sectionID uu
 type ImportResult struct {
 	RowCount   int         `json:"row_count"`
 	CreatedIDs []uuid.UUID `json:"created_ids,omitempty"`
+	// CreatedCodes mirrors CreatedIDs as course codes — added alongside the
+	// schedule_imports history (15/09/2026) for the same reason SkippedCodes/
+	// MergedCodes are codes, not ids: a history screen and an officer reading
+	// it both think in course codes, not uuids.
+	CreatedCodes []string `json:"created_codes,omitempty"`
 	// SkippedCodes carries course codes that were deliberately skipped by the
 	// staff decision or because the course already exists in this term. Not an
 	// error.
@@ -2019,8 +2220,19 @@ type ImportResult struct {
 	// MergedCodes lists codes folded into another course on staff's say-so,
 	// as "SC313302 → CP353301". Neither created nor skipped.
 	MergedCodes []string `json:"merged_codes,omitempty"`
-	ErrorCount  int      `json:"error_count"`
-	Errors      []string `json:"errors,omitempty"`
+	// WarningCount/Warnings are rows this shape is EXPECTED to produce —
+	// courses with no timetable at all (โครงงาน/สหกิจ/วิทยานิพนธ์). The import
+	// still succeeded for these; nothing here needs an officer's attention.
+	// Split out 15/09/2026 (TOR §3.3 ข.4) — before that these were counted as
+	// errors, so a clean import of the real registrar file reported "error 65
+	// รายการ" even though all 127 courses were created.
+	WarningCount int      `json:"warning_count"`
+	Warnings     []string `json:"warnings,omitempty"`
+	// ErrorCount/Errors are genuine problems: a row that should have described
+	// a real class period but couldn't be read, or a course that failed to
+	// commit outright.
+	ErrorCount int      `json:"error_count"`
+	Errors     []string `json:"errors,omitempty"`
 }
 
 type ImportPreviewCourse struct {
@@ -2190,7 +2402,7 @@ func isExamForLab(raw string) bool { return strings.HasPrefix(strings.TrimSpace(
 func pickImportSheet(f *excelize.File) (name string, raw bool, err error) {
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
-		return "", false, errors.New("ไฟล์ไม่มี sheet")
+		return "", false, Invalid("ไฟล์ไม่มี sheet")
 	}
 	headerHas := func(sheet, needle string) bool {
 		rows, e := f.GetRows(sheet)
@@ -2312,21 +2524,39 @@ func curriculumFromReserved(reserved string) string {
 }
 
 // parseNormalizedSheet reads the Excel body and groups its rows into courses.
-// It reports per-row structural warnings via `warnings` — malformed rows are
-// simply skipped so a single bad row cannot lose the entire course.
-func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []string, err error) {
+// It reports structural row problems in two separate lists — see `warnings`
+// vs `errs` below — because until 15/09/2026 (TOR §3.3 ข.4) they were one
+// list shown to staff as "error N รายการ", and a course with genuinely no
+// timetable (โครงงาน/สหกิจ/วิทยานิพนธ์ — every one of them, by nature) counted
+// as an "error" even though the import succeeded outright. Confirmed against
+// the real registrar file (2026-09-14): 127/127 courses imported, 0 rows with
+// an actual data problem, 65 rows that were simply "this course has no
+// periods" — reported as 65 errors before this split.
+//
+//	warnings: a row this shape is EXPECTED to produce (no SessionType, no Time
+//	          — nothing was ever going to be scheduled here).
+//	errs:     a row that WAS supposed to describe a real class period but
+//	          couldn't be read (unknown session-type text, unparseable day or
+//	          time) — worth an officer's attention, unlike the above.
+func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []string, errs []string, err error) {
 	f, err := excelize.OpenReader(bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, err
+		// The handler already rejects a non-.xlsx upload by extension + magic
+		// bytes (see ImportExcel), so reaching here with an OpenReader error
+		// means a file that LOOKS like a zip but isn't a valid .xlsx —
+		// truncated, corrupted, or a same-magic-bytes format under a renamed
+		// extension. Wrapped so the client sees Thai + a reason instead of
+		// excelize's raw Go error text (was "zip: not a valid zip file").
+		return nil, nil, nil, Invalid("เปิดไฟล์ Excel ไม่ได้ ไฟล์อาจเสียหายหรือไม่ใช่ไฟล์ .xlsx ที่ถูกต้อง: " + err.Error())
 	}
 	defer f.Close()
 	sheet, raw, err := pickImportSheet(f)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	rows, err := f.GetRows(sheet)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// Raw registrar export (multi-line cells, header + section rows) is flattened
 	// by parseRawRows into the same []*parsedCourse the Normalized branch builds.
@@ -2334,7 +2564,7 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		return parseRawRows(rows)
 	}
 	if len(rows) < 2 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	// Header row → column index. Keys are lower-cased with spaces collapsed.
 	headers := map[string]int{}
@@ -2423,6 +2653,7 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		}
 
 		kindRaw := strings.ToLower(get(row, "sessiontype"))
+		timeRaw := get(row, "time")
 		var kind string
 		switch kindRaw {
 		case "lec", "lecture":
@@ -2430,18 +2661,25 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		case "lab":
 			kind = "lab"
 		default:
-			warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): ประเภทคาบ '%s' ไม่รู้จัก ข้าม", r+1, code, secNo, kindRaw))
+			if kindRaw == "" && timeRaw == "" {
+				// The expected shape for a course with no periods at all —
+				// โครงงาน/สหกิจศึกษา/วิทยานิพนธ์ always look like this in the
+				// registrar file. Not a data problem.
+				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): ไม่มีตารางเรียน (วิชาโครงงาน/สหกิจ/วิทยานิพนธ์)", r+1, code, secNo))
+			} else {
+				errs = append(errs, fmt.Sprintf("แถว %d (%s SEC %s): ประเภทคาบ '%s' ไม่รู้จัก ข้าม", r+1, code, secNo, kindRaw))
+			}
 			continue
 		}
 
 		dow, dowOK := dowFromAbbrev(get(row, "day"))
 		if !dowOK {
-			warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): วัน '%s' ไม่รู้จัก ข้าม", r+1, code, secNo, get(row, "day")))
+			errs = append(errs, fmt.Sprintf("แถว %d (%s SEC %s): วัน '%s' ไม่รู้จัก ข้าม", r+1, code, secNo, get(row, "day")))
 			continue
 		}
-		start, end, tOK := parseTimeRange(get(row, "time"))
+		start, end, tOK := parseTimeRange(timeRaw)
 		if !tOK {
-			warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): เวลา '%s' อ่านไม่ได้ ข้าม", r+1, code, secNo, get(row, "time")))
+			errs = append(errs, fmt.Sprintf("แถว %d (%s SEC %s): เวลา '%s' อ่านไม่ได้ ข้าม", r+1, code, secNo, timeRaw))
 			continue
 		}
 		room := get(row, "room")
@@ -2463,7 +2701,7 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 	for _, code := range order {
 		courses = append(courses, byCode[code])
 	}
-	return courses, warnings, nil
+	return courses, warnings, errs, nil
 }
 
 // splitLines splits a multi-line Excel cell (Alt+Enter line breaks) into its
@@ -2483,7 +2721,14 @@ func splitLines(s string) []string {
 // A course spans one header row (col A set) followed by its section rows
 // (col E set). The Day (H) and Time (I) cells are multi-line — one line per
 // meeting, aligned by index — so a section can hold several Lec/Lab meetings.
-func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, err error) {
+// parseRawRows never emits a "no schedule" warning of its own: a section with
+// no meeting lines (timeLines empty — the blank "Time" cell of a
+// โครงงาน/สหกิจ course) simply produces zero schedules, silently, which is
+// the correct outcome and needs no message. Both messages below fire only
+// when a meeting line DID exist but couldn't be read, so — unlike the
+// Normalized-sheet branch above — everything this function reports is a
+// genuine error, never routed through `warnings`.
+func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, errs []string, err error) {
 	cell := func(row []string, i int) string {
 		if i >= len(row) {
 			return ""
@@ -2583,12 +2828,12 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 			}
 			dow, dowOK := dowFromAbbrev(dayTok)
 			if !dowOK {
-				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): วัน '%s' ไม่รู้จัก ข้าม", r+1, cur.code, secNo, dayTok))
+				errs = append(errs, fmt.Sprintf("แถว %d (%s SEC %s): วัน '%s' ไม่รู้จัก ข้าม", r+1, cur.code, secNo, dayTok))
 				continue
 			}
 			start, end, tOK := parseTimeRange(fields[0])
 			if !tOK {
-				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): เวลา '%s' อ่านไม่ได้ ข้าม", r+1, cur.code, secNo, fields[0]))
+				errs = append(errs, fmt.Sprintf("แถว %d (%s SEC %s): เวลา '%s' อ่านไม่ได้ ข้าม", r+1, cur.code, secNo, fields[0]))
 				continue
 			}
 			if sec.room == "" {
@@ -2601,7 +2846,7 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 	for _, code := range order {
 		courses = append(courses, byCode[code])
 	}
-	return courses, warnings, nil
+	return courses, warnings, errs, nil
 }
 
 // officerTokens splits the raw Officer cell on whitespace and drops the
@@ -2673,7 +2918,7 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 	if !priv {
 		return nil, ErrForbidden
 	}
-	courses, _, err := parseNormalizedSheet(body)
+	courses, _, _, err := parseNormalizedSheet(body)
 	if err != nil {
 		return nil, err
 	}
@@ -2743,6 +2988,10 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 // the file. Codes listed in skipCodes are ignored, letting staff resolve
 // unmatched-officer rows preview-side.
 func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte, skipCodes []string, merges []ImportMerge) (*ImportResult, error) {
+	started := time.Now()
+	sum := sha256.Sum256(body)
+	fileSHA256 := hex.EncodeToString(sum[:])
+
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
 		return nil, err
@@ -2750,11 +2999,20 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 	if !priv {
 		return nil, ErrForbidden
 	}
-	courses, warnings, err := parseNormalizedSheet(body)
+	courses, warnings, parseErrs, err := parseNormalizedSheet(body)
 	if err != nil {
+		// The whole commit failed before a single row was touched — record
+		// the attempt anyway. Before this, a staff member who uploaded a
+		// corrupt or wrong-format file left NO trace they had tried; the
+		// history screen (GET /teaching-courses/import/history) would show
+		// nothing for what they remember as "I tried to import this today".
+		s.recordFailedImport(ctx, actor, termID, filename, fileSHA256, started, err)
 		return nil, err
 	}
-	res := &ImportResult{Errors: warnings, ErrorCount: len(warnings)}
+	res := &ImportResult{
+		Warnings: warnings, WarningCount: len(warnings),
+		Errors: parseErrs, ErrorCount: len(parseErrs),
+	}
 	skipSet := map[string]struct{}{}
 	for _, c := range skipCodes {
 		if v := strings.ToUpper(strings.TrimSpace(c)); v != "" {
@@ -2800,6 +3058,7 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		}
 		createdByCode[c.code] = id
 		res.CreatedIDs = append(res.CreatedIDs, id)
+		res.CreatedCodes = append(res.CreatedCodes, c.code)
 	}
 	// Second pass: merges, once every primary that comes from the file exists.
 	// A primary already open in the term (or one created by an earlier run)
@@ -2838,23 +3097,189 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		"created_count": len(res.CreatedIDs),
 		"skipped_count": len(res.SkippedCodes),
 		"merged_count":  len(res.MergedCodes),
+		"warning_count": res.WarningCount,
 		"error_count":   res.ErrorCount,
 	}
 	// The import ledger row and its audit entry describe the same run, so they
 	// go in together. The ledger write used to be `_, _ =` — discarded outright,
 	// which meant a failed insert left the import unrecorded and unnoticed.
+	// Columns beyond the original (term_id, file_sha256, the code lists, the
+	// warning/error MESSAGES) were added 15/09/2026 for TOR §3.3 ข.5 — see
+	// migration 0115_schedule_imports_detail; `summary` stays for the audit
+	// trail's own JSON diff and is otherwise superseded by the typed columns.
 	if err := writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "schedule.import", Entity: "term", EntityID: termID.String(), After: summary},
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx,
-				`INSERT INTO schedule_imports (id, imported_by, filename, row_count, error_count, summary, at)
-				 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-				uuid.New(), actor, filename, res.RowCount, res.ErrorCount, summary, time.Now())
+				`INSERT INTO schedule_imports
+				   (id, imported_by, filename, row_count, error_count, summary, at,
+				    term_id, file_sha256, started_at,
+				    created_count, skipped_count, merged_count, warning_count,
+				    created_codes, skipped_codes, merged_codes, warnings, errors)
+				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+				uuid.New(), actor, filename, res.RowCount, res.ErrorCount, summary, time.Now(),
+				termID, fileSHA256, started,
+				len(res.CreatedIDs), len(res.SkippedCodes), len(res.MergedCodes), res.WarningCount,
+				notNilStrs(res.CreatedCodes), notNilStrs(res.SkippedCodes), notNilStrs(res.MergedCodes),
+				notNilStrs(res.Warnings), notNilStrs(res.Errors))
 			return err
 		}); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// recordFailedImport writes a schedule_imports row for a commit that failed
+// before touching a single course — an unreadable/corrupt file, most likely
+// (see parseNormalizedSheet's own Invalid-wrapped errors). Best-effort: this
+// runs after CommitImport has already decided to return failParseErr to the
+// caller, so a logging failure here must not shadow that original error or
+// leave the caller with a plain error where an Invalid/UserError belonged.
+// notNilStrs coalesces a nil []string to a non-nil empty one. pgx encodes a
+// nil Go slice as SQL NULL, not an empty array — which the schedule_imports
+// TEXT[] columns refuse (NOT NULL DEFAULT '{}'). A clean import routinely
+// leaves Warnings/Errors/etc. nil (nothing was ever appended to them), so
+// every code/message list must go through this before reaching the INSERT.
+func notNilStrs(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func (s *TeachingService) recordFailedImport(
+	ctx context.Context, actor, termID uuid.UUID, filename, fileSHA256 string, started time.Time, failParseErr error,
+) {
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO schedule_imports
+		   (id, imported_by, filename, row_count, error_count, at,
+		    term_id, file_sha256, started_at, fatal_error)
+		 VALUES ($1,$2,$3,0,0,$4,$5,$6,$7,$8)`,
+		uuid.New(), actor, filename, time.Now(), termID, fileSHA256, started, failParseErr.Error()); err != nil {
+		log.Printf("schedule_imports: failed to record failed import for term=%s file=%q: %v", termID, filename, err)
+	}
+}
+
+// ScheduleImportSummary is one row of the import history list — enough to
+// recognise a past run (who, when, which file, how it went) without pulling
+// the full message lists. TOR §3.3 ข.5.
+type ScheduleImportSummary struct {
+	ID             uuid.UUID  `json:"id"`
+	TermID         *uuid.UUID `json:"term_id,omitempty"`
+	ImportedBy     *uuid.UUID `json:"imported_by,omitempty"`
+	ImportedByName string     `json:"imported_by_name,omitempty"`
+	Filename       string     `json:"filename"`
+	FileSHA256     *string    `json:"file_sha256,omitempty"`
+	RowCount       int        `json:"row_count"`
+	CreatedCount   int        `json:"created_count"`
+	SkippedCount   int        `json:"skipped_count"`
+	MergedCount    int        `json:"merged_count"`
+	WarningCount   int        `json:"warning_count"`
+	ErrorCount     int        `json:"error_count"`
+	// FatalError is set only when the whole commit failed before any row was
+	// touched (e.g. the file could not be parsed at all) — every count above
+	// is 0 in that case.
+	FatalError *string `json:"fatal_error,omitempty"`
+	StartedAt  *string `json:"started_at,omitempty"`
+	At         string  `json:"at"`
+}
+
+// ScheduleImportDetail adds the actual code lists and messages to one run —
+// fetched separately from the list (ListImportHistory) since these can run
+// to hundreds of lines for a large registrar file.
+type ScheduleImportDetail struct {
+	ScheduleImportSummary
+	CreatedCodes []string `json:"created_codes"`
+	SkippedCodes []string `json:"skipped_codes"`
+	MergedCodes  []string `json:"merged_codes"`
+	Warnings     []string `json:"warnings"`
+	Errors       []string `json:"errors"`
+}
+
+// ListImportHistory returns the most recent registrar-import attempts,
+// newest first. termID filters to one term when set; nil returns across all
+// terms (an admin auditing overall import health, say). Admin/staff only —
+// enforced by the caller (route gate + here, matching the rest of this file's
+// defense-in-depth convention).
+func (s *TeachingService) ListImportHistory(ctx context.Context, actor uuid.UUID, termID *uuid.UUID, limit int) ([]ScheduleImportSummary, error) {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return nil, err
+	}
+	if !priv {
+		return nil, ErrForbidden
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT si.id, si.term_id, si.imported_by,
+		       COALESCE(u.first_name || ' ' || u.last_name, ''),
+		       si.filename, si.file_sha256, si.row_count,
+		       si.created_count, si.skipped_count, si.merged_count, si.warning_count, si.error_count,
+		       si.fatal_error, TO_CHAR(si.started_at,'YYYY-MM-DD"T"HH24:MI:SS'),
+		       TO_CHAR(si.at,'YYYY-MM-DD"T"HH24:MI:SS')
+		  FROM schedule_imports si
+		  LEFT JOIN users u ON u.id = si.imported_by
+		 WHERE ($1::uuid IS NULL OR si.term_id = $1)
+		 ORDER BY si.at DESC
+		 LIMIT $2`, termID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ScheduleImportSummary{}
+	for rows.Next() {
+		var e ScheduleImportSummary
+		var startedAt *string
+		if err := rows.Scan(&e.ID, &e.TermID, &e.ImportedBy, &e.ImportedByName,
+			&e.Filename, &e.FileSHA256, &e.RowCount,
+			&e.CreatedCount, &e.SkippedCount, &e.MergedCount, &e.WarningCount, &e.ErrorCount,
+			&e.FatalError, &startedAt, &e.At); err != nil {
+			return nil, err
+		}
+		e.StartedAt = startedAt
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// GetImportHistoryDetail fetches one import run's full code lists and
+// messages. Admin/staff only, same as ListImportHistory.
+func (s *TeachingService) GetImportHistoryDetail(ctx context.Context, actor, id uuid.UUID) (*ScheduleImportDetail, error) {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return nil, err
+	}
+	if !priv {
+		return nil, ErrForbidden
+	}
+	var d ScheduleImportDetail
+	var startedAt *string
+	err = s.pool.QueryRow(ctx, `
+		SELECT si.id, si.term_id, si.imported_by,
+		       COALESCE(u.first_name || ' ' || u.last_name, ''),
+		       si.filename, si.file_sha256, si.row_count,
+		       si.created_count, si.skipped_count, si.merged_count, si.warning_count, si.error_count,
+		       si.fatal_error, TO_CHAR(si.started_at,'YYYY-MM-DD"T"HH24:MI:SS'),
+		       TO_CHAR(si.at,'YYYY-MM-DD"T"HH24:MI:SS'),
+		       si.created_codes, si.skipped_codes, si.merged_codes, si.warnings, si.errors
+		  FROM schedule_imports si
+		  LEFT JOIN users u ON u.id = si.imported_by
+		 WHERE si.id = $1`, id).Scan(
+		&d.ID, &d.TermID, &d.ImportedBy, &d.ImportedByName,
+		&d.Filename, &d.FileSHA256, &d.RowCount,
+		&d.CreatedCount, &d.SkippedCount, &d.MergedCount, &d.WarningCount, &d.ErrorCount,
+		&d.FatalError, &startedAt, &d.At,
+		&d.CreatedCodes, &d.SkippedCodes, &d.MergedCodes, &d.Warnings, &d.Errors)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	d.StartedAt = startedAt
+	return &d, nil
 }
 
 // errImportSkipped signals commitOneCourse chose not to create the row because

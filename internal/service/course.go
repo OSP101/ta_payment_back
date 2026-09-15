@@ -10,9 +10,13 @@ import (
 	"ta-payment-back/internal/audit"
 )
 
-// CourseService now holds only pay-rate + budget-cap settings. The faculty
-// course catalog was removed — course identity lives per-term on
-// teaching_courses, populated from the imported registrar file.
+// CourseService now holds only pay-rate settings. The faculty course catalog
+// was removed — course identity lives per-term on teaching_courses,
+// populated from the imported registrar file. The manual per-course budget
+// cap (budget_caps) was removed 15/09/2026 (TOR §3.4 ข.4): BudgetService.Compute
+// derives the ceiling from the workload formula and had stopped reading this
+// table entirely, leaving a settings screen and an endpoint that changed a
+// number nothing consulted.
 type CourseService struct {
 	pool *pgxpool.Pool
 	aud  *audit.Auditor
@@ -226,50 +230,6 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 	return &in, nil
 }
 
-type BudgetCap struct {
-	ID            uuid.UUID `json:"id"`
-	EffectiveFrom string    `json:"effective_from" validate:"required"`
-	PerCourseMax  float64   `json:"per_course_max" validate:"gte=0"`
-	Note          *string   `json:"note,omitempty" validate:"omitempty,max=500"`
-}
-
-func (s *CourseService) LatestBudgetCap(ctx context.Context) (*BudgetCap, error) {
-	b := &BudgetCap{}
-	err := s.pool.QueryRow(ctx,
-		`SELECT id, TO_CHAR(effective_from,'YYYY-MM-DD'), per_course_max, note
-		 FROM budget_caps ORDER BY effective_from DESC LIMIT 1`).Scan(&b.ID, &b.EffectiveFrom, &b.PerCourseMax, &b.Note)
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-func (s *CourseService) UpsertBudgetCap(ctx context.Context, actor uuid.UUID, in BudgetCap) (*BudgetCap, error) {
-	if in.PerCourseMax < 0 {
-		return nil, Invalid("จำนวนเงินต้องไม่ติดลบ")
-	}
-	in.ID = uuid.New()
-	prevCap, err := s.latestBudgetCapSnapshot(ctx)
-	if err != nil {
-		return nil, err
-	}
-	capEntry := audit.Entry{ActorID: &actor, Action: "budget_cap.create", Entity: "budget_cap",
-		EntityID: in.ID.String(), After: in}
-	if prevCap != nil {
-		capEntry.Before = prevCap
-	}
-	if err := writeAudited(ctx, s.pool, s.aud, capEntry,
-		func(tx pgx.Tx) error {
-			_, err := tx.Exec(ctx,
-				`INSERT INTO budget_caps (id, effective_from, per_course_max, note) VALUES ($1,$2::date,$3,$4)`,
-				in.ID, in.EffectiveFrom, in.PerCourseMax, in.Note)
-			return err
-		}); err != nil {
-		return nil, err
-	}
-	return &in, nil
-}
-
 // latestPayRateSnapshot returns the rate currently in force, as a plain map, or
 // nil when this is the first one ever set.
 //
@@ -279,8 +239,4 @@ func (s *CourseService) UpsertBudgetCap(ctx context.Context, actor uuid.UUID, in
 // years later when somebody asks what a cap used to be.
 func (s *CourseService) latestPayRateSnapshot(ctx context.Context) (map[string]any, error) {
 	return latestRowSnapshot(ctx, s.pool, "pay_rates")
-}
-
-func (s *CourseService) latestBudgetCapSnapshot(ctx context.Context) (map[string]any, error) {
-	return latestRowSnapshot(ctx, s.pool, "budget_caps")
 }

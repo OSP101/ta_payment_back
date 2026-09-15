@@ -56,9 +56,9 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Audit = &AuditService{pool: pool, store: store}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
+	c.Notify = &NotifyService{pool: pool, mailer: mailer}
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}
 	c.Budget = &BudgetService{pool: pool}
-	c.Notify = &NotifyService{pool: pool, mailer: mailer}
 	c.TARequest = &TARequestService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
 	// A nil scanner is not allowed: antivirus.New returns the Disabled no-op when
 	// CLAMAV_ADDR is unset, so the upload path always has something to ask.
@@ -67,7 +67,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		log.Printf("WARNING: CLAMAV_ADDR is not set — uploaded documents are NOT virus-scanned")
 	}
 	c.AV = av
-	c.Docs = &DocsService{pool: pool, aud: auditor, store: store, av: av, pii: piiCipher}
+	c.Docs = &DocsService{pool: pool, aud: auditor, store: store, av: av, pii: piiCipher, notify: c.Notify}
 	// Workload holds a back-reference to TARequest so saving a TA timetable can
 	// finalise the requests that were waiting for it (deferred-decision model).
 	c.Workload = &WorkloadService{pool: pool, requests: c.TARequest}
@@ -83,11 +83,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.ExportBatches = &ExportBatchService{pool: pool, aud: auditor}
 	c.DocProgress = &DocumentProgressService{pool: pool, aud: auditor, notify: c.Notify, export: c.Export}
 	c.Appointment = &AppointmentOrderService{pool: pool, aud: auditor, fontDir: cfg.FontDir}
-	c.Holiday = &HolidayService{
-		pool: pool, aud: auditor, notify: c.Notify,
-		botAPIBaseURL:  cfg.BotAPIBaseURL,
-		botAPIClientID: cfg.BotAPIClientID,
-	}
+	c.Holiday = &HolidayService{pool: pool, aud: auditor, notify: c.Notify}
 	c.MFA = &MFAService{pool: pool, aud: auditor, totp: totpCipher}
 	c.DataDeletion = &DataDeletionService{
 		pool: pool, aud: auditor, docs: c.Docs, users: c.Users,

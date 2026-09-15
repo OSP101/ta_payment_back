@@ -37,6 +37,13 @@ type DocsService struct {
 	// that never call a citizen-ID path; every such path guards against that
 	// explicitly rather than risk a silent no-op.
 	pii *pii.Cipher
+	// notify tells the TA when a document or their profile is approved or sent
+	// back. Added 15/09/2026 (TOR §3.7 ข.7) — until then a rejection was
+	// silent: the TA only found out by opening /ta/documents on their own,
+	// which routinely left a "ต้องแก้ไข" sitting unseen until the submission
+	// window closed. May be nil in tests that construct DocsService directly
+	// without a NotifyService; every send site guards against that.
+	notify *NotifyService
 
 	// zipTokens holds one-shot download tokens minted after approve-all so
 	// the client can pull the ZIP without re-triggering the approve tx.
@@ -749,16 +756,26 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			return err
 		}
 		defer tx.Rollback(ctx)
-		if _, err := tx.Exec(ctx,
-			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3 WHERE id=$4`,
-			status, reason, actor, docID); err != nil {
+		var rejUserID uuid.UUID
+		var rejKind string
+		if err := tx.QueryRow(ctx,
+			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3
+			 WHERE id=$4 RETURNING user_id, kind`,
+			status, reason, actor, docID).Scan(&rejUserID, &rejKind); err != nil {
 			return err
 		}
 		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
 			EntityID: docID.String(), After: map[string]any{"status": status, "reason": reason}}); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		if s.notify != nil {
+			s.notify.Send(ctx, rejUserID, "เอกสารต้องแก้ไข: "+kindLabel(rejKind),
+				reason, "/ta/documents")
+		}
+		return nil
 	}
 	// Approve. Three things happen together, so they share a transaction: the
 	// document flips, its 7-day retention clock starts, and — if this was the
@@ -776,13 +793,14 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	defer tx.Rollback(ctx)
 
 	var userID uuid.UUID
+	var approvedKind string
 	if err := tx.QueryRow(ctx, `
 		UPDATE ta_documents
 		   SET status='approved', reject_reason=NULL, reviewed_at=NOW(), reviewed_by=$1,
 		       expires_at=NOW() + INTERVAL '7 days'
 		 WHERE id=$2
-		 RETURNING user_id`,
-		actor, docID).Scan(&userID); err != nil {
+		 RETURNING user_id, kind`,
+		actor, docID).Scan(&userID, &approvedKind); err != nil {
 		return err
 	}
 
@@ -806,6 +824,14 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if s.notify != nil {
+		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบ: "+kindLabel(approvedKind),
+			"", "/ta/documents")
+		if profileApproved {
+			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว",
+				"เอกสารครบทั้ง 3 รายการและผ่านการตรวจสอบแล้ว", "/ta/documents")
+		}
 	}
 	return nil
 }
@@ -936,6 +962,13 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if s.notify != nil {
+		if approve {
+			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว", "", "/ta/documents")
+		} else {
+			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวต้องแก้ไข", reason, "/ta/documents")
+		}
 	}
 	return nil
 }

@@ -256,9 +256,8 @@ func provisionProblemCourse(
 // deadlineProblemCourse below — because this event needs a normal, OPEN
 // submission window to actually submit+approve real hours through; the
 // overage it demonstrates comes from an unrealistically tiny enrollment
-// (1 student, so the formula-derived cap — see budget.go's Compute doc
-// comment, "no more manual budget_caps setting" — comes out tiny too), not
-// from a closed period.
+// (1 student, so the formula-derived cap — see budget.go's Compute — comes
+// out tiny too), not from a closed period.
 const budgetProblemCourse = "CP999001"
 
 func problemBudgetOverCap(ctx context.Context, svc *service.Container) (string, error) {

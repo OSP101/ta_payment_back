@@ -58,7 +58,6 @@ var auditSnapshotTables = map[string]bool{
 	"submission_periods":       true,
 	"submission_period_status": true,
 	"pay_rates":                true,
-	"budget_caps":              true,
 	"holidays":                 true,
 	"announcements":            true,
 	"ta_requests":              true,
@@ -197,7 +196,7 @@ func appendNote(existing, add string) string {
 }
 
 // latestRowSnapshot reads the currently-effective row of a versioned table
-// (pay_rates, budget_caps) as a JSON object, or nil when there is none yet.
+// (pay_rates) as a JSON object, or nil when there is none yet.
 //
 // These tables are append-only by design — a change is a NEW row with a later
 // effective_from — so the "before" for one of them is not the same row read

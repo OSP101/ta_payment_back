@@ -127,13 +127,6 @@ func seedSlot(ctx context.Context, svc *service.Container) error {
 	                WHERE NOT EXISTS (SELECT 1 FROM pay_rates)`); err != nil {
 		return fmt.Errorf("seed pay_rates: %w", err)
 	}
-	if _, err := svc.Pool.Exec(ctx,
-		`INSERT INTO budget_caps (id, effective_from, per_course_max, note)
-		 SELECT gen_random_uuid(), CURRENT_DATE, 20000, 'seed default (demo sandbox)'
-		 WHERE NOT EXISTS (SELECT 1 FROM budget_caps)`); err != nil {
-		return fmt.Errorf("seed budget_caps: %w", err)
-	}
-
 	// The scenario engine's appointment-order step (BuildAppointmentOrder)
 	// needs a signer to resolve — see service.loadSignerAuthority, which
 	// reads admin_officers by id. Title matches signer_authority.go's

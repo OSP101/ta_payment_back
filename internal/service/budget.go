@@ -38,7 +38,7 @@ type BudgetSnapshot struct {
 	LabHrs           int     `json:"lab_hrs"`
 	LectureCredits   int     `json:"lecture_credits"`
 	LabCredits       int     `json:"lab_credits"`
-	PerCourseMaxBaht float64 `json:"per_course_max"` // from budget_caps
+	PerCourseMaxBaht float64 `json:"per_course_max"` // derived from the workload formula, not a stored cap — see Compute below
 	// Aggregate (regular + special)
 	WeeklyWorkload float64 `json:"weekly_workload_hours"`
 	MonthlyPay     float64 `json:"monthly_pay_baht"`
@@ -104,7 +104,8 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 		snap.NumStudentsRegular = snap.NumStudents
 	}
 	// per_course_max is derived from the formula (weekly workload × rate × months)
-	// — set below after workload is computed. No more manual budget_caps.
+	// — set below after workload is computed. There is no manual per-course cap
+	// table any more (budget_caps, removed 15/09/2026 — TOR §3.4 ข.4).
 
 	rates := BudgetRates{}
 	if err := s.pool.QueryRow(ctx, `
@@ -160,7 +161,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 		snap.TermPay = snap.MonthlyPay * m
 	}
 	// Per-course budget cap is DERIVED from the formula (weekly workload × rate × months)
-	// — no more manual budget_caps setting. Total term pay across both tracks = the cap.
+	// — no manual override exists any more. Total term pay across both tracks = the cap.
 	snap.PerCourseMaxBaht = snap.TermPay
 
 	// Suggested TAs: informational only. Use aggregate student count.

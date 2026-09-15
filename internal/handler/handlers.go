@@ -291,26 +291,6 @@ func (h *CourseHandler) CreatePayRate(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-func (h *CourseHandler) BudgetCap(c *fiber.Ctx) error {
-	b, err := h.Svc.Courses.LatestBudgetCap(c.Context())
-	if err != nil {
-		return c.JSON(nil)
-	}
-	return c.JSON(b)
-}
-
-func (h *CourseHandler) UpsertBudgetCap(c *fiber.Ctx) error {
-	var in service.BudgetCap
-	if err := Bind(c, &in); err != nil {
-		return err
-	}
-	out, err := h.Svc.Courses.UpsertBudgetCap(c.Context(), UserID(c), in)
-	if err != nil {
-		return err
-	}
-	return c.JSON(out)
-}
-
 // -------------------- Teaching --------------------
 
 type TeachingHandler struct{ Svc *service.Container }
@@ -615,6 +595,24 @@ func (h *TeachingHandler) SetNumStudents(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+func (h *TeachingHandler) ReplaceLecturers(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	body := struct {
+		LecturerIDs []uuid.UUID `json:"lecturer_ids" validate:"required,min=1,dive,required"`
+		PrimaryID   uuid.UUID   `json:"primary_id" validate:"required"`
+	}{}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.ReplaceLecturers(c.Context(), UserID(c), id, body.LecturerIDs, body.PrimaryID); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *TeachingHandler) UpdateSettings(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -860,6 +858,22 @@ func (h *TeachingHandler) ImportExcel(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// Reject anything that isn't actually an .xlsx before it reaches excelize —
+	// added 15/09/2026 (TOR §3.3 ข.3-4). Until then a bad upload (.xls, .csv,
+	// a renamed .txt, a truncated file) surfaced excelize's own error verbatim
+	// — "zip: not a valid zip file" — which is neither Thai nor actionable.
+	// .xlsx IS a zip container, so checking both the extension and the zip
+	// magic bytes catches a wrong-format file before spending any work on it;
+	// a merely CORRUPT .xlsx still reaches the clearer message wrapped around
+	// excelize.OpenReader in parseNormalizedSheet/pickImportSheet.
+	const maxImportBytes = 20 << 20 // 20 MB — registrar files run a few hundred KB
+	if !strings.HasSuffix(strings.ToLower(fh.Filename), ".xlsx") || !bytes.HasPrefix(body, []byte("PK\x03\x04")) {
+		return fiber.NewError(fiber.StatusUnprocessableEntity,
+			"รองรับเฉพาะไฟล์ Excel (.xlsx) จากงานทะเบียนเท่านั้น")
+	}
+	if len(body) > maxImportBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 20 MB")
+	}
 	// Preview path: staff uploads to see per-course preview (new / existing /
 	// missing_catalog / unmatched_officer) without touching the DB.
 	if c.Query("dry_run") == "1" {
@@ -893,6 +907,35 @@ func (h *TeachingHandler) ImportExcel(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(res)
+}
+
+// ImportHistory lists past registrar-import attempts, newest first —
+// TOR §3.3 ข.5. `term_id` narrows to one term; omitted, it lists across all.
+func (h *TeachingHandler) ImportHistory(c *fiber.Ctx) error {
+	termID, err := optUUID(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid term_id")
+	}
+	limit, _ := strconv.Atoi(c.Query("limit", "50"))
+	out, err := h.Svc.Teaching.ListImportHistory(c.Context(), UserID(c), termID, limit)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// ImportHistoryDetail returns one import run's full code lists and warning/
+// error messages, fetched separately from the list since these can run long.
+func (h *TeachingHandler) ImportHistoryDetail(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Teaching.GetImportHistoryDetail(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
 }
 
 // MergeCourseCode folds a second registrar code (with its sections) into an
@@ -3369,36 +3412,6 @@ func (h *HolidayHandler) Delete(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
-// SyncFromBOT pulls national holidays from BOT (Bank of Thailand) Open API.
-// Two invocation modes (?start_year+?end_year takes priority):
-//   - ?year=YYYY                              → single-year, returns SyncFromBOTResult
-//   - ?start_year=YYYY&end_year=YYYY          → range, returns SyncFromBOTRangeResult
-//
-// Requires BOT_API_CLIENT_ID in server env.
-func (h *HolidayHandler) SyncFromBOT(c *fiber.Ctx) error {
-	startS, endS := c.Query("start_year"), c.Query("end_year")
-	if startS != "" || endS != "" {
-		startY, err1 := strconv.Atoi(startS)
-		endY, err2 := strconv.Atoi(endS)
-		if err1 != nil || err2 != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "invalid start_year/end_year")
-		}
-		res, err := h.Svc.Holiday.SyncFromBOTRange(c.Context(), UserID(c), startY, endY)
-		if err != nil {
-			return err
-		}
-		return c.JSON(res)
-	}
-	year, err := strconv.Atoi(c.Query("year"))
-	if err != nil || year < 1900 || year > 3000 {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid year")
-	}
-	res, err := h.Svc.Holiday.SyncFromBOT(c.Context(), UserID(c), year)
-	if err != nil {
-		return err
-	}
-	return c.JSON(res)
-}
 
 // ============================================================================
 // TDBMHandler — the webhook TDBM calls, plus a staff-facing manual trigger
@@ -3407,15 +3420,19 @@ func (h *HolidayHandler) SyncFromBOT(c *fiber.Ctx) error {
 
 type TDBMHandler struct{ Svc *service.Container }
 
-// Webhook is POST /tdbm-webhook — called by TDBM, not a signed-in user (see
-// VerifyTDBMWebhookSecret, the only gate in front of this route). The body is
-// only ever {"event":"...","type":"holidays"|"extra-teachings"} and is purely
-// informational: whatever it says, the response is the same full re-sync of
-// the active term, so a malformed or empty body is not treated as an error —
-// there is nothing in the payload this handler actually branches on.
+// Webhook is POST /tdbm-webhook — called by TDBM, not a signed-in user, and
+// deliberately UNAUTHENTICATED (decided 2026-09-15, reversing an earlier
+// shared-secret design): the body is only ever
+// {"event":"...","type":"holidays"|"extra-teachings"} and is never trusted
+// for anything beyond "something changed, sync now" — whatever it says (or
+// even an empty/malformed body), the response is the same full re-sync of the
+// active term. The worst an unauthenticated caller can do is make us pull
+// TDBM's own public read API one extra time; there is no write this endpoint
+// can be tricked into making on our data, so a secret was judged not worth
+// the operational cost of provisioning and rotating one.
 //
 // Answers immediately; the pull itself runs in the background via
-// TriggerAsync so TDBM's request doesn't sit open for however long three
+// TriggerAsync so TDBM's request doesn't sit open for however long two
 // upstream calls take.
 func (h *TDBMHandler) Webhook(c *fiber.Ctx) error {
 	var body struct {

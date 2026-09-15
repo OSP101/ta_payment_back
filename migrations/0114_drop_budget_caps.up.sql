@@ -1,0 +1,11 @@
+-- 15/09/2026 — remove the dead manual per-course budget cap.
+--
+-- Found during the TOR acceptance review (§3.4 ข.4): budget_caps and its
+-- endpoint (GET/POST /settings/budget-cap) let staff set a per-course ceiling,
+-- but BudgetService.Compute (budget.go) has derived PerCourseMaxBaht from the
+-- workload formula (weekly workload × rate × term months) for a long time —
+-- nothing in the codebase has read this table since. It had become a settings
+-- screen and an endpoint that changed a number nothing consulted, which is
+-- exactly the shape of thing a real acceptance review catches. No frontend
+-- screen ever called the endpoint either (grep confirmed).
+DROP TABLE IF EXISTS budget_caps;

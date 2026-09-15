@@ -161,6 +161,11 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		return nil, err
 	}
 
+	if s.notify != nil {
+		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบแล้ว",
+			"ข้อมูลส่วนตัวและเอกสารทั้ง 3 รายการของคุณผ่านการตรวจสอบแล้ว", "/ta/documents")
+	}
+
 	token, err := s.mintZipToken(actor, userID, ids)
 	if err != nil {
 		// Approve already committed; a mint failure is a soft error the FE
@@ -278,6 +283,11 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if s.notify != nil {
+		s.notify.Send(ctx, userID,
+			fmt.Sprintf("เอกสารต้องแก้ไข %d รายการ", len(items)),
+			summary, "/ta/documents")
 	}
 	return nil
 }

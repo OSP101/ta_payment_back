@@ -122,11 +122,12 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	api.Post("/auth/logout", authH.Logout)
 
 	// TDBM webhook — called by another SYSTEM, not a signed-in user, so it
-	// sits outside the JWT-authed group like the public routes above. Its own
-	// gate is VerifyTDBMWebhookSecret, not a session: see that function's doc
-	// comment and docs/TDBM-API-requirements.md.
+	// sits outside the JWT-authed group like the public routes above. No
+	// shared-secret gate (deliberate — see TDBMHandler.Webhook's doc comment):
+	// the body is never trusted for anything beyond "sync now", so accepting
+	// an unauthenticated ping costs at most one extra pull against TDBM.
 	tdbmH := &TDBMHandler{Svc: svc}
-	api.Post("/tdbm-webhook", VerifyTDBMWebhookSecret(svc.Cfg.TDBMWebhookSecret), tdbmH.Webhook)
+	api.Post("/tdbm-webhook", tdbmH.Webhook)
 
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
@@ -229,13 +230,14 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// service validates the enrollment belongs to UserID(c), not a :id param.
 	authed.Post("/me/enrollment-scope", enrollH.SetSessionScope)
 
-	// Pay-rate & budget-cap settings (admin, staff). The faculty course catalog
-	// was removed — course identity now lives per-term on teaching_courses.
+	// Pay-rate settings (admin, staff). The faculty course catalog was removed
+	// — course identity now lives per-term on teaching_courses. The manual
+	// per-course budget cap (/settings/budget-cap) was removed 15/09/2026
+	// (TOR §3.4 ข.4) — BudgetService.Compute derives the ceiling from the
+	// workload formula and never read it; see CourseService's doc comment.
 	ch := &CourseHandler{Svc: svc}
 	authed.Get("/settings/pay-rate", ch.PayRate)
 	authed.Post("/settings/pay-rate", adminOrStaff, ch.CreatePayRate)
-	authed.Get("/settings/budget-cap", ch.BudgetCap)
-	authed.Post("/settings/budget-cap", adminOrStaff, ch.UpsertBudgetCap)
 
 	// Terms
 	th := &TeachingHandler{Svc: svc}
@@ -281,6 +283,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// which is why the route still admits them.
 	authed.Patch("/teaching-courses/:id/num-students", adminOrStaff, th.SetNumStudents)
 	authed.Patch("/teaching-courses/:id/settings", adminOrStaff, th.UpdateSettings)
+	// Lecturer attribution is set at open/import time only (Create,
+	// CommitImport); this is the only way to correct or change it afterwards —
+	// see ReplaceLecturers. Staff/admin only, same as every other correction to
+	// registrar-sourced course identity.
+	authed.Put("/teaching-courses/:id/lecturers", adminOrStaff, th.ReplaceLecturers)
 	// Course identity — the registrar file arrives with typos, and rebuilding a
 	// course to fix one meant re-entering every section and schedule by hand.
 	authed.Patch("/teaching-courses/:id/info", adminOrStaff, th.UpdateCourseInfo)
@@ -301,7 +308,17 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/teaching-courses/:id/holiday-impacts", th.HolidayImpacts)
 	authed.Post("/teaching-courses/:id/holiday-impacts/:originalDate/remind", RequireRole(rbac.RoleTA), taApproved, th.RemindLecturerAboutMakeup)
 	authed.Post("/teaching-courses/:id/review-date/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddReviewDate)
-	authed.Post("/teaching-courses/import", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.ImportExcel)
+	// Staff/admin only — matches TeachingService.CommitImport/PreviewImport's own
+	// isPrivileged() check. RoleLecturer used to be allowed here too, which the
+	// service silently refused (ErrForbidden) — the route now says what the
+	// service has always enforced: the registrar file is the office's to
+	// import, never the lecturer's (TOR §3.3 ข.1, corrected 15/09/2026).
+	authed.Post("/teaching-courses/import", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), th.ImportExcel)
+	// Import history — TOR §3.3 ข.5. Neither path can collide with
+	// "/teaching-courses/:id" (line above): that route matches exactly one
+	// segment after the prefix, and both of these have two.
+	authed.Get("/teaching-courses/import/history", adminOrStaff, th.ImportHistory)
+	authed.Get("/teaching-courses/import/history/:id", adminOrStaff, th.ImportHistoryDetail)
 	// Budget is management data (course pay-rate/cap usage): restrict to the
 	// same roles that manage teaching courses. A per-course lecturer-ownership
 	// check (only the course's own lecturer) belongs in the service/handler.
@@ -581,19 +598,21 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/teaching-courses/:tcId/submission-timeline", spH.ListByCourse)
 
 	// Public holidays — GET is open to any authenticated user so the TA and
-	// lecturer holidays pages can render; writes are staff/admin only.
+	// lecturer holidays pages can render; writes are staff/admin only. The BOT
+	// (Bank of Thailand) sync that used to seed 'national' rows here was
+	// removed 2026-09-15: TDBM is now the sole source of truth for holidays
+	// (see docs/TDBM-API-requirements.md) — existing BOT-sourced rows are left
+	// in place as historical data, just no longer kept fresh by this route.
 	hh := &HolidayHandler{Svc: svc}
 	authed.Get("/holidays", hh.List)
 	authed.Post("/holidays", adminOrStaff, hh.Create)
 	authed.Post("/holidays/bulk", adminOrStaff, hh.BulkCreate)
-	authed.Post("/holidays/sync-from-bot", adminOrStaff, hh.SyncFromBOT)
 	authed.Patch("/holidays/:id", adminOrStaff, hh.Patch)
 	authed.Delete("/holidays/:id", adminOrStaff, hh.Delete)
 
 	// TDBM sync — manual trigger + history, for staff to confirm the webhook
 	// (registered above, outside this group) and hourly sweep are actually
-	// working. Read-only history open to staff/admin; the trigger itself too,
-	// same tier as sync-from-bot above.
+	// working. Read-only history open to staff/admin; the trigger itself too.
 	authed.Post("/tdbm/sync-now", adminOrStaff, tdbmH.SyncNow)
 	authed.Get("/tdbm/sync-log", adminOrStaff, tdbmH.SyncLog)
 
