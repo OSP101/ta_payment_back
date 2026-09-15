@@ -123,6 +123,11 @@ func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User) error {
 // SSOURL returns the SSO redirect URL for the frontend to send the user to.
 // Stub: real implementation depends on KKU IT integration protocol.
 func (h *AuthHandler) SSOURL(c *fiber.Ctx) error {
+	// Config-derived, not user-specific, but still not safe for a shared
+	// cache to serve stale: SSOEnabled/SSOAuthURL can change between one
+	// request and the next (env update + restart), and a cached "enabled:
+	// false" would lock a browser out of SSO until the cache expired.
+	c.Set("Cache-Control", "no-store")
 	if !h.Svc.Cfg.SSOEnabled {
 		return c.JSON(fiber.Map{"enabled": false})
 	}
