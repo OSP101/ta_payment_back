@@ -173,6 +173,20 @@ func main() {
 		WriteTimeout: 60 * time.Second,
 		BodyLimit:    32 * 1024 * 1024,
 		ErrorHandler: handler.ErrorHandler,
+		// Without this, fasthttp falls back to ReadTimeout (30s) as the
+		// keep-alive idle timeout too (see its idleTimeout()) — too short
+		// against Next.js's rewrite proxy, which pools persistent connections
+		// to this backend and can leave one sitting idle well past 30s
+		// between requests (confirmed live: 244 "Failed to proxy ... Error:
+		// write ECONNRESET" entries in the frontend container's own log,
+		// 2026-09-15 09:38–09:47 UTC, every one of them the backend closing a
+		// pooled connection out from under Next mid-reuse — this is what a
+		// ZAP scan misreported as SQL Injection on two upload endpoints: a
+		// bare "Internal Server Error" from Next's proxy layer, never a
+		// request this process ever saw — its own access log has no trace of
+		// any of the 244). 120s comfortably outlasts the proxy's own pool
+		// idle window, so this backend is never the one racing to close first.
+		IdleTimeout: 120 * time.Second,
 		// See config.TrustedProxyIPs: only a listed peer's X-Forwarded-For is
 		// honoured, so c.IP() resolves to the real browser IP instead of the
 		// Next.js hop's — everyone else's copy of the header is ignored.
