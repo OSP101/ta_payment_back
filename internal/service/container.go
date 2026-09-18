@@ -90,6 +90,11 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		sessions: c.Sessions, notify: c.Notify, store: store,
 	}
 	c.Enrollments = &EnrollmentService{pool: pool, aud: auditor}
-	c.TDBM = &TDBMService{pool: pool, apiBase: cfg.TDBMAPIBaseURL}
+	c.TDBM = &TDBMService{pool: pool, aud: auditor, apiBase: cfg.TDBMAPIBaseURL}
+	// Back-reference, set after both exist (same pattern as WorkLog.export
+	// above): lets a course/section write trigger an immediate re-match
+	// instead of waiting for the next TDBM sync — see TeachingService.tdbm's
+	// doc comment.
+	c.Teaching.tdbm = c.TDBM
 	return c
 }

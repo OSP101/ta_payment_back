@@ -158,6 +158,13 @@ type TeachingService struct {
 	// fontDir carries the Sarabun TTFs the timetable-form PDF needs. Empty
 	// means "no PDF" rather than a broken one — same convention as ExportService.
 	fontDir string
+	// tdbm re-matches TDBM extra-teachings rows against courses/sections
+	// immediately after one changes (see Create, AddSection, CommitImport) —
+	// without this, a course added AFTER TDBM data was already synced sits
+	// unmatched until the next sync sweep (up to an hour away). Wired by
+	// Container after TDBM exists (see container.go); nil-checked at every
+	// call site because tests construct TeachingService without it.
+	tdbm *TDBMService
 }
 
 // Create a teaching course with sections + schedules in one transaction.
@@ -355,6 +362,11 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return uuid.Nil, err
+	}
+	// A course opened in a term that already has TDBM data synced needs an
+	// immediate re-match — see TeachingService.tdbm's doc comment.
+	if s.tdbm != nil {
+		s.tdbm.ResolveMatchesForTermID(ctx, in.TermID)
 	}
 	return id, nil
 }
@@ -1433,6 +1445,11 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return uuid.Nil, err
+	}
+	// A newly added section (e.g. its sec_no/track now matches what TDBM sent
+	// earlier) needs an immediate re-match — see TeachingService.tdbm's doc comment.
+	if s.tdbm != nil {
+		s.tdbm.ResolveMatchesForTeachingCourse(ctx, tcID)
 	}
 	return id, nil
 }
@@ -3125,6 +3142,13 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 			return err
 		}); err != nil {
 		return nil, err
+	}
+	// The registrar import is the normal way courses get added each term —
+	// so it's also the normal way TDBM data ends up unmatched (synced before
+	// this import ran). Re-match now instead of waiting for the next TDBM
+	// sync — see TeachingService.tdbm's doc comment.
+	if s.tdbm != nil {
+		s.tdbm.ResolveMatchesForTermID(ctx, termID)
 	}
 	return res, nil
 }

@@ -2199,6 +2199,62 @@ func (s *WorkLogService) assignmentRate(ctx context.Context, assignmentID uuid.U
 	return rate
 }
 
+// PayRateEstimate is how the current pay rate applies to ONE assignment —
+// enough for the TA-facing UI to turn "X hours this month" into "≈ Y baht"
+// before anything is even submitted, let alone approved. See PayRateFor and
+// its caller, the "ส่งอนุมัติ" confirm dialog on the worklog page.
+//
+// Deliberately NOT what the TA will actually be paid: it ignores whether the
+// course's budget can afford it (a separate, real possibility surfaced
+// elsewhere via /teaching-courses/:id/budget-settlement, which this page
+// already shows as its own unpaid/partial-month banners) and whether a row
+// still needs to clear the lecturer's review. It only answers "hours × rate,
+// with the same monthly/term ceiling the real payout would apply" — the
+// arithmetic a TA can do in their head once they know the rate, done for them.
+type PayRateEstimate struct {
+	Level string `json:"level"`
+	Track string `json:"track"`
+	// True for a graduate TA on ภาคพิเศษ: paid a flat term lumpsum, not by the
+	// hour, so there is no per-month rate to multiply hours by at all.
+	IsLumpsum bool `json:"is_lumpsum"`
+	// Meaningful only when IsLumpsum — RatePerHour is 0 in that case.
+	LumpsumBaht float64 `json:"lumpsum_baht,omitempty"`
+	RatePerHour float64 `json:"rate_per_hour,omitempty"`
+	// >0 only for undergrad ภาคพิเศษ (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000
+	// บาท/เดือน" — whichever the month's hours would exceed). Zero means no
+	// monthly ceiling applies to this assignment's rate.
+	MonthlyCapBaht float64 `json:"monthly_cap_baht,omitempty"`
+}
+
+// PayRateFor resolves the pay rate that applies to one assignment, for the
+// TA who owns it. See PayRateEstimate's doc comment for what this is (and
+// pointedly is not) a rough estimate of.
+func (s *WorkLogService) PayRateFor(ctx context.Context, actor, assignmentID uuid.UUID) (*PayRateEstimate, error) {
+	ac, err := s.assertTAOwnsAssignment(ctx, actor, assignmentID)
+	if err != nil {
+		return nil, err
+	}
+	out := &PayRateEstimate{Level: ac.Level, Track: ac.Track}
+	grad := ac.Level == "master" || ac.Level == "phd"
+	if grad && ac.Track == "special" {
+		out.IsLumpsum = true
+		// Same LEAST(...) the real settlement bills (see budget.go) — the
+		// term cap exists so a course that raised its own lumpsum figure
+		// can't be billed above the college-wide ceiling.
+		_ = s.pool.QueryRow(ctx, `
+			SELECT LEAST(graduate_special_lumpsum, grad_special_term_cap)
+			FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&out.LumpsumBaht)
+		return out, nil
+	}
+	out.RatePerHour = s.assignmentRate(ctx, assignmentID)
+	if !grad && ac.Track == "special" {
+		_ = s.pool.QueryRow(ctx,
+			`SELECT ug_special_monthly_cap FROM pay_rates ORDER BY effective_from DESC LIMIT 1`,
+		).Scan(&out.MonthlyCapBaht)
+	}
+	return out, nil
+}
+
 // enforceWeeklyActivityCap rejects a worklog upsert that would push the TA's
 // weekly total for the same activity past what the lecturer declared in the
 // workload form. Week bounds follow PostgreSQL's date_trunc('week', ...) —

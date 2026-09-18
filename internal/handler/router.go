@@ -406,6 +406,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	wl := &WorkLogHandler{Svc: svc}
 	authed.Post("/assignments/:id/worklog/generate", RequireRole(rbac.RoleTA), taApproved, wl.Generate)
 	authed.Get("/assignments/:id/worklog", wl.List)
+	// TA-only, read-only — the rate this assignment pays, so the "ส่งอนุมัติ"
+	// dialog can show "≈ ฿X" per month before the TA commits. No taApproved
+	// gate: same reasoning as the List route above, this only previews.
+	authed.Get("/assignments/:id/worklog/pay-rate", RequireRole(rbac.RoleTA), wl.PayRate)
 	authed.Put("/assignments/:id/worklog", RequireRole(rbac.RoleTA), taApproved, wl.Upsert)
 	authed.Delete("/assignments/:id/worklog/:logId", RequireRole(rbac.RoleTA), taApproved, wl.Delete)
 	authed.Post("/assignments/:id/worklog/submit", RequireRole(rbac.RoleTA), taApproved, wl.Submit)
@@ -615,6 +619,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// working. Read-only history open to staff/admin; the trigger itself too.
 	authed.Post("/tdbm/sync-now", adminOrStaff, tdbmH.SyncNow)
 	authed.Get("/tdbm/sync-log", adminOrStaff, tdbmH.SyncLog)
+	authed.Get("/tdbm/extra-teachings", adminOrStaff, tdbmH.ExtraTeachings)
 
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}

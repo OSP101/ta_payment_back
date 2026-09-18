@@ -1754,6 +1754,18 @@ func (h *WorkLogHandler) Generate(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+func (h *WorkLogHandler) PayRate(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.WorkLog.PayRateFor(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 func (h *WorkLogHandler) List(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -3464,6 +3476,20 @@ func (h *TDBMHandler) SyncNow(c *fiber.Ctx) error {
 func (h *TDBMHandler) SyncLog(c *fiber.Ctx) error {
 	limit, _ := strconv.Atoi(c.Query("limit", "50"))
 	out, err := h.Svc.TDBM.RecentSyncLog(c.Context(), limit)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// ExtraTeachings lists the raw makeup-teaching submissions TDBM sent for one
+// term, joined with our own match info — the page that actually answers "did
+// the sync really pull real data". ?academic_year & ?semester default to the
+// active term when either is omitted or fails to parse.
+func (h *TDBMHandler) ExtraTeachings(c *fiber.Ctx) error {
+	year, _ := strconv.Atoi(c.Query("academic_year"))
+	semester, _ := strconv.Atoi(c.Query("semester"))
+	out, err := h.Svc.TDBM.ListExtraTeachings(c.Context(), year, semester)
 	if err != nil {
 		return err
 	}
