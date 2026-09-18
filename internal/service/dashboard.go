@@ -223,6 +223,11 @@ type LecturerCourseStatus struct {
 	EstimatedBaht        float64 `json:"estimated_baht"`
 	BudgetMax            float64 `json:"budget_max"`
 	BudgetUsed           float64 `json:"budget_used"`
+	// BudgetUsed split by pool — lets the home-page card's usage bar show
+	// which pool the spend is actually coming from, not just how full the
+	// combined bar is. Straight from BudgetSnapshot, see its own doc comment.
+	BudgetUsedRegular float64 `json:"budget_used_regular"`
+	BudgetUsedSpecial float64 `json:"budget_used_special"`
 }
 
 // LecturerOverview lists every course the lecturer teaches this term with
@@ -318,6 +323,8 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		if snap, err := budget.Compute(ctx, out[i].TeachingCourseID); err == nil {
 			out[i].BudgetMax = snap.PerCourseMaxBaht
 			out[i].BudgetUsed = snap.UsedBaht
+			out[i].BudgetUsedRegular = snap.UsedBahtRegular
+			out[i].BudgetUsedSpecial = snap.UsedBahtSpecial
 		}
 	}
 	return out, nil

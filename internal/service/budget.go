@@ -57,7 +57,14 @@ type BudgetSnapshot struct {
 	} `json:"suggested_tas"`
 	OverBudget    bool    `json:"over_budget"`
 	UsedBaht      float64 `json:"used_baht"`
-	RemainingBaht float64 `json:"remaining_baht"`
+	// UsedBaht split by track — same billing rules as UsedBaht (undergrad
+	// hourly + grad regular hourly + grad special lumpsum), just kept apart
+	// by which pool actually pays each part. Drives the dashboard card's
+	// segmented usage bar (see LecturerOverview) so a lecturer glancing at
+	// the card sees not just "how full" but "full with which pool's money".
+	UsedBahtRegular float64 `json:"used_baht_regular"`
+	UsedBahtSpecial float64 `json:"used_baht_special"`
+	RemainingBaht   float64 `json:"remaining_baht"`
 }
 
 // Compute a budget snapshot using the undergrad formula from the historical
@@ -194,22 +201,23 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	//                 independently per course — a TA on 3 special-track courses gets up
 	//                 to 3 × 4,000, there is no cross-course aggregate cap.
 	_ = s.pool.QueryRow(ctx, `
-        WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
-        SELECT COALESCE(
-            (SELECT COALESCE(SUM(wl.hours * pr.undergrad_regular), 0)
-             FROM work_logs wl
-             JOIN ta_request_assignments a ON a.id = wl.assignment_id
-             JOIN ta_requests r  ON r.id = a.request_id
-             JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'regular'
-             JOIN users u        ON u.id = a.ta_id
-             CROSS JOIN latest pr
-             WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND a.level = 'undergrad')
-          +
-            -- ป.ตรี ภาคพิเศษ: รายชั่วโมงแต่ไม่เกิน ug_special_monthly_cap ต่อคน/เดือน
-            -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") คิดทีละเดือนแล้วรวม
-            (SELECT COALESCE(SUM(LEAST(m.hrs * (SELECT undergrad_special FROM latest),
-                                       (SELECT ug_special_monthly_cap FROM latest))), 0)
-             FROM (
+        WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+        ug_reg AS (
+            SELECT COALESCE(SUM(wl.hours * pr.undergrad_regular), 0) AS baht
+            FROM work_logs wl
+            JOIN ta_request_assignments a ON a.id = wl.assignment_id
+            JOIN ta_requests r  ON r.id = a.request_id
+            JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'regular'
+            JOIN users u        ON u.id = a.ta_id
+            CROSS JOIN latest pr
+            WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND a.level = 'undergrad'
+        ),
+        -- ป.ตรี ภาคพิเศษ: รายชั่วโมงแต่ไม่เกิน ug_special_monthly_cap ต่อคน/เดือน
+        -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") คิดทีละเดือนแล้วรวม
+        ug_sp AS (
+            SELECT COALESCE(SUM(LEAST(m.hrs * (SELECT undergrad_special FROM latest),
+                                       (SELECT ug_special_monthly_cap FROM latest))), 0) AS baht
+            FROM (
                 SELECT a.ta_id, to_char(wl.work_date,'YYYY-MM') AS ym, SUM(wl.hours) AS hrs
                 FROM work_logs wl
                 JOIN ta_request_assignments a ON a.id = wl.assignment_id
@@ -219,29 +227,33 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
                 WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
                   AND a.level = 'undergrad'
                 GROUP BY a.ta_id, to_char(wl.work_date,'YYYY-MM')
-             ) m)
-          +
-            (SELECT COALESCE(SUM(wl.hours * pr.graduate_regular_hourly), 0)
-             FROM work_logs wl
-             JOIN ta_request_assignments a ON a.id = wl.assignment_id
-             JOIN ta_requests r  ON r.id = a.request_id
-             JOIN sections sec   ON sec.id = a.section_id
-             JOIN users u        ON u.id = a.ta_id
-             CROSS JOIN latest pr
-             WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
-               AND a.level IN ('master','phd') AND sec.track = 'regular')
-          +
-            (SELECT COALESCE(SUM(
-                LEAST(pr.graduate_special_lumpsum, pr.grad_special_term_cap)
-             ), 0)
-             FROM ta_request_assignments a
-             JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
-             JOIN sections sec   ON sec.id = a.section_id
-             JOIN users u        ON u.id = a.ta_id
-             CROSS JOIN latest pr
-             WHERE r.teaching_course_id = $1 AND a.level IN ('master','phd')
-               AND sec.track = 'special')
-        , 0)`, tcID).Scan(&snap.UsedBaht)
+            ) m
+        ),
+        grad_reg AS (
+            SELECT COALESCE(SUM(wl.hours * pr.graduate_regular_hourly), 0) AS baht
+            FROM work_logs wl
+            JOIN ta_request_assignments a ON a.id = wl.assignment_id
+            JOIN ta_requests r  ON r.id = a.request_id
+            JOIN sections sec   ON sec.id = a.section_id
+            JOIN users u        ON u.id = a.ta_id
+            CROSS JOIN latest pr
+            WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
+              AND a.level IN ('master','phd') AND sec.track = 'regular'
+        ),
+        grad_sp AS (
+            SELECT COALESCE(SUM(LEAST(pr.graduate_special_lumpsum, pr.grad_special_term_cap)), 0) AS baht
+            FROM ta_request_assignments a
+            JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
+            JOIN sections sec   ON sec.id = a.section_id
+            JOIN users u        ON u.id = a.ta_id
+            CROSS JOIN latest pr
+            WHERE r.teaching_course_id = $1 AND a.level IN ('master','phd')
+              AND sec.track = 'special'
+        )
+        SELECT (SELECT baht FROM ug_reg) + (SELECT baht FROM grad_reg),
+               (SELECT baht FROM ug_sp)  + (SELECT baht FROM grad_sp)`,
+		tcID).Scan(&snap.UsedBahtRegular, &snap.UsedBahtSpecial)
+	snap.UsedBaht = snap.UsedBahtRegular + snap.UsedBahtSpecial
 
 	snap.RemainingBaht = snap.PerCourseMaxBaht - snap.UsedBaht
 	snap.OverBudget = snap.PerCourseMaxBaht > 0 && snap.RemainingBaht < 0

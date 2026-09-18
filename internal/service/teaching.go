@@ -805,6 +805,12 @@ type TAAssignment struct {
 	// HoursLogged counts everything not rejected, matching the term-ceiling
 	// arithmetic the worklog screen already shows.
 	HoursLogged float64 `json:"hours_logged"`
+	// HoursByActivity breaks HoursLogged down by activity (lecture/lab/review/
+	// makeup/other), same status filter — so the worklog screen's progress bar
+	// can be split into coloured segments instead of one solid fill that only
+	// says "how much", never "of what". Zero-valued entries are included (not
+	// omitted) so a caller can safely index it without a nil check.
+	HoursByActivity map[string]float64 `json:"hours_by_activity"`
 }
 
 // ListAssignmentsForTA returns every approved TA-request assignment belonging to
@@ -839,12 +845,25 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	             (SELECT COUNT(*) FROM work_logs wl
 	               WHERE wl.assignment_id = a.id AND wl.status = 'approved'),
 	             (SELECT COALESCE(SUM(wl.hours), 0) FROM work_logs wl
-	               WHERE wl.assignment_id = a.id AND wl.status <> 'rejected')
+	               WHERE wl.assignment_id = a.id AND wl.status <> 'rejected'),
+	             hb.lec, hb.lab, hb.rev, hb.mk, hb.oth
 	      FROM ta_request_assignments a
 	      JOIN sections sec ON sec.id = a.section_id
 	      JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 	      JOIN ta_requests r ON r.id = a.request_id
 	      LEFT JOIN ta_workload_forms wf ON wf.assignment_id = a.id
+	      -- One pass over this assignment's rows for all five activity totals,
+	      -- instead of five separate correlated subqueries each re-scanning
+	      -- work_logs from scratch.
+	      LEFT JOIN LATERAL (
+	          SELECT
+	              COALESCE(SUM(hours) FILTER (WHERE activity = 'lecture'), 0) AS lec,
+	              COALESCE(SUM(hours) FILTER (WHERE activity = 'lab'),     0) AS lab,
+	              COALESCE(SUM(hours) FILTER (WHERE activity = 'review'),  0) AS rev,
+	              COALESCE(SUM(hours) FILTER (WHERE activity = 'makeup'),  0) AS mk,
+	              COALESCE(SUM(hours) FILTER (WHERE activity = 'other'),   0) AS oth
+	          FROM work_logs wl WHERE wl.assignment_id = a.id AND wl.status <> 'rejected'
+	      ) hb ON TRUE
 	      -- 'dropped' means every session of that section clashed with the TA's
 	      -- own timetable, so they are not assisting it at all. Showing it here
 	      -- would offer a work-log target that can never accept an entry.
@@ -863,12 +882,17 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	out := []TAAssignment{}
 	for rows.Next() {
 		var a TAAssignment
+		var hLec, hLab, hRev, hMk, hOth float64
 		if err := rows.Scan(&a.ID, &a.TeachingCourseID, &a.CourseCode, &a.CourseName,
 			&a.SectionID, &a.SecNo, &a.Track, &a.Level, &a.ReimburseScope, &a.HasSchedule,
 			&a.WeeklyCapLecture, &a.WeeklyCapLab, &a.WeeklyCapReview, &a.WeeklyCapOther,
 			&a.WeeklyLectureLabShared, &a.WeeklyCapsSet, &a.State, &a.StateReason,
-			&a.UnsentCount, &a.SubmittableCount, &a.MonthsInReview, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged); err != nil {
+			&a.UnsentCount, &a.SubmittableCount, &a.MonthsInReview, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged,
+			&hLec, &hLab, &hRev, &hMk, &hOth); err != nil {
 			return nil, err
+		}
+		a.HoursByActivity = map[string]float64{
+			"lecture": hLec, "lab": hLab, "review": hRev, "makeup": hMk, "other": hOth,
 		}
 		out = append(out, a)
 	}
