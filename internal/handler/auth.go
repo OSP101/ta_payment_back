@@ -133,7 +133,12 @@ func (h *AuthHandler) SSOURL(c *fiber.Ctx) error {
 	if !h.Svc.SSO.Enabled() {
 		return c.JSON(fiber.Map{"enabled": false})
 	}
-	return c.JSON(fiber.Map{"enabled": true, "url": h.Svc.SSO.LoginURL()})
+	// logout_url is for the login page's "use another KKU account": leaving
+	// the confirm card for /login keeps the KKU session alive, and the next
+	// KKU click signs the same person straight back in. Going through KKU's
+	// logout (which returns to our registered logout callback, /login) is the
+	// only way to actually switch account on a shared machine.
+	return c.JSON(fiber.Map{"enabled": true, "url": h.Svc.SSO.LoginURL(), "logout_url": h.Svc.SSO.LogoutURL()})
 }
 
 type ssoExchangeReq struct {

@@ -205,3 +205,19 @@ func TestSSO_RejectedCodeAndDisabledService(t *testing.T) {
 		t.Errorf("disabled exchange status = %d, want 404", res.StatusCode)
 	}
 }
+
+// The login page needs KKU's logout URL for "use another account" — leaving
+// the confirm card for /login alone keeps the KKU session alive.
+func TestSSO_URLIncludesLogoutURL(t *testing.T) {
+	app, _ := newSSOApp(t, "http://kku.test")
+	res, err := app.Test(httptest.NewRequest("GET", "/auth/sso/url", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	res.Body.Close()
+	if out["enabled"] != true || out["logout_url"] != "http://kku.test/logout?app=app" {
+		t.Fatalf("/auth/sso/url = %v", out)
+	}
+}
