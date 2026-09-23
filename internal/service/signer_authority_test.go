@@ -114,6 +114,13 @@ func TestSignerAuthority_NamesTheSeatWhenNoDeanIsOnTheRoster(t *testing.T) {
 // An inactive dean row still words the seat better than the constant does.
 func TestSignerAuthority_PrefersTheRostersWordingOverTheFallback(t *testing.T) {
 	pool, ids := signerFixture(t, [2]string{"ศรัณย์ อภิชนตระกูล", "รองคณบดีฝ่ายบริหาร"})
+	// Migration 0101 seeds a vacant dean seat worded exactly as the fallback,
+	// and it predates any row inserted here, so it would win the tie on
+	// is_active. Clear the dean seat so this row is the roster's only wording.
+	if _, err := pool.Exec(context.Background(),
+		`DELETE FROM admin_officers WHERE title LIKE $1 || '%'`, deanTitlePrefix); err != nil {
+		t.Fatal(err)
+	}
 	deanID := uuid.New()
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO admin_officers (id, academic_prefix, full_name, title, is_active)
