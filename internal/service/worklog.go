@@ -2480,7 +2480,11 @@ func weekStart(d time.Time) time.Time {
 // class removed right before approval and restored right after still passes),
 // which is why the timetable is now also on the audit trail
 // (ta_class_schedule.replace) and why export must re-check too.
-func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx pgx.Tx, ac *assignmentContext, assignmentID uuid.UUID) error {
+//
+// Scoped to yearMonth with the SAME predicate the approving UPDATE uses: only
+// the rows this approval will move are checked, so a clashing row in another
+// month cannot block approving this one ("" = every month, as for the UPDATE).
+func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx pgx.Tx, ac *assignmentContext, assignmentID uuid.UUID, yearMonth string) error {
 	termID, err := courseTermID(ctx, s.pool, ac.TeachingCourseID)
 	if err != nil {
 		return err
@@ -2493,7 +2497,8 @@ func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx
 		SELECT TO_CHAR(work_date,'YYYY-MM-DD'), TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
 		FROM work_logs
 		WHERE assignment_id = $1 AND status = 'submitted'
-		ORDER BY work_date, start_time`, assignmentID)
+		  AND ($2 = '' OR to_char(work_date, 'YYYY-MM') = $2)
+		ORDER BY work_date, start_time`, assignmentID, yearMonth)
 	if err != nil {
 		return err
 	}
@@ -2524,7 +2529,11 @@ func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx
 // The caps are normally enforced at Upsert time, but staff edits or workload
 // changes between submit and approve can push the totals past them — approval
 // is the last gate before the hours become billable.
-func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, ac *assignmentContext, assignmentID uuid.UUID) error {
+//
+// yearMonth is the month being approved ("" = all). Only the own-class check is
+// scoped by it: the hour caps stay assignment-wide, because a week can straddle
+// two months and filtering by month would let an over-cap week through.
+func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, ac *assignmentContext, assignmentID uuid.UUID, yearMonth string) error {
 	dailyCap := s.dailyHourCapFor(ctx, assignmentID)
 	rows, err := tx.Query(ctx, `
 		SELECT TO_CHAR(work_date,'YYYY-MM-DD')
@@ -2555,7 +2564,7 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 	}
 	// Before the workload-form early return below: the own-class rule applies
 	// whether or not the course filed a workload form.
-	if err := s.recheckOwnClassClashForApproval(ctx, tx, ac, assignmentID); err != nil {
+	if err := s.recheckOwnClassClashForApproval(ctx, tx, ac, assignmentID, yearMonth); err != nil {
 		return err
 	}
 
@@ -3344,7 +3353,7 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 
 	var affected int64
 	for _, id := range ids {
-		if err := s.recheckCapsForApproval(ctx, tx, ctxs[id], id); err != nil {
+		if err := s.recheckCapsForApproval(ctx, tx, ctxs[id], id, yearMonth); err != nil {
 			return err
 		}
 		// Listed BEFORE the update, while the rows still say 'submitted'.
@@ -3450,7 +3459,7 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 
 	// Last-gate cap recheck: staff edits after submit can push a day/week past
 	// its cap; refuse rather than approve hours that violate the pay rules.
-	if err := s.recheckCapsForApproval(ctx, tx, ac, assignmentID); err != nil {
+	if err := s.recheckCapsForApproval(ctx, tx, ac, assignmentID, yearMonth); err != nil {
 		return err
 	}
 

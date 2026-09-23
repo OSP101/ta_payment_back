@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"ta-payment-back/internal/audit"
@@ -170,5 +171,64 @@ func TestApprove_RefusesRowsThatNowClashWithOwnClass(t *testing.T) {
 	err = f.Svc.Approve(f.ctx, f.LecturerID, f.AssignmentID, "", false)
 	if userErrStatus(err) != 409 || !strings.Contains(err.Error(), "ตารางเรียน") {
 		t.Fatalf("approval must refuse a row that now clashes with the TA's class, got %v", err)
+	}
+}
+
+// The approval-time clash recheck covers only the rows the approval moves: a
+// clashing row in ANOTHER month must not block approving this one, while
+// approving that month (or every month) still refuses.
+func TestApprove_ClashRecheckIsScopedToTheApprovedMonth(t *testing.T) {
+	for _, many := range []bool{false, true} {
+		f := newFixture(t, fixtureOpts{})
+		thisDay := day(10)
+		d1, err := timeutil.ParseDate(thisDay)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A day next month on a different weekday, so a class on that weekday
+		// clashes with the next-month row only.
+		next := monthStart().AddDate(0, 1, 9)
+		if next.Weekday() == d1.Weekday() {
+			next = next.AddDate(0, 0, 1)
+		}
+		nextDay := next.Format("2006-01-02")
+		f.mustUpsert(f.entry(thisDay, "09:00", "11:00", 2))
+		f.mustUpsert(f.entry(nextDay, "09:00", "11:00", 2))
+		f.exec(`UPDATE work_logs SET status='submitted' WHERE assignment_id=$1`, f.AssignmentID)
+
+		svc := &WorkloadService{pool: f.Pool, aud: audit.New(f.Pool)}
+		if err := svc.ReplaceClasses(f.ctx, f.TAID, f.TermID, []ClassBlock{
+			{CourseCode: "ZZ000", Kind: "lecture", DayOfWeek: 0, StartTime: "07:00", EndTime: "08:00"},
+			{CourseCode: "CLASH1", Kind: "lecture", DayOfWeek: int(next.Weekday()), StartTime: "09:00", EndTime: "12:00"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		approve := func(ym string) error {
+			if many {
+				return f.Svc.ApproveMany(f.ctx, f.LecturerID, []uuid.UUID{f.AssignmentID}, ym, false)
+			}
+			return f.Svc.Approve(f.ctx, f.LecturerID, f.AssignmentID, ym, false)
+		}
+
+		if err := approve(""); userErrStatus(err) != 409 {
+			t.Fatalf("many=%v: approving every month must refuse the clash, got %v", many, err)
+		}
+		if err := approve(next.Format("2006-01")); userErrStatus(err) != 409 {
+			t.Fatalf("many=%v: approving the clashing month must refuse, got %v", many, err)
+		}
+		if err := approve(thisDay[:7]); err != nil {
+			t.Fatalf("many=%v: a clash next month must not block approving this month: %v", many, err)
+		}
+		var thisStatus, nextStatus string
+		const q = `SELECT status::text FROM work_logs WHERE assignment_id=$1 AND work_date=$2::date`
+		if err := f.Pool.QueryRow(f.ctx, q, f.AssignmentID, thisDay).Scan(&thisStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Pool.QueryRow(f.ctx, q, f.AssignmentID, nextDay).Scan(&nextStatus); err != nil {
+			t.Fatal(err)
+		}
+		if thisStatus != "approved" || nextStatus != "submitted" {
+			t.Errorf("many=%v: statuses this=%s next=%s, want approved/submitted", many, thisStatus, nextStatus)
+		}
 	}
 }
