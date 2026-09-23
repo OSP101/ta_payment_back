@@ -207,6 +207,9 @@ func (s *ExportService) PlanFacts(ctx context.Context, courseID uuid.UUID) (*Pla
 		out.Sections = append(out.Sections, ps)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	allWeeks := map[string]bool{}
 	for i := range out.Sections {
@@ -292,6 +295,9 @@ func (s *ExportService) PlanFacts(ctx context.Context, courseID uuid.UUID) (*Pla
 		}
 	}
 	seat.Close()
+	if err := seat.Err(); err != nil {
+		return nil, err
+	}
 	out.Tracks.Regular.ExistingTAs = len(seatRegular)
 	out.Tracks.Special.ExistingTAs = len(seatSpecial)
 	for _, e := range people {
@@ -335,6 +341,9 @@ func (s *ExportService) walkSection(
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	if len(schs) == 0 {
 		return nil
 	}
@@ -361,6 +370,9 @@ func (s *ExportService) walkSection(
 		}
 	}
 	mk.Close()
+	if err := mk.Err(); err != nil {
+		return err
+	}
 	exam := map[string]bool{}
 	ex, err := s.pool.Query(ctx, `SELECT exam_date FROM exam_schedules WHERE section_id = $1`, ps.SectionID)
 	if err != nil {
@@ -373,6 +385,9 @@ func (s *ExportService) walkSection(
 		}
 	}
 	ex.Close()
+	if err := ex.Err(); err != nil {
+		return err
+	}
 
 	weeks := map[string]bool{}
 	type monthAcc struct {
