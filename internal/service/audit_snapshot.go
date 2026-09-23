@@ -210,13 +210,21 @@ func appendNote(existing, add string) string {
 // These tables are append-only by design — a change is a NEW row with a later
 // effective_from — so the "before" for one of them is not the same row read
 // earlier, it is the row this one supersedes.
+//
+// "Currently effective" means effective_from <= today, the same rule as
+// payRatesInForce. The newest row by date is NOT it once versions can be saved
+// ahead of time: taking that one recorded a scheduled, never-applied version as
+// the rate a change replaced, and left the rate actually in force out of the
+// trail.
 func latestRowSnapshot(ctx context.Context, q querier, table string) (map[string]any, error) {
 	if !auditSnapshotTables[table] {
 		return nil, fmt.Errorf("audit snapshot: %q is not an allowed table", table)
 	}
 	var raw []byte
 	err := q.QueryRow(ctx,
-		`SELECT to_jsonb(t) FROM `+table+` t ORDER BY t.effective_from DESC, t.created_at DESC LIMIT 1`).Scan(&raw)
+		`SELECT to_jsonb(t) FROM `+table+` t
+		  WHERE t.effective_from <= CURRENT_DATE
+		  ORDER BY t.effective_from DESC, t.created_at DESC LIMIT 1`).Scan(&raw)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil

@@ -300,6 +300,15 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 			if prev != nil {
 				e.Before = prev
 			}
+			// A version saved ahead of time replaces nothing today. Say so, or
+			// the trail reads as if the rate changed on the day it was saved.
+			var future bool
+			if err := tx.QueryRow(ctx, `SELECT $1::date > CURRENT_DATE`, in.EffectiveFrom).Scan(&future); err != nil {
+				return err
+			}
+			if future {
+				e.Note = appendNote(e.Note, "ตั้งล่วงหน้า เริ่มใช้ "+in.EffectiveFrom)
+			}
 			_, err = tx.Exec(ctx, `
 		INSERT INTO pay_rates (id, effective_from, undergrad_regular, undergrad_special,
 		    graduate_regular, graduate_special_lumpsum,

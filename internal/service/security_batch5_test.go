@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,5 +390,41 @@ func TestGradLump_RateChangeMidTermKeepsTheFrozenBasis(t *testing.T) {
 	}
 	if got := sumLump(after); got != lump {
 		t.Fatalf("the term lump is the frozen basis %.2f, got %.2f", lump, got)
+	}
+}
+
+// The audit before-image of a new pay rate is the rate IN FORCE, never a
+// version saved ahead of time that has not started yet.
+func TestPayRate_AuditBeforeIsTheRateInForce(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	cs := &CourseService{pool: f.Pool, aud: audit.New(f.Pool)}
+	inForce, err := cs.LatestPayRate(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := cs.UpsertPayRate(f.ctx, f.StaffID, payRateInput(dateOffset(90), 999))
+	if err != nil {
+		t.Fatal(err)
+	}
+	today, err := cs.UpsertPayRate(f.ctx, f.StaffID, payRateInput(dateOffset(0), 45))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAudit := func(id uuid.UUID) (beforeID, note string) {
+		t.Helper()
+		if err := f.Pool.QueryRow(f.ctx, `
+			SELECT COALESCE(before->>'id',''), COALESCE(note,'') FROM audit_logs
+			WHERE action = 'pay_rate.create' AND entity_id = $1`, id.String()).Scan(&beforeID, &note); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if b, note := readAudit(today.ID); b != inForce.ID.String() {
+		t.Fatalf("before = %q, want the rate in force %q (not scheduled %q)", b, inForce.ID, scheduled.ID)
+	} else if strings.Contains(note, "ตั้งล่วงหน้า") {
+		t.Errorf("a version starting today is not scheduled, note = %q", note)
+	}
+	if _, note := readAudit(scheduled.ID); !strings.Contains(note, "ตั้งล่วงหน้า") {
+		t.Errorf("a future version must be noted as scheduled, note = %q", note)
 	}
 }
