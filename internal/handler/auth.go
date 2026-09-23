@@ -114,7 +114,12 @@ func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User, viaSSO bool) er
 		return err
 	}
 	setAuthCookie(c, tok, h.Svc.Cfg.JWTLifetime, h.Svc.Cfg.CookieSecure)
-	setSSOCookie(c, viaSSO, h.Svc.Cfg.JWTLifetime, h.Svc.Cfg.CookieSecure)
+	if h.Svc.Cfg.SSOSingleLogout {
+		// Off (the default) means this browser is never given an SSO cookie
+		// at all — not even an expiring one — so nothing here has to be
+		// cleaned up later.
+		setSSOSessionCookie(c, viaSSO, h.Svc.Cfg.JWTLifetime, h.Svc.Cfg.CookieSecure)
+	}
 	// The token lives only in the HttpOnly cookie — it is deliberately NOT
 	// returned in the body so it can't be stashed in localStorage where XSS
 	// could read it.
@@ -122,8 +127,9 @@ func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User, viaSSO bool) er
 }
 
 // SSOURL tells the login page whether to show the KKU button and where it
-// goes. See service.SSOService for the whole flow; the browser is sent to
-// KKU directly, nothing on our side happens until the callback.
+// goes. "url" is OUR /auth/sso/login, not KKU's: that hop plants the CSRF
+// nonce before redirecting on (see auth_sso_nonce.go). See
+// service.SSOService for the rest of the flow.
 func (h *AuthHandler) SSOURL(c *fiber.Ctx) error {
 	// Config-derived, not user-specific, but still not safe for a shared
 	// cache to serve stale: SSOEnabled can change between one request and
@@ -138,7 +144,11 @@ func (h *AuthHandler) SSOURL(c *fiber.Ctx) error {
 	// KKU click signs the same person straight back in. Going through KKU's
 	// logout (which returns to our registered logout callback, /login) is the
 	// only way to actually switch account on a shared machine.
-	return c.JSON(fiber.Map{"enabled": true, "url": h.Svc.SSO.LoginURL(), "logout_url": h.Svc.SSO.LogoutURL()})
+	return c.JSON(fiber.Map{
+		"enabled":    true,
+		"url":        "/api/v1/auth/sso/login",
+		"logout_url": h.Svc.SSO.LogoutURL(),
+	})
 }
 
 type ssoExchangeReq struct {
@@ -161,6 +171,15 @@ func (h *AuthHandler) SSOExchange(c *fiber.Ctx) error {
 	var in ssoExchangeReq
 	if err := Bind(c, &in); err != nil {
 		return err
+	}
+	// Single use, cleared whatever happens next: one code exchange per
+	// login attempt, so a code cannot be replayed through this browser.
+	nonce := c.Cookies(ssoNonceCookie)
+	setSSONonceCookie(c, "", h.Svc.Cfg.CookieSecure)
+	if !validSSONonce(h.Svc.Cfg.JWTSecret, nonce, time.Now()) {
+		// Never reaches KKU's /auth.token. See auth_sso_nonce.go for what
+		// this is standing in for.
+		return fiber.NewError(fiber.StatusUnauthorized, ssoRejectedMsg)
 	}
 	p, err := h.Svc.SSO.Exchange(c.Context(), in.Code, c.IP(), c.Get("User-Agent"))
 	if err != nil {
@@ -213,12 +232,15 @@ func (h *AuthHandler) SSOConfirm(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
-		// Carry "this login came through KKU" across the 2FA round trip so
-		// the eventual session is marked for Logout — see ssoPendingCookie.
-		c.Cookie(&fiber.Cookie{
-			Name: ssoPendingCookie, Value: "1", HTTPOnly: true, SameSite: "Lax",
-			Secure: h.Svc.Cfg.CookieSecure, Path: "/", Expires: time.Now().Add(service.MFAChallengeTTL),
-		})
+		if h.Svc.Cfg.SSOSingleLogout {
+			// Carry "this login came through KKU" across the 2FA round trip;
+			// mfa_challenges has no column for it. Read back by
+			// LoginTwoFactor, cleared by setSSOSessionCookie either way.
+			c.Cookie(&fiber.Cookie{
+				Name: ssoPendingCookie, Value: "1", HTTPOnly: true, SameSite: "Lax",
+				Secure: h.Svc.Cfg.CookieSecure, Path: "/", Expires: time.Now().Add(service.MFAChallengeTTL),
+			})
+		}
 		return c.JSON(fiber.Map{"mfa_required": true, "challenge": challenge})
 	}
 	return h.finishLogin(c, u, true)
@@ -239,14 +261,24 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 		}
 	}
 	clearAuthCookie(c, h.Svc.Cfg.CookieSecure)
-	// A session that came in through KKU should go out through KKU too —
-	// see ssonext.Client.LogoutURL for the shared-machine reason. The
-	// frontend navigates there instead of to /login; KKU then sends the
-	// browser back to our registered logout callback.
-	viaSSO := c.Cookies(ssoSessionCookie) == "1"
-	setSSOCookie(c, false, 0, h.Svc.Cfg.CookieSecure)
-	if viaSSO && h.Svc.SSO.Enabled() {
-		return c.JSON(fiber.Map{"ok": true, "sso_logout_url": h.Svc.SSO.LogoutURL()})
+	// Local-only by default, INCLUDING for a session that came in through
+	// KKU: SSONext's /logout ends the KKU session itself, which signs the
+	// person out of every KKU system they have open — e-learning, REG, mail
+	// — for the sake of leaving this one. That is the user's call to make,
+	// not a side effect of clicking "ออกจากระบบ" here. So this revokes our
+	// session row, clears our cookie, and the frontend goes to /login.
+	//
+	// KKU_SSO_SINGLE_LOGOUT=true opts a deployment into the other trade-off
+	// (see Config.SSOSingleLogout); only then is the marker cookie ever
+	// written, and only a session that actually came through KKU carries it.
+	// Switching account from the confirm card ends the KKU session either
+	// way — there it is the point, not a side effect.
+	if h.Svc.Cfg.SSOSingleLogout {
+		viaSSO := c.Cookies(ssoSessionCookie) == "1"
+		setSSOSessionCookie(c, false, 0, h.Svc.Cfg.CookieSecure)
+		if viaSSO && h.Svc.SSO.Enabled() {
+			return c.JSON(fiber.Map{"ok": true, "sso_logout_url": h.Svc.SSO.LogoutURL()})
+		}
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -346,19 +378,22 @@ func setAuthCookie(c *fiber.Ctx, token string, ttl time.Duration, secure bool) {
 	})
 }
 
-// ssoSessionCookie marks a session as having been opened through KKU SSO so
-// Logout knows to end the KKU-side session too. ssoPendingCookie is the
-// same idea for the gap between SSOConfirm returning mfa_required and
-// LoginTwoFactor finishing — the mfa_challenges row has no column for it.
-// Neither is secret (a yes/no about the login method) and neither is
+// ssoSessionCookie marks a session as having been opened through KKU SSO, so
+// Logout knows whether ending the KKU session is on the table.
+// ssoPendingCookie bridges the gap between SSOConfirm answering mfa_required
+// and LoginTwoFactor finishing. BOTH are written only when
+// KKU_SSO_SINGLE_LOGOUT is on — with the default off, no SSO cookie is ever
+// set. Neither is secret (a yes/no about the login method) and neither is
 // trusted for anything security-relevant: the worst a forged one does is
-// send the browser to KKU's logout page.
+// send that browser to KKU's logout page.
 const (
 	ssoSessionCookie = "sso_session"
 	ssoPendingCookie = "sso_pending"
 )
 
-func setSSOCookie(c *fiber.Ctx, on bool, ttl time.Duration, secure bool) {
+// setSSOSessionCookie writes (or expires) the marker and always expires the
+// pending bridge — by the time a session exists, the bridge has done its job.
+func setSSOSessionCookie(c *fiber.Ctx, on bool, ttl time.Duration, secure bool) {
 	val, exp := "", time.Now().Add(-time.Hour)
 	if on {
 		val, exp = "1", time.Now().Add(ttl)
@@ -366,7 +401,6 @@ func setSSOCookie(c *fiber.Ctx, on bool, ttl time.Duration, secure bool) {
 	c.Cookie(&fiber.Cookie{
 		Name: ssoSessionCookie, Value: val, HTTPOnly: true, SameSite: "Lax", Secure: secure, Path: "/", Expires: exp,
 	})
-	// The pending marker is done either way once a session exists.
 	c.Cookie(&fiber.Cookie{
 		Name: ssoPendingCookie, Value: "", HTTPOnly: true, SameSite: "Lax", Secure: secure, Path: "/", Expires: time.Now().Add(-time.Hour),
 	})

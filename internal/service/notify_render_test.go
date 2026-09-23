@@ -97,16 +97,18 @@ func TestRenderMailHTML_Layout(t *testing.T) {
 	}
 }
 
-// The copyright line follows the site footer's wording, with the Thai year.
+// The copyright line follows the site footer's wording, English only.
 func TestMailCopyright(t *testing.T) {
 	defer func(f func() time.Time) { mailNow = f }(mailNow)
 	mailNow = func() time.Time { return time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC) }
 	m := mailContent{Title: "t", Body: "b", Recipient: "คุณก ข", Closing: closingInform}
-	th := "© 2569 วิทยาลัยการคอมพิวเตอร์ มหาวิทยาลัยขอนแก่น สงวนลิขสิทธิ์"
 	en := "© 2026 College of Computing, Khon Kaen University. All rights reserved."
 	for name, out := range map[string]string{"html": renderMailHTML(m), "text": renderMailText(m)} {
-		if !strings.Contains(out, th) || !strings.Contains(out, en) {
-			t.Errorf("%s missing the copyright lines", name)
+		if !strings.Contains(out, en) {
+			t.Errorf("%s missing the copyright line", name)
+		}
+		if strings.Contains(out, "สงวนลิขสิทธิ์") {
+			t.Errorf("%s still has the Thai copyright line", name)
 		}
 	}
 }

@@ -33,6 +33,14 @@ func fakeAPI(t *testing.T) (*httptest.Server, *map[string]string) {
 		_, _ = w.Write([]byte(`{"ok":true,"accessToken":"tok-1","email":" Somchai.J@KKUMAIL.COM ",
 			"immutableId":"imm-1","citizenId":"1234567890123","firstName":"สมชาย","lastName":"ใจดี","employeeId":""}`))
 	})
+	mux.HandleFunc("/auth.status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok-1" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"user":{"sessionId":"sess-1","email":"Somchai.J@KKUMAIL.COM","role":"STUDENT"}}`))
+	})
 	mux.HandleFunc("/user.profile", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok-1" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -125,3 +133,23 @@ func TestLoginAndLogoutURLs(t *testing.T) {
 }
 
 func containsBytes(b []byte, s string) bool { return bytes.Contains(b, []byte(s)) }
+
+func TestStatus(t *testing.T) {
+	srv, _ := fakeAPI(t)
+	defer srv.Close()
+	c := &Client{APIBase: srv.URL}
+
+	sess, err := c.Status(context.Background(), "tok-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.SessionID != "sess-1" || sess.Role != "STUDENT" {
+		t.Errorf("session = %+v", sess)
+	}
+	if sess.Email != "somchai.j@kkumail.com" {
+		t.Errorf("email not normalised: %q", sess.Email)
+	}
+	if _, err := c.Status(context.Background(), "wrong"); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("bad token err = %v, want ErrUnauthorized", err)
+	}
+}

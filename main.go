@@ -350,6 +350,13 @@ func main() {
 		}
 	}()
 	log.Printf("TA Payment API listening on :%s", cfg.Port)
+	// Said once at startup because "no KKU button on /login" otherwise
+	// needs a curl to /auth/sso/url to tell a missing credential from a bug.
+	if cfg.SSOEnabled {
+		log.Printf("sso: enabled — login %s, callback %s", services.SSO.LoginURL(), cfg.SSORedirect)
+	} else {
+		log.Printf("sso: disabled — KKU_SSO_APP_ID, KKU_SSO_CLIENT_ID and KKU_SSO_CLIENT_SECRET must all be set")
+	}
 
 	// Background sweep for scheduled-but-not-yet-fanned-out announcements.
 	// Lazy fanout on GET /announcements handles the common case; this loop

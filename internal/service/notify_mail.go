@@ -48,11 +48,9 @@ var mailNow = time.Now
 
 // mailCopyright is the line under the footer, worded as the site's own
 // footer is ("© 2026 College of Computing, Khon Kaen University", see
-// ta_payment_front app/login/LoginForm.tsx), with a Thai line above it.
-func mailCopyright() (th, en string) {
-	y := mailNow().In(timeutil.Bangkok).Year()
-	return "© " + strconv.Itoa(y+543) + " " + mailCollegeName + " สงวนลิขสิทธิ์",
-		"© " + strconv.Itoa(y) + " " + mailUnitEN + ". All rights reserved."
+// ta_payment_front app/login/LoginForm.tsx). English only, by request.
+func mailCopyright() string {
+	return "© " + strconv.Itoa(mailNow().In(timeutil.Bangkok).Year()) + " " + mailUnitEN + ". All rights reserved."
 }
 
 // MailFact is one "label : value" line.
@@ -282,9 +280,8 @@ func renderMailHTML(m mailContent) string {
 	b.WriteString(`</td></tr>`)
 
 	// Copyright, outside the card.
-	th, en := mailCopyright()
 	b.WriteString(`<tr><td align="center" style="padding:18px 30px 0;font-size:12px;line-height:1.7;color:#9ca3af">` +
-		mailEsc(th) + `<br>` + mailEsc(en) + `</td></tr>`)
+		mailEsc(mailCopyright()) + `</td></tr>`)
 
 	b.WriteString(`</table></td></tr></table></body></html>`)
 	return b.String()
@@ -337,7 +334,6 @@ func renderMailText(m mailContent) string {
 		b.WriteString(c.Detail + "\n")
 	}
 	b.WriteString(mailAutoNotice + "\n\n")
-	th, en := mailCopyright()
-	b.WriteString(th + "\n" + en + "\n")
+	b.WriteString(mailCopyright() + "\n")
 	return b.String()
 }

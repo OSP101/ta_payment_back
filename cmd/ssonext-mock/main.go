@@ -5,8 +5,8 @@
 // whatever address is typed is who KKU says you are. Point the backend at
 // it with
 //
-//	SSO_APP_ID=mock SSO_CLIENT_ID=mock SSO_CLIENT_SECRET=mock
-//	SSO_LOGIN_BASE=http://localhost:8099 SSO_API_BASE=http://localhost:8099
+//	KKU_SSO_APP_ID=mock KKU_SSO_CLIENT_ID=mock KKU_SSO_CLIENT_SECRET=mock
+//	KKU_SSO_WEB_BASE_URL=http://localhost:8099 KKU_SSO_API_BASE_URL=http://localhost:8099
 //
 // and run `go run ./cmd/ssonext-mock`. Deliberately not wired into the real
 // server binary: nothing here must ever be reachable in a deployment.

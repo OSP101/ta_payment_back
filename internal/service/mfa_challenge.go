@@ -17,8 +17,10 @@ import (
 // mfaChallengeTTL/mfaChallengeMaxAttempts bound the "you got the password
 // right, now prove the second factor" ticket issued by step 1 of login.
 const (
-	mfaChallengeTTL          = 5 * time.Minute
-	MFAChallengeTTL          = mfaChallengeTTL // exported for the SSO handler's pending cookie
+	mfaChallengeTTL = 5 * time.Minute
+	// MFAChallengeTTL is the same value for the handler's SSO bridge cookie,
+	// which must not outlive the challenge it is paired with.
+	MFAChallengeTTL          = mfaChallengeTTL
 	mfaChallengeMaxAttempts  = 5
 	mfaChallengeTokenSizeRaw = 32 // bytes of randomness before base64 encoding
 )

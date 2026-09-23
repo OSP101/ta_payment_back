@@ -47,6 +47,14 @@ const (
 	DefaultAPIBase   = "https://ssonext-api.kku.ac.th"
 )
 
+// KKU's UAT (test) pair. A newly registered app is issued UAT credentials
+// first and only gets production ones after passing there; UAT credentials
+// do not work against the production hosts, nor the reverse.
+const (
+	UATLoginBase = "https://sso-uat-web.kku.ac.th"
+	UATAPIBase   = "https://sso-uat-api.kku.ac.th"
+)
+
 // maxBody caps what we are willing to read from the identity service — the
 // real responses are a few hundred bytes.
 const maxBody = 64 << 10
@@ -91,6 +99,14 @@ type Identity struct {
 	FirstName   string `json:"firstName"`
 	LastName    string `json:"lastName"`
 	EmployeeID  string `json:"employeeId"`
+}
+
+// Session is what /auth.status returns: KKU's own session id for this
+// token, plus who it belongs to.
+type Session struct {
+	SessionID string `json:"sessionId"`
+	Email     string `json:"email"`
+	Role      string `json:"role"`
 }
 
 // Profile is the subset of /user.profile we have a use for. phoneNumber and
@@ -199,42 +215,73 @@ func (c *Client) Exchange(ctx context.Context, code string) (*Identity, error) {
 	return &out.Identity, nil
 }
 
+// Status is the manual's third REST service, POST /auth.status: it answers
+// whether an access token from Exchange still corresponds to a live KKU
+// session. Unused by the login flow itself (which is finished with the
+// token by the time it has matched an account) and kept for the same reason
+// as Profile — the package covers the documented protocol, so a caller that
+// needs to re-check a KKU session does not have to re-derive the wire
+// format. Like Profile it answers a real 401, not ok:false.
+func (c *Client) Status(ctx context.Context, accessToken string) (*Session, error) {
+	var out struct {
+		OK   bool    `json:"ok"`
+		User Session `json:"user"`
+	}
+	if err := c.postBearer(ctx, "/auth.status", accessToken, &out); err != nil {
+		return nil, err
+	}
+	if !out.OK {
+		return nil, ErrUnauthorized
+	}
+	out.User.Email = strings.ToLower(strings.TrimSpace(out.User.Email))
+	return &out.User, nil
+}
+
 // Profile fetches the extended record for an access token from Exchange.
 // The login flow does not need it (Exchange already returns the email we
 // match on); it exists for the follow-up of enriching a matched account
 // with faculty / level / person type.
 func (c *Client) Profile(ctx context.Context, accessToken string) (*Profile, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiBase()+"/user.profile", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-	res, err := c.http().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("ssonext: user.profile: %w", err)
-	}
-	defer res.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, maxBody))
-	if err != nil {
-		return nil, fmt.Errorf("ssonext: user.profile: %w", err)
-	}
-	if res.StatusCode == http.StatusUnauthorized {
-		return nil, ErrUnauthorized
-	}
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ssonext: user.profile: HTTP %d", res.StatusCode)
-	}
 	var out struct {
 		OK      bool    `json:"ok"`
 		Profile Profile `json:"profile"`
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("ssonext: user.profile: bad JSON: %w", err)
+	if err := c.postBearer(ctx, "/user.profile", accessToken, &out); err != nil {
+		return nil, err
 	}
 	if !out.OK {
 		return nil, ErrUnauthorized
 	}
 	out.Profile.Email = strings.ToLower(strings.TrimSpace(out.Profile.Email))
 	return &out.Profile, nil
+}
+
+// postBearer is the shape both token-authenticated endpoints share: empty
+// POST body, Bearer header, a real 401 when the token is no longer good.
+func (c *Client) postBearer(ctx context.Context, path, accessToken string, dst any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiBase()+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	res, err := c.http().Do(req)
+	if err != nil {
+		return fmt.Errorf("ssonext: %s: %w", path, err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(res.Body, maxBody))
+	if err != nil {
+		return fmt.Errorf("ssonext: %s: %w", path, err)
+	}
+	if res.StatusCode == http.StatusUnauthorized {
+		return ErrUnauthorized
+	}
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("ssonext: %s: HTTP %d", path, res.StatusCode)
+	}
+	if err := json.Unmarshal(raw, dst); err != nil {
+		return fmt.Errorf("ssonext: %s: bad JSON: %w", path, err)
+	}
+	return nil
 }

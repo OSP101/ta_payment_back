@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"ta-payment-back/internal/ssonext"
 )
 
 // LoadDotEnv reads a KEY=VALUE file and populates os.Environ for keys not
@@ -90,15 +92,32 @@ type Config struct {
 	// the three arrive together from สำนักเทคโนโลยีดิจิทัล once the app is
 	// registered. SSORedirect must equal the login callback registered with
 	// them byte for byte (it is echoed on the token exchange), defaulting to
-	// AppBaseURL + "/login/sso". SSOLoginBase/SSOAPIBase exist so a dev
-	// machine can point at cmd/ssonext-mock instead of the real service.
-	SSOEnabled           bool
-	SSOAppID             string
-	SSOClientID          string
-	SSOSecret            string
-	SSORedirect          string
-	SSOLoginBase         string
-	SSOAPIBase           string
+	// AppBaseURL + "/login/sso". KKU_SSO_ENV picks KKU's host pair: "prod"
+	// (default) or "uat", where a new app's first credentials work.
+	// SSOLoginBase/SSOAPIBase override either host outright, which is how a
+	// dev machine points at cmd/ssonext-mock instead of the real service.
+	SSOEnabled   bool
+	SSOAppID     string
+	SSOClientID  string
+	SSOSecret    string
+	SSORedirect  string
+	SSOLoginBase string
+	SSOAPIBase   string
+	// SSOLogoutRedirect is the logout callback registered with KKU — where
+	// KKU sends the browser after ITS /logout. Nothing in this process calls
+	// it (KKU holds the registered copy); it lives here so the deployment
+	// records what was registered, and so the two URLs that must be filed
+	// with สำนักฯ sit next to each other.
+	SSOLogoutRedirect string
+	// SSOSingleLogout: whether "ออกจากระบบ" here should also end the KKU
+	// session. Default FALSE, deliberately — SSONext's logout is global, so
+	// leaving this app would sign the person out of e-learning, REG and mail
+	// as well. Turning it on suits a deployment on shared lab machines,
+	// where the next person sitting down inheriting a live KKU session is
+	// the bigger risk. Switching account from the confirm card
+	// ("ใช้บัญชี KKU อื่น") ends the KKU session either way — there it is
+	// the point, not a side effect.
+	SSOSingleLogout      bool
 	CreditorTemplatePath string
 	FontDir              string
 	// TADocsEncKey is a 32-byte AES-256 key (base64) used to encrypt TA
@@ -216,12 +235,13 @@ func Load() (Config, error) {
 		SMTPPass:             env("SMTP_PASS", ""),
 		MailFrom:             env("MAIL_FROM", "no-reply@coco.kku.ac.th"),
 		AppBaseURL:           env("APP_BASE_URL", "http://localhost:3000"),
-		SSOAppID:             env("SSO_APP_ID", ""),
-		SSOClientID:          env("SSO_CLIENT_ID", ""),
-		SSOSecret:            env("SSO_CLIENT_SECRET", ""),
-		SSORedirect:          env("SSO_REDIRECT", ""),
-		SSOLoginBase:         env("SSO_LOGIN_BASE", ""),
-		SSOAPIBase:           env("SSO_API_BASE", ""),
+		SSOAppID:             env("KKU_SSO_APP_ID", ""),
+		SSOClientID:          env("KKU_SSO_CLIENT_ID", ""),
+		SSOSecret:            env("KKU_SSO_CLIENT_SECRET", ""),
+		SSORedirect:          env("KKU_SSO_REDIRECT_URL", ""),
+		SSOLogoutRedirect:    env("KKU_SSO_LOGOUT_REDIRECT_URL", ""),
+		SSOLoginBase:         env("KKU_SSO_WEB_BASE_URL", ""),
+		SSOAPIBase:           env("KKU_SSO_API_BASE_URL", ""),
 		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.pdf"),
 		FontDir:              env("FONT_DIR", "./assets/fonts"),
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
@@ -248,9 +268,40 @@ func Load() (Config, error) {
 		// DatabaseURL.
 		c.DemoDatabaseURL = deriveDemoDatabaseURL(c.DatabaseURL)
 	}
+	// สำนักฯ issues some apps the same value for both — the cocolabs
+	// registration is one — so an unset App ID means "same as Client ID"
+	// rather than a misconfiguration. Same rule as the sibling KKU app
+	// (OSP101/itii-assist-classroom-back, services/kku_sso.go).
+	if c.SSOAppID == "" {
+		c.SSOAppID = c.SSOClientID
+	}
 	c.SSOEnabled = c.SSOAppID != "" && c.SSOClientID != "" && c.SSOSecret != ""
+	c.SSOSingleLogout = envBool("KKU_SSO_SINGLE_LOGOUT", false)
+	switch ssoEnv := strings.ToLower(strings.TrimSpace(env("KKU_SSO_ENV", "prod"))); ssoEnv {
+	case "prod":
+		// Empty bases fall through to ssonext's production defaults.
+	case "uat":
+		if c.SSOLoginBase == "" {
+			c.SSOLoginBase = ssonext.UATLoginBase
+		}
+		if c.SSOAPIBase == "" {
+			c.SSOAPIBase = ssonext.UATAPIBase
+		}
+	default:
+		// A typo must not quietly send UAT credentials to production (or the
+		// reverse) and surface only as every KKU login failing.
+		return c, fmt.Errorf("KKU_SSO_ENV must be prod or uat, got %q", ssoEnv)
+	}
+	// APP_BASE_URL may carry several origins (it doubles as the allowed-origin
+	// list for notification links, e.g. a LAN address next to the public one).
+	// Only the first can be the registered SSO callback, and pasting the whole
+	// list into redirectUrl would be rejected by KKU as AUTH0001 with nothing
+	// pointing at the cause.
 	if c.SSORedirect == "" {
-		c.SSORedirect = strings.TrimRight(c.AppBaseURL, "/") + "/login/sso"
+		c.SSORedirect = primaryBaseURL(c.AppBaseURL) + "/login/sso"
+	}
+	if c.SSOLogoutRedirect == "" {
+		c.SSOLogoutRedirect = primaryBaseURL(c.AppBaseURL) + "/login"
 	}
 	c.JWTLifetime = envDuration("JWT_LIFETIME", 12*time.Hour)
 	c.SMTPPort = envInt("SMTP_PORT", 587)
@@ -290,6 +341,13 @@ func envInt(k string, def int) int {
 		}
 	}
 	return def
+}
+
+// primaryBaseURL is the first origin in APP_BASE_URL, without its trailing
+// slash — the one a browser is actually sent to.
+func primaryBaseURL(raw string) string {
+	first, _, _ := strings.Cut(raw, ",")
+	return strings.TrimRight(strings.TrimSpace(first), "/")
 }
 
 func envBool(k string, def bool) bool {

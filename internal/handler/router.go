@@ -103,6 +103,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// comment.
 	api.Post("/auth/login/2fa", loginLimiter, authH.LoginTwoFactor)
 	api.Get("/auth/sso/url", authH.SSOURL)
+	// Where the KKU button points. Plants the CSRF nonce, then 302s to KKU
+	// — see auth_sso_nonce.go.
+	api.Get("/auth/sso/login", loginLimiter, authH.SSOLoginStart)
 	// KKU SSONext login, two steps like the password path — see
 	// service.SSOService. Both are anonymous login endpoints, so they share
 	// /auth/login's brute-force ceiling: exchange is where a guessed code
