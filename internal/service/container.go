@@ -9,6 +9,7 @@ import (
 	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/mail"
 	"ta-payment-back/internal/pii"
+	"ta-payment-back/internal/ssonext"
 	"ta-payment-back/internal/storage"
 )
 
@@ -44,6 +45,7 @@ type Container struct {
 	Holiday           *HolidayService
 	DocProgress       *DocumentProgressService
 	MFA               *MFAService
+	SSO               *SSOService
 	DataDeletion      *DataDeletionService
 	Enrollments       *EnrollmentService
 	TDBM              *TDBMService
@@ -85,6 +87,14 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Appointment = &AppointmentOrderService{pool: pool, aud: auditor, fontDir: cfg.FontDir}
 	c.Holiday = &HolidayService{pool: pool, aud: auditor, notify: c.Notify}
 	c.MFA = &MFAService{pool: pool, aud: auditor, totp: totpCipher}
+	c.SSO = &SSOService{users: c.Users, aud: auditor}
+	if cfg.SSOEnabled {
+		c.SSO.client = &ssonext.Client{
+			LoginBase: cfg.SSOLoginBase, APIBase: cfg.SSOAPIBase,
+			AppID: cfg.SSOAppID, ClientID: cfg.SSOClientID, ClientSecret: cfg.SSOSecret,
+			RedirectURL: cfg.SSORedirect,
+		}
+	}
 	c.DataDeletion = &DataDeletionService{
 		pool: pool, aud: auditor, docs: c.Docs, users: c.Users,
 		sessions: c.Sessions, notify: c.Notify, store: store,

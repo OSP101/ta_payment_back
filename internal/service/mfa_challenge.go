@@ -18,6 +18,7 @@ import (
 // right, now prove the second factor" ticket issued by step 1 of login.
 const (
 	mfaChallengeTTL          = 5 * time.Minute
+	MFAChallengeTTL          = mfaChallengeTTL // exported for the SSO handler's pending cookie
 	mfaChallengeMaxAttempts  = 5
 	mfaChallengeTokenSizeRaw = 32 // bytes of randomness before base64 encoding
 )

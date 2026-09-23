@@ -49,7 +49,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 		}
 		return c.JSON(fiber.Map{"mfa_required": true, "challenge": challenge})
 	}
-	return h.finishLogin(c, u)
+	return h.finishLogin(c, u, false)
 }
 
 type login2FAReq struct {
@@ -84,14 +84,14 @@ func (h *AuthHandler) LoginTwoFactor(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return h.finishLogin(c, u)
+	return h.finishLogin(c, u, c.Cookies(ssoPendingCookie) == "1")
 }
 
 // finishLogin mints the session, token and cookie for an already-fully-
 // authenticated user (password alone when 2FA is off, or password+code when
 // it's on) and returns the same {"user": ...} body either path used to
 // return directly.
-func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User) error {
+func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User, viaSSO bool) error {
 	// The synthetic executive role rides in the TOKEN only, not in u.Roles:
 	// RequireRole reads roles from JWT claims, so leaving it out here made the
 	// analytics endpoints 403 for a flagged lecturer. u.Roles itself stays the
@@ -114,40 +114,109 @@ func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User) error {
 		return err
 	}
 	setAuthCookie(c, tok, h.Svc.Cfg.JWTLifetime, h.Svc.Cfg.CookieSecure)
+	setSSOCookie(c, viaSSO, h.Svc.Cfg.JWTLifetime, h.Svc.Cfg.CookieSecure)
 	// The token lives only in the HttpOnly cookie — it is deliberately NOT
 	// returned in the body so it can't be stashed in localStorage where XSS
 	// could read it.
 	return c.JSON(fiber.Map{"user": u})
 }
 
-// SSOURL returns the SSO redirect URL for the frontend to send the user to.
-// Stub: real implementation depends on KKU IT integration protocol.
+// SSOURL tells the login page whether to show the KKU button and where it
+// goes. See service.SSOService for the whole flow; the browser is sent to
+// KKU directly, nothing on our side happens until the callback.
 func (h *AuthHandler) SSOURL(c *fiber.Ctx) error {
 	// Config-derived, not user-specific, but still not safe for a shared
-	// cache to serve stale: SSOEnabled/SSOAuthURL can change between one
-	// request and the next (env update + restart), and a cached "enabled:
-	// false" would lock a browser out of SSO until the cache expired.
+	// cache to serve stale: SSOEnabled can change between one request and
+	// the next (env update + restart), and a cached "enabled: false" would
+	// lock a browser out of SSO until the cache expired.
 	c.Set("Cache-Control", "no-store")
-	if !h.Svc.Cfg.SSOEnabled {
+	if !h.Svc.SSO.Enabled() {
 		return c.JSON(fiber.Map{"enabled": false})
 	}
-	return c.JSON(fiber.Map{
-		"enabled": true,
-		"url":     h.Svc.Cfg.SSOAuthURL + "?client_id=" + h.Svc.Cfg.SSOClientID + "&redirect_uri=" + h.Svc.Cfg.SSORedirect + "&response_type=code&scope=openid+email+profile",
-	})
+	return c.JSON(fiber.Map{"enabled": true, "url": h.Svc.SSO.LoginURL()})
 }
 
-// SSOCallback exchanges an authorization code for a session.
-// Stub: real implementation depends on KKU IT integration protocol.
-//
-// When this is implemented: it MUST branch on TOTPEnabled and issue an MFA
-// challenge exactly like Login does, not go straight to CreateAndSupersede +
-// Issue + setAuthCookie. SSO is a second, independent path to a session, and
-// nothing about a KKU SSO assertion proves possession of the account's
-// second factor — copy Login's TOTPEnabled branch, don't skip it because
-// "SSO already authenticated them".
-func (h *AuthHandler) SSOCallback(c *fiber.Ctx) error {
-	return fiber.NewError(fiber.StatusNotImplemented, "SSO callback not yet configured — supply SSO_* env vars and update handler once KKU IT provides endpoints/credentials")
+type ssoExchangeReq struct {
+	Code string `json:"code" validate:"required"`
+}
+
+// ssoRejectedMsg covers a stale, reused or mis-issued code alike — the
+// remedy is the same (start again), and which one it was is KKU's business.
+const ssoRejectedMsg = "ลิงก์เข้าสู่ระบบหมดอายุหรือถูกใช้ไปแล้ว กรุณากดเข้าสู่ระบบด้วย KKU อีกครั้ง"
+
+// SSOExchange is step 1 of the SSO login (POST /auth/sso/exchange): the
+// callback page hands over the code KKU appended to its URL, and gets back
+// a confirm ticket plus whose account it resolved to — no session yet. The
+// unknown-account case is a 403 that names the KKU email, because "which
+// address do I ask staff to register" is the one thing that person needs.
+func (h *AuthHandler) SSOExchange(c *fiber.Ctx) error {
+	if !h.Svc.SSO.Enabled() {
+		return fiber.NewError(fiber.StatusNotFound, "SSO is not enabled")
+	}
+	var in ssoExchangeReq
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	p, err := h.Svc.SSO.Exchange(c.Context(), in.Code, c.IP(), c.Get("User-Agent"))
+	if err != nil {
+		var noAcct *service.SSONoAccountError
+		switch {
+		case errors.Is(err, service.ErrSSORejected):
+			return fiber.NewError(fiber.StatusUnauthorized, ssoRejectedMsg)
+		case errors.As(err, &noAcct):
+			// The address goes in the message itself: the frontend's
+			// ApiError only carries `error`, and the address is the one
+			// thing this person needs to show staff.
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error":     "บัญชี " + noAcct.Email + " ยังไม่ได้ลงทะเบียนในระบบ กรุณาติดต่อเจ้าหน้าที่วิทยาลัยเพื่อเปิดใช้งานด้วยอีเมลนี้",
+				"code":      "sso_no_account",
+				"kku_email": noAcct.Email,
+			})
+		}
+		return err
+	}
+	c.Set("Cache-Control", "no-store")
+	return c.JSON(p)
+}
+
+type ssoConfirmReq struct {
+	Ticket string `json:"ticket" validate:"required"`
+}
+
+// SSOConfirm is step 2 (POST /auth/sso/confirm): the confirm click. From
+// here on it is a password login that has just passed the password check —
+// including the TOTP branch. A KKU assertion says who this is; it says
+// nothing about possession of the account's second factor, so the branch is
+// copied from Login rather than skipped.
+func (h *AuthHandler) SSOConfirm(c *fiber.Ctx) error {
+	if !h.Svc.SSO.Enabled() {
+		return fiber.NewError(fiber.StatusNotFound, "SSO is not enabled")
+	}
+	var in ssoConfirmReq
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	u, err := h.Svc.SSO.Redeem(c.Context(), in.Ticket, c.IP(), c.Get("User-Agent"))
+	if err != nil {
+		if errors.Is(err, service.ErrSSOTicketInvalid) {
+			return fiber.NewError(fiber.StatusUnauthorized, ssoRejectedMsg)
+		}
+		return err
+	}
+	if u.TOTPEnabled {
+		challenge, err := h.Svc.MFA.IssueChallenge(c.Context(), u.ID)
+		if err != nil {
+			return err
+		}
+		// Carry "this login came through KKU" across the 2FA round trip so
+		// the eventual session is marked for Logout — see ssoPendingCookie.
+		c.Cookie(&fiber.Cookie{
+			Name: ssoPendingCookie, Value: "1", HTTPOnly: true, SameSite: "Lax",
+			Secure: h.Svc.Cfg.CookieSecure, Path: "/", Expires: time.Now().Add(service.MFAChallengeTTL),
+		})
+		return c.JSON(fiber.Map{"mfa_required": true, "challenge": challenge})
+	}
+	return h.finishLogin(c, u, true)
 }
 
 // Logout sits outside the authed group (see router.go) so a client with an
@@ -165,6 +234,15 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 		}
 	}
 	clearAuthCookie(c, h.Svc.Cfg.CookieSecure)
+	// A session that came in through KKU should go out through KKU too —
+	// see ssonext.Client.LogoutURL for the shared-machine reason. The
+	// frontend navigates there instead of to /login; KKU then sends the
+	// browser back to our registered logout callback.
+	viaSSO := c.Cookies(ssoSessionCookie) == "1"
+	setSSOCookie(c, false, 0, h.Svc.Cfg.CookieSecure)
+	if viaSSO && h.Svc.SSO.Enabled() {
+		return c.JSON(fiber.Map{"ok": true, "sso_logout_url": h.Svc.SSO.LogoutURL()})
+	}
 	return c.JSON(fiber.Map{"ok": true})
 }
 
@@ -260,6 +338,32 @@ func setAuthCookie(c *fiber.Ctx, token string, ttl time.Duration, secure bool) {
 		Secure:   secure,
 		Path:     "/",
 		Expires:  time.Now().Add(ttl),
+	})
+}
+
+// ssoSessionCookie marks a session as having been opened through KKU SSO so
+// Logout knows to end the KKU-side session too. ssoPendingCookie is the
+// same idea for the gap between SSOConfirm returning mfa_required and
+// LoginTwoFactor finishing — the mfa_challenges row has no column for it.
+// Neither is secret (a yes/no about the login method) and neither is
+// trusted for anything security-relevant: the worst a forged one does is
+// send the browser to KKU's logout page.
+const (
+	ssoSessionCookie = "sso_session"
+	ssoPendingCookie = "sso_pending"
+)
+
+func setSSOCookie(c *fiber.Ctx, on bool, ttl time.Duration, secure bool) {
+	val, exp := "", time.Now().Add(-time.Hour)
+	if on {
+		val, exp = "1", time.Now().Add(ttl)
+	}
+	c.Cookie(&fiber.Cookie{
+		Name: ssoSessionCookie, Value: val, HTTPOnly: true, SameSite: "Lax", Secure: secure, Path: "/", Expires: exp,
+	})
+	// The pending marker is done either way once a session exists.
+	c.Cookie(&fiber.Cookie{
+		Name: ssoPendingCookie, Value: "", HTTPOnly: true, SameSite: "Lax", Secure: secure, Path: "/", Expires: time.Now().Add(-time.Hour),
 	})
 }
 

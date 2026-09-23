@@ -84,13 +84,21 @@ type Config struct {
 	// AppBaseURL is already required to be the real public URL for the SSO
 	// redirect, so reusing it here can't drift from that URL and needs no
 	// extra trust configuration.
-	CookieSecure         bool
+	CookieSecure bool
+	// KKU Single Sign On (SSONext) — see internal/ssonext for the protocol.
+	// Enabled only when AppID, ClientID and ClientSecret are all present;
+	// the three arrive together from สำนักเทคโนโลยีดิจิทัล once the app is
+	// registered. SSORedirect must equal the login callback registered with
+	// them byte for byte (it is echoed on the token exchange), defaulting to
+	// AppBaseURL + "/login/sso". SSOLoginBase/SSOAPIBase exist so a dev
+	// machine can point at cmd/ssonext-mock instead of the real service.
 	SSOEnabled           bool
-	SSOAuthURL           string
-	SSOTokenURL          string
+	SSOAppID             string
 	SSOClientID          string
 	SSOSecret            string
 	SSORedirect          string
+	SSOLoginBase         string
+	SSOAPIBase           string
 	CreditorTemplatePath string
 	FontDir              string
 	// TADocsEncKey is a 32-byte AES-256 key (base64) used to encrypt TA
@@ -208,11 +216,12 @@ func Load() (Config, error) {
 		SMTPPass:             env("SMTP_PASS", ""),
 		MailFrom:             env("MAIL_FROM", "no-reply@coco.kku.ac.th"),
 		AppBaseURL:           env("APP_BASE_URL", "http://localhost:3000"),
-		SSOAuthURL:           env("SSO_AUTH_URL", ""),
-		SSOTokenURL:          env("SSO_TOKEN_URL", ""),
+		SSOAppID:             env("SSO_APP_ID", ""),
 		SSOClientID:          env("SSO_CLIENT_ID", ""),
 		SSOSecret:            env("SSO_CLIENT_SECRET", ""),
 		SSORedirect:          env("SSO_REDIRECT", ""),
+		SSOLoginBase:         env("SSO_LOGIN_BASE", ""),
+		SSOAPIBase:           env("SSO_API_BASE", ""),
 		CreditorTemplatePath: env("CREDITOR_TEMPLATE_PATH", "./assets/creditor_form_template.pdf"),
 		FontDir:              env("FONT_DIR", "./assets/fonts"),
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
@@ -239,7 +248,10 @@ func Load() (Config, error) {
 		// DatabaseURL.
 		c.DemoDatabaseURL = deriveDemoDatabaseURL(c.DatabaseURL)
 	}
-	c.SSOEnabled = c.SSOAuthURL != "" && c.SSOClientID != ""
+	c.SSOEnabled = c.SSOAppID != "" && c.SSOClientID != "" && c.SSOSecret != ""
+	if c.SSORedirect == "" {
+		c.SSORedirect = strings.TrimRight(c.AppBaseURL, "/") + "/login/sso"
+	}
 	c.JWTLifetime = envDuration("JWT_LIFETIME", 12*time.Hour)
 	c.SMTPPort = envInt("SMTP_PORT", 587)
 	c.MaxUploadMB = envInt("MAX_UPLOAD_MB", 20)

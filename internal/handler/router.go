@@ -102,8 +102,13 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// challenges to dodge a single challenge's own 5-attempt cap; see its doc
 	// comment.
 	api.Post("/auth/login/2fa", loginLimiter, authH.LoginTwoFactor)
-	api.Post("/auth/sso/callback", authH.SSOCallback) // stub
 	api.Get("/auth/sso/url", authH.SSOURL)
+	// KKU SSONext login, two steps like the password path — see
+	// service.SSOService. Both are anonymous login endpoints, so they share
+	// /auth/login's brute-force ceiling: exchange is where a guessed code
+	// would land, confirm is where a guessed ticket would.
+	api.Post("/auth/sso/exchange", loginLimiter, authH.SSOExchange)
+	api.Post("/auth/sso/confirm", loginLimiter, authH.SSOConfirm)
 	// Shared announcements. Anonymous by design — a link posted to Facebook or
 	// LINE is useless if it lands on a login page. The service only answers for
 	// rows staff explicitly opened, and only while they are live.
