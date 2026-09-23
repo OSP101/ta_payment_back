@@ -157,7 +157,9 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 		case "update":
 			w := c.After
 			w.ID = c.WorkLogID
-			_, err = s.StaffUpsert(ctx, actor, true, w)
+			// Password and reason were verified above; this batch sends its own
+			// notice to the TA and every lecturer (notifyEditBatch).
+			_, err = s.StaffUpsert(ctx, actor, true, w, &EditStepUp{Reason: in.Reason, verified: true})
 		default:
 			err = Invalid("action ต้องเป็น update หรือ delete")
 		}

@@ -114,6 +114,8 @@ func TestClaimLogs_RestrictedToTheSelectedMonths(t *testing.T) {
 // has been taught and reviewed, i.e. only after its budget year has closed.
 func TestCourseExportBlockers_ScopedToSelectedMonths(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	payoutReady(f)
 	m1 := monthStart()
 	m2 := m1.AddDate(0, 1, 0)
@@ -148,6 +150,8 @@ func TestCourseExportBlockers_ScopedToSelectedMonths(t *testing.T) {
 // have to stay editable.
 func TestMarkCourseExported_LocksOnlySelectedMonths(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	m1 := monthStart()
 	m2 := m1.AddDate(0, 1, 0)
 	p1 := f.addSubmissionPeriod(m1.Format("01"), "2026-12-31", "", false)

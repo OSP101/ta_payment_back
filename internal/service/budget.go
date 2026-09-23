@@ -120,7 +120,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 		       baseline_students_lecture, baseline_students_lab,
 		       ug_workload_rate_regular,
 		       graduate_regular, graduate_special_lumpsum, term_months
-		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		FROM `+payRatesInForce+``).Scan(
 		&rates.UGLectureHoursPerCredit, &rates.UGLabHoursPerCredit,
 		&rates.BaselineStudentsLecture, &rates.BaselineStudentsLab,
 		&rates.UGWorkloadRateRegular,
@@ -180,7 +180,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	// defaults were one per 25 capped at 3.
 	var perTA, capTA int
 	_ = s.pool.QueryRow(ctx, `SELECT plan_students_per_ta, plan_suggested_ta_cap
-	                          FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&perTA, &capTA)
+	                          FROM `+payRatesInForce+``).Scan(&perTA, &capTA)
 	if perTA <= 0 {
 		perTA = 25
 	}
@@ -201,7 +201,7 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	//                 independently per course — a TA on 3 special-track courses gets up
 	//                 to 3 × 4,000, there is no cross-course aggregate cap.
 	_ = s.pool.QueryRow(ctx, `
-        WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+        WITH latest AS (SELECT * FROM `+payRatesInForce+`),
         ug_reg AS (
             SELECT COALESCE(SUM(wl.hours * pr.undergrad_regular), 0) AS baht
             FROM work_logs wl

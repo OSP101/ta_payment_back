@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
+	"ta-payment-back/internal/timeutil"
 )
 
 // CourseService now holds only pay-rate settings. The faculty course catalog
@@ -71,10 +72,9 @@ type PayRate struct {
 	Note                 *string `json:"note,omitempty" validate:"omitempty,max=500"`
 }
 
-func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
-	pr := &PayRate{}
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, TO_CHAR(effective_from,'YYYY-MM-DD'),
+// payRateColumns / scanPayRate are the one column list every PayRate read uses,
+// so the in-force read and the scheduled list cannot drift apart.
+const payRateColumns = `id, TO_CHAR(effective_from,'YYYY-MM-DD'),
 		       undergrad_regular, undergrad_special, graduate_regular, graduate_special_lumpsum,
 		       ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
 		       baseline_students_lecture, baseline_students_lab,
@@ -83,8 +83,11 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		       graduate_regular_hourly, grad_special_term_cap, daily_pay_cap_baht,
 		       ug_regular_daily_hour_cap, ug_special_daily_hour_cap, grad_regular_daily_hour_cap,
 		       ug_special_monthly_cap,
-		       plan_students_per_ta, plan_min_students_per_ta, plan_suggested_ta_cap, note
-		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		       plan_students_per_ta, plan_min_students_per_ta, plan_suggested_ta_cap, note`
+
+func scanPayRate(row pgx.Row) (*PayRate, error) {
+	pr := &PayRate{}
+	err := row.Scan(
 		&pr.ID, &pr.EffectiveFrom, &pr.UndergradRegular, &pr.UndergradSpecial,
 		&pr.GraduateRegular, &pr.GraduateSpecialLumpsum,
 		&pr.UGLectureHoursPerCredit, &pr.UGLabHoursPerCredit,
@@ -99,6 +102,93 @@ func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
 		return nil, err
 	}
 	return pr, nil
+}
+
+// LatestPayRate is the version in force TODAY — not the newest row. A version
+// saved ahead of time waits for its own date (see payRatesInForce).
+func (s *CourseService) LatestPayRate(ctx context.Context) (*PayRate, error) {
+	return scanPayRate(s.pool.QueryRow(ctx, `SELECT `+payRateColumns+` FROM `+payRatesInForce))
+}
+
+// ScheduledPayRates lists versions saved ahead of time whose date has not
+// arrived — nothing has been priced with them yet — earliest first.
+func (s *CourseService) ScheduledPayRates(ctx context.Context) ([]PayRate, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+payRateColumns+` FROM pay_rates
+		WHERE effective_from > CURRENT_DATE ORDER BY effective_from, created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PayRate{}
+	for rows.Next() {
+		pr, err := scanPayRate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *pr)
+	}
+	return out, rows.Err()
+}
+
+// DeleteScheduledPayRate withdraws a version whose date has not arrived — the
+// correction path for a mis-typed future date, which pay_rates' insert-only
+// design otherwise left uncorrectable until that date came. Only a version
+// that has never been in force may go: once its date arrives it may have
+// priced a cap, a budget, or a payout, and history must keep it.
+func (s *CourseService) DeleteScheduledPayRate(ctx context.Context, actor, id uuid.UUID) error {
+	entry := audit.Entry{ActorID: &actor, Action: "pay_rate.delete_scheduled", Entity: "pay_rate",
+		EntityID: id.String()}
+	return writeAuditedRow(ctx, s.pool, s.aud, entry, "pay_rates", id, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM pay_rates WHERE id = $1 AND effective_from > CURRENT_DATE`, id)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			var exists bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM pay_rates WHERE id = $1)`, id).Scan(&exists); err != nil {
+				return err
+			}
+			if exists {
+				return Conflict("อัตรานี้มีผลแล้ว ลบไม่ได้ — ถ้าต้องการเปลี่ยน ให้บันทึกเวอร์ชันใหม่")
+			}
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// checkPayRateDate refuses the two effective dates that would not do what the
+// save dialog says ("starts on {date}"):
+//   - earlier than the version in force: ordering would never pick it, so it
+//     would be saved and silently ignored;
+//   - in the future when nothing is in force yet: the system would run with no
+//     rate at all until that date.
+//
+// Runs under the pay_rates advisory lock, so "the version in force" cannot
+// change between this check and the INSERT.
+func checkPayRateDate(ctx context.Context, tx pgx.Tx, effectiveFrom string) error {
+	if _, err := timeutil.ParseDate(effectiveFrom); err != nil {
+		return Invalid("วันเริ่มใช้ไม่ถูกต้อง (ต้องเป็น YYYY-MM-DD)")
+	}
+	var inForce *string
+	var future bool
+	if err := tx.QueryRow(ctx, `
+		SELECT (SELECT TO_CHAR(effective_from,'YYYY-MM-DD') FROM `+payRatesInForce+`),
+		       $1::date > CURRENT_DATE`, effectiveFrom).Scan(&inForce, &future); err != nil {
+		return err
+	}
+	if inForce == nil {
+		if future {
+			return Invalid("ยังไม่มีอัตราที่มีผลอยู่ — เวอร์ชันแรกต้องเริ่มใช้ไม่เกินวันนี้ ระบบจึงจะมีอัตราใช้คำนวณ")
+		}
+		return nil
+	}
+	if effectiveFrom < *inForce {
+		return Invalid("วันเริ่มใช้ต้องไม่ก่อน " + *inForce + " ซึ่งเป็นวันเริ่มใช้ของอัตราที่มีผลอยู่ — เวอร์ชันที่เริ่มก่อนหน้านั้นจะไม่ถูกใช้เลย")
+	}
+	return nil
 }
 
 func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in PayRate) (*PayRate, error) {
@@ -190,20 +280,27 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 	}
 	// A new pay_rates row supersedes the one that was in force, so the rate it
 	// REPLACED is the before-image — without it the trail says "the graduate
-	// rate is 60" and never that it used to be 50. Read inside the transaction
-	// so a concurrent insert cannot slip between the two.
-	prev, err := s.latestPayRateSnapshot(ctx)
-	if err != nil {
-		return nil, err
-	}
+	// rate is 60" and never that it used to be 50. Read inside the transaction,
+	// after serialising rate changes: an INSERT has no existing row to lock, so
+	// two concurrent saves would otherwise both record the same "before".
 	entry := audit.Entry{ActorID: &actor, Action: "pay_rate.create", Entity: "pay_rate",
 		EntityID: in.ID.String(), After: in}
-	if prev != nil {
-		entry.Before = prev
-	}
-	if err := writeAudited(ctx, s.pool, s.aud, entry,
-		func(tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `
+	if err := writeAuditedLocked(ctx, s.pool, s.aud, entry,
+		func(tx pgx.Tx, e *audit.Entry) error {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('pay_rates', 7))`); err != nil {
+				return err
+			}
+			if err := checkPayRateDate(ctx, tx, in.EffectiveFrom); err != nil {
+				return err
+			}
+			prev, err := latestRowSnapshot(ctx, tx, "pay_rates")
+			if err != nil {
+				return err
+			}
+			if prev != nil {
+				e.Before = prev
+			}
+			_, err = tx.Exec(ctx, `
 		INSERT INTO pay_rates (id, effective_from, undergrad_regular, undergrad_special,
 		    graduate_regular, graduate_special_lumpsum,
 		    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
@@ -228,15 +325,4 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 		return nil, err
 	}
 	return &in, nil
-}
-
-// latestPayRateSnapshot returns the rate currently in force, as a plain map, or
-// nil when this is the first one ever set.
-//
-// Read as a whole row rather than a chosen list of columns: pay_rates has
-// grown a dozen caps and ceilings over the project's life, and a hand-picked
-// list would go stale the next time one is added — silently, and only visible
-// years later when somebody asks what a cap used to be.
-func (s *CourseService) latestPayRateSnapshot(ctx context.Context) (map[string]any, error) {
-	return latestRowSnapshot(ctx, s.pool, "pay_rates")
 }

@@ -98,16 +98,33 @@ func (s *WorkLogService) assertCanView(ctx context.Context, actor, assignmentID 
 }
 
 // courseDateRange returns the teaching course's start/end dates for validating
-// that a work_date falls within the term. Falls back to the parent term's
-// range when the course doesn't override it (same COALESCE chain as Generate)
-// — without the term fallback a course with blank dates would silently disable
-// the in-term check altogether.
+// that a work_date falls within the term: the course's own dates when set,
+// otherwise the parent term's — the shared CourseStartSQL/CourseEndSQL
+// definition, not a fourth private copy of it.
+//
+// When neither the course nor its term has dates it REFUSES rather than
+// substituting an open range. The old fallback ('0001-01-01'..'9999-12-31')
+// silently disabled the in-term check, so a TA could log a paid entry dated
+// 2099 on a term that had not been set up yet. Fail closed like Generate does.
 func (s *WorkLogService) courseDateRange(ctx context.Context, tcID uuid.UUID) (start, end time.Time, err error) {
+	st, et, err := s.courseDateRangeOpt(ctx, tcID)
+	if err != nil {
+		return start, end, err
+	}
+	if st == nil || et == nil {
+		return start, end, errCourseDatesUnset
+	}
+	return *st, *et, nil
+}
+
+var errCourseDatesUnset = Invalid("ยังไม่ได้กำหนดวันเริ่ม/วันสิ้นสุดของภาคการศึกษาหรือรายวิชา — เจ้าหน้าที่ต้องตั้งช่วงวันที่ก่อน จึงจะลงเวลาได้")
+
+// courseDateRangeOpt is courseDateRange for readers that can show "not set"
+// instead of refusing (the TA planner). Nil means that bound has no date.
+func (s *WorkLogService) courseDateRangeOpt(ctx context.Context, tcID uuid.UUID) (start, end *time.Time, err error) {
 	err = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(tc.starts_on, at.starts_on, '0001-01-01'::date),
-		       COALESCE(tc.ends_on,   at.ends_on,   '9999-12-31'::date)
+		SELECT `+CourseStartSQL("tc")+`, `+CourseEndSQL("tc")+`
 		FROM teaching_courses tc
-		JOIN academic_terms at ON at.id = tc.term_id
 		WHERE tc.id = $1`, tcID).Scan(&start, &end)
 	return
 }
@@ -795,7 +812,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	var dailyBahtCap float64
 	if genRate > 0 {
 		_ = s.pool.QueryRow(ctx,
-			`SELECT daily_pay_cap_baht FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&dailyBahtCap)
+			`SELECT daily_pay_cap_baht FROM `+payRatesInForce+``).Scan(&dailyBahtCap)
 	}
 	dailyBaht := map[string]float64{}
 	bahtBlocks := func(dkey string, hrs float64) bool {
@@ -2075,7 +2092,7 @@ func (s *WorkLogService) DeleteTAReviewSchedule(ctx context.Context, actor, assi
 func (s *WorkLogService) dailyHourCapFor(ctx context.Context, assignmentID uuid.UUID) float64 {
 	var cap float64
 	err := s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`)
 		SELECT CASE
 		    WHEN a.level = 'undergrad' AND sec.track = 'regular' THEN pr.ug_regular_daily_hour_cap
 		    WHEN a.level = 'undergrad' AND sec.track = 'special' THEN pr.ug_special_daily_hour_cap
@@ -2099,7 +2116,7 @@ func (s *WorkLogService) dailyHourCapFor(ctx context.Context, assignmentID uuid.
 func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID, w WorkLog) error {
 	var capBaht float64
 	if err := s.pool.QueryRow(ctx,
-		`SELECT daily_pay_cap_baht FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&capBaht); err != nil {
+		`SELECT daily_pay_cap_baht FROM `+payRatesInForce+``).Scan(&capBaht); err != nil {
 		// เฉพาะ "ไม่มีแถว pay_rates เลย" เท่านั้นที่แปลว่ายังไม่ตั้งเพดาน
 		// error อื่น (connection reset, timeout, context cancelled) แปลว่า
 		// "อ่านไม่ได้" ไม่ใช่ "ไม่มีเพดาน" — เดิมกลืนรวมกันหมด ⇒ DB สะดุด
@@ -2129,7 +2146,7 @@ func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID
 	// later.
 	var total float64
 	if err := s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
 		cand AS (
 		    SELECT $3::uuid AS id, $4::time AS start_time, $5::time AS end_time,
 		           $6::numeric AS hours, a.request_id, a.cotaught_group,
@@ -2185,7 +2202,7 @@ func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID
 func (s *WorkLogService) assignmentRate(ctx context.Context, assignmentID uuid.UUID) float64 {
 	var rate float64
 	_ = s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`)
 		SELECT CASE
 		    WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
 		    WHEN a.level='undergrad' AND sec.track='special' THEN pr.undergrad_special
@@ -2243,13 +2260,13 @@ func (s *WorkLogService) PayRateFor(ctx context.Context, actor, assignmentID uui
 		// can't be billed above the college-wide ceiling.
 		_ = s.pool.QueryRow(ctx, `
 			SELECT LEAST(graduate_special_lumpsum, grad_special_term_cap)
-			FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(&out.LumpsumBaht)
+			FROM `+payRatesInForce+``).Scan(&out.LumpsumBaht)
 		return out, nil
 	}
 	out.RatePerHour = s.assignmentRate(ctx, assignmentID)
 	if !grad && ac.Track == "special" {
 		_ = s.pool.QueryRow(ctx,
-			`SELECT ug_special_monthly_cap FROM pay_rates ORDER BY effective_from DESC LIMIT 1`,
+			`SELECT ug_special_monthly_cap FROM `+payRatesInForce+``,
 		).Scan(&out.MonthlyCapBaht)
 	}
 	return out, nil
@@ -2450,6 +2467,58 @@ func weekStart(d time.Time) time.Time {
 	return d.AddDate(0, 0, -(wd - 1))
 }
 
+// recheckOwnClassClashForApproval re-applies the own-class rule to every row
+// about to be approved, against the TA's timetable AS IT IS NOW.
+//
+// enforceNoOwnClassConflict runs only when a row is written, but the timetable
+// it checks against is the TA's own self-service data and stays editable until
+// the term is exported. So a TA could remove a class, log hours in its slot,
+// then put the class back — and approval, which re-checked only the hour caps,
+// would pass a row that clashes with a class the TA is recorded as attending.
+//
+// This narrows that window to the approval itself; it cannot close it alone (a
+// class removed right before approval and restored right after still passes),
+// which is why the timetable is now also on the audit trail
+// (ta_class_schedule.replace) and why export must re-check too.
+func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx pgx.Tx, ac *assignmentContext, assignmentID uuid.UUID) error {
+	termID, err := courseTermID(ctx, s.pool, ac.TeachingCourseID)
+	if err != nil {
+		return err
+	}
+	blocks, err := loadOwnClassBlocks(ctx, s.pool, ac.TAID, termID)
+	if err != nil || len(blocks) == 0 {
+		return err
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT TO_CHAR(work_date,'YYYY-MM-DD'), TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
+		FROM work_logs
+		WHERE assignment_id = $1 AND status = 'submitted'
+		ORDER BY work_date, start_time`, assignmentID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var day, start, end string
+		if err := rows.Scan(&day, &start, &end); err != nil {
+			return err
+		}
+		d, derr := timeutil.ParseDate(day)
+		sm, ok1 := parseHM(start)
+		em, ok2 := parseHM(end)
+		if derr != nil || !ok1 || !ok2 {
+			continue
+		}
+		if clash := findOwnClassClash(blocks, int(d.Weekday()), sm, em); clash != nil {
+			return Conflict(fmt.Sprintf(
+				"อนุมัติไม่ได้ รายการวันที่ %s เวลา %s–%s ตรงกับตารางเรียนของ TA: %s "+
+					"(ตารางเรียนเปลี่ยนไปหลังจากลงเวลา — ให้ตีกลับรายการนี้ให้ TA แก้ไข)",
+				day, start, end, clash.describe()))
+		}
+	}
+	return rows.Err()
+}
+
 // recheckCapsForApproval re-validates the per-day and per-week hour caps over
 // the assignment's submitted+approved rows inside the approval transaction.
 // The caps are normally enforced at Upsert time, but staff edits or workload
@@ -2483,6 +2552,11 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 	if len(badDays) > 0 {
 		return Conflict(fmt.Sprintf(
 			"อนุมัติไม่ได้ ชั่วโมงรวมต่อวันเกิน %.1f ชม. ในวันที่: %s", dailyCap, strings.Join(badDays, ", ")))
+	}
+	// Before the workload-form early return below: the own-class rule applies
+	// whether or not the course filed a workload form.
+	if err := s.recheckOwnClassClashForApproval(ctx, tx, ac, assignmentID); err != nil {
+		return err
 	}
 
 	if !ac.HasWorkloadForm {
@@ -3174,7 +3248,7 @@ func validateYearMonth(ym string) error {
 func pendingApprovalBaht(ctx context.Context, tx pgx.Tx, assignmentID uuid.UUID, yearMonth string) (float64, error) {
 	var addBaht float64
 	err := tx.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1)
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`)
 		SELECT COALESCE(SUM(wl.hours *
 			CASE
 			    WHEN a.level='undergrad' AND sec.track='regular' THEN pr.undergrad_regular
@@ -3817,21 +3891,45 @@ func auditDeleteAction(privileged bool) string {
 	return "worklog.lecturer_delete"
 }
 
+// EditStepUp is what an edit to an ALREADY-APPROVED work log must carry: the
+// editor's password and a written reason, the same bar ApplyStaffEditBatch sets.
+//
+// An approved row's hours are live money — budget and export totals read them
+// directly — and approval is the lecturer's sign-off on them. Changing one
+// afterwards is a correction to a signed record, so it needs re-authentication,
+// a stated reason, and notice to every lecturer on the course, whichever route
+// it arrives by. Before this, PUT /staff/worklogs skipped all three while the
+// batch route enforced them, for the identical write.
+type EditStepUp struct {
+	Password string
+	Reason   string
+	// verified is set only inside this package, by ApplyStaffEditBatch after it
+	// has checked the password itself and before it sends its own notices. A
+	// caller outside the package cannot set it, so it cannot skip the check.
+	verified bool
+}
+
 // StaffUpsert edits a TA's work log on their behalf. Reachable by staff/admin
 // (privileged) and, since the 24/07/2026 meeting, by the course's own lecturer.
-func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privileged bool, w WorkLog) (uuid.UUID, error) {
+//
+// stepUp may be nil for new rows and for rows not yet approved; editing an
+// approved row without a valid one is refused (see EditStepUp).
+func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privileged bool, w WorkLog, stepUp *EditStepUp) (uuid.UUID, error) {
 	// For an existing row the assignment is authoritative from the DB, never the
 	// request body. Otherwise a caller could send a locked row's id together with
 	// some OTHER (unlocked) assignment_id: every lock/cap check below would run
 	// against the unlocked assignment while the UPDATE (matched by id) rewrote the
 	// locked row. Pin w.AssignmentID to the row's real owner up front.
+	var wasApproved bool
 	if w.ID != uuid.Nil {
 		var realAssignment uuid.UUID
+		var status string
 		if err := s.pool.QueryRow(ctx,
-			`SELECT assignment_id FROM work_logs WHERE id=$1`, w.ID).Scan(&realAssignment); err != nil {
+			`SELECT assignment_id, status::text FROM work_logs WHERE id=$1`, w.ID).Scan(&realAssignment, &status); err != nil {
 			return uuid.Nil, Invalid("ไม่พบรายการที่ต้องการแก้ไข")
 		}
 		w.AssignmentID = realAssignment
+		wasApproved = status == "approved"
 	}
 	ac, err := loadAssignmentContext(ctx, s.pool, w.AssignmentID)
 	if err != nil {
@@ -3849,6 +3947,13 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		}
 		if !owns {
 			return uuid.Nil, ErrForbidden
+		}
+	}
+	// After authorization, so an outsider gets a plain 403 rather than being
+	// asked for a password.
+	if wasApproved {
+		if err := s.checkApprovedEditStepUp(ctx, actor, stepUp); err != nil {
+			return uuid.Nil, err
 		}
 	}
 	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
@@ -3969,7 +4074,8 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	// snapshot is what the row was and what it became. On a create the
 	// before-image is simply absent, which is the honest record.
 	if err := writeAuditedRow(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String()},
+		audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(),
+			Note: approvedEditNote(wasApproved, stepUp)},
 		"work_logs", w.ID,
 		func(tx pgx.Tx) error {
 			if isNew {
@@ -3981,15 +4087,18 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 			}
 			// Preserve status so approved rows stay approved; staff cannot silently unlock review state.
 			// The assignment_id predicate is defence-in-depth on top of the pin above.
+			// $11: when the step-up was NOT required (row read as unapproved),
+			// refuse to touch a row that has been approved in the meantime —
+			// otherwise the check above could be raced by a concurrent approval.
 			tag, err := tx.Exec(ctx,
 				`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8
-				 WHERE id=$9 AND assignment_id=$10`,
-				w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note, w.ID, w.AssignmentID)
+				 WHERE id=$9 AND assignment_id=$10 AND ($11 OR status <> 'approved')`,
+				w.WorkDate, w.StartTime, w.EndTime, w.Hours, w.Activity, w.ParentKind, w.Room, w.Note, w.ID, w.AssignmentID, wasApproved)
 			if err != nil {
 				return err
 			}
 			if tag.RowsAffected() == 0 {
-				return Invalid("ไม่พบรายการที่ต้องการแก้ไข")
+				return Conflict("รายการนี้ถูกเปลี่ยนสถานะระหว่างแก้ไข (อาจเพิ่งได้รับอนุมัติ) กรุณาโหลดใหม่แล้วลองอีกครั้ง")
 			}
 			return nil
 		}); err != nil {
@@ -4002,8 +4111,48 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 			fmt.Sprintf("เจ้าหน้าที่ปรับข้อมูลบันทึกเวลาวิชา %s วันที่ %s เวลา %s–%s",
 				t.Code, w.WorkDate, w.StartTime, w.EndTime),
 			t.Link)
+		// A signed-off row changed: every lecturer on the course hears about it,
+		// with the reason. The batch path sends its own combined notice, so only
+		// the direct route does it here.
+		if wasApproved && (stepUp == nil || !stepUp.verified) {
+			if lecturers, err := courseLecturerIDs(ctx, s.pool, ac.TeachingCourseID); err == nil {
+				for _, lid := range lecturers {
+					if lid == actor {
+						continue
+					}
+					s.notify.Send(ctx, lid,
+						"มีการแก้ไขบันทึกเวลาที่อนุมัติแล้ว "+t.Code,
+						fmt.Sprintf("บันทึกเวลาวันที่ %s ซึ่งอนุมัติแล้ว ถูกแก้ไขเป็น %s–%s (%.2f ชม.) เหตุผล: %s",
+							w.WorkDate, w.StartTime, w.EndTime, w.Hours, strings.TrimSpace(stepUp.Reason)),
+						t.Link)
+				}
+			}
+		}
 	}
 	return w.ID, nil
+}
+
+// approvedEditNote records WHY a signed-off row was changed, next to the
+// before/after diff the audit row already carries.
+func approvedEditNote(wasApproved bool, stepUp *EditStepUp) string {
+	if !wasApproved || stepUp == nil {
+		return ""
+	}
+	return "แก้ไขรายการที่อนุมัติแล้ว เหตุผล: " + strings.TrimSpace(stepUp.Reason)
+}
+
+// checkApprovedEditStepUp enforces EditStepUp. Cheap checks first, bcrypt last,
+// matching ApplyStaffEditBatch.
+func (s *WorkLogService) checkApprovedEditStepUp(ctx context.Context, actor uuid.UUID, stepUp *EditStepUp) error {
+	if stepUp != nil && stepUp.verified {
+		return nil
+	}
+	if stepUp == nil || len([]rune(strings.TrimSpace(stepUp.Reason))) < editReasonMinLen {
+		return Invalid(fmt.Sprintf(
+			"รายการนี้อนุมัติแล้ว การแก้ไขต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร และยืนยันรหัสผ่าน เหตุผลจะถูกส่งให้อาจารย์ประจำวิชา",
+			editReasonMinLen))
+	}
+	return VerifyUserPassword(ctx, s.pool, actor, stepUp.Password)
 }
 
 // Delete removes a single work_log entry owned by the calling TA. Draft and

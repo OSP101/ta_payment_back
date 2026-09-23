@@ -131,18 +131,29 @@ func (s *ExportService) PlanFacts(ctx context.Context, courseID uuid.UUID) (*Pla
 	out := &PlanFacts{Sections: []PlanSection{}, Existing: []PlanExistingPerson{}}
 	wl := &WorkLogService{pool: s.pool}
 
-	start, end, err := wl.courseDateRange(ctx, courseID)
+	// Planning happens while a term is still being set up, so missing dates are
+	// shown as "not set" rather than refused — but never replaced by an open
+	// range: the calendar walk below goes day by day from start to end.
+	startP, endP, err := wl.courseDateRangeOpt(ctx, courseID)
 	if err != nil {
 		return nil, err
 	}
-	out.StartsOn, out.EndsOn = start.Format("2006-01-02"), end.Format("2006-01-02")
+	datesSet := startP != nil && endP != nil
+	var start, end time.Time
+	if datesSet {
+		start, end = *startP, *endP
+		out.StartsOn, out.EndsOn = start.Format("2006-01-02"), end.Format("2006-01-02")
+	}
 	out.WeeksTotal = WeeksInTerm(ctx, s.pool, courseID)
 
 	midterm, final, err := wl.courseExamWindows(ctx, courseID)
 	if err != nil {
 		return nil, err
 	}
-	holidays, err := wl.loadHolidaysInRange(ctx, start, end)
+	var holidays holidaySet
+	if datesSet {
+		holidays, err = wl.loadHolidaysInRange(ctx, start, end)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +163,7 @@ func (s *ExportService) PlanFacts(ctx context.Context, courseID uuid.UUID) (*Pla
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
 		       graduate_special_lumpsum, ug_special_monthly_cap, term_months,
 		       plan_students_per_ta, plan_min_students_per_ta, plan_suggested_ta_cap
-		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		FROM `+payRatesInForce+``).Scan(
 		&out.Rates.UndergradRegular, &out.Rates.UndergradSpecial, &out.Rates.GraduateRegularHourly,
 		&out.Rates.GraduateSpecialLumpsum, &out.Rates.UGSpecialMonthlyCap, &out.Rates.TermMonths,
 		&out.Rates.PlanStudentsPerTA, &out.Rates.PlanMinStudentsPerTA, &out.Rates.PlanSuggestedTACap); err != nil {
@@ -199,6 +210,9 @@ func (s *ExportService) PlanFacts(ctx context.Context, courseID uuid.UUID) (*Pla
 
 	allWeeks := map[string]bool{}
 	for i := range out.Sections {
+		if !datesSet {
+			break // no calendar to walk: sections keep their static facts, no months
+		}
 		if err := s.walkSection(ctx, &out.Sections[i], start, end, holidays, midterm, final, allWeeks); err != nil {
 			return nil, err
 		}

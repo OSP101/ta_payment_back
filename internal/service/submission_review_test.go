@@ -120,6 +120,8 @@ func TestExport_AllowsMonthAfterStaffReview(t *testing.T) {
 // meaningless — and the export gate downstream trusts it.
 func TestStaffReview_RefusesWhileRowsUnapproved(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2)) // stays draft
 	f.addSubmissionPeriod(currentMonthMM(), openDueDate(), "", false)
 	staff := f.insertUser("staff", "officer")

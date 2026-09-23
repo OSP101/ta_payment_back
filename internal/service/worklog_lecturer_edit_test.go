@@ -17,7 +17,7 @@ func TestStaffUpsert_LecturerCanEditOwnCourse(t *testing.T) {
 	edited := f.entry(day(10), "09:00", "10:00", 1)
 	edited.ID = id
 	// f.LecturerID teaches this course (see insertCourse).
-	if _, err := f.Svc.StaffUpsert(f.ctx, f.LecturerID, false, edited); err != nil {
+	if _, err := f.Svc.StaffUpsert(f.ctx, f.LecturerID, false, edited, nil); err != nil {
 		t.Fatalf("the course's own lecturer must be able to correct a row: %v", err)
 	}
 
@@ -39,7 +39,7 @@ func TestStaffUpsert_LecturerCannotEditAnotherCourse(t *testing.T) {
 
 	edited := f.entry(day(10), "09:00", "10:00", 1)
 	edited.ID = id
-	_, err := f.Svc.StaffUpsert(f.ctx, outsider, false, edited)
+	_, err := f.Svc.StaffUpsert(f.ctx, outsider, false, edited, nil)
 	if err != ErrForbidden {
 		t.Fatalf("a lecturer from another course must be refused, got: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestStaffUpsert_StaffStillEditsAnyCourse(t *testing.T) {
 
 	edited := f.entry(day(10), "09:00", "10:00", 1)
 	edited.ID = id
-	if _, err := f.Svc.StaffUpsert(f.ctx, staff, true, edited); err != nil {
+	if _, err := f.Svc.StaffUpsert(f.ctx, staff, true, edited, nil); err != nil {
 		t.Fatalf("staff must retain access to every course: %v", err)
 	}
 }

@@ -264,6 +264,25 @@ func (s *TeachingService) ConfirmCourseGroup(
 	if len(courseIDs) < 2 {
 		return uuid.Nil, Invalid("ต้องเลือกอย่างน้อย 2 รายวิชาเพื่อรวมกลุ่ม")
 	}
+	// Every member (the primary included — it is one) must belong to the term the
+	// group is filed under. DetectCourseGroups only ever proposes same-term
+	// candidates, but this write trusted the submitted ids, and the schema has no
+	// constraint tying a member's term to its group's. A foreign-term member's
+	// pay was then folded into this term's course-summary total while still
+	// printing again under its own term — one course billed in two documents.
+	var inTerm int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(DISTINCT id) FROM teaching_courses WHERE id = ANY($1) AND term_id = $2`,
+		courseIDs, termID).Scan(&inTerm); err != nil {
+		return uuid.Nil, err
+	}
+	distinct := make(map[uuid.UUID]struct{}, len(courseIDs))
+	for _, id := range courseIDs {
+		distinct[id] = struct{}{}
+	}
+	if inTerm != len(distinct) {
+		return uuid.Nil, Invalid("รายวิชาที่เลือกต้องอยู่ในภาคการศึกษาเดียวกันกับกลุ่มที่กำลังยืนยัน")
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

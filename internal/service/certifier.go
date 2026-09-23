@@ -74,12 +74,16 @@ func (s *ExportService) ResolveCertifier(ctx context.Context, termID uuid.UUID) 
 
 	if chosen != nil {
 		var a signerAuthority
+		var active bool
 		err := s.pool.QueryRow(ctx, `
-			SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
+			SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title, ao.is_active
 			FROM admin_officers ao
 			LEFT JOIN users u ON u.id = ao.user_id
-			WHERE ao.id = $1`, *chosen).Scan(&a.Name, &a.Title)
-		if err == nil {
+			WHERE ao.id = $1`, *chosen).Scan(&a.Name, &a.Title, &active)
+		// A choice that has since become vacant or ineligible is treated like
+		// one that was deleted: it must not be printed as the certifier of
+		// record, so fall through to the seat holder instead.
+		if err == nil && active && CanCertifyForHead(a.Title) {
 			// Worded against the HEAD-OF-DEPARTMENT seat — that is the authority
 			// a claim form is certified under, not the dean's.
 			a.applyActing(ctx, s.pool, headTitlePrefix, fallbackHeadTitle)
@@ -88,8 +92,9 @@ func (s *ExportService) ResolveCertifier(ctx context.Context, termID uuid.UUID) 
 				TitleLine: a.Title, ActingFor: a.ActingFor, Resolved: true,
 			}, nil
 		}
-		// An officer deleted after being chosen must not break the export — fall
-		// through to the seat holder, the same as never having chosen.
+		// An officer deleted, deactivated or no longer eligible after being chosen
+		// must not break the export — fall through to the seat holder, the same
+		// as never having chosen.
 	}
 
 	// No explicit choice: whoever currently holds the seat.
@@ -118,6 +123,16 @@ func (s *ExportService) SetCertifier(ctx context.Context, actor, termID uuid.UUI
 		}
 		if !active {
 			return Invalid("รายชื่อที่เลือกถูกปิดใช้งานแล้ว เลือกผู้รับรองที่ยังใช้งานอยู่")
+		}
+		// is_active alone let any seat — a clerical post included — be printed
+		// as certifying under the head of department's authority.
+		var title string
+		if err := s.pool.QueryRow(ctx,
+			`SELECT title FROM admin_officers WHERE id = $1`, *officerID).Scan(&title); err != nil {
+			return err
+		}
+		if !CanCertifyForHead(title) {
+			return Invalid("ตำแหน่งที่เลือกไม่สามารถเป็นผู้รับรองแทนหัวหน้าสาขาได้ (ต้องเป็นหัวหน้าสาขาหรือทีมบริหาร)")
 		}
 	}
 	return writeAudited(ctx, s.pool, s.aud,

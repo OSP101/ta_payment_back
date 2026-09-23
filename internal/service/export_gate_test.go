@@ -41,6 +41,8 @@ func blockerKinds(t *testing.T, f *fixture) map[string]int {
 
 func TestExportGate_BlocksWhileTheLecturerStillHasRows(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	payoutReady(f)
 	f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
@@ -62,6 +64,8 @@ func TestExportGate_BlocksWhileTheLecturerStillHasRows(t *testing.T) {
 
 func TestExportGate_BlocksWhileTheTAStillHasAnOpenDraft(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	// Deadline well in the future — the TA can still send this, so it is a
 	// genuine blocker rather than a forfeit.
 	f.addSubmissionPeriod(currentMonthMM(), "2099-12-31", "", false)
@@ -91,6 +95,8 @@ func TestExportGate_ForfeitedDraftDoesNotBlock(t *testing.T) {
 
 func TestExportGate_BlocksAnApprovedMonthStaffNeverSignedOff(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	payoutReady(f)
 	f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
@@ -120,6 +126,8 @@ func TestExportGate_BlocksAnApprovedMonthStaffNeverSignedOff(t *testing.T) {
 
 func TestExportGate_ClearsOnceStaffSignOff(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	pid := f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
 	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID); err != nil {
@@ -220,6 +228,8 @@ func TestExportBlockers_MonthLabelsStayBuddhistEra(t *testing.T) {
 // was current.
 func TestBuildCourseZip_NamesTheFileByTermAndCourse(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	payoutReady(f)
 	pid := f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
@@ -258,6 +268,8 @@ func TestBuildCourseZip_NamesTheFileByTermAndCourse(t *testing.T) {
 // overwrites the first in whatever folder finance keeps these in.
 func TestBuildCourseZip_MonthSliceIsNamedDifferentlyFromTheWholeTerm(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	payoutReady(f)
 	pid := f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))

@@ -85,7 +85,7 @@ func AccountsForTier(t Tier) []DemoAccount {
 // TierAllowsAccountEmail is the actual enforcement point — LoginHandler.Login
 // calls this against whatever demo account email the request names, using a
 // tier freshly resolved for the CURRENT slot owner (see
-// Manager.TierForSlotIndex), not one cached from an earlier request. An
+// Manager.TierForClaim), not one cached from an earlier request. An
 // account email demoAccounts doesn't recognize at all is never allowed,
 // tier notwithstanding.
 func TierAllowsAccountEmail(t Tier, accountEmail string) bool {

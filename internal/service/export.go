@@ -181,7 +181,7 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	_ = s.pool.QueryRow(ctx,
 		`SELECT undergrad_regular, undergrad_special, graduate_regular, graduate_special_lumpsum,
 		        graduate_regular_hourly, grad_special_term_cap, ug_special_monthly_cap, term_months
-		 FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		 FROM `+payRatesInForce+``).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegular, &pr.GraduateSpecialLumpsum,
 		&pr.GraduateRegularHourly, &pr.GradSpecialTermCap, &pr.UGSpecialMonthlyCap, &pr.TermMonths)
 	// Prefer per-term months (source of truth); fall back to pay_rates.term_months.
@@ -453,8 +453,11 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 // worth — and the new figure reaches finance as a document that looks like a
 // reprint of the one they already hold.
 //
-// The real fix is to persist per-month amounts at lock time; until then this
-// catches the divergence at the boundary where it would leave the server.
+// The graduate-special lump is now persisted per exported month
+// (grad_lump_ledger), so reapportioning can no longer move it. Hourly pay is
+// still priced live from the rate in force, so this check stays: it catches a
+// rate version that came into force after the month was exported, at the
+// boundary where the new figure would leave the server.
 // Deliberately scoped to an EXACT month-set match: a later fiscal round covers
 // a different slice and legitimately totals something else, so comparing across
 // different month sets would block normal work instead of catching drift.

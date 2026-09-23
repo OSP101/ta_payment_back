@@ -467,6 +467,12 @@ func (f *fixture) addSubmissionPeriod(month, dueDate, status string, closed bool
 // without it is a course whose TA was requested but never appointed, which is a
 // real state and a useful one to test — just not the default one.
 func (f *fixture) addAppointmentOrder() uuid.UUID {
+	return f.addAppointmentOrderFor(f.TAID)
+}
+
+// addAppointmentOrderFor prints a new round naming one given TA on the
+// fixture's course — for tests where a second TA is appointed later.
+func (f *fixture) addAppointmentOrderFor(ta uuid.UUID) uuid.UUID {
 	orderID := uuid.New()
 	// round_no is unique per term, so derive one that will not collide if a test
 	// records two orders.
@@ -483,7 +489,7 @@ func (f *fixture) addAppointmentOrder() uuid.UUID {
 	f.exec(`INSERT INTO appointment_order_items
 	          (id, appointment_order_id, teaching_course_id, ta_id)
 	        VALUES (gen_random_uuid(), $1, $2, $3)`,
-		orderID, f.CourseID, f.TAID)
+		orderID, f.CourseID, ta)
 	return orderID
 }
 

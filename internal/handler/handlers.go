@@ -279,6 +279,27 @@ func (h *CourseHandler) PayRate(c *fiber.Ctx) error {
 	return c.JSON(pr)
 }
 
+// ScheduledPayRates lists versions saved ahead of time that are not in force yet.
+func (h *CourseHandler) ScheduledPayRates(c *fiber.Ctx) error {
+	out, err := h.Svc.Courses.ScheduledPayRates(c.Context())
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// DeleteScheduledPayRate withdraws a version whose date has not arrived (admin).
+func (h *CourseHandler) DeleteScheduledPayRate(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.ErrBadRequest
+	}
+	if err := h.Svc.Courses.DeleteScheduledPayRate(c.Context(), UserID(c), id); err != nil {
+		return err
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 func (h *CourseHandler) CreatePayRate(c *fiber.Ctx) error {
 	var in service.PayRate
 	if err := Bind(c, &in); err != nil {
@@ -413,6 +434,11 @@ func (h *TeachingHandler) ListMyTACourses(c *fiber.Ctx) error {
 // different permissions for the same document.
 func (h *TeachingHandler) timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.UUID, yearMonth string, err error) {
 	taID = UserID(c)
+	// Parsed first: the lecturer check below is scoped to this term.
+	termID, perr := uuid.Parse(c.Query("term_id"))
+	if perr != nil {
+		return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusBadRequest, "term_id is required")
+	}
 	if raw := c.Query("user_id"); raw != "" {
 		id, perr := uuid.Parse(raw)
 		if perr != nil {
@@ -427,7 +453,7 @@ func (h *TeachingHandler) timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.U
 				// lecturer account could pull any TA's weekly whereabouts by
 				// iterating user ids — a personal timetable is not faculty-wide
 				// data.
-				ok, qerr := h.Svc.Teaching.LecturerSupervisesTA(c.Context(), UserID(c), id)
+				ok, qerr := h.Svc.Teaching.LecturerSupervisesTA(c.Context(), UserID(c), id, termID)
 				if qerr != nil {
 					return uuid.Nil, uuid.Nil, "", qerr
 				}
@@ -439,10 +465,6 @@ func (h *TeachingHandler) timetableFormTarget(c *fiber.Ctx) (taID, termID uuid.U
 			}
 		}
 		taID = id
-	}
-	termID, perr := uuid.Parse(c.Query("term_id"))
-	if perr != nil {
-		return uuid.Nil, uuid.Nil, "", fiber.NewError(fiber.StatusBadRequest, "term_id is required")
 	}
 	return taID, termID, c.Query("year_month"), nil
 }
@@ -1941,14 +1963,21 @@ func (h *WorkLogHandler) StaffListAssignments(c *fiber.Ctx) error {
 
 // StaffUpsert — PUT /staff/worklogs — edit or add a row on any TA's behalf.
 func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
-	var w service.WorkLog
-	if err := Bind(c, &w); err != nil {
+	// password/reason ride alongside the work log fields; they are required
+	// only when the row being edited is already approved (the service decides).
+	var in struct {
+		service.WorkLog
+		Password string `json:"password"`
+		Reason   string `json:"reason"`
+	}
+	if err := Bind(c, &in); err != nil {
 		return err
 	}
 	// Staff/admin may edit any course; a lecturer only their own, enforced in
 	// the service so the rule survives a future caller.
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
-	id, err := h.Svc.WorkLog.StaffUpsert(c.Context(), UserID(c), privileged, w)
+	id, err := h.Svc.WorkLog.StaffUpsert(c.Context(), UserID(c), privileged, in.WorkLog,
+		&service.EditStepUp{Password: in.Password, Reason: in.Reason})
 	if err != nil {
 		return err
 	}
@@ -2792,6 +2821,12 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// Fail the request instead so staff retries; months still being worked on
 	// stay editable and lock on a later re-export.
 	if _, err := h.Svc.SubmissionPeriods.MarkCourseExported(c.Context(), actor, id, months); err != nil {
+		return err
+	}
+	// The graduate-special lump each exported month carries is fixed from here
+	// on (grad_lump_ledger): a later month gaining weight must not shrink a
+	// month finance already has. Same rule as the lock above — not best-effort.
+	if err := h.Svc.Export.FreezeGradLumps(c.Context(), actor, id, months); err != nil {
 		return err
 	}
 	// Freeze section edits — this export is now the source of truth for the

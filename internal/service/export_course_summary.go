@@ -929,8 +929,8 @@ func writeCourseSummarySheet(
 	blocks []courseSummaryBlock,
 ) error {
 	set := func(cell string, style int, v any) error {
-		if str, ok := v.(string); ok && strings.HasPrefix(str, "=") {
-			if err := f.SetCellFormula(sheet, cell, strings.TrimPrefix(str, "=")); err != nil {
+		if fm, ok := v.(xlFormula); ok {
+			if err := f.SetCellFormula(sheet, cell, strings.TrimPrefix(string(fm), "=")); err != nil {
 				return err
 			}
 		} else if err := f.SetCellValue(sheet, cell, v); err != nil {
@@ -1081,13 +1081,13 @@ func writeCourseSummarySheet(
 		// คงเหลือ is a live formula, ขออนุมัติเบิกจ่าย minus every visible
 		// month's own printed cell, so it keeps agreeing with them even if
 		// someone edits a cell by hand after the file is handed over.
-		remainReg := fmt.Sprintf("=L%d", top)
+		remainReg := xlf("=L%d", top)
 		for _, c := range regCells {
-			remainReg += "-" + c
+			remainReg += xlFormula("-" + c)
 		}
-		remainSpec := fmt.Sprintf("=M%d", top)
+		remainSpec := xlf("=M%d", top)
 		for _, c := range specCells {
-			remainSpec += "-" + c
+			remainSpec += xlFormula("-" + c)
 		}
 		if err := set(fmt.Sprintf("%s%d", remainCol0, top), st.money, remainReg); err != nil {
 			return err
@@ -1129,16 +1129,16 @@ func writeCourseSummarySheet(
 	}
 	for _, col := range sumCols {
 		cell := fmt.Sprintf("%s%d", col, totalRow)
-		formula := fmt.Sprintf("=SUM(%s5:%s%d)", col, col, lastDataRow)
+		formula := xlf("=SUM(%s5:%s%d)", col, col, lastDataRow)
 		if err := set(cell, st.moneyBold, formula); err != nil {
 			return err
 		}
 	}
-	remainRegTotal := fmt.Sprintf("=L%d", totalRow)
-	remainSpecTotal := fmt.Sprintf("=M%d", totalRow)
+	remainRegTotal := xlf("=L%d", totalRow)
+	remainSpecTotal := xlf("=M%d", totalRow)
 	for i := range months {
-		remainRegTotal += "-" + fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i), totalRow)
-		remainSpecTotal += "-" + fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i+1), totalRow)
+		remainRegTotal += xlFormula("-" + fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i), totalRow))
+		remainSpecTotal += xlFormula("-" + fmt.Sprintf("%s%d", excelCol(monthStartCol+2*i+1), totalRow))
 	}
 	if err := set(fmt.Sprintf("%s%d", remainCol0, totalRow), st.moneyBold, remainRegTotal); err != nil {
 		return err

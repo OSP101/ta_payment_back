@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/testutil"
 )
 
@@ -16,7 +17,7 @@ import (
 func TestReplaceClasses_WBA_UndergradYear4Allowed(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
-	svc := &WorkloadService{pool: pool}
+	svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 	term := insertTerm(t, pool, 2569, 1, true)
 	ta := insertDashUser(t, pool, "ta")
 	if _, err := pool.Exec(ctx, `UPDATE users SET study_year = 4 WHERE id = $1`, ta); err != nil {
@@ -31,7 +32,7 @@ func TestReplaceClasses_WBA_UndergradYear4Allowed(t *testing.T) {
 func TestReplaceClasses_WBA_UndergradBelowYear4Rejected(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
-	svc := &WorkloadService{pool: pool}
+	svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 	term := insertTerm(t, pool, 2569, 1, true)
 	ta := insertDashUser(t, pool, "ta")
 	if _, err := pool.Exec(ctx, `UPDATE users SET study_year = 2 WHERE id = $1`, ta); err != nil {
@@ -46,7 +47,7 @@ func TestReplaceClasses_WBA_UndergradBelowYear4Rejected(t *testing.T) {
 func TestReplaceClasses_WBA_UndergradWithNoYearOnFileRejected(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
-	svc := &WorkloadService{pool: pool}
+	svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 	term := insertTerm(t, pool, 2569, 1, true)
 	ta := insertDashUser(t, pool, "ta") // study_year left NULL
 
@@ -64,7 +65,7 @@ func TestReplaceClasses_WBA_GraduateAllowedRegardlessOfYear(t *testing.T) {
 		t.Run(level, func(t *testing.T) {
 			pool := testutil.NewPool(t)
 			ctx := context.Background()
-			svc := &WorkloadService{pool: pool}
+			svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 			term := insertTerm(t, pool, 2569, 1, true)
 			ta := insertDashUser(t, pool, "ta")
 			if _, err := pool.Exec(ctx,
@@ -83,7 +84,7 @@ func TestReplaceClasses_WBA_GraduateAllowedRegardlessOfYear(t *testing.T) {
 func TestReplaceClasses_WBA_AtMostOneRowAllowed(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
-	svc := &WorkloadService{pool: pool}
+	svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 	term := insertTerm(t, pool, 2569, 1, true)
 	ta := insertDashUser(t, pool, "ta")
 	if _, err := pool.Exec(ctx,

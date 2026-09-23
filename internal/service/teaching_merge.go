@@ -226,6 +226,9 @@ func (s *TeachingService) mergeCodeTx(ctx context.Context, tx pgx.Tx, termID, ta
 		targetID, code); err != nil {
 		return err
 	}
+	if err := assertActiveLecturers(ctx, tx, lecturerIDs); err != nil {
+		return err
+	}
 	for _, lid := range lecturerIDs {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO teaching_lecturers (teaching_course_id, lecturer_id, is_primary) VALUES ($1,$2,false)

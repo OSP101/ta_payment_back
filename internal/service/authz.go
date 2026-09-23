@@ -308,3 +308,35 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 	}
 	return &ac, nil
 }
+
+// assertActiveLecturers is the single rule for who may be written into
+// teaching_lecturers: every id must be an existing, active account holding the
+// lecturer role.
+//
+// A teaching_lecturers row is authority, not a label — it is what
+// lecturerOwnsCourse reads to let someone approve a course's worklogs and see
+// its budget, and what the course-scoped notifications fan out to. The three
+// writers of this table used to disagree: ReplaceLecturers checked, Create and
+// the course-code merge trusted the client's list as given. One helper keeps a
+// fourth writer from quietly disagreeing again.
+func assertActiveLecturers(ctx context.Context, q querier, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	distinct := make(map[uuid.UUID]struct{}, len(ids))
+	for _, id := range ids {
+		distinct[id] = struct{}{}
+	}
+	var valid int
+	if err := q.QueryRow(ctx,
+		`SELECT COUNT(*) FROM users u
+		  WHERE u.id = ANY($1) AND u.is_active
+		    AND EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role::text = 'lecturer')`,
+		ids).Scan(&valid); err != nil {
+		return err
+	}
+	if valid != len(distinct) {
+		return Invalid("รายชื่อมีบัญชีที่ไม่ใช่อาจารย์ที่ใช้งานอยู่ปะปนอยู่")
+	}
+	return nil
+}

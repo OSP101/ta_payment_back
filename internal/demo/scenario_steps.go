@@ -641,6 +641,9 @@ func stepStaffReviewExport(ctx context.Context, svc *service.Container) (string,
 		if _, err := svc.SubmissionPeriods.MarkCourseExported(ctx, staffID, courseID, months); err != nil {
 			return "", fmt.Errorf("ล็อกเดือนของวิชา %s: %w", cs.code, err)
 		}
+		if err := svc.Export.FreezeGradLumps(ctx, staffID, courseID, months); err != nil {
+			return "", fmt.Errorf("แช่แข็งยอดเหมาจ่ายของวิชา %s: %w", cs.code, err)
+		}
 		_ = svc.Teaching.MarkExported(ctx, courseID)
 		if prev, perr := svc.Export.CoursePreview(ctx, courseID, months); perr == nil {
 			_, _ = svc.ExportBatches.Record(ctx, staffID, service.ExportBatch{

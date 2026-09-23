@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/testutil"
 )
 
@@ -20,7 +21,7 @@ import (
 func TestReplaceClasses_LockedAfterExport(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
-	svc := &WorkloadService{pool: pool}
+	svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 
 	term := insertTerm(t, pool, 2569, 1, true)
 	ta := insertDashUser(t, pool, "ta")
@@ -85,7 +86,7 @@ func TestReplaceClasses_LockedAfterExport(t *testing.T) {
 func TestScheduleLock_ScopedToTAAndTerm(t *testing.T) {
 	pool := testutil.NewPool(t)
 	ctx := context.Background()
-	svc := &WorkloadService{pool: pool}
+	svc := &WorkloadService{pool: pool, aud: audit.New(pool)}
 
 	locked := insertTerm(t, pool, 2569, 1, true)
 	other := insertTerm(t, pool, 2569, 2, false)

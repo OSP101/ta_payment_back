@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -76,6 +77,14 @@ var auditSnapshotTables = map[string]bool{
 // the trail would then report a change that never happened between those two
 // numbers.
 //
+// Reading inside the transaction is not enough on its own: a plain SELECT takes
+// no lock, so a concurrent writer of the same row could still commit between
+// this read and our write, and the recorded "before" would be a value that was
+// already gone. FOR UPDATE makes the second writer wait at this read, so the
+// before-image is the value our write actually replaced. Lock order is
+// course → section everywhere (see assertNotExported), which is what keeps this
+// from introducing deadlocks.
+//
 // A missing row returns (nil, nil), not an error — "there was nothing here" is
 // a legitimate before-image for a create.
 func snapshotRow(ctx context.Context, tx pgx.Tx, table string, id any) (map[string]any, error) {
@@ -84,7 +93,7 @@ func snapshotRow(ctx context.Context, tx pgx.Tx, table string, id any) (map[stri
 	}
 	var raw []byte
 	err := tx.QueryRow(ctx,
-		`SELECT to_jsonb(t) FROM `+table+` t WHERE t.id = $1`, id).Scan(&raw)
+		`SELECT to_jsonb(t) FROM `+table+` t WHERE t.id = $1 FOR UPDATE`, id).Scan(&raw)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -201,12 +210,12 @@ func appendNote(existing, add string) string {
 // These tables are append-only by design — a change is a NEW row with a later
 // effective_from — so the "before" for one of them is not the same row read
 // earlier, it is the row this one supersedes.
-func latestRowSnapshot(ctx context.Context, pool *pgxpool.Pool, table string) (map[string]any, error) {
+func latestRowSnapshot(ctx context.Context, q querier, table string) (map[string]any, error) {
 	if !auditSnapshotTables[table] {
 		return nil, fmt.Errorf("audit snapshot: %q is not an allowed table", table)
 	}
 	var raw []byte
-	err := pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`SELECT to_jsonb(t) FROM `+table+` t ORDER BY t.effective_from DESC, t.created_at DESC LIMIT 1`).Scan(&raw)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -256,6 +265,18 @@ func setAuditDiff(e *audit.Entry, before, after map[string]any) {
 	// `null` in a column whose whole meaning is the difference between "no
 	// before-image" and "the before-image was nothing".
 	e.Note = appendNote(e.Note, "ไม่มีค่าใดเปลี่ยนแปลง")
+}
+
+// lockPeriodCell serialises every status transition of one (period, TA,
+// course) cell for the rest of the transaction. An advisory lock rather than
+// SELECT … FOR UPDATE because the first staff sign-off finds NO row yet — a row
+// lock would lock nothing and two first sign-offs could both read "no row".
+// Same idiom as worklog.go / ta_request.go use for "serialise even when nothing
+// exists yet".
+func lockPeriodCell(ctx context.Context, tx pgx.Tx, periodID, taID, tcID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))`,
+		"submission_period_status/"+periodID.String()+"/"+taID.String()+"/"+tcID.String())
+	return err
 }
 
 // periodStatus reads the workflow state of one (period, TA, course) cell.

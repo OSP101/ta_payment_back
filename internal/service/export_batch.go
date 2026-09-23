@@ -126,6 +126,13 @@ type CourseSummary struct {
 	// to name them — otherwise a download silently contains fewer TAs than the
 	// course actually has, which is the failure mode staff would notice last.
 	UnreviewedMonths []string `json:"unreviewed_months,omitempty"`
+	// AwaitingAppointment names TAs with lecturer-approved work on this course
+	// who are not on any printed appointment order yet. They cannot be reviewed
+	// (the queue hides them) or billed, and the claim stays blocked until an order
+	// names them — so the fix is "issue the next order", not "sign off a month",
+	// and the screen has to say so. Kept apart from UnreviewedMonths for exactly
+	// that reason: the two call for different actions from different screens.
+	AwaitingAppointment []string `json:"awaiting_appointment,omitempty"`
 
 	// HasAppointmentOrder is whether a printed appointment order covers this
 	// course (see AppointedSQL). Until it does, the TA's work is not official and
@@ -371,6 +378,50 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		out[i].UnreviewedMonths = unreviewed[out[i].TeachingCourseID]
 	}
 
+	// TAs holding approved work without a printed order. The claim is blocked
+	// while any exist (decided 23/09/2026: a partly-appointed course waits for
+	// the next order rather than claiming only the appointed TAs), so
+	// ExportEligible must see them too — otherwise the dashboard offers an export
+	// the download then refuses. Same grad-special exclusion as above.
+	awaitingRows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tc.id,
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,'') AS ta_name
+		FROM teaching_courses tc
+		JOIN sections sec          ON sec.teaching_course_id = tc.id
+		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
+		JOIN users u               ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp   ON tp.user_id = u.id
+		WHERE ($1::uuid IS NULL OR tc.term_id = $1)
+		  AND NOT `+AppointedSQL("tc.id", "a.ta_id")+`
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		  AND EXISTS (SELECT 1 FROM work_logs wl
+		               WHERE wl.assignment_id = a.id AND wl.status = 'approved')
+		ORDER BY 2`,
+		uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
+	if err != nil {
+		return nil, err
+	}
+	awaiting := map[uuid.UUID][]string{}
+	for awaitingRows.Next() {
+		var tc uuid.UUID
+		var name string
+		if err := awaitingRows.Scan(&tc, &name); err != nil {
+			awaitingRows.Close()
+			return nil, err
+		}
+		awaiting[tc] = append(awaiting[tc], name)
+	}
+	if err := awaitingRows.Err(); err != nil {
+		awaitingRows.Close()
+		return nil, err
+	}
+	awaitingRows.Close()
+	for i := range out {
+		out[i].AwaitingAppointment = awaiting[out[i].TeachingCourseID]
+	}
+
 	// Decide eligibility last, once both inputs exist. Both conditions, not
 	// either: the order makes the work official, the review makes the amounts
 	// final, and an export missing either produces a package the finance office
@@ -378,7 +429,8 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 	for i := range out {
 		out[i].ReviewComplete = anySignedOff[out[i].TeachingCourseID] &&
 			len(out[i].UnreviewedMonths) == 0
-		out[i].ExportEligible = out[i].HasAppointmentOrder && out[i].ReviewComplete
+		out[i].ExportEligible = out[i].HasAppointmentOrder && out[i].ReviewComplete &&
+			len(out[i].AwaitingAppointment) == 0
 	}
 
 	// Per-round standing: only worth querying when the TERM actually crosses the

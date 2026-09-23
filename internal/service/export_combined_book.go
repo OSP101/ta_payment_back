@@ -520,12 +520,12 @@ func writeClaimSheetHeader(f *excelize.File, st *claimStyles, sheet, trackTH str
 // filled grey.
 func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	d *combinedBookData, p *claimant, ordinal, top int) (int, error) {
-	// excelize stores a string beginning with "=" as literal TEXT; only
-	// SetCellFormula makes it calculate. Routed here once so no call site can
-	// forget and ship a claim whose totals never add up.
+	// Only an xlFormula calculates (see xlsx_formula.go): a formula the code
+	// built. Any other string is text, even one starting with "=" — names come
+	// from user input and must never become a live formula in finance's copy.
 	set := func(cell string, v any) error {
-		if str, ok := v.(string); ok && strings.HasPrefix(str, "=") {
-			return f.SetCellFormula(sheet, cell, strings.TrimPrefix(str, "="))
+		if fm, ok := v.(xlFormula); ok {
+			return f.SetCellFormula(sheet, cell, strings.TrimPrefix(string(fm), "="))
 		}
 		return f.SetCellValue(sheet, cell, v)
 	}
@@ -684,10 +684,10 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	if p.LevelTH != "ป.ตรี" {
 		sumRow = gradRow
 	}
-	if err := set(at("H", sumRow), fmt.Sprintf("=SUM(H%d:H%d)", first, last)); err != nil {
+	if err := set(at("H", sumRow), xlf("=SUM(H%d:H%d)", first, last)); err != nil {
 		return 0, err
 	}
-	if err := set(at("I", sumRow), fmt.Sprintf("=SUM(I%d:I%d)", first, last)); err != nil {
+	if err := set(at("I", sumRow), xlf("=SUM(I%d:I%d)", first, last)); err != nil {
 		return 0, err
 	}
 
@@ -725,10 +725,10 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 		}
 		mine := ln.level == p.LevelTH && ln.track == trackTH
 		if mine {
-			if err := set(at("C", rr), fmt.Sprintf("=H%d+I%d", sumRow, sumRow)); err != nil {
+			if err := set(at("C", rr), xlf("=H%d+I%d", sumRow, sumRow)); err != nil {
 				return 0, err
 			}
-			if err := set(at("J", rr), fmt.Sprintf("=C%d*G%d", rr, rr)); err != nil {
+			if err := set(at("J", rr), xlf("=C%d*G%d", rr, rr)); err != nil {
 				return 0, err
 			}
 			moneyRow = rr
@@ -788,7 +788,7 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 		return 0, err
 	}
 	if moneyRow > 0 {
-		if err := set(at("C", grand), fmt.Sprintf("=J%d", moneyRow)); err != nil {
+		if err := set(at("C", grand), xlf("=J%d", moneyRow)); err != nil {
 			return 0, err
 		}
 	}
@@ -798,7 +798,7 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	// BAHTTEXT is an Excel-only function and the college's own file uses it;
 	// LibreOffice shows #NAME? for it, which is why nothing here depends on its
 	// value.
-	if err := set(at("G", grand), fmt.Sprintf(`=" = "&BAHTTEXT(C%d)&" = "`, grand)); err != nil {
+	if err := set(at("G", grand), xlf(`=" = "&BAHTTEXT(C%d)&" = "`, grand)); err != nil {
 		return 0, err
 	}
 	if err := set(at("B", grand+1), "ขอเบิกจ่ายเพียง"); err != nil {
@@ -823,7 +823,7 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 		if err := set(at("E", grand+1), "บาท"); err != nil {
 			return 0, err
 		}
-		if err := set(at("G", grand+1), fmt.Sprintf(`=" = "&BAHTTEXT(C%d)&" = "`, grand+1)); err != nil {
+		if err := set(at("G", grand+1), xlf(`=" = "&BAHTTEXT(C%d)&" = "`, grand+1)); err != nil {
 			return 0, err
 		}
 	}
@@ -893,7 +893,7 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 	// unlike the lecturer/certifier names on the หลักฐาน sheet, which stay
 	// parenthesised, this line is the TA's own name, not a printed reading
 	// of someone else's signature.
-	if err := set(at("A", rule+1), fmt.Sprintf(`=B%d`, first)); err != nil {
+	if err := set(at("A", rule+1), xlf(`=B%d`, first)); err != nil {
 		return 0, err
 	}
 	if err := set(at("A", rule+2), "วันที่….เดือน…………..…พ.ศ…..……"); err != nil {
@@ -1012,8 +1012,8 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ภาคฤดูร้อน"}[d.Semester]
 
 	set := func(cell string, v any) error {
-		if str, ok := v.(string); ok && strings.HasPrefix(str, "=") {
-			return f.SetCellFormula(sheet, cell, strings.TrimPrefix(str, "="))
+		if fm, ok := v.(xlFormula); ok {
+			return f.SetCellFormula(sheet, cell, strings.TrimPrefix(string(fm), "="))
 		}
 		return f.SetCellValue(sheet, cell, v)
 	}
@@ -1113,19 +1113,19 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		if err := set(at("A", r), i+1); err != nil {
 			return err
 		}
-		if err := set(at("B", r), fmt.Sprintf("=%s!B%d", quoted, p.nameRow)); err != nil {
+		if err := set(at("B", r), xlf("=%s!B%d", quoted, p.nameRow)); err != nil {
 			return err
 		}
 		if err := set(at("C", r), p.LevelTH); err != nil {
 			return err
 		}
-		if err := set(at("D", r), fmt.Sprintf("=%s!C%d", quoted, p.hoursRow)); err != nil {
+		if err := set(at("D", r), xlf("=%s!C%d", quoted, p.hoursRow)); err != nil {
 			return err
 		}
 		if err := set(at("E", r), p.Rate); err != nil {
 			return err
 		}
-		if err := set(at("F", r), fmt.Sprintf("=D%d*E%d", r, r)); err != nil {
+		if err := set(at("F", r), xlf("=D%d*E%d", r, r)); err != nil {
 			return err
 		}
 		// รับจริง follows the same rule as ขอเบิกจ่ายเพียง: normally the =F
@@ -1136,7 +1136,7 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 			if err := set(at("G", r), p.PaidBaht); err != nil {
 				return err
 			}
-		} else if err := set(at("G", r), fmt.Sprintf("=F%d", r)); err != nil {
+		} else if err := set(at("G", r), xlf("=F%d", r)); err != nil {
 			return err
 		}
 		// หมายเหตุ is left EMPTY, as the college's file leaves it. The course
@@ -1202,7 +1202,7 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
-	if err := set(at("G", sum), fmt.Sprintf("=SUM(G10:G%d)", lastRow)); err != nil {
+	if err := set(at("G", sum), xlf("=SUM(G10:G%d)", lastRow)); err != nil {
 		return err
 	}
 	// The total is set off with MEDIUM rules down its sides in their file.
@@ -1217,7 +1217,7 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 		bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
-	if err := set(at("C", sum+1), fmt.Sprintf(`="("&BAHTTEXT(G%d)&")"`, sum)); err != nil {
+	if err := set(at("C", sum+1), xlf(`="("&BAHTTEXT(G%d)&")"`, sum)); err != nil {
 		return err
 	}
 	if err := f.MergeCell(sheet, at("C", sum+1), at("H", sum+1)); err != nil {
@@ -1335,7 +1335,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	_ = s.pool.QueryRow(ctx, `
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
 		       ug_special_monthly_cap, graduate_special_lumpsum, grad_special_term_cap
-		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		FROM `+payRatesInForce+``).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
 		// The cap has to come along: this PayRate also prices the คาบ that
 		// decide what the budget reached, and a zero cap there would pick a

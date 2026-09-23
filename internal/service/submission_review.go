@@ -286,7 +286,7 @@ func (s *SubmissionPeriodService) CountAwaitingAppointment(ctx context.Context, 
 func (s *SubmissionPeriodService) approvedBahtForMonth(ctx context.Context, taID, tcID uuid.UUID, yearMonth string) (float64, error) {
 	var baht float64
 	err := s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),`+
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),`+
 		mergedSittingsCTE+`
 		-- Priced from SITTINGS, not from work_log rows: the same rule the claim
 		-- form bills by (billable_hours.go).
@@ -318,6 +318,9 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 	if err := s.assertSignTarget(ctx, periodID, taID, tcID); err != nil {
 		return err
 	}
+	if err := assertAppointed(ctx, s.pool, tcID, taID); err != nil {
+		return err
+	}
 
 	var yearMonth string
 	if err := s.pool.QueryRow(ctx,
@@ -343,19 +346,24 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 	// The state this sign-off replaced. Without it a re-sign of a month that
 	// was already reviewed is indistinguishable from the first one — and the
 	// two mean very different things when a month turns out to be wrong.
-	prevStatus, err := periodStatus(ctx, s.pool, periodID, taID, tcID)
-	if err != nil {
-		return err
-	}
-	return writeAudited(ctx, s.pool, s.aud,
+	return writeAuditedLocked(ctx, s.pool, s.aud,
 		audit.Entry{
 			ActorID: &actor, Action: "submission.staff_reviewed",
 			Entity: "submission_period_status", EntityID: periodID.String(),
-			Note:   fmt.Sprintf("ta=%s course=%s", taID, tcID),
-			Before: prevStatus,
-			After:  map[string]any{"status": StatusStaffReviewed},
+			Note:  fmt.Sprintf("ta=%s course=%s", taID, tcID),
+			After: map[string]any{"status": StatusStaffReviewed},
 		},
-		func(tx pgx.Tx) error {
+		func(tx pgx.Tx, e *audit.Entry) error {
+			// Lock, then read the before-image, on the same transaction as the
+			// write — so it is the state this sign-off actually replaced.
+			if err := lockPeriodCell(ctx, tx, periodID, taID, tcID); err != nil {
+				return err
+			}
+			prevStatus, err := periodStatus(ctx, tx, periodID, taID, tcID)
+			if err != nil {
+				return err
+			}
+			e.Before = prevStatus
 			tag, err := tx.Exec(ctx, `
 				INSERT INTO submission_period_status
 				    (id, submission_period_id, ta_id, teaching_course_id, status,

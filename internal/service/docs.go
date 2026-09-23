@@ -298,7 +298,9 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 		return err
 	}
 	if prevStatus == "approved" {
-		return errors.New("profile already approved; contact staff to reopen")
+		// A UserError, not a bare error: this is an expected refusal the TA should
+		// read, and a bare error surfaced as a 500 with English text.
+		return Conflict("โปรไฟล์ได้รับการอนุมัติแล้ว หากต้องการแก้ไข กรุณาติดต่อเจ้าหน้าที่เพื่อเปิดแก้ไข")
 	}
 
 	// Keep ta_enrollments (migration 0094) in sync with this self-service
@@ -512,9 +514,48 @@ func (s *DocsService) scanUpload(ctx context.Context, userID uuid.UUID, kind, fi
 // Upload stores a supporting document and marks any previous non-superseded
 // row of the same kind for that user as superseded. Round increments each
 // time the TA replaces a rejected doc so history shows submission attempts.
+// assertMayStoreDocument holds the two preconditions for persisting a TA's
+// national-ID scan, bank book, or creditor form:
+//
+//  1. PDPA consent for the current notice version. These are the most sensitive
+//     records in the system; the API must refuse to collect them from someone
+//     who was never shown the notice, whichever client or route they arrive by.
+//
+//  2. The profile is not already approved. An approved profile is the staff's
+//     sign-off on the documents behind it, including the bank account payouts
+//     go to. Replacing one afterwards would silently swap a reviewed value for
+//     an unreviewed one — and, because review queues key off the profile flag,
+//     the swap would not appear in any queue. Staff reopen the profile (or
+//     reject a document, which now also reopens it) when a change is genuine.
+func (s *DocsService) assertMayStoreDocument(ctx context.Context, userID uuid.UUID) error {
+	if consented, err := s.HasPdpaConsent(ctx, userID); err != nil {
+		return err
+	} else if !consented {
+		return Forbidden("กรุณายอมรับข้อตกลงการเก็บและใช้ข้อมูลส่วนบุคคล (PDPA) ก่อนส่งเอกสาร")
+	}
+	var status string
+	err := s.pool.QueryRow(ctx,
+		`SELECT status::text FROM ta_profiles WHERE user_id = $1`, userID).Scan(&status)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if status == "approved" {
+		return Conflict("โปรไฟล์ได้รับการอนุมัติแล้ว หากต้องการแก้ไขเอกสาร กรุณาติดต่อเจ้าหน้าที่เพื่อเปิดแก้ไข")
+	}
+	return nil
+}
+
 func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filename, mime string, size int64, r io.Reader) (uuid.UUID, error) {
 	if !DocKinds[kind] {
 		return uuid.Nil, errors.New("invalid document kind")
+	}
+	// Both rules below live HERE, at the one function every document write goes
+	// through, rather than on individual routes. They used to be enforced only
+	// by UpsertProfile, so POST /me/documents and the generated creditor form
+	// (AttachGeneratedCreditorForm) both skipped them — each new caller was a
+	// new way around a rule nobody had meant to relax.
+	if err := s.assertMayStoreDocument(ctx, userID); err != nil {
+		return uuid.Nil, err
 	}
 	if size > maxDocBytes {
 		return uuid.Nil, errDocTooLarge()
@@ -762,6 +803,19 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3
 			 WHERE id=$4 RETURNING user_id, kind`,
 			status, reason, actor, docID).Scan(&rejUserID, &rejKind); err != nil {
+			return err
+		}
+		// An approved profile promises that every current required document is
+		// approved; rejecting one breaks that promise, so the profile must leave
+		// 'approved' too — exactly what RejectBatch already does. Without this
+		// the TA is told to fix a document but Upload refuses them (profile
+		// still approved), and the profile sits in the approved bucket where no
+		// officer is looking for work.
+		if _, err := tx.Exec(ctx, `
+			UPDATE ta_profiles
+			   SET status='needs_fix', reject_reason=$2, verified_at=NOW(), verified_by=$3
+			 WHERE user_id=$1 AND status='approved'`,
+			rejUserID, reason, actor); err != nil {
 			return err
 		}
 		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
@@ -1278,6 +1332,11 @@ func (s *DocsService) BuildCreditorFormPDF(ctx context.Context, userID uuid.UUID
 // creditor_form doc for that user in the same way as a manual upload). Called
 // when the TA clicks "ยืนยัน" on the preview.
 func (s *DocsService) AttachGeneratedCreditorForm(ctx context.Context, userID uuid.UUID, in TAProfile, templatePath, fontDir string) (uuid.UUID, error) {
+	// Upload enforces this too; checking first just avoids rendering a PDF full
+	// of PII that is about to be refused.
+	if err := s.assertMayStoreDocument(ctx, userID); err != nil {
+		return uuid.Nil, err
+	}
 	body, filename, err := s.BuildCreditorFormPDF(ctx, userID, in, templatePath, fontDir, false)
 	if err != nil {
 		return uuid.Nil, err

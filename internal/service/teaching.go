@@ -303,6 +303,9 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 		}
 		lecturerIDs = []uuid.UUID{actor}
 	}
+	if err := assertActiveLecturers(ctx, tx, lecturerIDs); err != nil {
+		return uuid.Nil, err
+	}
 	for i, lid := range lecturerIDs {
 		primary := i == 0
 		if _, err := tx.Exec(ctx,
@@ -1016,16 +1019,8 @@ func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid
 	// Every id must actually be a lecturer account in good standing — nothing
 	// here should let a stray uuid (or a deactivated account) end up attributed
 	// to a course.
-	var validCount int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM users u
-		  WHERE u.id = ANY($1) AND u.is_active
-		    AND EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role::text = 'lecturer')`,
-		lecturerIDs).Scan(&validCount); err != nil {
+	if err := assertActiveLecturers(ctx, s.pool, lecturerIDs); err != nil {
 		return err
-	}
-	if validCount != len(lecturerIDs) {
-		return Invalid("รายชื่อมีบัญชีที่ไม่ใช่อาจารย์ที่ใช้งานอยู่ปะปนอยู่")
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -1361,12 +1356,21 @@ var ErrCourseLocked = errors.New("course is locked after export")
 // assertNotExported returns ErrCourseLocked if the course has been exported.
 // All section CRUD mutations gate on this so the export file stays the source
 // of truth after staff has generated it.
+//
+// On a transaction it also LOCKS the course row, for two reasons. The check is
+// then atomic with the edit that follows — an export cannot land between them.
+// And it fixes the lock order: every course-level write (UpdateCourseInfo,
+// SetNumStudents, Delete …) locks the course and then its sections, while the
+// section edits used to lock the section first and reach the course only later
+// via recomputeAggregate. Two such transactions on one course could deadlock
+// (SQLSTATE 40P01). Taking the course here, before any section is touched,
+// makes every path course → section.
 func (s *TeachingService) assertNotExported(ctx context.Context, tx pgx.Tx, tcID uuid.UUID) error {
 	var exported *time.Time
 	q := "SELECT exported_at FROM teaching_courses WHERE id = $1"
 	var err error
 	if tx != nil {
-		err = tx.QueryRow(ctx, q, tcID).Scan(&exported)
+		err = tx.QueryRow(ctx, q+" FOR UPDATE", tcID).Scan(&exported)
 	} else {
 		err = s.pool.QueryRow(ctx, q, tcID).Scan(&exported)
 	}
@@ -2285,8 +2289,12 @@ type ImportPreviewCourse struct {
 	OfficerRaw         string      `json:"officer_raw"`
 	OfficerNames       []string    `json:"officer_names"`
 	MatchedLecturerIDs []uuid.UUID `json:"matched_lecturer_ids"`
-	UnmatchedNames     []string    `json:"unmatched_names,omitempty"`
-	Note               string      `json:"note,omitempty"`
+	// Who those ids are, by full name — so the person reviewing the import can
+	// see WHICH lecturers will own the course, not only how many. A wrong
+	// auto-match is invisible behind a count.
+	MatchedLecturerNames []string `json:"matched_lecturer_names"`
+	UnmatchedNames       []string `json:"unmatched_names,omitempty"`
+	Note                 string   `json:"note,omitempty"`
 }
 
 type ImportPreview struct {
@@ -2923,13 +2931,49 @@ func officerTokens(raw string) []string {
 // matchOfficers looks up each name in the users table. A name that matches
 // exactly one active lecturer is auto-assigned; anything else (0 matches or
 // >1 ambiguous match) is returned as unmatched so staff can resolve it.
+//
+// The registrar's Officer cell lists several lecturers by FIRST name, space-
+// separated ("ณกร ศรัณย์" is two people), which is why each token is its own
+// lookup. The one reading that breaks is a full name: "สมชาย ใจดี" written for
+// one lecturer whose surname happens to be another lecturer's first name would
+// silently make the second one a co-owner of the course, with authority over
+// its TAs' hours. So a token that completes the previous token into an active
+// lecturer's full name is never auto-assigned on its own: if it is nobody's
+// first name it is just that surname and is skipped; if it is also someone's
+// first name the cell is ambiguous and it goes to staff as unmatched.
 func (s *TeachingService) matchOfficers(ctx context.Context, names []string) (matched []uuid.UUID, unmatched []string, err error) {
 	// Non-nil so they marshal as [] instead of null — the import preview UI
 	// reads .length on both without a guard.
 	matched = []uuid.UUID{}
 	unmatched = []string{}
 	seen := map[uuid.UUID]struct{}{}
-	for _, name := range names {
+	surnameAt := map[int]bool{}
+	for i := 0; i+1 < len(names); i++ {
+		var fullName, firstName bool
+		if err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM users u
+			                 JOIN user_roles r ON r.user_id = u.id AND r.role = 'lecturer'
+			                WHERE u.first_name = $1 AND u.last_name = $2
+			                  AND u.is_active AND u.deleted_at IS NULL),
+			       EXISTS (SELECT 1 FROM users u
+			                 JOIN user_roles r ON r.user_id = u.id AND r.role = 'lecturer'
+			                WHERE u.first_name = $2 AND u.is_active AND u.deleted_at IS NULL)`,
+			names[i], names[i+1]).Scan(&fullName, &firstName); err != nil {
+			return nil, nil, err
+		}
+		if !fullName {
+			continue
+		}
+		surnameAt[i+1] = true
+		if firstName {
+			unmatched = append(unmatched, names[i+1])
+		}
+		i++ // the surname cannot also start a full name
+	}
+	for i, name := range names {
+		if surnameAt[i] {
+			continue
+		}
 		rows, err := s.pool.Query(ctx, `
 			SELECT u.id FROM users u
 			JOIN user_roles r ON r.user_id = u.id AND r.role = 'lecturer'
@@ -2996,8 +3040,9 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 			// Default to empty slices: an "existing" course returns before
 			// matchOfficers runs, and a nil slice would reach the client as
 			// JSON null and crash the preview table.
-			MatchedLecturerIDs: []uuid.UUID{},
-			UnmatchedNames:     []string{},
+			MatchedLecturerIDs:   []uuid.UUID{},
+			MatchedLecturerNames: []string{},
+			UnmatchedNames:       []string{},
 		}
 		// Course identity comes from the file — nothing to pre-populate. A course
 		// is "existing" only when it was already imported into THIS term.
@@ -3019,6 +3064,13 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 		}
 		row.MatchedLecturerIDs = matched
 		row.UnmatchedNames = unmatched
+		if len(matched) > 0 {
+			if err := s.pool.QueryRow(ctx, `
+				SELECT COALESCE(array_agg(first_name || ' ' || last_name ORDER BY array_position($1::uuid[], id)), '{}')
+				FROM users WHERE id = ANY($1)`, matched).Scan(&row.MatchedLecturerNames); err != nil {
+				return nil, err
+			}
+		}
 		if len(unmatched) > 0 {
 			row.Status = "unmatched_officer"
 			out.BlockedCount++
@@ -3773,20 +3825,29 @@ func nilStr(s *string) any {
 // unused import guard
 var _ io.Reader = (io.Reader)(nil)
 
-// LecturerSupervisesTA reports whether the lecturer has this TA assigned in
-// any of their courses (either as the requesting lecturer or as a co-lecturer
-// on the course). Used to scope the timetable form: the form is a personal
-// weekly schedule, so "is a lecturer" alone must not open it.
-func (s *TeachingService) LecturerSupervisesTA(ctx context.Context, lecturerID, taID uuid.UUID) (bool, error) {
+// LecturerSupervisesTA reports whether the lecturer currently supervises this
+// TA in the given term: an APPROVED, not-dropped assignment on one of the
+// lecturer's courses (as requesting lecturer or co-lecturer) in that term.
+// Used to scope the timetable form — a personal weekly schedule — so "is a
+// lecturer" alone must not open it.
+//
+// All three conditions matter. Assignment rows are written when a request is
+// SUBMITTED and never deleted, so without the status check any request the
+// lecturer ever filed — rejected or self-cancelled — granted permanent access.
+// Without the term, one old assignment opened the TA's timetable for every
+// term, past and future.
+func (s *TeachingService) LecturerSupervisesTA(ctx context.Context, lecturerID, taID, termID uuid.UUID) (bool, error) {
 	var ok bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1
 			FROM ta_request_assignments a
-			JOIN ta_requests r ON r.id = a.request_id
+			JOIN ta_requests r      ON r.id = a.request_id AND r.status = 'approved'
+			JOIN teaching_courses tc ON tc.id = r.teaching_course_id AND tc.term_id = $3
 			LEFT JOIN teaching_lecturers tl ON tl.teaching_course_id = r.teaching_course_id
 			WHERE a.ta_id = $1
+			  AND a.state <> 'dropped'
 			  AND (r.lecturer_id = $2 OR tl.lecturer_id = $2)
-		)`, taID, lecturerID).Scan(&ok)
+		)`, taID, lecturerID, termID).Scan(&ok)
 	return ok, err
 }

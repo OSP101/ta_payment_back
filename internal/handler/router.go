@@ -243,6 +243,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	ch := &CourseHandler{Svc: svc}
 	authed.Get("/settings/pay-rate", ch.PayRate)
 	authed.Post("/settings/pay-rate", adminOrStaff, ch.CreatePayRate)
+	// Versions saved ahead of time: listed for staff, withdrawn only by admin
+	// (staff move work forward, only admin reverses) and only before their date.
+	authed.Get("/settings/pay-rate/scheduled", adminOrStaff, ch.ScheduledPayRates)
+	authed.Delete("/settings/pay-rate/:id", RequireRole(rbac.RoleAdmin), ch.DeleteScheduledPayRate)
 
 	// Terms
 	th := &TeachingHandler{Svc: svc}
