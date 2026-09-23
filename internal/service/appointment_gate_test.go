@@ -175,17 +175,16 @@ func TestExportSummary_NoWorkIsNotReviewComplete(t *testing.T) {
 	t.Fatal("course missing from the summary")
 }
 
-// THE DEADLOCK. An unappointed TA's approved month cannot be reviewed — it is not
-// in the queue. If it still counted as an unreviewed month, the course could
-// never reach ReviewComplete, so it would never become exportable no matter what
-// staff did: the screen would demand a sign-off that no screen offers.
-func TestExportSummary_UnappointedWorkDoesNotBlockExportForever(t *testing.T) {
+// A partly-appointed course waits for the next order (decided 23/09/2026) rather
+// than claiming only the appointed TAs: the claim workbook lists people from the
+// assignments, so leaving someone out of the gate would still bill them in the
+// file. The dashboard must therefore agree with the download — not eligible — and
+// name who is waiting, and it must NOT be wedged forever: printing the missing
+// order and signing their month off makes the course eligible again.
+func TestExportSummary_UnappointedWorkBlocksUntilTheirOrderIsPrinted(t *testing.T) {
 	f, month := reviewFixture(t) // appointed TA, approved work
+	other := f.secondTAOnSameCourse()
 
-	// A colleague with approved work who is NOT on the order.
-	f.secondTAOnSameCourse()
-
-	// Everything a diligent officer CAN do: sign off the one row the queue offers.
 	staff := f.insertUser("staff", "officer")
 	pid := mustUUID(t, f.periodID(t, month))
 	if err := f.Periods.MarkStaffReviewed(f.ctx, staff, pid, f.TAID, f.CourseID, ""); err != nil {
@@ -193,20 +192,43 @@ func TestExportSummary_UnappointedWorkDoesNotBlockExportForever(t *testing.T) {
 	}
 
 	exp := &ExportBatchService{pool: f.Pool, aud: audit.New(f.Pool)}
-	all, err := exp.DashboardSummary(f.ctx, &BudgetService{pool: f.Pool}, exportSvcFor(f), f.TermID)
+	summary := func() CourseSummary {
+		all, err := exp.DashboardSummary(f.ctx, &BudgetService{pool: f.Pool}, exportSvcFor(f), f.TermID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range all.Courses {
+			if s.TeachingCourseID == f.CourseID {
+				return s
+			}
+		}
+		t.Fatal("course missing from the summary")
+		return CourseSummary{}
+	}
+
+	s := summary()
+	if s.ExportEligible {
+		t.Error("export_eligible is true while a colleague with approved work has no order — the download would refuse")
+	}
+	if len(s.AwaitingAppointment) != 1 {
+		t.Errorf("awaiting_appointment = %v, want the one un-appointed colleague named", s.AwaitingAppointment)
+	}
+	blockers, err := exportSvcFor(f).CourseExportBlockers(f.ctx, f.CourseID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range all.Courses {
-		if s.TeachingCourseID != f.CourseID {
-			continue
-		}
-		if !s.ExportEligible {
-			t.Errorf("course is stuck: export_eligible=false with unreviewed months %v, "+
-				"but those months belong to a TA the review queue refuses to show",
-				s.UnreviewedMonths)
-		}
-		return
+	if s.ExportEligible != (len(blockers) == 0) {
+		t.Errorf("dashboard eligible=%v but download blockers=%v — the two screens disagree", s.ExportEligible, blockers)
 	}
-	t.Fatal("course missing from the summary")
+
+	// Not forever: print their order, sign their month off, and it clears.
+	f.addAppointmentOrderFor(other)
+	if err := f.Periods.MarkStaffReviewed(f.ctx, staff, pid, other, f.CourseID, ""); err != nil {
+		t.Fatalf("MarkStaffReviewed after appointing: %v", err)
+	}
+	s = summary()
+	if !s.ExportEligible || len(s.AwaitingAppointment) != 0 {
+		t.Errorf("after the order: eligible=%v awaiting=%v, want eligible and nobody waiting",
+			s.ExportEligible, s.AwaitingAppointment)
+	}
 }

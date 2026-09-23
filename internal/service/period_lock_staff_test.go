@@ -27,7 +27,7 @@ func TestStaffUpsert_RefusesAClosedMonth(t *testing.T) {
 
 	// A brand-new row in the closed month.
 	w := f.entry(day(12), "09:00", "11:00", 2)
-	_, err := f.Svc.StaffUpsert(f.ctx, f.LecturerID, true, w)
+	_, err := f.Svc.StaffUpsert(f.ctx, f.LecturerID, true, w, nil)
 	if err == nil {
 		t.Fatal("staff must not be able to add hours to a month that has closed")
 	}
@@ -78,7 +78,7 @@ func TestApprove_StillWorksAfterTheMonthCloses(t *testing.T) {
 func TestStaffUpsert_StillWorksWhileTheMonthIsOpen(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	w := f.entry(day(12), "09:00", "11:00", 2)
-	if _, err := f.Svc.StaffUpsert(f.ctx, f.LecturerID, true, w); err != nil {
+	if _, err := f.Svc.StaffUpsert(f.ctx, f.LecturerID, true, w, nil); err != nil {
 		t.Fatalf("staff must still be able to correct an open month: %v", err)
 	}
 }

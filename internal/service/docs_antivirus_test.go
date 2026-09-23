@@ -55,6 +55,11 @@ func avFixture(t *testing.T, sc antivirus.Scanner) (*DocsService, *countingStore
 		uid, "av-"+uid.String()+"@example.test"); err != nil {
 		t.Fatalf("insert user: %v", err)
 	}
+	// Upload refuses anyone who has not accepted the PDPA notice; these tests
+	// are about scanning, so start from a TA who has.
+	if err := svc.RecordPdpaConsent(context.Background(), uid, "127.0.0.1", "test-agent"); err != nil {
+		t.Fatalf("record consent: %v", err)
+	}
 	return svc, store, uid
 }
 

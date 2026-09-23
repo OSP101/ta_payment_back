@@ -621,6 +621,10 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		  -- lecturer-approved month qualified, which is the gap the meeting
 		  -- closed by making "ตรวจสอบเบิกจ่ายค่าตอบแทน" its own step.
 		  AND COALESCE(st.status,'pending') = 'staff_reviewed'
+		  -- Never lock a pair absent from a printed order. MarkStaffReviewed now
+		  -- refuses such pairs, but rows reviewed before that check existed can
+		  -- still be sitting at staff_reviewed.
+		  AND `+AppointedSQL("tc.id", "a.ta_id")+`
 		  -- The approved work this period is locked FOR must fall inside the
 		  -- fiscal slice being exported. Without this, issuing มิ.ย.–ก.ย. in
 		  -- September would also freeze ตุลาคม, which is still being taught and
@@ -705,6 +709,9 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 	if err := s.assertSignTarget(ctx, periodID, taID, tcID); err != nil {
 		return err
 	}
+	if err := assertAppointed(ctx, s.pool, tcID, taID); err != nil {
+		return err
+	}
 	// Payout readiness: the reimbursement documents carry the TA's national ID
 	// and bank account — refuse the handoff while the profile is unapproved or
 	// incomplete instead of shipping paperwork with blank fields.
@@ -712,20 +719,24 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 		return err
 	}
 	name := s.userDisplayName(ctx, actor)
-	// Read on the pool before the transaction opens. Slightly weaker than an
-	// in-transaction read, and deliberately so: these cells are serialised by
-	// the workflow itself (only staff move them, one screen at a time) and the
-	// alternative is restructuring five callers around a wrapper. The state it
-	// records is what the operator was looking at when they clicked.
-	prevStatus, err := periodStatus(ctx, s.pool, periodID, taID, tcID)
-	if err != nil {
-		return err
-	}
+	// The before-image is read inside the transaction, under the cell's lock
+	// (see writeAuditedLocked / lockPeriodCell), so it is the state this write
+	// actually replaced. It used to be read on the pool first, on the theory that
+	// only one officer moves a cell at a time — which the audit trail cannot
+	// assume, since it is the record used when that assumption is in question.
 	sentEntry := audit.Entry{ActorID: &actor, Action: "submission_period.finance_sent",
 		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-		Before: prevStatus, After: map[string]any{"status": "finance_sent"}}
-	if err := writeAudited(ctx, s.pool, s.aud, sentEntry,
-		func(tx pgx.Tx) error {
+		After: map[string]any{"status": "finance_sent"}}
+	if err := writeAuditedLocked(ctx, s.pool, s.aud, sentEntry,
+		func(tx pgx.Tx, e *audit.Entry) error {
+			if err := lockPeriodCell(ctx, tx, periodID, taID, tcID); err != nil {
+				return err
+			}
+			prevStatus, err := periodStatus(ctx, tx, periodID, taID, tcID)
+			if err != nil {
+				return err
+			}
+			e.Before = prevStatus
 			tag, err := tx.Exec(ctx, `
 				UPDATE submission_period_status
 				SET status            = 'finance_sent',
@@ -904,15 +915,19 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 		return err
 	}
 	name := s.userDisplayName(ctx, actor)
-	prevStatus, err := periodStatus(ctx, s.pool, periodID, taID, tcID)
-	if err != nil {
-		return err
-	}
 	revertEntry := audit.Entry{ActorID: &actor, Action: "submission_period.finance_revert",
 		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-		Note: reason, Before: prevStatus, After: map[string]any{"status": "exported"}}
-	if err := writeAudited(ctx, s.pool, s.aud, revertEntry,
-		func(tx pgx.Tx) error {
+		Note: reason, After: map[string]any{"status": "exported"}}
+	if err := writeAuditedLocked(ctx, s.pool, s.aud, revertEntry,
+		func(tx pgx.Tx, e *audit.Entry) error {
+			if err := lockPeriodCell(ctx, tx, periodID, taID, tcID); err != nil {
+				return err
+			}
+			prevStatus, err := periodStatus(ctx, tx, periodID, taID, tcID)
+			if err != nil {
+				return err
+			}
+			e.Before = prevStatus
 			tag, err := tx.Exec(ctx, `
 				UPDATE submission_period_status SET
 				  status            = 'exported',

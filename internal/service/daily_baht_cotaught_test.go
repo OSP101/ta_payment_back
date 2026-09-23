@@ -71,7 +71,7 @@ func TestDailyBahtCap_EditingANoteOnACoTaughtRowIsAllowed(t *testing.T) {
 	note := "เช็คชื่อ แทน"
 	edited.Note = &note
 
-	if _, err := f.Svc.StaffUpsert(f.ctx, f.StaffID, true, edited); err != nil {
+	if _, err := f.Svc.StaffUpsert(f.ctx, f.StaffID, true, edited, nil); err != nil {
 		t.Fatalf("changing only the note must not be refused by the pay cap: %v", err)
 	}
 }

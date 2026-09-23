@@ -117,9 +117,17 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 			return nil, Forbidden("เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่สร้างบัญชี admin ได้")
 		}
 	}
-	// Enforce the same minimum password policy staff-supplied passwords must meet.
-	if in.Password != nil && *in.Password != "" && len(*in.Password) < 8 {
-		return nil, Invalid("รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร")
+	// Enforce the FULL password policy, not just a length floor. An operator-set
+	// initial password is a live credential the moment it is written: login works
+	// immediately, and because ChangePassword skips the current-password proof
+	// while must_change_password is true, whoever reaches /me/password first owns
+	// the account for good. A blocklisted value here is therefore not a temporary
+	// weakness, so it gets the same check a user's own password change gets.
+	// (The crypto/rand temp-password branch below needs no check.)
+	if in.Password != nil && *in.Password != "" {
+		if err := ValidatePassword(*in.Password); err != nil {
+			return nil, err
+		}
 	}
 	if err := validateStudyYear(in.StudyYear); err != nil {
 		return nil, err

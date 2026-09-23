@@ -10,7 +10,7 @@ import (
 )
 
 // ErrNotAuthorized is returned by Claim (and surfaced by
-// Manager.TierForSlotIndex) when the email in question has no row in
+// Manager.TierForClaim) when the email in question has no row in
 // demo_authorized_testers. Unlike ErrFull this is not a capacity problem
 // that resolves itself later — it stays true until staff adds the email via
 // AddAuthorizedTester.
@@ -36,7 +36,7 @@ func normalizeEmail(email string) string {
 // caching layer sits in front of this anywhere, so a change staff makes via
 // RemoveAuthorizedTester/AddAuthorizedTester is visible to the very next
 // call. Called both by Claim (deciding whether to hand out a slot at all)
-// and by Manager.TierForSlotIndex (deciding whether a login may proceed).
+// and by Manager.TierForClaim (deciding whether a login may proceed).
 func LookupTier(ctx context.Context, pool *pgxpool.Pool, email string) (Tier, bool, error) {
 	email = normalizeEmail(email)
 	if email == "" {
@@ -104,7 +104,7 @@ func AddAuthorizedTester(ctx context.Context, pool *pgxpool.Pool, email string, 
 
 // RemoveAuthorizedTester revokes email's access outright.
 //
-// This alone does NOT end an in-progress demo session — TierForSlotIndex is
+// This alone does NOT end an in-progress demo session — TierForClaim is
 // only consulted at login (LoginHandler.Login), never by DemoAuthenticated
 // or AccountGuard on later requests, so a token already issued keeps working
 // until it expires (JWT_LIFETIME, 12h default) or something else revokes the

@@ -70,9 +70,9 @@ func TestLecturerSupervisesTA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	check := func(lect uuid.UUID, want bool, label string) {
+	check := func(lect, term uuid.UUID, want bool, label string) {
 		t.Helper()
-		got, err := svc.LecturerSupervisesTA(ctx, lect, ta)
+		got, err := svc.LecturerSupervisesTA(ctx, lect, ta, term)
 		if err != nil {
 			t.Fatalf("%s: %v", label, err)
 		}
@@ -80,7 +80,35 @@ func TestLecturerSupervisesTA(t *testing.T) {
 			t.Errorf("%s: got %v, want %v", label, got, want)
 		}
 	}
-	check(owner, true, "requesting lecturer")
-	check(coLect, true, "co-lecturer on the course")
-	check(outside, false, "unrelated lecturer")
+	check(owner, termID, true, "requesting lecturer")
+	check(coLect, termID, true, "co-lecturer on the course")
+	check(outside, termID, false, "unrelated lecturer")
+
+	// Scoped to the term asked about: one assignment is not a pass to the TA's
+	// timetable in every other term.
+	var otherTerm uuid.UUID
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO academic_terms (academic_year, semester) VALUES (9968, 2) RETURNING id`,
+	).Scan(&otherTerm); err != nil {
+		t.Fatal(err)
+	}
+	check(owner, otherTerm, false, "same lecturer, a term with no assignment")
+
+	// A dropped assignment no longer supervises.
+	if _, err := pool.Exec(ctx, `UPDATE ta_request_assignments SET state = 'dropped' WHERE request_id = $1`, reqID); err != nil {
+		t.Fatal(err)
+	}
+	check(owner, termID, false, "assignment dropped")
+	if _, err := pool.Exec(ctx, `UPDATE ta_request_assignments SET state = DEFAULT WHERE request_id = $1`, reqID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assignment rows are written at SUBMIT and never deleted, so a request that
+	// was rejected or cancelled must not keep granting access.
+	for _, st := range []string{"rejected", "cancelled", "submitted"} {
+		if _, err := pool.Exec(ctx, `UPDATE ta_requests SET status = $2::ta_request_status WHERE id = $1`, reqID, st); err != nil {
+			t.Fatal(err)
+		}
+		check(owner, termID, false, "request "+st)
+	}
 }

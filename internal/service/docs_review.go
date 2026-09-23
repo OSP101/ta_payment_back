@@ -358,6 +358,13 @@ func (s *DocsService) SweepZipTokens(now time.Time) {
 // two clicks would lock every TA out of individual re-download for good. The
 // audit entry is what keeps it accountable instead: who pulled it, when, and
 // exactly which TAs were inside.
+// maxBulkUserIDs bounds one bulk-bundle request. Every named TA contributes up
+// to three required documents, all of which are read fully into memory and
+// merged in-process, so without a cap the bytes buffered per request grow with
+// the officer's selection and nothing else — the per-document 10MB limit bounds
+// each file but not the total.
+const maxBulkUserIDs = 50
+
 func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UUID, password string, userIDs []uuid.UUID) (string, int, error) {
 	password = strings.TrimSpace(password)
 	if password == "" {
@@ -367,6 +374,9 @@ func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UU
 	// database, which is exactly the behaviour being removed.
 	if len(userIDs) == 0 {
 		return "", 0, Invalid("ยังไม่มีใครในรายชื่อนี้ที่อนุมัติครบทั้ง 3 ไฟล์")
+	}
+	if len(userIDs) > maxBulkUserIDs {
+		return "", 0, Invalid(fmt.Sprintf("เลือกได้ไม่เกิน %d คนต่อครั้ง กรุณาแบ่งดาวน์โหลดเป็นชุดย่อย", maxBulkUserIDs))
 	}
 	if err := s.verifyOfficerPassword(ctx, actor, password); err != nil {
 		return "", 0, err

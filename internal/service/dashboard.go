@@ -115,7 +115,7 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 		args = append(args, *enrollmentID)
 	}
 	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
 		assign AS (
 		    SELECT tc.id AS tc_id, tc.code, tc.name_th, tc.exported_at,
 		           t.academic_year, t.semester,
@@ -240,7 +240,7 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 		args = append(args, *termID)
 	}
 	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
 		course AS (
 		    SELECT tc.id, tc.code, tc.name_th, t.academic_year, t.semester
 		    FROM teaching_courses tc

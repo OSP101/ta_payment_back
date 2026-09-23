@@ -391,7 +391,7 @@ func (m *Manager) TouchSlotActivity(ctx context.Context, idx int) error {
 func (m *Manager) Release(ctx context.Context, ownerEmail string) (bool, error) {
 	ownerEmail = strings.ToLower(strings.TrimSpace(ownerEmail))
 	// หา slot ก่อน เพื่อจะ revoke session ที่ยังเปิดอยู่ในนั้น — ไม่ใช่แค่
-	// ปลด owner_email · TierForSlotIndex ถูกเช็คตอน login เท่านั้น ดังนั้น
+	// ปลด owner_email · TierForClaim ถูกเช็คตอน login เท่านั้น ดังนั้น
 	// ถ้าไม่ revoke ตรงนี้ คุกกี้เดิมของคนที่เพิ่งถูกเพิกถอนสิทธิ์จะยังใช้ได้
 	// ต่ออีกจนหมดอายุ JWT (ค่าเริ่มต้น 12 ชม.) ซึ่งขัดกับสิ่งที่คอมเมนต์ของ
 	// RemoveAuthorizedTester สัญญาไว้
@@ -415,32 +415,39 @@ func (m *Manager) Release(ctx context.Context, ownerEmail string) (bool, error) 
 	return tag.RowsAffected() > 0, nil
 }
 
-// TierForSlotIndex resolves the tier CURRENTLY authorized for whoever owns
-// slot idx, looked up fresh — never cached — so a tier change or an outright
-// revocation in demo_authorized_testers takes effect on that slot's very
-// next login, not its next visit. LoginHandler.Login is the one caller that
-// matters: the same 8 slots get reassigned to many different real testers
-// over the sandbox's lifetime, so trusting a tier resolved once at Mount
-// (boot) time would keep granting a departed tester's old access to
-// whoever claims their old slot next.
-func (m *Manager) TierForSlotIndex(ctx context.Context, idx int) (Tier, error) {
-	// owner_email is nullable — NULL means the slot is free (see migration
-	// 0086's own comment) — which is the everyday state for most of the 8
-	// slots at any given moment. A plain string scan target errors on that
-	// NULL (pgx v5 rejects NULL→non-pointer-string), and every slot's login
-	// route is reachable unconditionally regardless of claim status (see
-	// handlers.go's Mount), so an unclaimed slot's login attempt must reach
-	// ErrNotAuthorized here, not a raw scan error surfaced as a 500.
-	var email *string
+// claimKey is the HMAC key for slot claim credentials (claim.go), derived from
+// the demo JWT secret so no new secret needs provisioning.
+func (m *Manager) claimKey() []byte {
+	return []byte(m.cfg.DemoJWTSecret)
+}
+
+// SignSlotClaim mints the credential /enter hands the browser that claimed slot
+// idx with email.
+func (m *Manager) SignSlotClaim(idx int, email string) string {
+	return signClaim(m.claimKey(), slotClaim{Slot: idx, Email: email}, time.Now())
+}
+
+// TierForClaim resolves the tier for a login on slot idx from the claim
+// credential the caller presents — never from the slot alone. The credential
+// must be valid, name THIS slot, and belong to the email that still owns the
+// slot right now (a reclaimed slot invalidates its previous owner's claim).
+// The tier is then looked up fresh for that email, so revocation and tier
+// changes still apply on the very next login.
+func (m *Manager) TierForClaim(ctx context.Context, idx int, rawClaim string) (Tier, error) {
+	cl, err := verifyClaim(m.claimKey(), rawClaim, time.Now())
+	if err != nil || cl.Slot != idx {
+		return "", errBadClaim
+	}
+	var owner *string
 	if err := m.mainPool.QueryRow(ctx,
 		`SELECT owner_email FROM demo_workspaces WHERE slot_index = $1`, idx,
-	).Scan(&email); err != nil {
+	).Scan(&owner); err != nil {
 		return "", err
 	}
-	if email == nil {
-		return "", ErrNotAuthorized
+	if owner == nil || normalizeEmail(*owner) != normalizeEmail(cl.Email) {
+		return "", errBadClaim
 	}
-	tier, ok, err := LookupTier(ctx, m.mainPool, *email)
+	tier, ok, err := LookupTier(ctx, m.mainPool, cl.Email)
 	if err != nil {
 		return "", err
 	}

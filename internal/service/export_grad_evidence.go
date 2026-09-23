@@ -265,8 +265,8 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	semTH := map[int]string{1: "ภาคต้น", 2: "ภาคปลาย", 3: "ภาคฤดูร้อน"}[d.Semester]
 
 	set := func(cell string, v any) error {
-		if str, ok := v.(string); ok && strings.HasPrefix(str, "=") {
-			return f.SetCellFormula(sheet, cell, strings.TrimPrefix(str, "="))
+		if fm, ok := v.(xlFormula); ok {
+			return f.SetCellFormula(sheet, cell, strings.TrimPrefix(string(fm), "="))
 		}
 		return f.SetCellValue(sheet, cell, v)
 	}
@@ -484,21 +484,21 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 		first, last := c.Months[0], c.Months[len(c.Months)-1]
 		if lump {
 			// เหมาจ่าย: the months ARE the money, so รับจริง is their sum.
-			if err := set(at(c.Received, r), fmt.Sprintf("=SUM(%s%d:%s%d)", first, r, last, r)); err != nil {
+			if err := set(at(c.Received, r), xlf("=SUM(%s%d:%s%d)", first, r, last, r)); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := set(at(c.TotalHours, r), fmt.Sprintf("=SUM(%s%d:%s%d)", first, r, last, r)); err != nil {
+		if err := set(at(c.TotalHours, r), xlf("=SUM(%s%d:%s%d)", first, r, last, r)); err != nil {
 			return err
 		}
 		if err := set(at(c.Rate, r), d.RateGradRegular); err != nil {
 			return err
 		}
-		if err := set(at(c.Amount, r), fmt.Sprintf("=%s%d*%s%d", c.TotalHours, r, c.Rate, r)); err != nil {
+		if err := set(at(c.Amount, r), xlf("=%s%d*%s%d", c.TotalHours, r, c.Rate, r)); err != nil {
 			return err
 		}
-		if err := set(at(c.Received, r), fmt.Sprintf("=%s%d", c.Amount, r)); err != nil {
+		if err := set(at(c.Received, r), xlf("=%s%d", c.Amount, r)); err != nil {
 			return err
 		}
 	}
@@ -563,7 +563,7 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 		bl: "thin", br: "thin", bt: "thin", bb: "thin"}); err != nil {
 		return err
 	}
-	if err := set(at(c.Received, sum), fmt.Sprintf("=SUM(%s10:%s%d)", c.Received, c.Received, lastRow)); err != nil {
+	if err := set(at(c.Received, sum), xlf("=SUM(%s10:%s%d)", c.Received, c.Received, lastRow)); err != nil {
 		return err
 	}
 	if err := styAt(c.Received, sum, cellSpec{bold: true, numFmt: fmtComma00,
@@ -586,7 +586,7 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 	// The college leaves those white — they are written in by hand, and a silver
 	// band under a signature is the one place on the form ink does not read.
 	bandEnd := colOffsetFrom(c.Last, -2)
-	if err := set(at(c.Level, sum+1), fmt.Sprintf(`="("&BAHTTEXT(%s%d)&")"`, c.Received, sum)); err != nil {
+	if err := set(at(c.Level, sum+1), xlf(`="("&BAHTTEXT(%s%d)&")"`, c.Received, sum)); err != nil {
 		return err
 	}
 	if err := f.MergeCell(sheet, at(c.Level, sum+1), at(bandEnd, sum+1)); err != nil {
@@ -653,7 +653,7 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 	var pr PayRate
 	if err := s.pool.QueryRow(ctx, `
 		SELECT graduate_regular_hourly, graduate_special_lumpsum, grad_special_term_cap
-		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		FROM `+payRatesInForce+``).Scan(
 		&pr.GraduateRegularHourly, &pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap); err != nil {
 		return nil, err
 	}

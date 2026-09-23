@@ -1225,7 +1225,7 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 	// unwound once the TA has worked the hours. Refuse and say why.
 	var haveRates bool
 	if err := s.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pay_rates)`).Scan(&haveRates); err != nil {
+		`SELECT EXISTS(SELECT 1 FROM `+payRatesInForce+`)`).Scan(&haveRates); err != nil {
 		return err
 	}
 	if !haveRates {
@@ -1240,7 +1240,7 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 	// whenever a slot begins after every previous one has ended, then measure
 	// each island once.
 	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM pay_rates ORDER BY effective_from DESC LIMIT 1),
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
 		slots AS (
 		    SELECT ss.day_of_week AS dow, ss.start_time AS st, ss.end_time AS en
 		    FROM section_schedules ss

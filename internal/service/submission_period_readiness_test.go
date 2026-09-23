@@ -16,6 +16,8 @@ import (
 // entirely) were being added to the SAME TA's real-assignment readiness count.
 func TestMarkStaffReviewed_NotBlockedByDeadGradSpecialSiblingAssignment(t *testing.T) {
 	f := newFixture(t, fixtureOpts{Level: "phd", Track: "regular"})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	pid := f.addSubmissionPeriod(currentMonthMM(), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
 	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID); err != nil {

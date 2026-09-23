@@ -49,6 +49,8 @@ func exportReadyZip(t *testing.T, f *fixture) []byte {
 
 func TestBuildCourseZip_GradCourseCarriesBothGraduateDocuments(t *testing.T) {
 	f := newFixture(t, fixtureOpts{Level: "master", Track: "regular"})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	names := zipEntryNames(t, exportReadyZip(t, f))
 
 	var evidence, workload bool
@@ -82,6 +84,8 @@ func TestBuildCourseZip_GradCourseCarriesBothGraduateDocuments(t *testing.T) {
 // to ask about.
 func TestBuildCourseZip_UndergradCourseGainsNothing(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	// Payout stages only apply to a TA on a printed appointment order.
+	f.addAppointmentOrder()
 	names := zipEntryNames(t, exportReadyZip(t, f))
 
 	for _, n := range names {

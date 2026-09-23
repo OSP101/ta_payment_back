@@ -239,7 +239,7 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 	if err := s.pool.QueryRow(ctx, `
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
 		       graduate_special_lumpsum, grad_special_term_cap, term_months
-		FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		FROM `+payRatesInForce+``).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
 		&pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap, &pr.TermMonths); err != nil {
 		return nil, nil, err

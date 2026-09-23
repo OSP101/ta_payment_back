@@ -35,18 +35,19 @@ import (
 // by (e.g. not filled in yet) — callers should fall back to an even split
 // across the term's months in that case rather than fail outright.
 func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID) (map[string]float64, error) {
-	var start, end time.Time
+	// The shared course-window definition. No dates at all → nothing to weight
+	// by, same as "no schedule": the caller splits evenly.
+	var startP, endP *time.Time
 	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(tc.starts_on, at.starts_on, '0001-01-01'::date),
-		       COALESCE(tc.ends_on,   at.ends_on,   '9999-12-31'::date)
+		SELECT `+CourseStartSQL("tc")+`, `+CourseEndSQL("tc")+`
 		FROM teaching_courses tc
-		JOIN academic_terms at ON at.id = tc.term_id
-		WHERE tc.id = $1`, tcID).Scan(&start, &end); err != nil {
+		WHERE tc.id = $1`, tcID).Scan(&startP, &endP); err != nil {
 		return nil, err
 	}
-	if start.IsZero() || end.IsZero() || end.Before(start) {
+	if startP == nil || endP == nil || endP.Before(*startP) {
 		return nil, nil
 	}
+	start, end := *startP, *endP
 
 	var midStart, midEnd, finStart, finEnd *time.Time
 	if err := pool.QueryRow(ctx, `
@@ -163,8 +164,34 @@ func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.U
 func (s *ExportService) gradLumpByMonth(
 	ctx context.Context, courseID, taID uuid.UUID, lump float64, approvedOnly bool,
 ) (map[string]float64, error) {
+	out, _, err := s.gradLumpSplit(ctx, s.pool, courseID, taID, lump, approvedOnly)
+	return out, err
+}
+
+// gradLumpSplit is gradLumpByMonth plus the whole-term lump it actually split
+// (the frozen basis once anything is frozen). q reads the ledger, so the freeze
+// can see it inside its own transaction.
+//
+// Months already in grad_lump_ledger keep the figure their claim document
+// carried; only the rest of the lump is placed, over the months not frozen yet.
+func (s *ExportService) gradLumpSplit(
+	ctx context.Context, q ledgerQuerier, courseID, taID uuid.UUID, lump float64, approvedOnly bool,
+) (map[string]float64, float64, error) {
+	frozen, err := loadFrozenGradLump(ctx, q, courseID, taID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if frozen.any() {
+		lump = frozen.basis
+	}
 	if lump <= 0 {
-		return map[string]float64{}, nil
+		return map[string]float64{}, lump, nil
+	}
+	remaining := lump - frozen.total
+	if remaining < 0 {
+		// Unreachable while the basis is locked with the first freeze; kept so
+		// a hand-edited ledger reads as "nothing left", never a negative month.
+		remaining = 0
 	}
 	status := "w.status = 'approved'"
 	if !approvedOnly {
@@ -179,7 +206,7 @@ func (s *ExportService) gradLumpByMonth(
 		  AND `+status+`
 		GROUP BY 1`, courseID, taID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	weights := map[string]float64{}
 	var total float64
@@ -188,7 +215,7 @@ func (s *ExportService) gradLumpByMonth(
 		var hrs float64
 		if err := rows.Scan(&ym, &hrs); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, 0, err
 		}
 		if hrs > 0 {
 			weights[ym] = hrs
@@ -197,13 +224,13 @@ func (s *ExportService) gradLumpByMonth(
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if total <= 0 {
 		// Nothing logged yet: the regular-track schedule estimate.
 		weights, err = gradSpecialMonthShares(ctx, s.pool, courseID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if len(weights) == 0 {
@@ -211,7 +238,7 @@ func (s *ExportService) gradLumpByMonth(
 		weights = map[string]float64{}
 		all, err := s.CourseTermMonths(ctx, courseID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for _, m := range all {
 			weights[m.YearMonth] = 1
@@ -219,14 +246,32 @@ func (s *ExportService) gradLumpByMonth(
 		if len(weights) == 0 {
 			cal, err := courseCalendarMonths(ctx, s.pool, courseID)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			for _, ym := range cal {
 				weights[ym] = 1
 			}
 		}
 	}
-	return placeLump(lump, weights), nil
+	open := withoutFrozen(weights, frozen)
+	if len(open) == 0 && remaining > 0 {
+		// Everything with weight is already frozen: what is left goes evenly
+		// over the term's remaining months rather than being dropped.
+		all, err := s.CourseTermMonths(ctx, courseID)
+		if err != nil {
+			return nil, 0, err
+		}
+		even := map[string]float64{}
+		for _, m := range all {
+			even[m.YearMonth] = 1
+		}
+		open = withoutFrozen(even, frozen)
+	}
+	out := placeLump(remaining, open)
+	for ym, v := range frozen.months {
+		out[ym] = v
+	}
+	return out, lump, nil
 }
 
 // placeLump divides a lump over months by weight, whole baht each, remainder

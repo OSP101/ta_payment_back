@@ -77,7 +77,14 @@ func documentAcademicPrefix(title string) string {
 	return title
 }
 
-func (s *AdminOfficerService) List(ctx context.Context, includeInactive bool) ([]AdminOfficer, error) {
+// List takes the caller's privilege because this route is deliberately open to
+// any authenticated user (document templates render the roster), while
+// LinkedEmail/LinkedActive exist only for the staff settings screen. Account
+// email is PII this API otherwise restricts to admin/staff/lecturer and records
+// via AuditRead, so a plain TA must not receive it here. Both fields are
+// `omitempty`: a non-privileged response simply omits them and every rendering
+// field is untouched.
+func (s *AdminOfficerService) List(ctx context.Context, includeInactive, privileged bool) ([]AdminOfficer, error) {
 	q := `SELECT ao.id, ao.user_id, ao.academic_prefix, ao.full_name, ao.title, ao.is_active,
 	             u.email, u.is_active
 	      FROM admin_officers ao
@@ -101,6 +108,10 @@ func (s *AdminOfficerService) List(ctx context.Context, includeInactive bool) ([
 		}
 		if userID != nil {
 			o.UserID = *userID
+		}
+		if !privileged {
+			o.LinkedEmail = nil
+			o.LinkedActive = nil
 		}
 		o.IsDean = IsDeanTitle(o.Title)
 		o.IsHead = IsHeadTitle(o.Title)

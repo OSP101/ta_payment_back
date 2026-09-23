@@ -72,7 +72,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Docs = &DocsService{pool: pool, aud: auditor, store: store, av: av, pii: piiCipher, notify: c.Notify}
 	// Workload holds a back-reference to TARequest so saving a TA timetable can
 	// finalise the requests that were waiting for it (deferred-decision model).
-	c.Workload = &WorkloadService{pool: pool, requests: c.TARequest}
+	c.Workload = &WorkloadService{pool: pool, aud: auditor, requests: c.TARequest}
 	c.WorkLog = &WorkLogService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
 	c.Export = &ExportService{pool: pool, aud: auditor, notify: c.Notify, store: store, budget: c.Budget, teaching: c.Teaching, users: c.Users, docs: c.Docs}
 	// Back-reference, set after both exist: approving is what moves the budget,

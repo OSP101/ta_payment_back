@@ -105,7 +105,7 @@ func TestStaffUpsert_AlsoRespectsOwnClass(t *testing.T) {
 	f.addOwnClass("CP101", weekdayOf(t, d), "09:00", "12:00")
 
 	w := f.entry(d, "10:00", "11:00", 1)
-	if _, err := f.Svc.StaffUpsert(f.ctx, staff, true, w); err == nil {
+	if _, err := f.Svc.StaffUpsert(f.ctx, staff, true, w, nil); err == nil {
 		t.Fatal("staff must not be able to enter hours clashing with the TA's class")
 	}
 	if n := f.countLogs(); n != 0 {

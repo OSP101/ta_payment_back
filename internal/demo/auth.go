@@ -180,13 +180,17 @@ func (h *LoginHandler) Login(c *fiber.Ctx) error {
 	// The real access-control check, not the account-picker filtering
 	// /api/demo/enter already did — that only hides cards the tester
 	// shouldn't click, which stops nobody who opens devtools and POSTs
-	// straight here. Resolved fresh per request (never cached) against
-	// whoever CURRENTLY owns this slot, so a tier change or revocation in
-	// demo_authorized_testers takes effect on this very login attempt.
-	tier, err := h.Manager.TierForSlotIndex(c.Context(), h.SlotIndex)
+	// straight here. The tier comes from the CALLER's slot claim (claim.go),
+	// not from whoever owns this slot: resolving it from the owner let any
+	// tester log into another tester's slot under that owner's tier. Still
+	// looked up fresh per request, so revocation applies immediately.
+	tier, err := h.Manager.TierForClaim(c.Context(), h.SlotIndex, c.Cookies(claimCookieName))
 	if err != nil {
 		if errors.Is(err, ErrNotAuthorized) {
 			return fiber.NewError(fiber.StatusForbidden, "สิทธิ์ทดสอบของคุณถูกยกเลิกแล้ว กรุณาติดต่อเจ้าหน้าที่")
+		}
+		if errors.Is(err, errBadClaim) {
+			return fiber.NewError(fiber.StatusForbidden, "ห้องทดลองนี้ไม่ใช่ของเบราว์เซอร์นี้ กรุณาเข้าห้องทดลองใหม่จากหน้าแรก")
 		}
 		return err
 	}

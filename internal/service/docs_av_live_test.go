@@ -65,6 +65,9 @@ func TestLiveAV_InfectedUploadRefusedAndNotStored(t *testing.T) {
 		uid, "avlive-"+uid.String()+"@example.test"); err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.RecordPdpaConsent(ctx, uid, "127.0.0.1", "test-agent"); err != nil {
+		t.Fatal(err)
+	}
 
 	// A clean PDF goes through the real scanner and is stored.
 	clean := append([]byte("%PDF-1.7\n"), bytes.Repeat([]byte("clean "), 500)...)

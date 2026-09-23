@@ -90,6 +90,9 @@ func Mount(app *fiber.App, m *Manager) {
 		if err != nil {
 			return err
 		}
+		// The only proof a later slot login is from the browser that claimed
+		// this slot — see claim.go.
+		setClaimCookie(c, m.SignSlotClaim(slot.Index, in.Email), m.cfg.CookieSecure)
 		return c.JSON(fiber.Map{
 			"base_path":     slotBasePath(slot.Index),
 			"accounts":      AccountsForTier(tier),

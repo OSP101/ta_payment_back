@@ -4,12 +4,14 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
@@ -179,7 +181,7 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	_ = s.pool.QueryRow(ctx,
 		`SELECT undergrad_regular, undergrad_special, graduate_regular, graduate_special_lumpsum,
 		        graduate_regular_hourly, grad_special_term_cap, ug_special_monthly_cap, term_months
-		 FROM pay_rates ORDER BY effective_from DESC LIMIT 1`).Scan(
+		 FROM `+payRatesInForce+``).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegular, &pr.GraduateSpecialLumpsum,
 		&pr.GraduateRegularHourly, &pr.GradSpecialTermCap, &pr.UGSpecialMonthlyCap, &pr.TermMonths)
 	// Prefer per-term months (source of truth); fall back to pay_rates.term_months.
@@ -441,7 +443,64 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 // BuildCourseZip builds the per-TA .xlsx (+ best-effort .pdf) ZIP for a course.
 // It gates on payout readiness, then reuses buildExportRows so the file numbers
 // match the preview exactly. Returns (zip bytes, filename, TA count, error).
+// assertNoLockedTotalDrift refuses to regenerate a claim ZIP whose money has
+// moved since the same slice was last exported.
+//
+// Exporting is the freeze point for a course's payout figures, but nothing is
+// actually frozen: every amount is recomputed live from pay_rates and work_logs
+// on each build. So a rate edit, or the grad-special lump being reapportioned
+// after a later month gains hours, silently changes what a re-exported month is
+// worth — and the new figure reaches finance as a document that looks like a
+// reprint of the one they already hold.
+//
+// The graduate-special lump is now persisted per exported month
+// (grad_lump_ledger), so reapportioning can no longer move it. Hourly pay is
+// still priced live from the rate in force, so this check stays: it catches a
+// rate version that came into force after the month was exported, at the
+// boundary where the new figure would leave the server.
+// Deliberately scoped to an EXACT month-set match: a later fiscal round covers
+// a different slice and legitimately totals something else, so comparing across
+// different month sets would block normal work instead of catching drift.
+func (s *ExportService) assertNoLockedTotalDrift(ctx context.Context, teachingCourseID uuid.UUID, months []string) error {
+	if len(months) == 0 {
+		return nil
+	}
+	var prevTotal float64
+	err := s.pool.QueryRow(ctx, `
+		SELECT total_baht
+		FROM export_batches
+		WHERE teaching_course_id = $1
+		  AND months IS NOT NULL
+		  AND months @> $2::text[] AND months <@ $2::text[]
+		ORDER BY generated_at DESC
+		LIMIT 1`, teachingCourseID, months).Scan(&prevTotal)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // never exported this exact slice — nothing to diverge from
+	}
+	if err != nil {
+		return err
+	}
+	prev, err := s.CoursePreview(ctx, teachingCourseID, months)
+	if err != nil {
+		return err
+	}
+	// Half a satang: total_baht is NUMERIC(12,2) and TotalActual is round2'd, so
+	// anything above this is a real change, not representation noise.
+	if math.Abs(prev.TotalActual-prevTotal) > 0.005 {
+		return Conflict(fmt.Sprintf(
+			"ยอดเงินของเดือนที่ export ไปแล้วเปลี่ยนไป (เดิม %.2f บาท ปัจจุบัน %.2f บาท ต่างกัน %.2f บาท) "+
+				"เอกสารชุดนี้จะไม่ตรงกับที่ส่งการเงินไปแล้ว กรุณาตรวจสอบอัตราค่าจ้างและบันทึกเวลาของเดือนนี้ก่อนออกเอกสารซ้ำ",
+			prevTotal, prev.TotalActual, prev.TotalActual-prevTotal))
+	}
+	return nil
+}
+
 func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID, months []string) ([]byte, string, int, error) {
+	// Before anything is built: if this exact slice was exported before, the
+	// figures must still be what finance already received.
+	if err := s.assertNoLockedTotalDrift(ctx, teachingCourseID, months); err != nil {
+		return nil, "", 0, err
+	}
 	// Student-count gate: the per-course budget is derived from the enrolled
 	// student count (budget.go). If staff never filled it in, num_students is 0,
 	// the budget cap is 0, and everyone would be pro-rata'd down to ฿0 silently.

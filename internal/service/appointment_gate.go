@@ -1,5 +1,12 @@
 package service
 
+import (
+	"context"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
 // The appointment order (คำสั่งแต่งตั้งผู้ช่วยสอน) is what makes a TA's work
 // official. A lecturer's request being approved in the app is an internal
 // decision; the printed, signed order is the document the faculty and the
@@ -39,4 +46,29 @@ func CourseAppointedSQL(courseCol string) string {
 		SELECT 1 FROM appointment_order_items aoi
 		 WHERE aoi.teaching_course_id = ` + courseCol + `
 	)`
+}
+
+// assertAppointed refuses a FORWARD payout transition (staff review, finance
+// handoff) for a (course, TA) pair that is not on a printed order.
+//
+// The read side (review queue, dashboard) already hides such pairs, but hiding
+// is not enforcement: the write endpoints were reachable directly, so an
+// un-appointed TA could be reviewed, exported and locked. This is the write-side
+// half of the same rule.
+//
+// Deliberately NOT folded into assertSignTarget or taHasApprovedAssignment:
+// assertSignTarget also guards the BACKWARD moves (MarkSentBack,
+// RevertFinanceSent), which must stay available so an admin can undo a pair that
+// was advanced before this check existed; taHasApprovedAssignment also gates what
+// a TA may do with their own work, which must not wait for the printed order.
+func assertAppointed(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.UUID) error {
+	var ok bool
+	if err := pool.QueryRow(ctx,
+		`SELECT `+AppointedSQL("$1::uuid", "$2::uuid"), tcID, taID).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return Invalid("TA คนนี้ยังไม่อยู่ในคำสั่งแต่งตั้งที่ออกแล้ว กรุณาออกคำสั่งแต่งตั้งก่อนตรวจสอบหรือส่งการเงิน")
+	}
+	return nil
 }

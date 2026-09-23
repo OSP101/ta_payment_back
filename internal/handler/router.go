@@ -243,6 +243,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	ch := &CourseHandler{Svc: svc}
 	authed.Get("/settings/pay-rate", ch.PayRate)
 	authed.Post("/settings/pay-rate", adminOrStaff, ch.CreatePayRate)
+	// Versions saved ahead of time: listed for staff, withdrawn only by admin
+	// (staff move work forward, only admin reverses) and only before their date.
+	authed.Get("/settings/pay-rate/scheduled", adminOrStaff, ch.ScheduledPayRates)
+	authed.Delete("/settings/pay-rate/:id", RequireRole(rbac.RoleAdmin), ch.DeleteScheduledPayRate)
 
 	// Terms
 	th := &TeachingHandler{Svc: svc}
@@ -318,7 +322,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// service silently refused (ErrForbidden) — the route now says what the
 	// service has always enforced: the registrar file is the office's to
 	// import, never the lecturer's (TOR §3.3 ข.1, corrected 15/09/2026).
-	authed.Post("/teaching-courses/import", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), th.ImportExcel)
+	authed.Post("/teaching-courses/import", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, th.ImportExcel)
 	// Import history — TOR §3.3 ข.5. Neither path can collide with
 	// "/teaching-courses/:id" (line above): that route matches exactly one
 	// segment after the prefix, and both of these have two.

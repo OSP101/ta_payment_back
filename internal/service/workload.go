@@ -2,14 +2,19 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"ta-payment-back/internal/audit"
 )
 
 // Structured-field limits — kept in sync with the frontend editor. Chosen so
@@ -29,6 +34,7 @@ var (
 
 type WorkloadService struct {
 	pool *pgxpool.Pool
+	aud  *audit.Auditor
 	// requests lets a timetable save finish any TA request that was waiting on
 	// it. Optional: nil in tests that only exercise timetable validation.
 	requests *TARequestService
@@ -156,8 +162,20 @@ func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, term
 	return "", nil
 }
 
+// maxClassBlocksPerTerm bounds the self-service timetable a TA may submit.
+const maxClassBlocksPerTerm = 200
+
 // ReplaceClasses swaps the whole schedule for a term.
 func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uuid.UUID, blocks []ClassBlock) error {
+	// A term's real timetable is a couple of dozen blocks. The cap is here
+	// because everything downstream scales with this count and none of it is
+	// bounded on its own: the insert below is one round trip per row inside a
+	// held transaction, and the timetable PDF lays blocks out by comparing each
+	// against those already placed, which is quadratic when they all overlap.
+	// Checked before any query so an oversized payload costs nothing.
+	if len(blocks) > maxClassBlocksPerTerm {
+		return Invalid(fmt.Sprintf("ตารางเรียนมีได้ไม่เกิน %d ช่วงต่อภาคการศึกษา", maxClassBlocksPerTerm))
+	}
 	// Checked server-side, not just hidden in the UI: the client can be stale
 	// by a whole term, and an export that lands between page load and save
 	// must still win.
@@ -172,6 +190,16 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// Serialise saves of one TA's term timetable so the before-image recorded
+	// below is exactly what this save replaced.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))`,
+		"ta_class_schedules/"+userID.String()+"/"+termID.String()); err != nil {
+		return err
+	}
+	before, err := classScheduleSnapshot(ctx, tx, userID, termID)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM ta_class_schedules WHERE user_id=$1 AND term_id=$2`, userID, termID); err != nil {
 		return err
@@ -278,6 +306,23 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 			return err
 		}
 	}
+	// The timetable decides which worked hours are payable (the own-class clash
+	// rule), and a TA can edit it freely until the term is exported — so removing
+	// a class, logging hours in its slot and putting the class back used to leave
+	// no trace at all. Recorded on the same transaction as the save.
+	after, err := classScheduleSnapshot(ctx, tx, userID, termID)
+	if err != nil {
+		return err
+	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{
+		ActorID: &userID, Action: "ta_class_schedule.replace",
+		Entity: "ta_class_schedule", EntityID: termID.String(),
+		Note:   "ta=" + userID.String(),
+		Before: map[string]any{"blocks": before},
+		After:  map[string]any{"blocks": after},
+	}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -297,4 +342,18 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 		}
 	}
 	return nil
+}
+
+// classScheduleSnapshot is a TA's whole timetable for one term as JSON, for the
+// audit trail. Whole rows minus identifiers, so a column added later is recorded
+// without anyone remembering to list it here.
+func classScheduleSnapshot(ctx context.Context, tx pgx.Tx, userID, termID uuid.UUID) (json.RawMessage, error) {
+	var raw []byte
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(jsonb_agg(
+		         to_jsonb(t) - 'id' - 'user_id' - 'term_id' - 'created_at' - 'updated_at'
+		         ORDER BY t.day_of_week, t.start_time), '[]'::jsonb)
+		FROM ta_class_schedules t
+		WHERE t.user_id = $1 AND t.term_id = $2`, userID, termID).Scan(&raw)
+	return json.RawMessage(raw), err
 }

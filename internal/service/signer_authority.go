@@ -67,6 +67,38 @@ func IsHeadTitle(title string) bool {
 	return strings.HasPrefix(strings.TrimSpace(title), headTitlePrefix)
 }
 
+// Who may exercise each printed authority. Prefixes, for the same reason as
+// deanTitlePrefix: the roster is free text and "รองคณบดีฝ่ายวิชาการ" must match
+// "รองคณบดี" without "รองหัวหน้าสาขาวิชา" matching "หัวหน้าสาขา".
+//
+// Decided 23/09/2026: the dean's seat may be exercised by the executive team
+// (the dean, vice deans, assistant deans); the head-of-department seat by the
+// head OR any member of that same executive team, so a vacant head seat never
+// stops claim forms from being certified.
+var (
+	executiveTeamPrefixes = []string{deanTitlePrefix, "รองคณบดี", "ผู้ช่วยคณบดี"}
+	deanSignerPrefixes    = executiveTeamPrefixes
+	headCertifierPrefixes = append([]string{headTitlePrefix}, executiveTeamPrefixes...)
+)
+
+func titleHasAnyPrefix(title string, prefixes []string) bool {
+	t := strings.TrimSpace(title)
+	for _, p := range prefixes {
+		if strings.HasPrefix(t, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// CanSignForDean reports whether a roster seat may sign an appointment order,
+// either as the dean or acting for them.
+func CanSignForDean(title string) bool { return titleHasAnyPrefix(title, deanSignerPrefixes) }
+
+// CanCertifyForHead reports whether a roster seat may certify claim forms,
+// either as head of department or acting for them.
+func CanCertifyForHead(title string) bool { return titleHasAnyPrefix(title, headCertifierPrefixes) }
+
 // signerAuthority is who signs and under whose authority, already worded for
 // the page. The renderers place lines; they do not decide what a line says.
 type signerAuthority struct {
@@ -80,14 +112,27 @@ type signerAuthority struct {
 }
 
 // loadSignerAuthority resolves one officer into a signature block.
+//
+// Refuses a seat that is vacant (inactive) or that holds no authority the order
+// can be issued under. applyActing below words ANY title as acting for the dean,
+// so without this check a clerical seat — or a seat nobody holds — would be
+// printed as exercising the dean's statutory authority on an official, dated
+// order, while the roster itself still looked correct.
 func loadSignerAuthority(ctx context.Context, pool *pgxpool.Pool, officerID uuid.UUID) (signerAuthority, error) {
 	var a signerAuthority
+	var active bool
 	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
+		SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title, ao.is_active
 		FROM admin_officers ao
 		LEFT JOIN users u ON u.id = ao.user_id
-		WHERE ao.id = $1`, officerID).Scan(&a.Name, &a.Title); err != nil {
+		WHERE ao.id = $1`, officerID).Scan(&a.Name, &a.Title, &active); err != nil {
 		return signerAuthority{}, Invalid("ไม่พบข้อมูลผู้ลงนามในระบบ")
+	}
+	if !active {
+		return signerAuthority{}, Invalid("ตำแหน่งที่เลือกว่างหรือถูกปิดใช้งานแล้ว กรุณาเลือกผู้ลงนามที่ยังดำรงตำแหน่งอยู่")
+	}
+	if !CanSignForDean(a.Title) {
+		return signerAuthority{}, Invalid("ตำแหน่งที่เลือกไม่สามารถลงนามแทนคณบดีได้ (ต้องเป็นคณบดี รองคณบดี หรือผู้ช่วยคณบดี)")
 	}
 	a.applyActing(ctx, pool, deanTitlePrefix, fallbackDeanTitle)
 	return a, nil

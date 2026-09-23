@@ -7,12 +7,14 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"ta-payment-back/internal/timeutil"
 )
 
 // ExportBlocker is one reason a course may not be exported yet, phrased for the
 // staff screen rather than for a log.
 type ExportBlocker struct {
-	// Kind is "waiting_ta" | "waiting_lecturer" | "unreviewed" | "not_exported".
+	// Kind is "waiting_ta" | "waiting_lecturer" | "class_clash" | "not_appointed" | "unreviewed" | "not_exported".
 	Kind   string `json:"kind"`
 	TAName string `json:"ta_name"`
 	// Months affected, as Thai labels ("สิงหาคม 2569").
@@ -63,7 +65,12 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		           COALESCE(st.status,'pending') AS staff_status,
 		           COUNT(*) FILTER (WHERE `+waitingTASQL("wl")+`)       AS waiting_ta,
 		           COUNT(*) FILTER (WHERE `+waitingLecturerSQL("wl")+`) AS waiting_lecturer,
-		           COUNT(*) FILTER (WHERE wl.status = 'approved')       AS approved
+		           COUNT(*) FILTER (WHERE wl.status = 'approved')       AS approved,
+		           -- Only used to NAME the reason. The row blocks exactly as it
+		           -- always did; an un-appointed pair's month simply cannot be
+		           -- signed off, so "ยังไม่ได้ตรวจสอบเบิกจ่าย" sent staff to a
+		           -- review queue that does not list them.
+		           `+AppointedSQL("tc.id", "a.ta_id")+`                AS appointed
 		    FROM teaching_courses tc
 		    JOIN academic_terms trm ON trm.id = tc.term_id
 		    JOIN submission_periods sp ON sp.term_id = tc.term_id
@@ -87,9 +94,9 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		      -- approves them), so counting them here would block this course's
 		      -- export forever.
 		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
-		    GROUP BY 1, 2, 3, 4, 5
+		    GROUP BY 1, 2, 3, 4, 5, a.ta_id, tc.id
 		)
-		SELECT ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved
+		SELECT ta_name, year_month, staff_status, waiting_ta, waiting_lecturer, approved, appointed
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
 		   OR (approved > 0 AND staff_status NOT IN ('staff_reviewed','exported','finance_sent'))
@@ -118,7 +125,8 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 	for rows.Next() {
 		var name, ym, staffStatus string
 		var waitingTA, waitingLecturer, approved int
-		if err := rows.Scan(&name, &ym, &staffStatus, &waitingTA, &waitingLecturer, &approved); err != nil {
+		var appointed bool
+		if err := rows.Scan(&name, &ym, &staffStatus, &waitingTA, &waitingLecturer, &approved, &appointed); err != nil {
 			return nil, err
 		}
 		if waitingTA > 0 {
@@ -131,15 +139,28 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		// otherwise the same month reads as two problems when it is one.
 		if waitingTA == 0 && waitingLecturer == 0 && approved > 0 &&
 			staffStatus != StatusStaffReviewed && staffStatus != "exported" && staffStatus != "finance_sent" {
-			add("unreviewed", name, ym, 0)
+			if appointed {
+				add("unreviewed", name, ym, 0)
+			} else {
+				add("not_appointed", name, ym, 0)
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	rows.Close()
+
+	clashes, err := s.approvedClassClashes(ctx, courseID, months)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range clashes {
+		add("class_clash", c.name, c.yearMonth, c.rows)
+	}
 
 	// Stage order, then name — staff read this list top-down as a work queue.
-	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "unreviewed": 2}
+	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "class_clash": 2, "not_appointed": 3, "unreviewed": 4}
 	sort.SliceStable(order, func(i, j int) bool {
 		if rank[order[i].kind] != rank[order[j].kind] {
 			return rank[order[i].kind] < rank[order[j].kind]
@@ -172,6 +193,10 @@ func exportBlockedError(blockers []ExportBlocker) error {
 			lines = append(lines, fmt.Sprintf("%s รออาจารย์อนุมัติ %d รายการ (%s)", name, b.Rows, months))
 		case "not_exported":
 			lines = append(lines, fmt.Sprintf("%s ตรวจสอบแล้วแต่ยังไม่ได้ส่งออกใบเบิกจ่าย (%s)", name, months))
+		case "class_clash":
+			lines = append(lines, fmt.Sprintf("%s มีรายการที่อนุมัติแล้วตรงกับตารางเรียนปัจจุบันของ TA %d รายการ — ตีกลับหรือแก้ไขก่อน (%s)", name, b.Rows, months))
+		case "not_appointed":
+			lines = append(lines, fmt.Sprintf("%s ยังไม่อยู่ในคำสั่งแต่งตั้ง — ออกคำสั่งรอบถัดไปก่อน (%s)", name, months))
 		default:
 			lines = append(lines, fmt.Sprintf("%s ยังไม่ได้ตรวจสอบเบิกจ่าย (%s)", name, months))
 		}
@@ -389,6 +414,97 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		b := agg[k]
 		b.Months = thaiMonthLabelsBE(b.Months)
 		out = append(out, *b)
+	}
+	return out, nil
+}
+
+type classClashMonth struct {
+	name, yearMonth string
+	rows            int
+}
+
+// approvedClassClashes finds approved hours, in months not yet exported, that
+// overlap the TA's CURRENT own-class timetable.
+//
+// The clash rule is checked when a row is logged and again at approval, but
+// the TA edits their own timetable freely: delete a class, log hours over it,
+// get them approved, put the class back. The approval-time recheck catches the
+// class restored before approval; this catches it restored after — the last
+// point before the hours become a claim document. Exported months are left
+// alone: they are frozen, and the timetable edits are in the audit trail.
+func (s *ExportService) approvedClassClashes(ctx context.Context, courseID uuid.UUID, months []string) ([]classClashMonth, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT a.ta_id, tc.term_id,
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
+		       TO_CHAR(wl.work_date,'YYYY-MM'), TO_CHAR(wl.work_date,'YYYY-MM-DD'),
+		       TO_CHAR(wl.start_time,'HH24:MI'), TO_CHAR(wl.end_time,'HH24:MI')
+		FROM teaching_courses tc
+		JOIN academic_terms trm ON trm.id = tc.term_id
+		JOIN sections sec ON sec.teaching_course_id = tc.id
+		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		JOIN users u ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
+		JOIN work_logs wl ON wl.assignment_id = a.id AND wl.status = 'approved'
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		 AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
+		LEFT JOIN submission_period_status st
+		  ON st.submission_period_id = sp.id AND st.ta_id = a.ta_id AND st.teaching_course_id = tc.id
+		WHERE tc.id = $1
+		  AND `+monthFilterSQL("wl.work_date", "$2")+`
+		  AND COALESCE(st.status,'pending') NOT IN ('exported','finance_sent')
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		ORDER BY u.first_name, wl.work_date, wl.start_time`, courseID, months)
+	if err != nil {
+		return nil, err
+	}
+	type logRow struct {
+		ta, term                  uuid.UUID
+		name, ym, day, start, end string
+	}
+	var logs []logRow
+	for rows.Next() {
+		var r logRow
+		if err := rows.Scan(&r.ta, &r.term, &r.name, &r.ym, &r.day, &r.start, &r.end); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		logs = append(logs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	type blocksKey struct{ ta, term uuid.UUID }
+	blocksOf := map[blocksKey][]ownClassBlock{}
+	type monthKey struct{ name, ym string }
+	counts := map[monthKey]int{}
+	var order []monthKey
+	for _, r := range logs {
+		k := blocksKey{r.ta, r.term}
+		blocks, ok := blocksOf[k]
+		if !ok {
+			if blocks, err = loadOwnClassBlocks(ctx, s.pool, r.ta, r.term); err != nil {
+				return nil, err
+			}
+			blocksOf[k] = blocks
+		}
+		d, derr := timeutil.ParseDate(r.day)
+		sm, ok1 := parseHM(r.start)
+		em, ok2 := parseHM(r.end)
+		if derr != nil || !ok1 || !ok2 || findOwnClassClash(blocks, int(d.Weekday()), sm, em) == nil {
+			continue
+		}
+		mk := monthKey{r.name, r.ym}
+		if counts[mk] == 0 {
+			order = append(order, mk)
+		}
+		counts[mk]++
+	}
+	out := make([]classClashMonth, 0, len(order))
+	for _, mk := range order {
+		out = append(out, classClashMonth{name: mk.name, yearMonth: mk.ym, rows: counts[mk]})
 	}
 	return out, nil
 }
