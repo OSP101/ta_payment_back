@@ -3299,7 +3299,10 @@ type AdminOfficerHandler struct{ Svc *service.Container }
 
 func (h *AdminOfficerHandler) List(c *fiber.Ctx) error {
 	includeInactive := c.Query("include_inactive") == "1"
-	out, err := h.Svc.AdminOfficers.List(c.Context(), includeInactive)
+	// Only admin/staff see which account backs a seat; every other authenticated
+	// reader (document rendering, TA-facing screens) gets the roster fields only.
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	out, err := h.Svc.AdminOfficers.List(c.Context(), includeInactive, privileged)
 	if err != nil {
 		return err
 	}

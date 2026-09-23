@@ -16,6 +16,7 @@
 package handler
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -93,6 +94,14 @@ func AuditRead(aud *audit.Auditor, action, entity, subjectParam string) fiber.Ha
 			ActorID: &viewer, Action: action, Entity: entity, EntityID: subject,
 			Note: readAuditNote(c),
 		}); err != nil {
+			// Release the window we just claimed. readAuditDue marks the key
+			// BEFORE this write is attempted, so leaving it marked would let one
+			// failed write silence every later SUCCESSFUL disclosure of the same
+			// key for the rest of the hour — the opposite of what the throttle is
+			// for. Unmarking keeps this file's stated tradeoff (an occasional
+			// duplicate entry beats a missing one).
+			readAuditSeen.Delete(readAuditKey{viewer: viewer, action: action, subject: subject})
+			log.Printf("audit read: recording %s for %s failed: %v", action, viewer, err)
 			return nil
 		}
 		return nil

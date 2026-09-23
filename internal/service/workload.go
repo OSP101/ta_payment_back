@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
@@ -156,8 +157,20 @@ func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, term
 	return "", nil
 }
 
+// maxClassBlocksPerTerm bounds the self-service timetable a TA may submit.
+const maxClassBlocksPerTerm = 200
+
 // ReplaceClasses swaps the whole schedule for a term.
 func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uuid.UUID, blocks []ClassBlock) error {
+	// A term's real timetable is a couple of dozen blocks. The cap is here
+	// because everything downstream scales with this count and none of it is
+	// bounded on its own: the insert below is one round trip per row inside a
+	// held transaction, and the timetable PDF lays blocks out by comparing each
+	// against those already placed, which is quadratic when they all overlap.
+	// Checked before any query so an oversized payload costs nothing.
+	if len(blocks) > maxClassBlocksPerTerm {
+		return Invalid(fmt.Sprintf("ตารางเรียนมีได้ไม่เกิน %d ช่วงต่อภาคการศึกษา", maxClassBlocksPerTerm))
+	}
 	// Checked server-side, not just hidden in the UI: the client can be stale
 	// by a whole term, and an export that lands between page load and save
 	// must still win.

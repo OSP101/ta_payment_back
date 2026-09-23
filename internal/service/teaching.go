@@ -2579,8 +2579,24 @@ func curriculumFromReserved(reserved string) string {
 //	errs:     a row that WAS supposed to describe a real class period but
 //	          couldn't be read (unknown session-type text, unparseable day or
 //	          time) — worth an officer's attention, unlike the above.
+// importUnzipLimits bounds what a registrar .xlsx may expand to once
+// decompressed. excelize's defaults are 16GB/16MB, sized for a general-purpose
+// library rather than for this endpoint: a real registrar file is a few hundred
+// KB, and the upload itself is already capped well below these numbers. Without
+// a ceiling, a small file declaring a huge decompressed size is materialized in
+// the shared process heap, which takes the whole backend down for every user —
+// not just the officer who uploaded it.
+//
+// UnzipXMLSizeLimit matters as much as UnzipSizeLimit and is easy to miss: it
+// is what makes an oversized worksheet/sharedStrings part spill to a temp file
+// instead of growing in memory.
+var importUnzipLimits = excelize.Options{
+	UnzipSizeLimit:    100 << 20, // 100MB total
+	UnzipXMLSizeLimit: 8 << 20,   // 8MB per part, then spill to disk
+}
+
 func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []string, errs []string, err error) {
-	f, err := excelize.OpenReader(bytes.NewReader(body))
+	f, err := excelize.OpenReader(bytes.NewReader(body), importUnzipLimits)
 	if err != nil {
 		// The handler already rejects a non-.xlsx upload by extension + magic
 		// bytes (see ImportExcel), so reaching here with an OpenReader error

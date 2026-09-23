@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -31,7 +32,15 @@ func main() {
 	}
 
 	adminEmail := envDefault("SEED_ADMIN_EMAIL", "admin@coco.kku.ac.th")
-	adminPass := envDefault("SEED_ADMIN_PASSWORD", "changeme123!")
+	// No default. envDefault treats an EMPTY variable as unset, and .env.example
+	// ships SEED_ADMIN_PASSWORD= blank — so a built-in fallback meant that
+	// copying the example file and running the seed silently produced a live
+	// admin account with a publicly known password. Refusing to start is the
+	// only safe behaviour: the operator must choose the credential.
+	adminPass := os.Getenv("SEED_ADMIN_PASSWORD")
+	if strings.TrimSpace(adminPass) == "" {
+		log.Fatal("SEED_ADMIN_PASSWORD is required and must not be empty — set it to a strong, unique password before seeding")
+	}
 
 	var exists int
 	_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE email=$1`, adminEmail).Scan(&exists)
