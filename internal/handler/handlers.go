@@ -2808,10 +2808,11 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	body, name, taCount, err := h.Svc.Export.BuildCourseZip(c.Context(), id, months)
+	pack, err := h.Svc.Export.BuildCourseZipPack(c.Context(), id, months)
 	if err != nil {
 		return err
 	}
+	body, name, taCount := pack.Body, pack.Name, pack.TACount
 	actor := UserID(c)
 	// Lock every fully-approved (TA × month) in the course BEFORE the file leaves
 	// the server: downloading the ZIP IS the freeze point for the payout numbers
@@ -2826,7 +2827,9 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// The graduate-special lump each exported month carries is fixed from here
 	// on (grad_lump_ledger): a later month gaining weight must not shrink a
 	// month finance already has. Same rule as the lock above — not best-effort.
-	if err := h.Svc.Export.FreezeGradLumps(c.Context(), actor, id, months); err != nil {
+	// It freezes the split THIS pack printed, and refuses (409, file not sent)
+	// if a concurrent export already froze different figures.
+	if err := h.Svc.Export.FreezeGradLumpSnapshot(c.Context(), actor, pack.GradLumps, months); err != nil {
 		return err
 	}
 	// Freeze section edits — this export is now the source of truth for the
@@ -2859,7 +2862,8 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// the recorded figure matches the ZIP the staff hands to finance — the old
 	// Budget.UsedBaht used different math and never reconciled with the file.
 	// Best-effort — a DB write failure must NOT hide the (already-locked) zip.
-	if prev, perr := h.Svc.Export.CoursePreview(c.Context(), id, months); perr == nil {
+	// Read with the pack's lump split so the recorded total is the file's.
+	if prev, perr := h.Svc.Export.CoursePreview(service.WithGradLumpSnapshot(c.Context(), pack.GradLumps), id, months); perr == nil {
 		_, _ = h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
 			TeachingCourseID: id,
 			FilePath:         filePath,

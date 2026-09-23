@@ -2,6 +2,11 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -85,16 +90,155 @@ func gradSpecialHolderIDs(ctx context.Context, q ledgerQuerier, courseID uuid.UU
 	return out, rows.Err()
 }
 
-// FreezeGradLumps records, for every grad-special holder of the course, the
-// lump share of each exported month — the figure the claim documents just
-// built for those months carry. Called when a course's claim ZIP is downloaded,
-// right after the months are locked; must not be best-effort, or the next
-// document could print a different figure for a month finance already has.
+// GradLumpSnapshot is the graduate-special lump split ONE claim pack printed.
+//
+// A course ZIP carries the lump in several documents (the export rows, the
+// combined book, the graduate evidence book, the budget settlement), and each
+// used to compute the split on its own; the freeze then computed it once more.
+// Anything that moved the weights in between — an approval, a course-date
+// edit, a second export of the same course — left the ledger holding a figure
+// the pack never printed. Computed once at the start of BuildCourseZip and
+// carried on the context, the snapshot is what every document reads, and it is
+// exactly what FreezeGradLumpSnapshot writes to the ledger.
+type GradLumpSnapshot struct {
+	CourseID uuid.UUID
+	// Lump is the whole-term lump offered to holders nothing is frozen for yet
+	// (LEAST(lumpsum, term cap) of the rate in force).
+	Lump float64
+
+	mu       sync.Mutex
+	lumpRead bool
+	byTA  map[uuid.UUID]map[string]float64
+	basis map[uuid.UUID]float64
+}
+
+func copyMonths(m map[string]float64) map[string]float64 {
+	out := make(map[string]float64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// gradLumpInForce is the per-term lump every document computes from the rate
+// in force: the lump sum, capped by the per-term ceiling when one is set.
+func gradLumpInForce(ctx context.Context, q ledgerQuerier) (float64, error) {
+	var lumpsum, termCap float64
+	if err := q.QueryRow(ctx,
+		`SELECT graduate_special_lumpsum, grad_special_term_cap FROM `+payRatesInForce).
+		Scan(&lumpsum, &termCap); err != nil {
+		return 0, err
+	}
+	if termCap > 0 && lumpsum > termCap {
+		return termCap, nil
+	}
+	return lumpsum, nil
+}
+
+// computeGradLumpSnapshot splits every current holder's lump once.
+func (s *ExportService) computeGradLumpSnapshot(ctx context.Context, courseID uuid.UUID) (*GradLumpSnapshot, error) {
+	snap := &GradLumpSnapshot{
+		CourseID: courseID,
+		byTA:     map[uuid.UUID]map[string]float64{},
+		basis:    map[uuid.UUID]float64{},
+	}
+	holders, err := gradSpecialHolderIDs(ctx, s.pool, courseID)
+	if err != nil {
+		return nil, err
+	}
+	if len(holders) == 0 {
+		// Nobody to split for. The lump is still read only when needed by a
+		// late holder (splitFor), so a course with no pay rate yet — none of
+		// whose documents carries a lump — is not refused here.
+		return snap, nil
+	}
+	if snap.Lump, err = gradLumpInForce(ctx, s.pool); err != nil {
+		return nil, err
+	}
+	snap.lumpRead = true
+	for _, ta := range holders {
+		byMonth, basis, err := s.gradLumpSplit(ctx, s.pool, courseID, ta, snap.Lump, true)
+		if err != nil {
+			return nil, err
+		}
+		snap.byTA[ta] = byMonth
+		snap.basis[ta] = basis
+	}
+	return snap, nil
+}
+
+// splitFor returns the snapshot's split for one holder, computing and
+// RECORDING it when the holder was not in the snapshot yet (a request approved
+// while the pack was being built) — so whatever a document printed is also
+// what the freeze writes, never a figure the freeze does not know about.
+func (snap *GradLumpSnapshot) splitFor(ctx context.Context, s *ExportService, taID uuid.UUID) (map[string]float64, error) {
+	snap.mu.Lock()
+	defer snap.mu.Unlock()
+	if m, ok := snap.byTA[taID]; ok {
+		return copyMonths(m), nil
+	}
+	if !snap.lumpRead {
+		lump, err := gradLumpInForce(ctx, s.pool)
+		if err != nil {
+			return nil, err
+		}
+		snap.Lump, snap.lumpRead = lump, true
+	}
+	byMonth, basis, err := s.gradLumpSplit(ctx, s.pool, snap.CourseID, taID, snap.Lump, true)
+	if err != nil {
+		return nil, err
+	}
+	snap.byTA[taID] = byMonth
+	snap.basis[taID] = basis
+	return copyMonths(byMonth), nil
+}
+
+type gradLumpSnapshotKey struct{}
+
+// WithGradLumpSnapshot makes every gradLumpByMonth call for snap's course (with
+// approvedOnly, as the documents use) read the snapshot instead of recomputing.
+func WithGradLumpSnapshot(ctx context.Context, snap *GradLumpSnapshot) context.Context {
+	if snap == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, gradLumpSnapshotKey{}, snap)
+}
+
+func gradLumpSnapshotFrom(ctx context.Context, courseID uuid.UUID) *GradLumpSnapshot {
+	snap, _ := ctx.Value(gradLumpSnapshotKey{}).(*GradLumpSnapshot)
+	if snap == nil || snap.CourseID != courseID {
+		return nil
+	}
+	return snap
+}
+
+// FreezeGradLumps freezes a freshly computed split. Kept for callers that do
+// not build a pack first; the export itself freezes the snapshot the pack
+// printed (FreezeGradLumpSnapshot).
+func (s *ExportService) FreezeGradLumps(ctx context.Context, actor, courseID uuid.UUID, months []string) error {
+	snap, err := s.computeGradLumpSnapshot(ctx, courseID)
+	if err != nil {
+		return err
+	}
+	return s.FreezeGradLumpSnapshot(ctx, actor, snap, months)
+}
+
+// FreezeGradLumpSnapshot records, for every holder in snap, the lump share of
+// each exported month — exactly the figure the claim pack printed. Called when
+// a course's claim ZIP is downloaded, right after the months are locked; must
+// not be best-effort, or the next document could print a different figure for
+// a month finance already has.
 //
 // Idempotent: a month already frozen keeps its first figure (ON CONFLICT DO
-// NOTHING), which is exactly what a re-export of the same month must print.
-// An empty month list means the whole term, as for the export itself.
-func (s *ExportService) FreezeGradLumps(ctx context.Context, actor, courseID uuid.UUID, months []string) error {
+// NOTHING). The rows are then read back and compared with the snapshot: a
+// mismatch means another export froze different figures first, and this pack
+// must not leave the server — the caller fails the request, and a re-download
+// prints the frozen figures. An empty month list means the whole term.
+func (s *ExportService) FreezeGradLumpSnapshot(ctx context.Context, actor uuid.UUID, snap *GradLumpSnapshot, months []string) error {
+	if snap == nil {
+		return nil
+	}
+	courseID := snap.CourseID
 	if len(months) == 0 {
 		all, err := s.CourseTermMonths(ctx, courseID)
 		if err != nil {
@@ -104,51 +248,89 @@ func (s *ExportService) FreezeGradLumps(ctx context.Context, actor, courseID uui
 			months = append(months, m.YearMonth)
 		}
 	}
-	if len(months) == 0 {
+	snap.mu.Lock()
+	byTA := make(map[uuid.UUID]map[string]float64, len(snap.byTA))
+	basis := make(map[uuid.UUID]float64, len(snap.basis))
+	for ta, m := range snap.byTA {
+		byTA[ta] = copyMonths(m)
+		basis[ta] = snap.basis[ta]
+	}
+	snap.mu.Unlock()
+	if len(months) == 0 || len(byTA) == 0 {
 		return nil
 	}
-	holders, err := gradSpecialHolderIDs(ctx, s.pool, courseID)
-	if err != nil || len(holders) == 0 {
-		return err
+	holders := make([]uuid.UUID, 0, len(byTA))
+	for ta := range byTA {
+		holders = append(holders, ta)
 	}
-	var pr struct{ lumpsum, termCap float64 }
-	if err := s.pool.QueryRow(ctx,
-		`SELECT graduate_special_lumpsum, grad_special_term_cap FROM `+payRatesInForce).
-		Scan(&pr.lumpsum, &pr.termCap); err != nil {
-		return err
-	}
-	lump := pr.lumpsum
-	if pr.termCap > 0 && lump > pr.termCap {
-		lump = pr.termCap
-	}
+	sort.Slice(holders, func(i, j int) bool { return holders[i].String() < holders[j].String() })
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	// Two exports of the same course at once must not each freeze a split
-	// computed without the other's rows.
+	// Two exports of the same course at once must not interleave their rows.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))`,
 		"grad_lump_ledger/"+courseID.String()); err != nil {
 		return err
 	}
 	for _, ta := range holders {
-		byMonth, basis, err := s.gradLumpSplit(ctx, tx, courseID, ta, lump, true)
-		if err != nil {
-			return err
-		}
 		for _, ym := range months {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO grad_lump_ledger (teaching_course_id, ta_id, year_month, baht, lump_basis, frozen_by)
 				VALUES ($1, $2, $3, $4, $5, $6)
 				ON CONFLICT (teaching_course_id, ta_id, year_month) DO NOTHING`,
-				courseID, ta, ym, round2(byMonth[ym]), round2(basis), actor); err != nil {
+				courseID, ta, ym, round2(byTA[ta][ym]), round2(basis[ta]), actor); err != nil {
 				return err
 			}
 		}
 	}
+
+	// Read back what the ledger now holds for these cells and compare with
+	// what the pack printed.
+	rows, err := tx.Query(ctx, `
+		SELECT ta_id, year_month, baht::float8
+		FROM grad_lump_ledger
+		WHERE teaching_course_id = $1 AND ta_id = ANY($2) AND year_month = ANY($3)`,
+		courseID, holders, months)
+	if err != nil {
+		return err
+	}
+	var drift []string
+	for rows.Next() {
+		var ta uuid.UUID
+		var ym string
+		var baht float64
+		if err := rows.Scan(&ta, &ym, &baht); err != nil {
+			rows.Close()
+			return err
+		}
+		if math.Abs(baht-round2(byTA[ta][ym])) > 0.005 {
+			drift = append(drift, ym)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(drift) > 0 {
+		sort.Strings(drift)
+		return Conflict(fmt.Sprintf(
+			"ยอดเหมาจ่ายบัณฑิตภาคพิเศษของเดือน %s ถูกกำหนดไว้แล้วจากการส่งออกอีกครั้งที่เกิดพร้อมกัน "+
+				"เอกสารชุดนี้จึงไม่ถูกส่งออก — กรุณากดดาวน์โหลดใหม่", strings.Join(uniqueStrings(drift), ", ")))
+	}
 	return tx.Commit(ctx)
+}
+
+func uniqueStrings(in []string) []string {
+	out := in[:0:0]
+	for i, v := range in {
+		if i == 0 || v != in[i-1] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // withoutFrozen drops the frozen months from a weight map.

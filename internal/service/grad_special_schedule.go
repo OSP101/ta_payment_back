@@ -164,6 +164,12 @@ func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.U
 func (s *ExportService) gradLumpByMonth(
 	ctx context.Context, courseID, taID uuid.UUID, lump float64, approvedOnly bool,
 ) (map[string]float64, error) {
+	// Inside a claim pack: every document reads the one split the pack is
+	// frozen with (see GradLumpSnapshot). The forecast (approvedOnly=false)
+	// is not a document and always computes live.
+	if snap := gradLumpSnapshotFrom(ctx, courseID); snap != nil && approvedOnly {
+		return snap.splitFor(ctx, s, taID)
+	}
 	out, _, err := s.gradLumpSplit(ctx, s.pool, courseID, taID, lump, approvedOnly)
 	return out, err
 }

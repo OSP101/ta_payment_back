@@ -633,7 +633,7 @@ func stepStaffReviewExport(ctx context.Context, svc *service.Container) (string,
 		if err != nil {
 			return "", err
 		}
-		body, name, taCount, err := svc.Export.BuildCourseZip(ctx, courseID, months)
+		pack, err := svc.Export.BuildCourseZipPack(ctx, courseID, months)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("ส่งออก %s: %s", cs.code, err.Error()))
 			continue
@@ -641,11 +641,12 @@ func stepStaffReviewExport(ctx context.Context, svc *service.Container) (string,
 		if _, err := svc.SubmissionPeriods.MarkCourseExported(ctx, staffID, courseID, months); err != nil {
 			return "", fmt.Errorf("ล็อกเดือนของวิชา %s: %w", cs.code, err)
 		}
-		if err := svc.Export.FreezeGradLumps(ctx, staffID, courseID, months); err != nil {
+		body, name, taCount := pack.Body, pack.Name, pack.TACount
+		if err := svc.Export.FreezeGradLumpSnapshot(ctx, staffID, pack.GradLumps, months); err != nil {
 			return "", fmt.Errorf("แช่แข็งยอดเหมาจ่ายของวิชา %s: %w", cs.code, err)
 		}
 		_ = svc.Teaching.MarkExported(ctx, courseID)
-		if prev, perr := svc.Export.CoursePreview(ctx, courseID, months); perr == nil {
+		if prev, perr := svc.Export.CoursePreview(service.WithGradLumpSnapshot(ctx, pack.GradLumps), courseID, months); perr == nil {
 			_, _ = svc.ExportBatches.Record(ctx, staffID, service.ExportBatch{
 				TeachingCourseID: courseID,
 				FilePath:         name,

@@ -496,6 +496,41 @@ func (s *ExportService) assertNoLockedTotalDrift(ctx context.Context, teachingCo
 }
 
 func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID, months []string) ([]byte, string, int, error) {
+	z, err := s.BuildCourseZipPack(ctx, teachingCourseID, months)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	return z.Body, z.Name, z.TACount, nil
+}
+
+// CourseZip is one built claim pack plus the graduate-special lump split it
+// printed — the split the locking download must freeze
+// (FreezeGradLumpSnapshot), never a recomputation of it.
+type CourseZip struct {
+	Body      []byte
+	Name      string
+	TACount   int
+	GradLumps *GradLumpSnapshot
+}
+
+// BuildCourseZipPack is BuildCourseZip returning the lump snapshot as well.
+func (s *ExportService) BuildCourseZipPack(ctx context.Context, teachingCourseID uuid.UUID, months []string) (*CourseZip, error) {
+	// Split every graduate-special lump ONCE, before any document reads it, and
+	// make every document in this pack read that one split (see
+	// GradLumpSnapshot).
+	snap, err := s.computeGradLumpSnapshot(ctx, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	ctx = WithGradLumpSnapshot(ctx, snap)
+	body, name, taCount, err := s.buildCourseZip(ctx, teachingCourseID, months)
+	if err != nil {
+		return nil, err
+	}
+	return &CourseZip{Body: body, Name: name, TACount: taCount, GradLumps: snap}, nil
+}
+
+func (s *ExportService) buildCourseZip(ctx context.Context, teachingCourseID uuid.UUID, months []string) ([]byte, string, int, error) {
 	// Before anything is built: if this exact slice was exported before, the
 	// figures must still be what finance already received.
 	if err := s.assertNoLockedTotalDrift(ctx, teachingCourseID, months); err != nil {
