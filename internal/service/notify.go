@@ -14,6 +14,10 @@ import (
 type NotifyService struct {
 	pool   *pgxpool.Pool
 	mailer *mail.Mailer
+	// baseURL is config.AppBaseURL. Links are stored as in-app paths
+	// ("/lecturer"), which the bell resolves against the current origin; a mail
+	// client has no origin, so the e-mail copy needs the absolute URL.
+	baseURL string
 }
 
 type Notification struct {
@@ -26,10 +30,41 @@ type Notification struct {
 	Channel   string    `json:"channel"`
 }
 
-// Send emits both in-app and email notification. Email delivery is
-// best-effort: if the SMTP call fails, the in-app row still stands so the
-// recipient sees the update on next bell open.
+// Closing lines of the e-mail, in the form of a Thai official letter. The
+// in-app copy carries neither the salutation nor the closing: the bell is a
+// list of short notices, not a letter.
+const (
+	closingInform = "จึงเรียนมาเพื่อโปรดทราบ"
+	closingAction = "จึงเรียนมาเพื่อโปรดดำเนินการ"
+)
+
+// Send emits both in-app and email notification, for news the recipient only
+// needs to know about. Email delivery is best-effort: if the SMTP call fails,
+// the in-app row still stands so the recipient sees the update on next bell
+// open.
 func (s *NotifyService) Send(ctx context.Context, userID uuid.UUID, title, body, link string) {
+	s.deliver(ctx, userID, title, body, link, closingInform, MailLayout{})
+}
+
+// SendAction is Send for a notice that asks the recipient to do something
+// (fix a document, approve hours, sign). Only the e-mail's closing differs.
+func (s *NotifyService) SendAction(ctx context.Context, userID uuid.UUID, title, body, link string) {
+	s.deliver(ctx, userID, title, body, link, closingAction, MailLayout{})
+}
+
+// SendLaidOut is Send with a structured e-mail: the in-app row still carries
+// the plain body, while the e-mail shows layout's info box, highlight and
+// table in place of that body. action picks the closing, as SendAction does.
+func (s *NotifyService) SendLaidOut(ctx context.Context, userID uuid.UUID, title, body, link string, action bool, layout MailLayout) {
+	closing := closingInform
+	if action {
+		closing = closingAction
+	}
+	s.deliver(ctx, userID, title, body, link, closing, layout)
+}
+
+func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, body, link, closing string, layout MailLayout) {
+	title, body = plainPunct(title), plainPunct(body)
 	linkArg := nilStr(&link)
 
 	// in-app row — the source of truth for the bell/inbox.
@@ -63,13 +98,24 @@ func (s *NotifyService) Send(ctx context.Context, userID uuid.UUID, title, body,
 	}
 
 	// email — informational only, so keep failures out of the caller's path.
-	var email string
-	if err := s.pool.QueryRow(ctx, `SELECT email FROM users WHERE id=$1`, userID).Scan(&email); err != nil {
+	var email, prefix, first, last string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT u.email,
+		       COALESCE(NULLIF(tp.prefix, ''), NULLIF(u.title, ''), ''),
+		       COALESCE(u.first_name, ''), COALESCE(u.last_name, '')
+		  FROM users u
+		  LEFT JOIN ta_profiles tp ON tp.user_id = u.id
+		 WHERE u.id = $1`, userID).Scan(&email, &prefix, &first, &last); err != nil {
 		return
 	}
-	// Wrap plain body in a minimal HTML template so mail clients render nicely.
-	html := renderMailHTML(title, body, link)
-	if err := s.mailer.Send(email, title, html); err != nil {
+	m := mailContent{
+		Title: title, Body: body, Link: absoluteLink(s.baseURL, link),
+		Recipient: recipientName(prefix, first, last), Closing: closing,
+		Layout: layout, Contact: loadMailContact(ctx, s.pool),
+	}
+	if err := s.mailer.SendMessage(mail.Message{
+		To: email, Subject: title, HTML: renderMailHTML(m), Text: renderMailText(m),
+	}); err != nil {
 		log.Printf("notify email: %v", err)
 		return
 	}
@@ -147,27 +193,14 @@ func (s *NotifyService) MarkAllRead(ctx context.Context, userID uuid.UUID) (int6
 	return tag.RowsAffected(), nil
 }
 
-// renderMailHTML wraps a notification body in a minimal responsive HTML
-// shell. Text is HTML-escaped inline (no external template) so a title with
-// "<" or "&" can't accidentally inject markup.
-func renderMailHTML(title, body, link string) string {
-	esc := func(s string) string {
-		r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;")
-		return r.Replace(s)
+// absoluteLink turns an in-app path into a URL a mail client can open. Anything
+// that is not a root-relative path (already absolute, or empty) is left alone,
+// as is every link when no base URL is configured.
+func absoluteLink(baseURL, link string) string {
+	if baseURL == "" || !strings.HasPrefix(link, "/") || strings.HasPrefix(link, "//") {
+		return link
 	}
-	linkHTML := ""
-	if link != "" {
-		linkHTML = `<p style="margin:16px 0 0"><a href="` + esc(link) + `" style="color:#0f766e;text-decoration:underline">เปิดดูรายละเอียด</a></p>`
-	}
-	return `<!doctype html><html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;padding:24px;color:#0f172a">
-<table role="presentation" style="max-width:560px;margin:auto;background:#fff;border-radius:12px;border:1px solid #e2e8f0;padding:24px">
-<tr><td>
-  <h2 style="margin:0 0 12px;font-size:18px">` + esc(title) + `</h2>
-  <div style="white-space:pre-wrap;font-size:14px;line-height:1.6">` + esc(body) + `</div>
-  ` + linkHTML + `
-  <p style="margin:24px 0 0;color:#64748b;font-size:12px">อีเมลนี้ส่งจากระบบ TA Payment คณะวิทยาการคอมพิวเตอร์ ม.ขอนแก่น (COCO KKU)</p>
-</td></tr></table>
-</body></html>`
+	return strings.TrimRight(baseURL, "/") + link
 }
 
 // SendMailTo delivers a message to a bare email address: no user row, no in-app

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1200,6 +1201,30 @@ func (h *TARequestHandler) UpsertWindow(c *fiber.Ctx) error {
 		return err
 	}
 	out, err := h.Svc.TARequest.UpsertWindow(c.Context(), UserID(c), w)
+	if err != nil {
+		return err
+	}
+	// Mail lecturers now if the window is already live, rather than at the
+	// next hourly tick. Detached from the request: dozens of SMTP round trips
+	// must not hold the save open, and the ledger makes a concurrent tick safe.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if _, err := h.Svc.TARequest.SweepWindowNotices(ctx); err != nil {
+			log.Printf("ta_window_notice: post-save sweep: %v", err)
+		}
+	}()
+	return c.JSON(out)
+}
+
+// WindowReadiness backs the "ready to notify lecturers" panel next to the
+// window list: who the mail will reach, and the course data still missing.
+func (h *TARequestHandler) WindowReadiness(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid term_id")
+	}
+	out, err := h.Svc.TARequest.WindowReadiness(c.Context(), termID)
 	if err != nil {
 		return err
 	}

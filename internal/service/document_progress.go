@@ -1049,13 +1049,13 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	}
 	roundNote := ""
 	if round == 2 {
-		roundNote = " (รอบ 2 — งบประมาณปีใหม่)"
+		roundNote = " ซึ่งเป็นการเบิกจ่ายรอบที่ 2 ของปีงบประมาณใหม่"
 	}
 	for _, uid := range order {
-		body := "มีเอกสารเบิกจ่าย TA ที่รอลายเซ็นของท่านในรายวิชา: " +
+		body := "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนที่รอการลงนามของท่าน ในรายวิชา " +
 			strings.Join(byUser[uid], ", ") + roundNote +
-			"\nกรุณาลงนามเพื่อให้เอกสารเดินทางต่อได้"
-		s.notify.Send(ctx, uid, "แจ้งเตือน: เอกสาร TA รอลายเซ็น", body, "/document-progress")
+			"\n\nขอให้ท่านลงนามในเอกสารดังกล่าว เพื่อให้สามารถดำเนินการเบิกจ่ายในขั้นตอนต่อไปได้"
+		s.notify.SendAction(ctx, uid, "เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม", body, "/document-progress")
 	}
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind",
 		Entity: "academic_term", EntityID: termID.String(),

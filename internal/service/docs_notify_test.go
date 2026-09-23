@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -105,7 +106,7 @@ func TestReview_RejectNotifiesWithReason(t *testing.T) {
 	if len(titles) != 1 {
 		t.Fatalf("got %d notifications, want 1: %v", len(titles), titles)
 	}
-	want := "เอกสารต้องแก้ไข: บัตรประชาชน"
+	want := "เอกสารต้องแก้ไข สำเนาบัตรประจำตัวประชาชน"
 	if titles[0] != want {
 		t.Errorf("title = %q, want %q", titles[0], want)
 	}
@@ -115,8 +116,8 @@ func TestReview_RejectNotifiesWithReason(t *testing.T) {
 		`SELECT body FROM notifications WHERE user_id = $1 AND channel = 'in_app'`, ta).Scan(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body != "รูปเบลอ อ่านเลขไม่ได้" {
-		t.Errorf("body = %q, want the rejection reason", body)
+	if !strings.Contains(body, "เนื่องจาก รูปเบลอ อ่านเลขไม่ได้") {
+		t.Errorf("body = %q, want it to give the rejection reason", body)
 	}
 }
 
@@ -134,7 +135,7 @@ func TestReview_ApproveNotifiesPerDocument(t *testing.T) {
 	if len(titles) != 1 {
 		t.Fatalf("got %d notifications, want 1: %v", len(titles), titles)
 	}
-	want := "เอกสารผ่านการตรวจสอบ: บัตรประชาชน"
+	want := "เอกสารผ่านการตรวจสอบ สำเนาบัตรประจำตัวประชาชน"
 	if titles[0] != want {
 		t.Errorf("title = %q, want %q", titles[0], want)
 	}

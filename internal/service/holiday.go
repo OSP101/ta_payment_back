@@ -509,10 +509,10 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 	}
 
 	// Look up the TA's name + course code for the notification body.
-	var taName, courseCode, courseNameTH, holidayName string
-	_ = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(prefix,'') || ' ' || first_name || ' ' || last_name
-		FROM users WHERE id = $1`, taID).Scan(&taName)
+	// The name used to come from users.prefix, a column that does not exist:
+	// the error was discarded and every notice named nobody.
+	var courseCode, courseNameTH, holidayName string
+	taName := personName(ctx, s.pool, taID)
 	_ = s.pool.QueryRow(ctx, `
 		SELECT tc.code, tc.name_th
 		FROM teaching_courses tc
@@ -551,16 +551,16 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		return Invalid("ไม่พบอาจารย์ประจำวิชา")
 	}
 	body := fmt.Sprintf(
-		"%s แจ้งว่ายังไม่ได้กำหนดวันชดเชยของวันที่ %s (%s) วิชา %s %s",
-		taName, originalDate, holidayName, courseCode, courseNameTH,
+		"%s ผู้ช่วยสอนรายวิชา %s %s แจ้งว่ายังไม่มีการกำหนดวันสอนชดเชยสำหรับวันที่ %s (%s)",
+		taName, courseCode, courseNameTH, thaiLongDateISO(originalDate), holidayName,
 	)
 	if note != "" {
-		body += " · หมายเหตุ: " + note
+		body += "\nหมายเหตุ: " + note
 	}
 	link := fmt.Sprintf("/lecturer/courses/%s/holidays", tcID.String())
 	if s.notify != nil {
 		for _, lid := range lecturerIDs {
-			s.notify.Send(ctx, lid, "TA แจ้งให้กำหนดวันชดเชย", body, link)
+			s.notify.SendAction(ctx, lid, "ผู้ช่วยสอนแจ้งให้กำหนดวันสอนชดเชย", body, link)
 		}
 	}
 	// Audit + rate-limit ledger. The ledger is what stops a TA sending the same

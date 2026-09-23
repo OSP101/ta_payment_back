@@ -261,6 +261,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// for courses taught under more than one registrar code.
 	authed.Get("/curricula", th.ListCurricula)
 	authed.Patch("/curricula/:code", adminOrStaff, th.UpdateCurriculum)
+	// Contact block at the foot of every notification e-mail.
+	msh := &MailSettingsHandler{Svc: svc}
+	authed.Get("/mail-settings", adminOrStaff, msh.Get)
+	authed.Put("/mail-settings", adminOrStaff, msh.Update)
+	authed.Post("/mail-settings/preview", adminOrStaff, msh.Preview)
 	authed.Patch("/sections/:id/curriculum", adminOrStaff, th.UpdateSectionCurriculum)
 	authed.Get("/terms/:id/course-groups/candidates", adminOrStaff, th.CourseGroupCandidates)
 	authed.Post("/terms/:id/course-groups", adminOrStaff, th.ConfirmCourseGroup)
@@ -337,6 +342,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	rh := &TARequestHandler{Svc: svc}
 	authed.Get("/ta-request/windows", rh.ListWindows)
 	authed.Post("/ta-request/windows", adminOrStaff, rh.UpsertWindow)
+	authed.Get("/ta-request/windows/readiness", adminOrStaff, rh.WindowReadiness)
 	authed.Delete("/ta-request/windows/:id", adminOrStaff, rh.DeleteWindow)
 
 	// TA requests

@@ -224,8 +224,8 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 			return err
 		}
 		if s.notify != nil {
-			s.notify.Send(ctx, userID, "คำขอลบข้อมูลถูกปฏิเสธ",
-				fmt.Sprintf("เหตุผล: %s", note), "/account/my-data")
+			s.notify.Send(ctx, userID, "คำขอลบข้อมูลส่วนบุคคลไม่ได้รับการอนุมัติ",
+				fmt.Sprintf("คำขอลบข้อมูลส่วนบุคคลของท่านไม่ได้รับการอนุมัติ เนื่องจาก %s", note), "/account/my-data")
 		}
 		return nil
 	}
@@ -324,13 +324,13 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 	}
 
 	if s.notify != nil {
-		msg := "บัญชีของคุณถูกปิดใช้งานและข้อมูลส่วนบุคคลที่ไม่จำเป็นถูกลบแล้วตามคำขอ"
+		msg := "บัญชีผู้ใช้งานของท่านได้ถูกปิดใช้งาน และข้อมูลส่วนบุคคลที่ไม่จำเป็นได้ถูกลบตามคำขอเรียบร้อยแล้ว"
 		if hasPayment {
-			msg += " ข้อมูลที่เกี่ยวข้องกับการเบิกจ่าย (เลขบัตรประชาชน ประวัติชั่วโมงสอน) ยังคงถูกเก็บไว้ตามข้อบังคับทางบัญชี/ภาษี"
+			msg += " ทั้งนี้ ข้อมูลที่เกี่ยวข้องกับการเบิกจ่าย ได้แก่ เลขประจำตัวประชาชนและประวัติชั่วโมงปฏิบัติงาน จะยังคงจัดเก็บไว้ตามระเบียบด้านบัญชีและภาษี"
 		} else {
-			msg += " รวมถึงเลขบัตรประชาชนที่เคยจัดเก็บไว้"
+			msg += " รวมถึงเลขประจำตัวประชาชนที่เคยจัดเก็บไว้"
 		}
-		s.notify.Send(ctx, userID, "คำขอลบข้อมูลได้รับการอนุมัติ", msg, "/account/my-data")
+		s.notify.Send(ctx, userID, "คำขอลบข้อมูลส่วนบุคคลได้รับการอนุมัติ", msg, "/account/my-data")
 	}
 	return nil
 }

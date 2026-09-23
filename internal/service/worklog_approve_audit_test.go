@@ -47,7 +47,7 @@ func TestApprove_WritesAnAuditRow(t *testing.T) {
 	var notes int
 	if err := f.Pool.QueryRow(f.ctx,
 		`SELECT COUNT(*) FROM notifications
-		 WHERE user_id=$1 AND title LIKE 'อนุมัติบันทึกเวลา%'`,
+		 WHERE user_id=$1 AND title LIKE 'บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ%'`,
 		f.TAID).Scan(&notes); err != nil {
 		t.Fatal(err)
 	}

@@ -163,7 +163,7 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 
 	if s.notify != nil {
 		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบแล้ว",
-			"ข้อมูลส่วนตัวและเอกสารทั้ง 3 รายการของคุณผ่านการตรวจสอบแล้ว", "/ta/documents")
+			"ข้อมูลส่วนตัวและเอกสารประกอบทั้ง 3 รายการของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
 	}
 
 	token, err := s.mintZipToken(actor, userID, ids)
@@ -216,6 +216,7 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 	// A single tx-lock per doc prevents the officer racing themselves.
 	batchID := uuid.New()
 	reasons := make([]string, 0, len(items))
+	fixRows := make([][]string, 0, len(items))
 	for _, it := range items {
 		var (
 			ownerID    uuid.UUID
@@ -256,6 +257,7 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 			return err
 		}
 		reasons = append(reasons, kindLabel(kind)+": "+it.Reason)
+		fixRows = append(fixRows, []string{kindLabel(kind), it.Reason})
 	}
 
 	// Compose a truncated summary on the profile so the TA lands on their
@@ -285,9 +287,20 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 		return err
 	}
 	if s.notify != nil {
-		s.notify.Send(ctx, userID,
+		s.notify.SendLaidOut(ctx, userID,
 			fmt.Sprintf("เอกสารต้องแก้ไข %d รายการ", len(items)),
-			summary, "/ta/documents")
+			fmt.Sprintf("เอกสารของท่านยังไม่ผ่านการตรวจสอบ จำนวน %d รายการ ดังนี้\n%s\n\nกรุณาแก้ไขและส่งเอกสารใหม่อีกครั้ง",
+				len(items), numberedLines(reasons)),
+			"/ta/documents", true, MailLayout{
+				Intro: fmt.Sprintf("เจ้าหน้าที่ได้ตรวจสอบเอกสารประกอบการเบิกจ่ายของท่านแล้ว พบว่ายังไม่ผ่านการตรวจสอบ จำนวน %d รายการ ดังนี้", len(items)),
+				Table: &MailTable{
+					Title: "รายการเอกสารที่ต้องแก้ไข",
+					Head:  []string{"เอกสาร", "เหตุผลที่ต้องแก้ไข"},
+					Rows:  fixRows,
+				},
+				After:       "กรุณาแก้ไขและส่งเอกสารใหม่อีกครั้งในระบบ",
+				ButtonLabel: "แก้ไขเอกสาร",
+			})
 	}
 	return nil
 }
@@ -297,9 +310,9 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 func kindLabel(kind string) string {
 	switch kind {
 	case "national_id":
-		return "บัตรประชาชน"
+		return "สำเนาบัตรประจำตัวประชาชน"
 	case "bank_book":
-		return "สมุดบัญชี"
+		return "สำเนาหน้าสมุดบัญชีธนาคาร"
 	case "creditor_form":
 		return "แบบฟอร์มเจ้าหนี้"
 	}

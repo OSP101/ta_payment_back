@@ -3225,10 +3225,13 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	// approver only discovers pending batches by polling their reports page.
 	if s.notify != nil {
 		if lects, err := courseLecturerIDs(ctx, s.pool, ac.TeachingCourseID); err == nil {
+			t := s.notifyTarget(ctx, ac.TeachingCourseID)
+			body := fmt.Sprintf("%s ผู้ช่วยสอนรายวิชา %s ได้ส่งบันทึกเวลาปฏิบัติงานเพื่อขอรับการอนุมัติจากท่าน",
+				personName(ctx, s.pool, ac.TAID), t.Label())
 			for _, lid := range lects {
-				s.notify.Send(ctx, lid,
-					"มีบันทึกเวลารอการอนุมัติ",
-					"TA ส่งบันทึกเวลาปฏิบัติงานรอการอนุมัติจากคุณ",
+				s.notify.SendAction(ctx, lid,
+					"มีบันทึกเวลาปฏิบัติงานรอการอนุมัติ",
+					body,
 					"/lecturer/courses/"+ac.TeachingCourseID.String()+"/reports")
 			}
 		}
@@ -3398,10 +3401,6 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 	// After the commit, and once per PERSON — a TA on two sections should not be
 	// told twice about one decision.
 	if s.notify != nil {
-		scope := "บันทึกเวลาปฏิบัติงานของคุณได้รับการอนุมัติแล้ว"
-		if yearMonth != "" {
-			scope = "บันทึกเวลาเดือน " + yearMonth + " ของคุณได้รับการอนุมัติแล้ว"
-		}
 		told := map[uuid.UUID]bool{}
 		for _, id := range ids {
 			ta := ctxs[id].TAID
@@ -3410,7 +3409,7 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 			}
 			told[ta] = true
 			t := s.notifyTarget(ctx, ctxs[id].TeachingCourseID)
-			s.notify.Send(ctx, ta, "อนุมัติบันทึกเวลา "+t.Code, scope, t.Link)
+			s.notify.Send(ctx, ta, "บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ "+t.Code, approvedBody(t, yearMonth), t.Link)
 		}
 	}
 	return nil
@@ -3491,11 +3490,7 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	}
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
-		scope := "บันทึกเวลาปฏิบัติงานวิชา " + t.Code + " ของคุณได้รับการอนุมัติแล้ว"
-		if when := thaiYearMonth(yearMonth); when != "" {
-			scope = "บันทึกเวลาวิชา " + t.Code + " เดือน" + when + " ของคุณได้รับการอนุมัติแล้ว"
-		}
-		s.notify.Send(ctx, ac.TAID, "อนุมัติบันทึกเวลา "+t.Code, scope, t.Link)
+		s.notify.Send(ctx, ac.TAID, "บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ "+t.Code, approvedBody(t, yearMonth), t.Link)
 	}
 	s.warnBudgetAfterApproval(ctx, ac.TeachingCourseID)
 	return nil
@@ -4116,9 +4111,9 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		s.notify.Send(ctx, ac.TAID,
-			"เจ้าหน้าที่แก้ไขบันทึกเวลา "+t.Code,
-			fmt.Sprintf("เจ้าหน้าที่ปรับข้อมูลบันทึกเวลาวิชา %s วันที่ %s เวลา %s–%s",
-				t.Code, w.WorkDate, w.StartTime, w.EndTime),
+			"เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน "+t.Code,
+			fmt.Sprintf("เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s",
+				t.Label(), thaiLongDateISO(w.WorkDate), thaiTimeRange(w.StartTime, w.EndTime)),
 			t.Link)
 		// A signed-off row changed: every lecturer on the course hears about it,
 		// with the reason. The batch path sends its own combined notice, so only
@@ -4131,8 +4126,9 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 					}
 					s.notify.Send(ctx, lid,
 						"มีการแก้ไขบันทึกเวลาที่อนุมัติแล้ว "+t.Code,
-						fmt.Sprintf("บันทึกเวลาวันที่ %s ซึ่งอนุมัติแล้ว ถูกแก้ไขเป็น %s–%s (%.2f ชม.) เหตุผล: %s",
-							w.WorkDate, w.StartTime, w.EndTime, w.Hours, strings.TrimSpace(stepUp.Reason)),
+						fmt.Sprintf("บันทึกเวลาปฏิบัติงานของ %s รายวิชา %s วันที่ %s ซึ่งท่านได้อนุมัติแล้ว ได้ถูกแก้ไขเป็น%s รวม %.2f ชั่วโมง เนื่องจาก %s",
+							personName(ctx, s.pool, ac.TAID), t.Label(), thaiLongDateISO(w.WorkDate),
+							thaiTimeRange(w.StartTime, w.EndTime), w.Hours, strings.TrimSpace(stepUp.Reason)),
 						t.Link)
 				}
 			}
@@ -4267,7 +4263,7 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, actor uuid.UUID, privi
 	if err := s.pool.QueryRow(ctx, `
 		SELECT a.ta_id, sec.teaching_course_id,
 		       TO_CHAR(wl.work_date,'YYYY-MM-DD'),
-		       wl.start_time::text || '–' || wl.end_time::text
+		       'เวลา ' || to_char(wl.start_time, 'HH24.MI') || ' ถึง ' || to_char(wl.end_time, 'HH24.MI') || ' น.'
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
@@ -4305,8 +4301,8 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, actor uuid.UUID, privi
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, tcID)
 		s.notify.Send(ctx, taID,
-			"เจ้าหน้าที่ลบบันทึกเวลา "+t.Code,
-			fmt.Sprintf("เจ้าหน้าที่ลบรายการบันทึกเวลาวิชา %s วันที่ %s เวลา %s", t.Code, workDate, timeSpan),
+			"เจ้าหน้าที่ลบบันทึกเวลาปฏิบัติงาน "+t.Code,
+			fmt.Sprintf("เจ้าหน้าที่ได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s", t.Label(), thaiLongDateISO(workDate), timeSpan),
 			t.Link)
 	}
 	return nil
@@ -4365,11 +4361,11 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		when := thaiYearMonth(yearMonth)
 		if when != "" {
-			when = " เดือน" + when
+			when = " ประจำเดือน" + when
 		}
-		s.notify.Send(ctx, ac.TAID,
-			"บันทึกเวลา "+t.Code+" ถูกตีกลับ",
-			"อาจารย์ส่งบันทึกเวลาวิชา "+t.Code+when+" กลับมาให้แก้ไข: "+reason,
+		s.notify.SendAction(ctx, ac.TAID,
+			"บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข "+t.Code,
+			"อาจารย์ผู้สอนได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา "+t.Label()+when+" กลับมาให้ท่านแก้ไข เนื่องจาก "+reason,
 			t.Link)
 	}
 	return nil
@@ -4385,12 +4381,28 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 // working link are the whole difference between a notice and a nuisance.
 type worklogNotifyTarget struct {
 	Code string
+	Name string
 	Link string
+}
+
+// Label is "CP353004 การพัฒนาซอฟต์แวร์" for a notice body.
+func (t worklogNotifyTarget) Label() string {
+	return strings.TrimSpace(t.Code + " " + t.Name)
+}
+
+// approvedBody is the body of the "hours approved" notice, with the month
+// spelled out when the approval covered one month.
+func approvedBody(t worklogNotifyTarget, yearMonth string) string {
+	when := ""
+	if m := thaiYearMonth(yearMonth); m != "" {
+		when = " ประจำเดือน" + m
+	}
+	return "บันทึกเวลาปฏิบัติงานรายวิชา " + t.Label() + when + " ของท่านได้รับการอนุมัติจากอาจารย์ผู้สอนแล้ว"
 }
 
 func (s *WorkLogService) notifyTarget(ctx context.Context, tcID uuid.UUID) worklogNotifyTarget {
 	t := worklogNotifyTarget{Link: "/ta/courses/" + tcID.String() + "/worklog"}
-	_ = s.pool.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id=$1`, tcID).Scan(&t.Code)
+	_ = s.pool.QueryRow(ctx, `SELECT code, COALESCE(name_th, '') FROM teaching_courses WHERE id=$1`, tcID).Scan(&t.Code, &t.Name)
 	return t
 }
 

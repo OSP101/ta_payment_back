@@ -25,7 +25,7 @@ func budgetNoticeCount(t *testing.T, f *fixture) int {
 	t.Helper()
 	var n int
 	if err := f.Pool.QueryRow(f.ctx,
-		`SELECT COUNT(*) FROM notifications WHERE title LIKE 'งบไม่พอ%'`).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM notifications WHERE title LIKE 'งบประมาณรายวิชาไม่เพียงพอ%'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -67,7 +67,7 @@ func TestNotifyBudgetShortfall_ReachesLecturerAndTA(t *testing.T) {
 	} {
 		var n int
 		if err := f.Pool.QueryRow(f.ctx,
-			`SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND title LIKE 'งบไม่พอ%'`,
+			`SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND title LIKE 'งบประมาณรายวิชาไม่เพียงพอ%'`,
 			id).Scan(&n); err != nil {
 			t.Fatal(err)
 		}

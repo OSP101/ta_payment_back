@@ -1179,17 +1179,19 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 	if s.notify == nil {
 		return
 	}
-	var code string
+	var code, nameTH string
 	if err := s.pool.QueryRow(ctx,
-		`SELECT code FROM teaching_courses WHERE id = $1`, courseID).Scan(&code); err != nil {
+		`SELECT code, COALESCE(name_th, '') FROM teaching_courses WHERE id = $1`, courseID).Scan(&code, &nameTH); err != nil {
 		return
 	}
 	link := "/ta/courses/" + courseID.String() + "/worklog"
-	body := "อาจารย์เปลี่ยนวิธีแบ่งงบเป็น “เฉลี่ยให้ได้ครบทุกเดือน” " +
-		"ทุกเดือนจะถูกหักเป็นสัดส่วนเท่ากัน ยอดรวมที่ได้รับไม่เปลี่ยน"
+	body := "อาจารย์ผู้สอนได้เปลี่ยนวิธีแบ่งงบประมาณรายวิชา " + code + " " + nameTH +
+		" เป็นแบบเฉลี่ยให้ได้รับครบทุกเดือน โดยทุกเดือนจะถูกหักเป็นสัดส่วนเท่ากัน " +
+		"ทั้งนี้ ยอดค่าตอบแทนรวมที่ท่านได้รับไม่เปลี่ยนแปลง"
 	if mode == SettleChronological {
-		body = "อาจารย์เปลี่ยนวิธีแบ่งงบกลับเป็นแบบเดิม (จ่ายเรียงเดือนจนงบหมด) " +
-			"เดือนต้นเทอมจะได้เต็ม ส่วนเดือนท้ายอาจไม่ได้รับ ยอดรวมที่ได้รับไม่เปลี่ยน"
+		body = "อาจารย์ผู้สอนได้เปลี่ยนวิธีแบ่งงบประมาณรายวิชา " + code + " " + nameTH +
+			" กลับเป็นแบบจ่ายตามลำดับเดือนจนกว่างบประมาณจะหมด โดยเดือนต้นภาคการศึกษาจะได้รับเต็มจำนวน " +
+			"และเดือนท้ายภาคการศึกษาอาจไม่ได้รับค่าตอบแทน ทั้งนี้ ยอดค่าตอบแทนรวมที่ท่านได้รับไม่เปลี่ยนแปลง"
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT a.ta_id
@@ -1206,7 +1208,7 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 			log.Printf("notifySettlementModeChanged scan %s: %v", courseID, err)
 			return
 		}
-		s.notify.Send(ctx, ta, "วิธีแบ่งงบของ "+code+" เปลี่ยนแปลงแล้ว", body, link)
+		s.notify.Send(ctx, ta, "วิธีแบ่งงบประมาณรายวิชา "+code+" มีการเปลี่ยนแปลง", body, link)
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("notifySettlementModeChanged rows %s: %v", courseID, err)
@@ -1280,21 +1282,21 @@ func (s *ExportService) NotifyBudgetShortfall(ctx context.Context, courseID uuid
 	var code, nameTH string
 	_ = s.pool.QueryRow(ctx,
 		`SELECT code, name_th FROM teaching_courses WHERE id = $1`, courseID).Scan(&code, &nameTH)
-	title := "งบไม่พอ " + code
+	title := "งบประมาณรายวิชาไม่เพียงพอ " + code
 	// Two different sentences: a month paid part of its worth still pays
 	// something, and saying "จะไม่ได้รับค่าตอบแทน" about it would be wrong.
 	var what []string
 	if len(forecast.PartialMonths) > 0 {
-		what = append(what, "เดือน "+strings.Join(thaiMonthLabels(forecast.PartialMonths), ", ")+" ได้ไม่เต็มจำนวน")
+		what = append(what, "เดือน"+strings.Join(thaiMonthLabels(forecast.PartialMonths), ", ")+" จะได้รับค่าตอบแทนไม่เต็มจำนวน")
 	}
 	if len(forecast.UnpaidMonths) > 0 {
-		what = append(what, "เดือน "+strings.Join(thaiMonthLabels(forecast.UnpaidMonths), ", ")+" ไม่ได้รับค่าตอบแทน")
+		what = append(what, "เดือน"+strings.Join(thaiMonthLabels(forecast.UnpaidMonths), ", ")+" จะไม่ได้รับค่าตอบแทน")
 	}
 	body := fmt.Sprintf(
-		"%s %s\nงบรายวิชาไม่พอจ่ายทั้งหมด %s (ขาดรวม %.0f บาท "+
-			"TA ทุกคนถูกหักเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่ควรได้)\n"+
-			"ชั่วโมงยังถูกบันทึกไว้ครบ และอาจารย์ยังอนุมัติได้ตามปกติ",
-		code, nameTH, strings.Join(what, " และ"), forecast.DroppedBaht)
+		"งบประมาณรายวิชา %s %s ไม่เพียงพอสำหรับการจ่ายค่าตอบแทนทั้งหมด โดย%s "+
+			"ขาดรวมเป็นเงิน %s บาท ผู้ช่วยสอนทุกคนจะถูกหักค่าตอบแทนเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่พึงได้รับ\n\n"+
+			"ทั้งนี้ ชั่วโมงปฏิบัติงานยังคงถูกบันทึกไว้ครบถ้วน และอาจารย์ผู้สอนยังคงอนุมัติบันทึกเวลาได้ตามปกติ",
+		code, nameTH, strings.Join(what, " และ"), thaiBaht(forecast.DroppedBaht))
 
 	if lects, err := courseLecturerIDs(ctx, s.pool, courseID); err == nil {
 		for _, id := range lects {

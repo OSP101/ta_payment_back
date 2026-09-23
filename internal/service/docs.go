@@ -826,8 +826,9 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			return err
 		}
 		if s.notify != nil {
-			s.notify.Send(ctx, rejUserID, "เอกสารต้องแก้ไข: "+kindLabel(rejKind),
-				reason, "/ta/documents")
+			s.notify.SendAction(ctx, rejUserID, "เอกสารต้องแก้ไข "+kindLabel(rejKind),
+				kindLabel(rejKind)+" ของท่านยังไม่ผ่านการตรวจสอบ เนื่องจาก "+reason+" กรุณาแก้ไขและส่งเอกสารใหม่อีกครั้ง",
+				"/ta/documents")
 		}
 		return nil
 	}
@@ -880,11 +881,11 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 		return err
 	}
 	if s.notify != nil {
-		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบ: "+kindLabel(approvedKind),
-			"", "/ta/documents")
+		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบ "+kindLabel(approvedKind),
+			kindLabel(approvedKind)+" ของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
 		if profileApproved {
 			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว",
-				"เอกสารครบทั้ง 3 รายการและผ่านการตรวจสอบแล้ว", "/ta/documents")
+				"ข้อมูลส่วนตัวและเอกสารประกอบทั้ง 3 รายการของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
 		}
 	}
 	return nil
@@ -1019,9 +1020,12 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 	}
 	if s.notify != nil {
 		if approve {
-			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว", "", "/ta/documents")
+			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว",
+				"ข้อมูลส่วนตัวของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
 		} else {
-			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวต้องแก้ไข", reason, "/ta/documents")
+			s.notify.SendAction(ctx, userID, "ข้อมูลส่วนตัวต้องแก้ไข",
+				"ข้อมูลส่วนตัวของท่านยังไม่ผ่านการตรวจสอบ เนื่องจาก "+reason+" กรุณาแก้ไขและส่งข้อมูลใหม่อีกครั้ง",
+				"/ta/documents")
 		}
 	}
 	return nil

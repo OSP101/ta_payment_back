@@ -57,7 +57,7 @@ func TestMakeupCancel_NotificationFiresThroughRealContainer(t *testing.T) {
 	var count int
 	if err := f.Pool.QueryRow(f.ctx,
 		`SELECT COUNT(*) FROM notifications
-		  WHERE user_id = $1 AND title = 'อาจารย์ยกเลิกวันชดเชย'`,
+		  WHERE user_id = $1 AND title = 'อาจารย์ผู้สอนยกเลิกวันสอนชดเชย'`,
 		f.TAID).Scan(&count); err != nil {
 		t.Fatalf("querying notifications: %v", err)
 	}

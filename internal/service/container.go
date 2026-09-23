@@ -50,6 +50,7 @@ type Container struct {
 	Enrollments       *EnrollmentService
 	TDBM              *TDBMService
 	Audit             *AuditService
+	MailSettings      *MailSettingsService
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
@@ -58,7 +59,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Audit = &AuditService{pool: pool, store: store}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
-	c.Notify = &NotifyService{pool: pool, mailer: mailer}
+	c.Notify = &NotifyService{pool: pool, mailer: mailer, baseURL: cfg.AppBaseURL}
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}
 	c.Budget = &BudgetService{pool: pool}
 	c.TARequest = &TARequestService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
@@ -106,5 +107,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	// instead of waiting for the next TDBM sync — see TeachingService.tdbm's
 	// doc comment.
 	c.Teaching.tdbm = c.TDBM
+	c.Teaching.requests = c.TARequest
+	c.MailSettings = &MailSettingsService{pool: pool, aud: auditor}
 	return c
 }

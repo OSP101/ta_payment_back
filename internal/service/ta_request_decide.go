@@ -585,15 +585,15 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 	var summary []string
 	for taID, lines := range notices {
 		s.notify.Send(ctx, taID,
-			"ตารางเรียนของคุณทับกับคาบสอน",
-			fmt.Sprintf("วิชา %s\n%s", label, strings.Join(lines, "\n")),
+			"ตารางเรียนของท่านทับซ้อนกับคาบสอน",
+			fmt.Sprintf("ระบบพบว่าตารางเรียนของท่านทับซ้อนกับคาบสอนของรายวิชา %s ดังนี้\n%s", label, strings.Join(lines, "\n")),
 			// /ta/courses is not a route — the TA's course list is the home page.
 			"/ta")
-		summary = append(summary, fmt.Sprintf("%s — %s", s.taName(ctx, taID), strings.Join(lines, "; ")))
+		summary = append(summary, fmt.Sprintf("%s %s", s.taName(ctx, taID), strings.Join(lines, " ")))
 	}
 	s.notify.Send(ctx, lecturerID,
-		"ผู้ช่วยสอนบางคนติดตารางเรียน",
-		fmt.Sprintf("วิชา %s\n%s", label, strings.Join(summary, "\n")),
+		"ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน",
+		fmt.Sprintf("ระบบพบว่าผู้ช่วยสอนในคำขอรายวิชา %s มีตารางเรียนทับซ้อนกับคาบสอน ดังนี้\n%s", label, numberedLines(summary)),
 		// Likewise: the lecturer's course list is their home page.
 		"/lecturer")
 }

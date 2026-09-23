@@ -130,6 +130,16 @@ func (s *Scheduler) tick(ctx context.Context) {
 		log.Printf("scheduler: finalised %d pending TA request(s)", n)
 	}
 
+	// TA-request window notices: "requests are open" once a lecturer has a
+	// course in the term, and "deadline near" a few days out. Hourly so a
+	// course attached late, or a window that opens in the future, is picked
+	// up without anyone pressing anything. See ta_request_notice.go.
+	if n, err := s.svc.TARequest.SweepWindowNotices(ctx); err != nil {
+		log.Printf("scheduler: ta_window_notice err=%v", err)
+	} else if n > 0 {
+		log.Printf("scheduler: sent %d TA request window notice(s)", n)
+	}
+
 	n, err := s.svc.SubmissionPeriods.SweepReminders(ctx)
 	if err != nil {
 		log.Printf("scheduler: sweep_reminders err=%v", err)

@@ -272,11 +272,15 @@ func (s *WorkLogService) notifyEditBatch(ctx context.Context, in EditBatchInput,
 		`SELECT code, COALESCE(name_th,'') FROM teaching_courses WHERE id=$1`,
 		in.TeachingCourseID).Scan(&code, &nameTH)
 
-	title := "เจ้าหน้าที่แก้ไขบันทึกเวลา " + code
-	body := fmt.Sprintf("%s %s · เดือน %s แก้ไข %d รายการ\nเหตุผล: %s",
-		code, nameTH, in.YearMonth, applied, strings.TrimSpace(in.Reason))
+	title := "เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน " + code
+	month := thaiYearMonth(in.YearMonth)
+	if month == "" {
+		month = in.YearMonth
+	}
+	body := fmt.Sprintf("เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานของ %s รายวิชา %s %s ประจำเดือน%s จำนวน %d รายการ เนื่องจาก %s",
+		personName(ctx, s.pool, in.TAID), code, nameTH, month, applied, strings.TrimSpace(in.Reason))
 	if files > 0 {
-		body += fmt.Sprintf("\n(แนบหลักฐาน %d รูป)", files)
+		body += fmt.Sprintf(" โดยได้แนบหลักฐานประกอบจำนวน %d ภาพ", files)
 	}
 
 	s.notify.Send(ctx, in.TAID, title, body,

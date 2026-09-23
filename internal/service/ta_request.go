@@ -860,8 +860,8 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 	}
 	code, nameTH := s.courseLabel(ctx, courseID)
 	if verdict == "approved" {
-		s.notify.Send(ctx, lecturerID, "คำขอ TA ได้รับการอนุมัติ",
-			fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ได้รับการอนุมัติจากระบบอัตโนมัติแล้ว", code, nameTH), "/lecturer")
+		s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนได้รับการอนุมัติ",
+			fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอดังกล่าวได้รับการอนุมัติเรียบร้อยแล้ว", code, nameTH), "/lecturer")
 		rows, err := s.pool.Query(ctx,
 			`SELECT DISTINCT a.ta_id FROM ta_request_assignments a WHERE a.request_id = $1`, reqID)
 		if err != nil {
@@ -873,13 +873,13 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 			if err := rows.Scan(&taID); err != nil {
 				return
 			}
-			s.notify.Send(ctx, taID, "คุณได้รับมอบหมายเป็นผู้ช่วยสอน",
-				fmt.Sprintf("คุณได้รับอนุมัติเป็นผู้ช่วยสอนวิชา %s %s", code, nameTH), "/ta")
+			s.notify.Send(ctx, taID, "ท่านได้รับการแต่งตั้งเป็นผู้ช่วยสอน",
+				fmt.Sprintf("ท่านได้รับการอนุมัติให้เป็นผู้ช่วยสอนรายวิชา %s %s และสามารถบันทึกเวลาปฏิบัติงานในระบบได้แล้ว", code, nameTH), "/ta")
 		}
 		return
 	}
-	s.notify.Send(ctx, lecturerID, "คำขอ TA ถูกปฏิเสธ",
-		fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ถูกระบบปฏิเสธอัตโนมัติ: %s", code, nameTH, reason), "/lecturer")
+	s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ",
+		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบแล้ว คำขอดังกล่าวไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/lecturer")
 	// The named TAs deserve to hear the outcome too — previously only the
 	// lecturer was told and a rejected TA never learned.
 	rows, err := s.pool.Query(ctx,
@@ -894,7 +894,7 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 			return
 		}
 		s.notify.Send(ctx, taID, "คำขอแต่งตั้งผู้ช่วยสอนไม่ผ่านการอนุมัติ",
-			fmt.Sprintf("คำขอผู้ช่วยสอนวิชา %s %s ที่ระบุชื่อคุณไม่ผ่านการอนุมัติ: %s", code, nameTH, reason), "/ta")
+			fmt.Sprintf("คำขอผู้ช่วยสอนรายวิชา %s %s ซึ่งระบุชื่อท่านเป็นผู้ช่วยสอน ไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/ta")
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("notifyDecision rows %s: %v", reqID, err)
@@ -1378,11 +1378,10 @@ func (s *TARequestService) validateTA(ctx context.Context, taID uuid.UUID, clien
 }
 
 func (s *TARequestService) taName(ctx context.Context, taID uuid.UUID) string {
-	var first, last string
-	if err := s.pool.QueryRow(ctx, `SELECT first_name, last_name FROM users WHERE id = $1`, taID).Scan(&first, &last); err != nil {
-		return "TA"
+	if name := personName(ctx, s.pool, taID); name != "" {
+		return name
 	}
-	return first + " " + last
+	return "ผู้ช่วยสอน"
 }
 
 // SectionConflict is one section's preview verdict for a specific TA.
@@ -2277,6 +2276,14 @@ type Window struct {
 	ClosesAt time.Time `json:"closes_at" validate:"required"`
 	IsOpen   bool      `json:"is_open"`
 	Note     *string   `json:"note,omitempty" validate:"omitempty,max=500"`
+	// NotifyLecturers turns on the automatic e-mails (window opened, deadline
+	// near) — see ta_request_notice.go. A pointer so an older client that does
+	// not know the field cannot switch it off by omission: nil means "on" for
+	// a new window and "leave as it is" for an existing one.
+	NotifyLecturers *bool `json:"notify_lecturers"`
+	// Read-only: how many lecturers each notice has reached so far.
+	OpenSent    int `json:"open_sent"`
+	ClosingSent int `json:"closing_sent"`
 }
 
 func (s *TARequestService) UpsertWindow(ctx context.Context, actor uuid.UUID, in Window) (*Window, error) {
@@ -2288,15 +2295,27 @@ func (s *TARequestService) UpsertWindow(ctx context.Context, actor uuid.UUID, in
 		audit.Entry{ActorID: &actor, Action: "ta_window.upsert", Entity: "ta_window", EntityID: in.ID.String(), After: in},
 		func(tx pgx.Tx) error {
 			if isNew {
+				notify := true
+				if in.NotifyLecturers != nil {
+					notify = *in.NotifyLecturers
+				}
+				in.NotifyLecturers = &notify
 				_, err := tx.Exec(ctx,
-					`INSERT INTO ta_request_windows (id, term_id, opens_at, closes_at, is_open, note)
-					 VALUES ($1,$2,$3,$4,$5,$6)`,
-					in.ID, in.TermID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note)
+					`INSERT INTO ta_request_windows (id, term_id, opens_at, closes_at, is_open, note, notify_lecturers)
+					 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+					in.ID, in.TermID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note, notify)
 				return err
 			}
-			_, err := tx.Exec(ctx,
-				`UPDATE ta_request_windows SET opens_at=$2, closes_at=$3, is_open=$4, note=$5 WHERE id=$1`,
-				in.ID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note)
+			err := tx.QueryRow(ctx,
+				`UPDATE ta_request_windows
+				    SET opens_at=$2, closes_at=$3, is_open=$4, note=$5,
+				        notify_lecturers=COALESCE($6, notify_lecturers)
+				  WHERE id=$1
+				  RETURNING notify_lecturers`,
+				in.ID, in.OpensAt, in.ClosesAt, in.IsOpen, in.Note, in.NotifyLecturers).Scan(&in.NotifyLecturers)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
 			return err
 		}); err != nil {
 		return nil, err
@@ -2305,7 +2324,10 @@ func (s *TARequestService) UpsertWindow(ctx context.Context, actor uuid.UUID, in
 }
 
 func (s *TARequestService) ListWindows(ctx context.Context, termID *uuid.UUID) ([]Window, error) {
-	q := `SELECT id, term_id, opens_at, closes_at, is_open, note FROM ta_request_windows`
+	q := `SELECT id, term_id, opens_at, closes_at, is_open, note, notify_lecturers,
+	             (SELECT COUNT(*) FROM ta_window_notices n WHERE n.window_id = w.id AND n.kind = 'open'),
+	             (SELECT COUNT(*) FROM ta_window_notices n WHERE n.window_id = w.id AND n.kind = 'closing')
+	        FROM ta_request_windows w`
 	args := []any{}
 	if termID != nil {
 		q += ` WHERE term_id = $1`
@@ -2320,7 +2342,8 @@ func (s *TARequestService) ListWindows(ctx context.Context, termID *uuid.UUID) (
 	out := []Window{}
 	for rows.Next() {
 		var w Window
-		if err := rows.Scan(&w.ID, &w.TermID, &w.OpensAt, &w.ClosesAt, &w.IsOpen, &w.Note); err != nil {
+		if err := rows.Scan(&w.ID, &w.TermID, &w.OpensAt, &w.ClosesAt, &w.IsOpen, &w.Note,
+			&w.NotifyLecturers, &w.OpenSent, &w.ClosingSent); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

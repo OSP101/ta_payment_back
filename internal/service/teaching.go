@@ -165,6 +165,11 @@ type TeachingService struct {
 	// Container after TDBM exists (see container.go); nil-checked at every
 	// call site because tests construct TeachingService without it.
 	tdbm *TDBMService
+	// requests sends the TA-request window notices (ta_request_notice.go). A
+	// lecturer attached to a course while a window is live gets the "requests
+	// are open" mail — which lists all their courses — instead of the plainer
+	// "you were added to X". Wired by Container; nil in tests.
+	requests *TARequestService
 }
 
 // Create a teaching course with sections + schedules in one transaction.
@@ -1070,8 +1075,9 @@ func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid
 	// that already committed.
 	if s.notify != nil {
 		var code, name string
-		_ = s.pool.QueryRow(ctx, `SELECT code, name_th FROM teaching_courses WHERE id = $1`, tcID).
-			Scan(&code, &name)
+		var termID uuid.UUID
+		_ = s.pool.QueryRow(ctx, `SELECT code, name_th, term_id FROM teaching_courses WHERE id = $1`, tcID).
+			Scan(&code, &name, &termID)
 		beforeIDs, afterIDs := map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
 		for _, l := range before {
 			beforeIDs[l.ID] = true
@@ -1080,16 +1086,27 @@ func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid
 			afterIDs[l.ID] = true
 		}
 		link := "/lecturer/courses/" + tcID.String()
+		var openNotice []uuid.UUID
 		for _, l := range after {
-			if !beforeIDs[l.ID] {
-				s.notify.Send(ctx, l.ID, "คุณถูกเพิ่มเป็นอาจารย์ผู้สอน "+code,
-					name+" ("+code+")", link)
+			if beforeIDs[l.ID] {
+				continue
+			}
+			if s.requests != nil && s.requests.PendingOpenNotice(ctx, termID, l.ID) {
+				openNotice = append(openNotice, l.ID)
+				continue
+			}
+			s.notify.Send(ctx, l.ID, "ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอน "+code,
+				"ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอนรายวิชา "+code+" "+name+" ในระบบแล้ว", link)
+		}
+		if len(openNotice) > 0 {
+			if _, err := s.requests.SweepWindowNoticesFor(ctx, openNotice); err != nil {
+				log.Printf("teaching: window notice after lecturer bind: %v", err)
 			}
 		}
 		for _, l := range before {
 			if !afterIDs[l.ID] {
-				s.notify.Send(ctx, l.ID, "คุณถูกถอดออกจากอาจารย์ผู้สอน "+code,
-					name+" ("+code+")", "/lecturer")
+				s.notify.Send(ctx, l.ID, "ชื่อของท่านถูกนำออกจากอาจารย์ผู้สอน "+code,
+					"ชื่อของท่านได้ถูกนำออกจากรายชื่ออาจารย์ผู้สอนรายวิชา "+code+" "+name+" ในระบบแล้ว", "/lecturer")
 			}
 		}
 	}
@@ -2127,9 +2144,15 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 		return err
 	}
 	if s.notify != nil {
-		body := fmt.Sprintf("อาจารย์ยกเลิกวันชดเชย %s รายการชั่วโมงร่างในวันนั้นถูกลบ", makeupDateStr)
+		var label string
+		_ = s.pool.QueryRow(ctx, `
+			SELECT tc.code || ' ' || COALESCE(tc.name_th, '')
+			  FROM sections sec JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+			 WHERE sec.id = $1`, sectionID).Scan(&label)
+		body := fmt.Sprintf("อาจารย์ผู้สอนรายวิชา %s ได้ยกเลิกวันสอนชดเชยวันที่ %s รายการบันทึกเวลาฉบับร่างของวันดังกล่าวจึงถูกลบออกจากระบบ",
+			strings.TrimSpace(label), thaiLongDateISO(makeupDateStr))
 		for _, taID := range notifyTargets {
-			s.notify.Send(ctx, taID, "อาจารย์ยกเลิกวันชดเชย", body, "/ta")
+			s.notify.Send(ctx, taID, "อาจารย์ผู้สอนยกเลิกวันสอนชดเชย", body, "/ta")
 		}
 	}
 	return nil

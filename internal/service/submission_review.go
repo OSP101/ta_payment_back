@@ -500,14 +500,14 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 		return Invalid("วิชานี้ยังไม่มีอาจารย์ผู้สอนในระบบ จึงยังแจ้งเตือนไม่ได้")
 	}
 
-	title := "มีบันทึกเวลา TA รออนุมัติ"
+	title := "มีบันทึกเวลาผู้ช่วยสอนรอการอนุมัติ"
 	body := fmt.Sprintf(
-		"%s %s มี %d รายการที่ TA ส่งมาแล้วและรอการอนุมัติของอาจารย์ "+
-			"เจ้าหน้าที่ยังตรวจเบิกจ่ายเดือนนั้นไม่ได้จนกว่าจะอนุมัติครบ",
+		"รายวิชา %s %s มีบันทึกเวลาปฏิบัติงานของผู้ช่วยสอนที่รอการอนุมัติจากท่าน จำนวน %d รายการ "+
+			"ทั้งนี้ เจ้าหน้าที่จะดำเนินการตรวจสอบเพื่อเบิกจ่ายได้เมื่อรายการของเดือนดังกล่าวได้รับการอนุมัติครบถ้วนแล้ว",
 		code, nameTH, openRows)
 	for _, id := range lecturerIDs {
 		// The lecturer approves on .../reports; there is no .../worklog for them.
-		s.notify.Send(ctx, id, title, body, "/lecturer/courses/"+tcID.String()+"/reports")
+		s.notify.SendAction(ctx, id, title, body, "/lecturer/courses/"+tcID.String()+"/reports")
 	}
 
 	if err := s.aud.Log(ctx, audit.Entry{

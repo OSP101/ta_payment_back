@@ -690,8 +690,9 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		if s.notify != nil {
 			for _, c := range cells {
 				s.notify.Send(ctx, c.taID,
-					"เจ้าหน้าที่ส่งออกเอกสารเบิกจ่ายแล้ว",
-					"เจ้าหน้าที่ตรวจสอบและส่งออกไฟล์เบิกจ่ายของคุณแล้ว บันทึกเวลาเดือนดังกล่าวถูกล็อก",
+					"เจ้าหน้าที่จัดทำเอกสารเบิกจ่ายแล้ว",
+					"เจ้าหน้าที่ได้ตรวจสอบและจัดทำเอกสารเบิกจ่ายค่าตอบแทนรายวิชา "+courseLabelOf(ctx, s.pool, tcID)+
+						" ของท่านเรียบร้อยแล้ว บันทึกเวลาปฏิบัติงานของเดือนดังกล่าวจึงถูกล็อกและไม่สามารถแก้ไขได้",
 					"/ta/reminders")
 			}
 		}
@@ -759,8 +760,8 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 	}
 	if s.notify != nil {
 		s.notify.Send(ctx, taID,
-			"ส่งเบิกจ่ายไปยังการเงินแล้ว",
-			"บันทึกเวลาประจำเดือนของคุณถูกส่งไปยังการเงินเรียบร้อยแล้ว",
+			"ส่งเรื่องเบิกจ่ายไปยังงานการเงินแล้ว",
+			"บันทึกเวลาปฏิบัติงานประจำเดือนของท่านได้ถูกส่งไปยังงานการเงินเพื่อดำเนินการเบิกจ่ายเรียบร้อยแล้ว",
 			"/ta/reminders")
 	}
 	return nil
@@ -879,14 +880,16 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 		return err
 	}
 	if s.notify != nil {
-		body := "บันทึกเวลาประจำเดือนของคุณถูกตีกลับให้แก้ไข: " + reason
-		s.notify.Send(ctx, taID, "บันทึกเวลาประจำเดือนถูกตีกลับ", body, "/ta/reminders")
+		label := courseLabelOf(ctx, s.pool, tcID)
+		body := "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือนรายวิชา " + label + " กลับมาให้ท่านแก้ไข เนื่องจาก " + reason
+		s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข", body, "/ta/reminders")
 		// The course lecturers may need to re-open a worklog for correction.
 		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 			for _, lid := range lects {
 				if lid != actor {
-					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกตีกลับ",
-						"เจ้าหน้าที่ตีกลับบันทึกเวลาประจำเดือนของ TA ในรายวิชาของคุณ: "+reason,
+					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข",
+						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือนของ "+personName(ctx, s.pool, taID)+
+							" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เนื่องจาก "+reason,
 						"/lecturer/courses/"+tcID.String()+"/reports")
 				}
 			}
@@ -953,13 +956,15 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 		return err
 	}
 	if s.notify != nil {
-		s.notify.Send(ctx, taID, "ปลดล็อกสถานะส่งการเงิน",
-			"ผู้ดูแลระบบปลดล็อกบันทึกเวลาประจำเดือนของคุณเพื่อแก้ไข: "+reason,
+		label := courseLabelOf(ctx, s.pool, tcID)
+		s.notify.SendAction(ctx, taID, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข",
+			"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือนรายวิชา "+label+" ของท่านเพื่อให้แก้ไข เนื่องจาก "+reason,
 			"/ta/reminders")
 		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 			for _, lid := range lects {
-				s.notify.Send(ctx, lid, "ปลดล็อกสถานะส่งการเงิน",
-					"ผู้ดูแลระบบปลดล็อกบันทึกเวลาประจำเดือนของ TA ในรายวิชาของคุณ: "+reason,
+				s.notify.Send(ctx, lid, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข",
+					"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือนของ "+personName(ctx, s.pool, taID)+
+						" ผู้ช่วยสอนรายวิชา "+label+" เพื่อให้แก้ไข เนื่องจาก "+reason,
 					"/lecturer/courses/"+tcID.String()+"/reports")
 			}
 		}
@@ -1183,9 +1188,9 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 		return 0, err
 	}
 	for _, it := range items {
-		body := fmt.Sprintf("โปรดบันทึกเวลาปฏิบัติงาน %s วิชา %s (%s) ให้ครบและส่งให้อาจารย์อนุมัติ กำหนดส่งภายในวันที่ %s",
-			it.label, it.code, it.nm, it.due)
-		s.notify.Send(ctx, it.taID, "แจ้งเตือน: ใกล้ครบกำหนดส่งบันทึกเวลา TA", body, "/ta/reminders")
+		body := fmt.Sprintf("ขอให้ท่านบันทึกเวลาปฏิบัติงานประจำงวด %s รายวิชา %s %s ให้ครบถ้วน และส่งให้อาจารย์ผู้สอนพิจารณาอนุมัติภายในวันที่ %s",
+			it.label, it.code, it.nm, thaiLongDateISO(it.due))
+		s.notify.SendAction(ctx, it.taID, "ใกล้ครบกำหนดส่งบันทึกเวลาปฏิบัติงาน", body, "/ta/reminders")
 		_, _ = s.pool.Exec(ctx, `
 			INSERT INTO submission_period_status
 			    (id, submission_period_id, ta_id, teaching_course_id, status, last_reminded_at)
