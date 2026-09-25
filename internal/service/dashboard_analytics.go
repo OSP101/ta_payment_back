@@ -50,6 +50,12 @@ type CourseSpendStat struct {
 	SpentBaht        float64   `json:"spent_baht"`
 	CapBaht          float64   `json:"cap_baht"`
 	OverBudget       bool      `json:"over_budget"`
+	// ForecastBaht is what the course will pay by the end of the term if every
+	// logged-but-not-yet-approved row goes through (ForecastCourse, after the
+	// cutoff). UnfundedBaht is forecast work the pool cannot pay.
+	ForecastBaht float64 `json:"forecast_baht"`
+	UnfundedBaht float64 `json:"unfunded_baht"`
+	Students     int     `json:"students"`
 }
 
 type TermAnalytics struct {
@@ -74,6 +80,30 @@ type TermAnalytics struct {
 	Monthly   []MonthSpend      `json:"monthly"`
 	Curricula []CurriculumStat  `json:"curricula"`
 	Courses   []CourseSpendStat `json:"courses"`
+
+	// ---- 26/09/2026 dashboard redesign (see dashboard_insights.go) ----
+
+	// The term's budget is BudgetAllocated above: the sum of each requesting
+	// course's formula ceiling — the money that has to be set aside for the
+	// term. Nobody types it in; it moves as requests arrive (26/09/2026).
+	// BudgetLump is the part of BudgetUsed that is graduate-special lump sums.
+	BudgetLump float64 `json:"budget_lump"`
+	// BudgetForecast is the projected term spend: BudgetUsed plus everything
+	// logged and still in play (floor, never an over-statement).
+	BudgetForecast float64 `json:"budget_forecast"`
+	// BudgetUnfunded is forecast work the course pools cannot pay.
+	BudgetUnfunded float64 `json:"budget_unfunded"`
+
+	ActiveTAs    int `json:"active_tas"`
+	TAsUndergrad int `json:"tas_undergrad"`
+	TAsGraduate  int `json:"tas_graduate"`
+
+	Plan     PlanRatios       `json:"plan"`
+	Staffing []CourseStaffing `json:"staffing"`
+	Pipeline *PipelineSummary `json:"pipeline"`
+	Flow     []MonthFlow      `json:"flow"`
+	Deadline *DeadlineInfo    `json:"deadline"`
+	Docs     DocStatusCounts  `json:"docs"`
 }
 
 // Analytics builds the executive view for one term (nil = active/newest, same
@@ -186,11 +216,25 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 		if err != nil {
 			return nil, err
 		}
+		forecast, err := export.ForecastCourse(ctx, c.id)
+		if err != nil {
+			return nil, err
+		}
+		forecastPaid := forecast.Regular.PaidBaht + forecast.Regular.Committed +
+			forecast.Special.PaidBaht + forecast.Special.Committed
+		unfunded := forecast.DroppedBaht
 		// Committed is the graduate-special lump sum — real money taken off the
 		// top with no month of its own, so it joins the totals but not the
 		// monthly series.
 		spent := settle.Regular.PaidBaht + settle.Regular.Committed +
 			settle.Special.PaidBaht + settle.Special.Committed
+		out.BudgetLump += settle.Regular.Committed + settle.Special.Committed
+		// The forecast includes the settled rows, so it can never honestly sit
+		// below them; a rounding wobble between the two passes must not show
+		// "จะใช้" smaller than "ใช้ไปแล้ว".
+		if forecastPaid < spent {
+			forecastPaid = spent
+		}
 		for _, tr := range []TrackSettlement{settle.Regular, settle.Special} {
 			for _, m := range tr.Months {
 				monthly[m.YearMonth] += m.PaidBaht
@@ -249,7 +293,12 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 			SpentBaht:        round2(spent),
 			CapBaht:          round2(snap.PerCourseMaxBaht),
 			OverBudget:       settle.OverBudget,
+			ForecastBaht:     round2(forecastPaid),
+			UnfundedBaht:     round2(unfunded),
+			Students:         snap.NumStudentsRegular + snap.NumStudentsSpecial,
 		})
+		out.BudgetForecast += forecastPaid
+		out.BudgetUnfunded += unfunded
 		st.SpentBaht += spent
 		st.CapBaht += snap.PerCourseMaxBaht
 		out.BudgetUsed += spent
@@ -290,5 +339,12 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 	out.BudgetUsed = round2(out.BudgetUsed)
 	out.BudgetAllocated = round2(out.BudgetAllocated)
 	out.ApprovedHours = round2(out.ApprovedHours)
+	out.BudgetLump = round2(out.BudgetLump)
+	out.BudgetForecast = round2(out.BudgetForecast)
+	out.BudgetUnfunded = round2(out.BudgetUnfunded)
+
+	if err := s.addInsights(ctx, out, tid); err != nil {
+		return nil, err
+	}
 	return out, nil
 }

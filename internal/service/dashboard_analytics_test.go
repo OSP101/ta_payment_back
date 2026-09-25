@@ -211,3 +211,58 @@ func TestAnalyticsElapsedPct(t *testing.T) {
 		t.Fatalf("elapsed%% = %.1f, want within [0,100]", a.ElapsedPct)
 	}
 }
+
+// The redesign's staffing question: every course of the term gets a row, the
+// requested count is DISTINCT named TAs on live requests, and the verdict is
+// read against the shared recommendation (ta_recommend.go).
+func TestAnalyticsStaffingVerdict(t *testing.T) {
+	f, dash, budget, export := analyticsWorld(t)
+	approveHours(f, 2)
+	// A second course with students but no request.
+	f.exec(`INSERT INTO teaching_courses (id, term_id, code, name_th, level, credits, lecture_hrs, num_students, num_students_regular)
+	        VALUES (gen_random_uuid(), $1, 'ZZ901', 'วิชายังไม่ขอ TA', 'undergrad', 3, 3, 40, 40)`, f.TermID)
+	f.exec(`INSERT INTO sections (id, teaching_course_id, sec_no, track, num_students, curriculum)
+	        SELECT gen_random_uuid(), id, '1', 'regular', 40, 'CS' FROM teaching_courses WHERE code = 'ZZ901'`)
+
+	a, err := dash.Analytics(f.ctx, &f.TermID, budget, export)
+	if err != nil {
+		t.Fatalf("Analytics: %v", err)
+	}
+	if len(a.Staffing) != 2 {
+		t.Fatalf("want a staffing row per course (2), got %d", len(a.Staffing))
+	}
+	byCode := map[string]CourseStaffing{}
+	for _, c := range a.Staffing {
+		byCode[c.Code] = c
+	}
+	none := byCode["ZZ901"]
+	if none.Status != StaffingNoRequest || none.Recommended != 2 || none.Ceiling != 3 {
+		t.Fatalf("ZZ901 = %+v, want no_request with recommended 2 / ceiling 3 for 40 students", none)
+	}
+	if a.Pipeline == nil || a.Pipeline.CoursesNoTA != 1 {
+		t.Fatalf("pipeline courses_no_ta = %+v, want 1", a.Pipeline)
+	}
+
+	var fixtureRow CourseStaffing
+	for code, c := range byCode {
+		if code != "ZZ901" {
+			fixtureRow = c
+		}
+	}
+	if fixtureRow.Requested != 1 || fixtureRow.Approved != 1 {
+		t.Fatalf("fixture course requested/approved = %d/%d, want 1/1", fixtureRow.Requested, fixtureRow.Approved)
+	}
+	if fixtureRow.Status != staffingStatus(fixtureRow) || fixtureRow.Status == StaffingNoRequest {
+		t.Fatalf("fixture course status %q is not the verdict for %+v", fixtureRow.Status, fixtureRow)
+	}
+	if fixtureRow.SpentBaht != a.Courses[0].SpentBaht {
+		t.Fatalf("staffing spend %.2f ≠ course spend %.2f — two tables on one screen disagree",
+			fixtureRow.SpentBaht, a.Courses[0].SpentBaht)
+	}
+	if a.ActiveTAs != 1 {
+		t.Fatalf("active TAs = %d, want 1 (the fixture TA has approved hours)", a.ActiveTAs)
+	}
+	if a.BudgetForecast < a.BudgetUsed {
+		t.Fatalf("forecast %.2f below settled %.2f", a.BudgetForecast, a.BudgetUsed)
+	}
+}

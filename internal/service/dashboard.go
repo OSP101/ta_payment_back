@@ -10,6 +10,9 @@ import (
 
 type DashboardService struct {
 	pool *pgxpool.Pool
+	// appointments feeds the analytics pipeline's "รอออกคำสั่งแต่งตั้ง" count.
+	// Optional: nil leaves that one stage at zero (unit tests).
+	appointments *AppointmentOrderService
 }
 
 // ExecutiveSummary is the staff/admin landing dashboard. Every figure is scoped
@@ -228,6 +231,11 @@ type LecturerCourseStatus struct {
 	// combined bar is. Straight from BudgetSnapshot, see its own doc comment.
 	BudgetUsedRegular float64 `json:"budget_used_regular"`
 	BudgetUsedSpecial float64 `json:"budget_used_special"`
+	// The staffing yardstick (ta_recommend.go) — the same numbers the planner
+	// and the staff dashboard judge the request against, shown on the card so
+	// the lecturer sees them before asking, not after staff query it.
+	RecommendedTAs int `json:"recommended_tas"`
+	CeilingTAs     int `json:"ceiling_tas"`
 }
 
 // LecturerOverview lists every course the lecturer teaches this term with
@@ -319,7 +327,11 @@ func (s *DashboardService) LecturerOverview(ctx context.Context, lecturerID uuid
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	ratios := loadPlanRatios(ctx, s.pool)
 	for i := range out {
+		if rec, err := recommendTAsForCourse(ctx, s.pool, out[i].TeachingCourseID, ratios); err == nil {
+			out[i].RecommendedTAs, out[i].CeilingTAs = rec.Recommended, rec.Ceiling
+		}
 		if snap, err := budget.Compute(ctx, out[i].TeachingCourseID); err == nil {
 			out[i].BudgetMax = snap.PerCourseMaxBaht
 			out[i].BudgetUsed = snap.UsedBaht
@@ -518,6 +530,11 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 	// keeps this card equal to the sum of the per-course pages — the previous
 	// hand-rolled SUM used graduate_regular (a 3,000฿/month lump sum) as if it
 	// were an hourly rate and ignored the ป.ตรี ภาคพิเศษ monthly cap entirely.
+	// budget nil = the caller only wants the counts (Analytics' pipeline); the
+	// per-course Compute loop is the slow part and it has its own figures.
+	if budget == nil {
+		return sum, nil
+	}
 	for _, id := range courseIDs {
 		snap, err := budget.Compute(ctx, id)
 		if err != nil {

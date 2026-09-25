@@ -86,6 +86,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.ExportBatches = &ExportBatchService{pool: pool, aud: auditor}
 	c.DocProgress = &DocumentProgressService{pool: pool, aud: auditor, notify: c.Notify, export: c.Export}
 	c.Appointment = &AppointmentOrderService{pool: pool, aud: auditor, fontDir: cfg.FontDir}
+	c.Dashboard.appointments = c.Appointment
 	c.Holiday = &HolidayService{pool: pool, aud: auditor, notify: c.Notify}
 	c.MFA = &MFAService{pool: pool, aud: auditor, totp: totpCipher}
 	c.SSO = &SSOService{users: c.Users, aud: auditor}

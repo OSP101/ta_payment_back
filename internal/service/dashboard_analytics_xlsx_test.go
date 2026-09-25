@@ -44,7 +44,7 @@ func TestAnalyticsWorkbookMirrorsTheStruct(t *testing.T) {
 	}
 	defer f.Close()
 
-	wantSheets := []string{"สรุป", "รายเดือน", "รายหลักสูตร", "รายวิชา"}
+	wantSheets := []string{"สรุป", "รายเดือน", "รายหลักสูตร", "รายวิชา", "การขอ TA"}
 	got := f.GetSheetList()
 	if len(got) != len(wantSheets) {
 		t.Fatalf("sheets = %v, want %v", got, wantSheets)

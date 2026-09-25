@@ -55,8 +55,8 @@ type BudgetSnapshot struct {
 		Undergrad int `json:"undergrad"`
 		Graduate  int `json:"graduate"`
 	} `json:"suggested_tas"`
-	OverBudget    bool    `json:"over_budget"`
-	UsedBaht      float64 `json:"used_baht"`
+	OverBudget bool    `json:"over_budget"`
+	UsedBaht   float64 `json:"used_baht"`
 	// UsedBaht split by track — same billing rules as UsedBaht (undergrad
 	// hourly + grad regular hourly + grad special lumpsum), just kept apart
 	// by which pool actually pays each part. Drives the dashboard card's
@@ -171,24 +171,16 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	// — no manual override exists any more. Total term pay across both tracks = the cap.
 	snap.PerCourseMaxBaht = snap.TermPay
 
-	// Suggested TAs: informational only. Use aggregate student count.
+	// Suggested TAs: informational only. Since 26/09/2026 this is the planner's
+	// per-sitting rule (ta_recommend.go) rather than a course-wide ceil(n/25),
+	// so the budget page, the planner and the dashboard give one answer.
 	totalStudents := snap.NumStudentsRegular + snap.NumStudentsSpecial
 	if totalStudents == 0 {
 		totalStudents = snap.NumStudents
 	}
-	// Ratios come from pay_rates (0112) so staff can move them; the historical
-	// defaults were one per 25 capped at 3.
-	var perTA, capTA int
-	_ = s.pool.QueryRow(ctx, `SELECT plan_students_per_ta, plan_suggested_ta_cap
-	                          FROM `+payRatesInForce+``).Scan(&perTA, &capTA)
-	if perTA <= 0 {
-		perTA = 25
+	if rec, err := recommendTAsForCourse(ctx, s.pool, tcID, loadPlanRatios(ctx, s.pool)); err == nil {
+		snap.SuggestedTAs.Undergrad = rec.Recommended
 	}
-	ug := (totalStudents + perTA - 1) / perTA
-	if capTA > 0 {
-		ug = min(capTA, ug)
-	}
-	snap.SuggestedTAs.Undergrad = ug
 	snap.SuggestedTAs.Graduate = min(2, totalStudents/60)
 
 	// Used baht — reflects post-2026 payment model (ประกาศ 731/2565 + 1080/2565):

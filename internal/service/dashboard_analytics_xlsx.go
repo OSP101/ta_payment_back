@@ -1,12 +1,13 @@
 package service
 
 // The Excel behind the dashboard's "ส่งออกข้อมูล" button — a report the
-// management team can open in a meeting, not a raw dump. Four sheets:
+// management team can open in a meeting, not a raw dump. Five sheets:
 //
 //	สรุป        cover page: KPI block + two native Excel charts
 //	รายเดือน     disbursement by month (+ cumulative), feeds the combo chart
 //	รายหลักสูตร  per-curriculum rollup, feeds the bar chart
 //	รายวิชา      per-course drill-down, severity-tinted rows
+//	การขอ TA     every course: requested vs recommended TAs (26/09/2026)
 //
 // Everything renders from the same TermAnalytics struct the page shows, in the
 // same request — a second query path would eventually disagree with the screen
@@ -17,6 +18,7 @@ package service
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strconv"
 
 	"github.com/xuri/excelize/v2"
@@ -218,6 +220,7 @@ const (
 	shMonthly    = "รายเดือน"
 	shCurriculum = "รายหลักสูตร"
 	shCourses    = "รายวิชา"
+	shStaffing   = "การขอ TA"
 )
 
 // AnalyticsWorkbook renders a TermAnalytics as a styled .xlsx report.
@@ -232,7 +235,7 @@ func AnalyticsWorkbook(a *TermAnalytics) ([]byte, error) {
 	if err := f.SetSheetName("Sheet1", shSummary); err != nil {
 		return nil, err
 	}
-	for _, name := range []string{shMonthly, shCurriculum, shCourses} {
+	for _, name := range []string{shMonthly, shCurriculum, shCourses, shStaffing} {
 		if _, err := f.NewSheet(name); err != nil {
 			return nil, err
 		}
@@ -245,6 +248,9 @@ func AnalyticsWorkbook(a *TermAnalytics) ([]byte, error) {
 		return nil, err
 	}
 	if err := fillCoursesSheet(f, st, a); err != nil {
+		return nil, err
+	}
+	if err := fillStaffingSheet(f, st, a); err != nil {
 		return nil, err
 	}
 	if err := fillSummarySheet(f, st, a); err != nil {
@@ -379,6 +385,88 @@ func fillCoursesSheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) e
 	_ = f.SetColWidth(shCourses, "H", "H", 12)
 	_ = f.SetColWidth(shCourses, "I", "I", 24)
 	return f.SetPanes(shCourses, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
+}
+
+// StaffingStatusTH is the verdict wording shared with the dashboard.
+func StaffingStatusTH(status string) string {
+	switch status {
+	case StaffingNoRequest:
+		return "ยังไม่ขอ TA"
+	case StaffingNoStudents:
+		return "ยังไม่มีจำนวนนักศึกษา"
+	case StaffingUnder:
+		return "น้อยกว่าที่แนะนำ"
+	case StaffingMatch:
+		return "ตามที่แนะนำ"
+	case StaffingAboveGuide:
+		return "เกินที่แนะนำ"
+	case StaffingOverCeiling:
+		return "เกินเพดานต่อนักศึกษา"
+	}
+	return status
+}
+
+// fillStaffingSheet — "ขอ TA เกินที่แนะนำไหม" for every course of the term,
+// requested or not, worst verdict first so the meeting starts at the top.
+func fillStaffingSheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) error {
+	if err := setRow(f, shStaffing, 1, st.header,
+		"รหัสวิชา", "ชื่อวิชา", "หลักสูตร", "อาจารย์", "นักศึกษา", "กลุ่มเรียน",
+		"TA แนะนำ", "TA เพดาน", "TA ที่ขอ", "TA อนุมัติ", "นศ. ต่อ TA", "ผลการเทียบ"); err != nil {
+		return err
+	}
+	rank := map[string]int{StaffingOverCeiling: 0, StaffingAboveGuide: 1, StaffingNoStudents: 2,
+		StaffingUnder: 3, StaffingMatch: 4, StaffingNoRequest: 5}
+	rows := append([]CourseStaffing(nil), a.Staffing...)
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rank[rows[i].Status] != rank[rows[j].Status] {
+			return rank[rows[i].Status] < rank[rows[j].Status]
+		}
+		return rows[i].Code < rows[j].Code
+	})
+	for i, c := range rows {
+		row := i + 2
+		textSt, numSt, statusSt := st.text, st.num, st.statusOK
+		if i%2 == 1 {
+			textSt, numSt = st.textZebra, st.numZebra
+		}
+		switch c.Status {
+		case StaffingOverCeiling:
+			textSt, numSt, statusSt = st.textDangerTint, st.numDangerTint, st.statusOver
+		case StaffingAboveGuide, StaffingNoStudents:
+			textSt, numSt, statusSt = st.textWarnTint, st.numWarnTint, st.statusWarn
+		}
+		var ratio any = ""
+		if c.StudentsPerTA > 0 {
+			ratio = c.StudentsPerTA
+		}
+		lect := ""
+		for k, l := range c.Lecturers {
+			if k > 0 {
+				lect += ", "
+			}
+			lect += l
+		}
+		if err := setRow(f, shStaffing, row, textSt,
+			c.Code, c.NameTH, CurriculumTH(c.Curriculum), lect, c.Students, c.Sittings,
+			c.Recommended, c.Ceiling, c.Requested, c.Approved, ratio, StaffingStatusTH(c.Status)); err != nil {
+			return err
+		}
+		r := strconv.Itoa(row)
+		_ = f.SetCellStyle(shStaffing, "E"+r, "K"+r, numSt)
+		_ = f.SetCellStyle(shStaffing, "L"+r, "L"+r, statusSt)
+	}
+	note := len(rows) + 3
+	_ = f.SetCellValue(shStaffing, fmt.Sprintf("A%d", note), fmt.Sprintf(
+		"เกณฑ์: แนะนำ 1 TA ต่อนักศึกษา %d คนต่อกลุ่มเรียนที่เรียนพร้อมกัน (สูงสุด %d คน อย่างน้อย 1 คน) · เพดาน 1 TA ต่อนักศึกษา %d คน",
+		a.Plan.StudentsPerTA, a.Plan.SuggestedTACap, a.Plan.MinStudentsPerTA))
+	_ = f.SetCellStyle(shStaffing, fmt.Sprintf("A%d", note), fmt.Sprintf("A%d", note), st.kpiHint)
+	_ = f.SetColWidth(shStaffing, "A", "A", 13)
+	_ = f.SetColWidth(shStaffing, "B", "B", 44)
+	_ = f.SetColWidth(shStaffing, "C", "C", 22)
+	_ = f.SetColWidth(shStaffing, "D", "D", 34)
+	_ = f.SetColWidth(shStaffing, "E", "K", 11)
+	_ = f.SetColWidth(shStaffing, "L", "L", 24)
+	return f.SetPanes(shStaffing, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
 }
 
 func fillSummarySheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) error {
