@@ -20,10 +20,22 @@ import (
 	"github.com/google/uuid"
 )
 
+// NearCapRatio is the one "ใกล้เพดาน" line for the whole product: a course
+// whose forecast spend (everything logged, if it all gets approved) reaches
+// 90% of its course cap is flagged. Forecast rather than spent, because by
+// the time spent reaches 90% the hours that break the cap are already
+// logged. Sent to the browser as near_cap_ratio so the page, the table and
+// the Excel export cannot drift apart (approved 26/09/2026).
+const NearCapRatio = 0.9
+
 // MonthSpend is one month of the term's disbursement, Gregorian "2026-06".
+// Baht is the month's whole disbursement — hourly pay plus the graduate-
+// special lump laid on that month (CommittedByMonth, the same dating the
+// monthly claim documents use); LumpBaht is the lump part of it.
 type MonthSpend struct {
 	YearMonth string  `json:"year_month"`
 	Baht      float64 `json:"baht"`
+	LumpBaht  float64 `json:"lump_baht"`
 }
 
 // CurriculumStat groups the term by the programme a section serves.
@@ -88,6 +100,15 @@ type TermAnalytics struct {
 	// term. Nobody types it in; it moves as requests arrive (26/09/2026).
 	// BudgetLump is the part of BudgetUsed that is graduate-special lump sums.
 	BudgetLump float64 `json:"budget_lump"`
+	// BudgetLumpUndated is the part of BudgetLump no month carries yet — a
+	// holder with no logged hours to date it by. Σ Monthly.Baht plus this
+	// equals BudgetUsed, to the satang.
+	BudgetLumpUndated float64 `json:"budget_lump_undated"`
+	// NearCapRatio echoes the constant above for the browser.
+	NearCapRatio float64 `json:"near_cap_ratio"`
+	// AsOf is the database's today (Asia/Bangkok), so "this month is not
+	// over yet" is decided by the server clock, not the viewer's.
+	AsOf string `json:"as_of,omitempty"`
 	// BudgetForecast is the projected term spend: BudgetUsed plus everything
 	// logged and still in play (floor, never an over-statement).
 	BudgetForecast float64 `json:"budget_forecast"`
@@ -109,7 +130,7 @@ type TermAnalytics struct {
 // Analytics builds the executive view for one term (nil = active/newest, same
 // resolution as Executive). Read-only.
 func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, budget *BudgetService, export *ExportService) (*TermAnalytics, error) {
-	out := &TermAnalytics{ElapsedPct: -1}
+	out := &TermAnalytics{ElapsedPct: -1, NearCapRatio: NearCapRatio}
 
 	var (
 		tid       uuid.UUID
@@ -191,6 +212,7 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 		WHERE tc.term_id = $1 AND a.state <> 'dropped'`, tid).Scan(&out.TotalTAs)
 
 	monthly := map[string]float64{}
+	monthlyLump := map[string]float64{}
 	curStats := map[string]*CurriculumStat{}
 	curStat := func(key string) *CurriculumStat {
 		st, ok := curStats[key]
@@ -224,8 +246,9 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 			forecast.Special.PaidBaht + forecast.Special.Committed
 		unfunded := forecast.DroppedBaht
 		// Committed is the graduate-special lump sum — real money taken off the
-		// top with no month of its own, so it joins the totals but not the
-		// monthly series.
+		// top of the course's pool (so it counts against the cap). It is dated
+		// by CommittedByMonth; whatever no month carries yet is kept apart as
+		// BudgetLumpUndated so the monthly series still adds up to the total.
 		spent := settle.Regular.PaidBaht + settle.Regular.Committed +
 			settle.Special.PaidBaht + settle.Special.Committed
 		out.BudgetLump += settle.Regular.Committed + settle.Special.Committed
@@ -239,6 +262,13 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 			for _, m := range tr.Months {
 				monthly[m.YearMonth] += m.PaidBaht
 			}
+			dated := 0.0
+			for ym, amt := range tr.CommittedByMonth {
+				monthly[ym] += amt
+				monthlyLump[ym] += amt
+				dated += amt
+			}
+			out.BudgetLumpUndated += tr.Committed - dated
 		}
 
 		snap, err := budget.Compute(ctx, c.id)
@@ -307,7 +337,7 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 	}
 
 	for ym, baht := range monthly {
-		out.Monthly = append(out.Monthly, MonthSpend{YearMonth: ym, Baht: round2(baht)})
+		out.Monthly = append(out.Monthly, MonthSpend{YearMonth: ym, Baht: round2(baht), LumpBaht: round2(monthlyLump[ym])})
 	}
 	sort.Slice(out.Monthly, func(i, j int) bool { return out.Monthly[i].YearMonth < out.Monthly[j].YearMonth })
 
@@ -342,6 +372,10 @@ func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, bud
 	out.BudgetLump = round2(out.BudgetLump)
 	out.BudgetForecast = round2(out.BudgetForecast)
 	out.BudgetUnfunded = round2(out.BudgetUnfunded)
+	out.BudgetLumpUndated = round2(out.BudgetLumpUndated)
+	if out.BudgetLumpUndated < 0.005 && out.BudgetLumpUndated > -0.005 {
+		out.BudgetLumpUndated = 0
+	}
 
 	if err := s.addInsights(ctx, out, tid); err != nil {
 		return nil, err

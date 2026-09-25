@@ -106,6 +106,10 @@ type MonthFlow struct {
 	SentBack  int     `json:"sent_back"`
 	Total     int     `json:"total"`
 	BahtPaid  float64 `json:"baht"`
+	// Codes names the courses in each bucket (bucket key → course codes,
+	// sorted), so a month that is too uniform to chart can be said in a
+	// sentence that names who is waiting ("ทุกเดือนมี 1 รายการ… (CP410872)").
+	Codes map[string][]string `json:"codes"`
 }
 
 // DeadlineInfo is the next open submission deadline.
@@ -364,7 +368,7 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 			prow.Close()
 			return err
 		}
-		f := &MonthFlow{YearMonth: ym, Label: label, DueDate: due.Format("2006-01-02"), IsClosed: closed}
+		f := &MonthFlow{YearMonth: ym, Label: label, DueDate: due.Format("2006-01-02"), IsClosed: closed, Codes: map[string][]string{}}
 		f.BahtPaid = round2(paid[gregorianYM(ym)])
 		periods = append(periods, f)
 		byID[id] = f
@@ -377,7 +381,7 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 
 	rows, err := s.pool.Query(ctx, `
 		WITH m AS (
-		    SELECT sp.id AS period_id, a.ta_id, tc.id AS tc_id,
+		    SELECT sp.id AS period_id, a.ta_id, tc.id AS tc_id, tc.code,
 		           COALESCE(st.status, 'pending') AS status,
 		           BOOL_OR(st.sent_back_at IS NOT NULL) AS sent_back,
 		           COUNT(*) FILTER (WHERE wl.status IN ('draft','rejected')) AS with_ta,
@@ -398,7 +402,7 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 		    WHERE tc.term_id = $1
 		      -- Grad-special holders no longer log; leftovers are no one's queue.
 		      AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
-		    GROUP BY sp.id, a.ta_id, tc.id, COALESCE(st.status, 'pending')
+		    GROUP BY sp.id, a.ta_id, tc.id, tc.code, COALESCE(st.status, 'pending')
 		)
 		SELECT period_id,
 		       CASE
@@ -412,7 +416,8 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 		         ELSE 'review'
 		       END AS bucket,
 		       COUNT(*),
-		       COUNT(*) FILTER (WHERE sent_back AND status = 'pending')
+		       COUNT(*) FILTER (WHERE sent_back AND status = 'pending'),
+		       ARRAY_AGG(DISTINCT code ORDER BY code)
 		FROM m GROUP BY 1, 2`, tid)
 	if err != nil {
 		return err
@@ -421,7 +426,8 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 		var pid uuid.UUID
 		var bucket string
 		var n, sentBack int
-		if err := rows.Scan(&pid, &bucket, &n, &sentBack); err != nil {
+		var codes []string
+		if err := rows.Scan(&pid, &bucket, &n, &sentBack, &codes); err != nil {
 			rows.Close()
 			return err
 		}
@@ -429,6 +435,16 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 		if !ok {
 			continue
 		}
+		// Keys match the JSON names of the counters above.
+		key := map[string]string{
+			"finance": "finance_sent", "exported": "exported", "export": "ready_export",
+			"skipped": "skipped", "ta": "with_ta", "lecturer": "with_lecturer",
+			"appoint": "await_appointment", "review": "staff_review",
+		}[bucket]
+		if key == "" {
+			key = "staff_review"
+		}
+		f.Codes[key] = codes
 		switch bucket {
 		case "finance":
 			f.Finance += n
@@ -468,6 +484,7 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 	if err := s.pool.QueryRow(ctx, `SELECT CURRENT_DATE`).Scan(&today); err != nil {
 		return err
 	}
+	out.AsOf = today.Format("2006-01-02")
 	var next *time.Time
 	for _, m := range meta {
 		if m.closed || m.due.Before(today) {

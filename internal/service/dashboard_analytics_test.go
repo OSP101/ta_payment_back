@@ -65,15 +65,14 @@ func TestAnalyticsSpendEqualsSettlement(t *testing.T) {
 		t.Fatalf("term total %.2f ≠ settlement %.2f", a.BudgetUsed, want)
 	}
 
-	// The monthly series must add back up to the slot-based part of the total
-	// (the graduate lump sum has no month and stays out of the series).
+	// The monthly series (lump included, dated or not) must add back up to
+	// the term total — the chart's running total ends on the KPI figure.
 	var monthSum float64
 	for _, m := range a.Monthly {
 		monthSum += m.Baht
 	}
-	slotPaid := settle.Regular.PaidBaht + settle.Special.PaidBaht
-	if round2(monthSum) != round2(slotPaid) {
-		t.Fatalf("Σmonthly %.2f ≠ settled slot pay %.2f", monthSum, slotPaid)
+	if round2(monthSum+a.BudgetLumpUndated) != a.BudgetUsed {
+		t.Fatalf("Σmonthly %.2f + undated lump %.2f ≠ BudgetUsed %.2f", monthSum, a.BudgetLumpUndated, a.BudgetUsed)
 	}
 
 	if a.ApprovedHours != 4 {
@@ -194,9 +193,9 @@ func TestAnalyticsReportsPaidNotEarnedWhenOverBudget(t *testing.T) {
 	for _, m := range a.Monthly {
 		monthSum += m.Baht
 	}
-	if round2(monthSum) != round2(settle.Regular.PaidBaht+settle.Special.PaidBaht) {
-		t.Fatalf("Σmonthly %.2f ≠ paid slot money %.2f unpaid คาบ leaked into the chart", monthSum,
-			settle.Regular.PaidBaht+settle.Special.PaidBaht)
+	if round2(monthSum+a.BudgetLumpUndated) != a.BudgetUsed {
+		t.Fatalf("Σmonthly %.2f + undated lump %.2f ≠ paid %.2f — unpaid คาบ leaked into the chart", monthSum,
+			a.BudgetLumpUndated, a.BudgetUsed)
 	}
 }
 
@@ -264,5 +263,50 @@ func TestAnalyticsStaffingVerdict(t *testing.T) {
 	}
 	if a.BudgetForecast < a.BudgetUsed {
 		t.Fatalf("forecast %.2f below settled %.2f", a.BudgetForecast, a.BudgetUsed)
+	}
+}
+
+// The graduate-special lump is dated by its holder's own hours (the same
+// CommittedByMonth the monthly claim documents read), so the dashboard's
+// monthly series carries it in the right months and the running total ends
+// on BudgetUsed — the KPI and the chart's last point are one figure (26/09/2026).
+func TestAnalyticsMonthlyCarriesTheDatedLump(t *testing.T) {
+	f := newTCFixture(t)
+	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
+		f.addPeriod(ym)
+	}
+	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP305", Curriculum: "CY", LectureHrs: 100})
+	grad := f.newTA("บัณฑิต เหมาจ่าย", "master")
+	f.assignTAOn(grad, courseID, specSec, "master",
+		[]string{"2026-09-07", "2026-09-14", "2026-09-21", "2026-10-05"})
+
+	dash := &DashboardService{pool: f.pool}
+	a, err := dash.Analytics(f.ctx, &f.termID, f.svc.budget, f.svc)
+	if err != nil {
+		t.Fatalf("Analytics: %v", err)
+	}
+	if a.BudgetLump != 1000 {
+		t.Fatalf("fixture bug: lump = %.2f, want 1000", a.BudgetLump)
+	}
+	byMonth := map[string]MonthSpend{}
+	var sum float64
+	for _, m := range a.Monthly {
+		byMonth[m.YearMonth] = m
+		sum += m.Baht
+	}
+	if m := byMonth["2026-09"]; m.LumpBaht != 750 || m.Baht < 750 {
+		t.Errorf("September = %+v, want lump 750 (3 of the holder's 4 hours)", m)
+	}
+	if m := byMonth["2026-10"]; m.LumpBaht != 250 {
+		t.Errorf("October = %+v, want lump 250", m)
+	}
+	if a.BudgetLumpUndated != 0 {
+		t.Errorf("undated lump = %.2f, want 0 — every baht here has a month", a.BudgetLumpUndated)
+	}
+	if round2(sum+a.BudgetLumpUndated) != a.BudgetUsed {
+		t.Fatalf("Σmonthly %.2f + undated %.2f ≠ BudgetUsed %.2f", sum, a.BudgetLumpUndated, a.BudgetUsed)
+	}
+	if a.NearCapRatio != NearCapRatio || a.AsOf == "" {
+		t.Errorf("near_cap_ratio = %v, as_of = %q; both must reach the browser", a.NearCapRatio, a.AsOf)
 	}
 }

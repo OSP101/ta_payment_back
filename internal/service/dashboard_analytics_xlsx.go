@@ -281,24 +281,37 @@ func setRow(f *excelize.File, sheet string, row int, style int, vals ...any) err
 }
 
 func fillMonthlySheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) error {
-	if err := setRow(f, shMonthly, 1, st.header, "เดือน", "ยอดเบิกจ่าย (บาท)", "ยอดสะสม (บาท)"); err != nil {
+	// B is the month's whole disbursement (hourly + the graduate lump dated
+	// to it) and C accumulates it, so C's last value is the cover's
+	// เบิกจ่ายแล้ว. D breaks the lump out of B. A lump no month carries yet
+	// gets its own row after the months so the column still adds up.
+	if err := setRow(f, shMonthly, 1, st.header, "เดือน", "ยอดเบิกจ่าย (บาท)", "ยอดสะสม (บาท)", "ในจำนวนนี้เป็นเหมาจ่ายบัณฑิต (บาท)"); err != nil {
 		return err
 	}
 	cum := 0.0
-	for i, m := range a.Monthly {
-		cum += m.Baht
-		row := i + 2
-		if err := setRow(f, shMonthly, row, st.baht, thaiMonthShortBE(m.YearMonth), m.Baht, round2(cum)); err != nil {
+	row := 1
+	put := func(label string, baht, lump float64) error {
+		cum += baht
+		row++
+		if err := setRow(f, shMonthly, row, st.baht, label, baht, round2(cum), lump); err != nil {
 			return err
 		}
 		// The month label is text, not money.
-		style := st.text
-		if err := f.SetCellStyle(shMonthly, fmt.Sprintf("A%d", row), fmt.Sprintf("A%d", row), style); err != nil {
+		return f.SetCellStyle(shMonthly, fmt.Sprintf("A%d", row), fmt.Sprintf("A%d", row), st.text)
+	}
+	for _, m := range a.Monthly {
+		if err := put(thaiMonthShortBE(m.YearMonth), m.Baht, m.LumpBaht); err != nil {
 			return err
 		}
 	}
-	_ = f.SetColWidth(shMonthly, "A", "A", 14)
+	if a.BudgetLumpUndated != 0 {
+		if err := put("เหมาจ่ายยังไม่ระบุเดือน", a.BudgetLumpUndated, a.BudgetLumpUndated); err != nil {
+			return err
+		}
+	}
+	_ = f.SetColWidth(shMonthly, "A", "A", 22)
 	_ = f.SetColWidth(shMonthly, "B", "C", 20)
+	_ = f.SetColWidth(shMonthly, "D", "D", 30)
 	return f.SetPanes(shMonthly, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
 }
 
@@ -339,39 +352,45 @@ func fillCurriculumSheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics
 
 func fillCoursesSheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) error {
 	if err := setRow(f, shCourses, 1, st.header,
-		"รหัสวิชา", "ชื่อวิชา", "หลักสูตร", "จำนวน TA", "ชม.อนุมัติ", "ยอดเบิกจ่าย (บาท)", "เพดานวิชา (บาท)", "% ของเพดาน", "สถานะ"); err != nil {
+		"รหัสวิชา", "ชื่อวิชา", "หลักสูตร", "จำนวน TA", "ชม.อนุมัติ", "ยอดเบิกจ่าย (บาท)", "เพดานวิชา (บาท)", "% ของเพดาน", "สถานะ",
+		"คาดการณ์เมื่ออนุมัติครบ (บาท)", "% คาดการณ์ของเพดาน", "งานที่ยังจ่ายไม่ได้ (บาท)"); err != nil {
 		return err
 	}
 	for i, co := range a.Courses {
 		row := i + 2
-		var pct any
-		pctVal := 0.0
+		var pct, fcPct any = "", ""
+		fcVal := 0.0
 		if co.CapBaht > 0 {
-			pctVal = co.SpentBaht / co.CapBaht
-			pct = pctVal
-		} else {
-			pct = ""
+			pct = co.SpentBaht / co.CapBaht
+			fcVal = co.ForecastBaht / co.CapBaht
+			fcPct = fcVal
 		}
 		statusTxt, statusSt := "ปกติ", st.statusOK
 		textSt, numSt, bahtSt, pctSt := st.text, st.num, st.baht, st.pct
 		if i%2 == 1 {
 			textSt, numSt, bahtSt, pctSt = st.textZebra, st.numZebra, st.bahtZebra, st.pctZebra
 		}
+		// Same rule as the dashboard's capState: over = work the cap cannot
+		// pay; near = forecast at or past NearCapRatio of the cap.
 		switch {
-		case co.OverBudget:
+		case co.OverBudget || co.UnfundedBaht > 0:
 			statusTxt, statusSt = "เกินเพดาน", st.statusOver
 			textSt, numSt, bahtSt, pctSt = st.textDangerTint, st.numDangerTint, st.bahtDangerTint, st.pctDanger
-		case pctVal >= 0.8:
+		case co.CapBaht > 0 && fcVal >= NearCapRatio:
 			statusTxt, statusSt = "ใกล้เพดาน", st.statusWarn
 			textSt, numSt, bahtSt, pctSt = st.textWarnTint, st.numWarnTint, st.bahtWarnTint, st.pctWarn
 		case co.SpentBaht <= 0:
 			statusTxt = "ยังไม่เริ่มเบิก"
 		}
 		if err := setRow(f, shCourses, row, textSt,
-			co.Code, co.NameTH, CurriculumTH(co.Curriculum), co.TAs, co.ApprovedHours, co.SpentBaht, co.CapBaht, pct, statusTxt); err != nil {
+			co.Code, co.NameTH, CurriculumTH(co.Curriculum), co.TAs, co.ApprovedHours, co.SpentBaht, co.CapBaht, pct, statusTxt,
+			co.ForecastBaht, fcPct, co.UnfundedBaht); err != nil {
 			return err
 		}
 		r := strconv.Itoa(row)
+		_ = f.SetCellStyle(shCourses, "J"+r, "J"+r, bahtSt)
+		_ = f.SetCellStyle(shCourses, "K"+r, "K"+r, pctSt)
+		_ = f.SetCellStyle(shCourses, "L"+r, "L"+r, bahtSt)
 		_ = f.SetCellStyle(shCourses, "D"+r, "E"+r, numSt)
 		_ = f.SetCellStyle(shCourses, "F"+r, "G"+r, bahtSt)
 		_ = f.SetCellStyle(shCourses, "H"+r, "H"+r, pctSt)
@@ -384,6 +403,9 @@ func fillCoursesSheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) e
 	_ = f.SetColWidth(shCourses, "F", "G", 18)
 	_ = f.SetColWidth(shCourses, "H", "H", 12)
 	_ = f.SetColWidth(shCourses, "I", "I", 24)
+	_ = f.SetColWidth(shCourses, "J", "J", 26)
+	_ = f.SetColWidth(shCourses, "K", "K", 18)
+	_ = f.SetColWidth(shCourses, "L", "L", 24)
 	return f.SetPanes(shCourses, &excelize.Panes{Freeze: true, YSplit: 1, TopLeftCell: "A2", ActivePane: "bottomLeft"})
 }
 
@@ -503,7 +525,7 @@ func fillSummarySheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) e
 		avg = round2(a.BudgetUsed / a.ApprovedHours)
 	}
 	valueStyle := st.kpiValue
-	if usedPct >= 0.8 {
+	if usedPct >= NearCapRatio {
 		valueStyle = st.kpiValueWarn
 	}
 	type kpi struct {
@@ -513,14 +535,14 @@ func fillSummarySheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) e
 	}
 	leftCol := []kpi{
 		{"เบิกจ่ายแล้ว (บาท)", a.BudgetUsed, valueStyle},
-		{"เพดานงบรวม (บาท)", a.BudgetAllocated, st.kpiValue},
+		{"งบรวม (บาท)", a.BudgetAllocated, st.kpiValue},
 		{"คงเหลือ (บาท)", round2(remaining), st.kpiValueGood},
 		{"ใช้ไปแล้ว (%)", usedPct, valueStyle},
 	}
 	rightCol := []kpi{
 		{"ชั่วโมงที่อนุมัติแล้ว", a.ApprovedHours, st.kpiValue},
 		{"ค่าใช้จ่ายเฉลี่ยต่อชั่วโมง (บาท)", avg, st.kpiValue},
-		{"TA ที่ปฏิบัติงาน (คน)", a.TotalTAs, st.kpiValue},
+		{"TA ปฏิบัติงานจริง / แต่งตั้ง (คน)", fmt.Sprintf("%d / %d", a.ActiveTAs, a.TotalTAs), st.kpiValue},
 		{"วิชาที่ใช้ TA / เปิดสอน", fmt.Sprintf("%d / %d", a.CoursesWithTA, a.CoursesOpen), st.kpiValue},
 	}
 	for i, k := range leftCol {
@@ -533,7 +555,7 @@ func fillSummarySheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) e
 	}
 	// The percentage cell needs its own format.
 	pctStyle, err := f.NewStyle(&excelize.Style{
-		Font:         &excelize.Font{Family: "TH Sarabun New", Size: 20, Bold: true, Color: ifStr(usedPct >= 0.8, xlWarn, xlBrand)},
+		Font:         &excelize.Font{Family: "TH Sarabun New", Size: 20, Bold: true, Color: ifStr(usedPct >= NearCapRatio, xlWarn, xlBrand)},
 		Alignment:    &excelize.Alignment{Horizontal: "right", Vertical: "center"},
 		CustomNumFmt: &[]string{"0.0%"}[0],
 	})
@@ -549,8 +571,11 @@ func fillSummarySheet(f *excelize.File, st *analyticsStyles, a *TermAnalytics) e
 		_ = f.SetCellValue(shSummary, "G"+row, k.value)
 		_ = f.SetCellStyle(shSummary, "G"+row, "G"+row, k.style)
 	}
-	_ = f.SetCellValue(shSummary, "A10",
-		"ข้อมูลจากระบบ TA Payment · วิชาที่ใช้เกินงบจะเบิกได้ตามเพดานที่กำหนดเท่านั้น")
+	note := "ข้อมูลจากระบบ TA Payment · งบรวมคือผลรวมงบของวิชาที่ส่งคำขอ TA · วิชาที่ใช้เกินงบจะเบิกได้ตามเพดานวิชาเท่านั้น"
+	if a.BudgetUnfunded > 0 {
+		note += fmt.Sprintf(" · มีงานที่ยังจ่ายไม่ได้ %s บาท (ดูชีต %s)", thaiBaht(a.BudgetUnfunded), shCourses)
+	}
+	_ = f.SetCellValue(shSummary, "A10", note)
 	_ = f.SetCellStyle(shSummary, "A10", "H10", st.kpiHint)
 	_ = f.MergeCell(shSummary, "A10", "H10")
 

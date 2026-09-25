@@ -16,14 +16,15 @@ import (
 // embedded charts.
 func TestAnalyticsWorkbookMirrorsTheStruct(t *testing.T) {
 	a := &TermAnalytics{
-		TermLabel:       "2569/1",
-		BudgetUsed:      40008.36,
-		BudgetAllocated: 112500,
-		ApprovedHours:   1523,
-		TotalTAs:        6,
-		CoursesWithTA:   7,
-		CoursesOpen:     127,
-		Monthly:         []MonthSpend{{YearMonth: "2026-06", Baht: 2360}, {YearMonth: "2026-07", Baht: 6760}},
+		TermLabel:         "2569/1",
+		BudgetUsed:        40008.36,
+		BudgetAllocated:   112500,
+		ApprovedHours:     1523,
+		TotalTAs:          6,
+		CoursesWithTA:     7,
+		CoursesOpen:       127,
+		Monthly:           []MonthSpend{{YearMonth: "2026-06", Baht: 2360}, {YearMonth: "2026-07", Baht: 6760, LumpBaht: 1000}},
+		BudgetLumpUndated: 500,
 		Curricula: []CurriculumStat{
 			{Curriculum: "IT", CoursesOpen: 33, CoursesWithTA: 7, TAs: 6, SpentBaht: 40008.36, CapBaht: 112500},
 			{Curriculum: "OTHER", CoursesOpen: 3},
@@ -32,6 +33,14 @@ func TestAnalyticsWorkbookMirrorsTheStruct(t *testing.T) {
 		Courses: []CourseSpendStat{{
 			TeachingCourseID: uuid.New(), Code: "SC362102", NameTH: "SOFTWARE ENGINEERING",
 			Curriculum: "IT", TAs: 4, ApprovedHours: 542, SpentBaht: 11888.5, CapBaht: 12000, OverBudget: true,
+		}, {
+			// Spent is only 42% of the cap but the forecast is 91.7%: near is
+			// judged on the forecast (NearCapRatio), not on what is paid so far.
+			TeachingCourseID: uuid.New(), Code: "SC362103", NameTH: "NEAR CAP",
+			Curriculum: "IT", TAs: 1, SpentBaht: 5000, CapBaht: 12000, ForecastBaht: 11000,
+		}, {
+			TeachingCourseID: uuid.New(), Code: "SC362104", NameTH: "UNDER THE LINE",
+			Curriculum: "IT", TAs: 1, SpentBaht: 5000, CapBaht: 12000, ForecastBaht: 10680, // 89%
 		}},
 	}
 	body, err := AnalyticsWorkbook(a)
@@ -83,6 +92,13 @@ func TestAnalyticsWorkbookMirrorsTheStruct(t *testing.T) {
 	if cell("รายเดือน", "C3") != "9,120.00" {
 		t.Fatalf("cumulative = %q, want 9,120.00 (2360+6760)", cell("รายเดือน", "C3"))
 	}
+	if cell("รายเดือน", "D3") != "1,000.00" {
+		t.Fatalf("lump column = %q, want 1,000.00", cell("รายเดือน", "D3"))
+	}
+	// A lump no month carries yet still lands in the running total.
+	if cell("รายเดือน", "A4") != "เหมาจ่ายยังไม่ระบุเดือน" || cell("รายเดือน", "C4") != "9,620.00" {
+		t.Fatalf("undated lump row = %q / %q, want เหมาจ่ายยังไม่ระบุเดือน / 9,620.00", cell("รายเดือน", "A4"), cell("รายเดือน", "C4"))
+	}
 
 	// Curriculum: display names must not drift off the frontend legend.
 	if cell("รายหลักสูตร", "A2") != "เทคโนโลยีสารสนเทศ" {
@@ -99,6 +115,12 @@ func TestAnalyticsWorkbookMirrorsTheStruct(t *testing.T) {
 	}
 	if got := cell("รายวิชา", "I2"); got != "เกินเพดาน" {
 		t.Fatalf("status = %q, want เกินเพดาน", got)
+	}
+	if got := cell("รายวิชา", "I3"); got != "ใกล้เพดาน" {
+		t.Fatalf("forecast 91.7%% of cap: status = %q, want ใกล้เพดาน", got)
+	}
+	if got := cell("รายวิชา", "I4"); got != "ปกติ" {
+		t.Fatalf("forecast 89%% of cap: status = %q, want ปกติ", got)
 	}
 	if got := cell("รายวิชา", "H2"); got != "99.1%" {
 		t.Fatalf("pct should format as 99.1%% (fraction 11888.5/12000 under 0.0%%), got %q", got)
