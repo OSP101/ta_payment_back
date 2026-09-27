@@ -91,7 +91,7 @@ func (s *ExportService) TermMonths(ctx context.Context, termID uuid.UUID) ([]Ter
 		SELECT year_month, label
 		FROM submission_periods
 		WHERE term_id = $1
-		ORDER BY year_month`, termID)
+		ORDER BY `+periodOrderSQL("year_month"), termID)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +117,14 @@ func (s *ExportService) TermMonths(ctx context.Context, termID uuid.UUID) ([]Ter
 	// Gregorian key so "in calendar order" is true for every term shape.
 	sortTermMonths(out)
 	return out, nil
+}
+
+// periodOrderSQL is the SQL twin of gregorianYearMonth for ORDER BY: it turns
+// an academic year_month key ("2568-11", "2568-01") into a sortable calendar
+// number (256811, 256901). Sorting the key as text put มกราคม–มีนาคม before
+// พฤศจิกายน–ธันวาคม on every second-semester screen and message.
+func periodOrderSQL(col string) string {
+	return fmt.Sprintf(`((CASE WHEN RIGHT(%[1]s, 2)::int <= 5 THEN LEFT(%[1]s, 4)::int + 1 ELSE LEFT(%[1]s, 4)::int END) * 100 + RIGHT(%[1]s, 2)::int)`, col)
 }
 
 func sortTermMonths(in []TermMonth) {

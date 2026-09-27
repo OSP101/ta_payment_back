@@ -71,6 +71,10 @@ type gradEvidencePerson struct {
 	// on the พิเศษ sheet BAHT — the same field because the sheets are otherwise
 	// the same table, and keeping them apart bought nothing but two writers.
 	ByMonth map[string]float64
+	// PaidBaht is set on the ปกติ sheet only when the course budget funded
+	// less than hours × rate for the printed months; รับจริง then prints the
+	// funded figure (same rule as the undergrad book's ขอเบิกจ่ายเพียง).
+	PaidBaht *float64
 }
 
 // total sums the months the sheet actually prints. Months outside the printed
@@ -498,7 +502,11 @@ func writeGradEvidenceSheet(f *excelize.File, st *claimStyles, sheet string,
 		if err := set(at(c.Amount, r), xlf("=%s%d*%s%d", c.TotalHours, r, c.Rate, r)); err != nil {
 			return err
 		}
-		if err := set(at(c.Received, r), xlf("=%s%d", c.Amount, r)); err != nil {
+		if p.PaidBaht != nil {
+			if err := set(at(c.Received, r), round2(*p.PaidBaht)); err != nil {
+				return err
+			}
+		} else if err := set(at(c.Received, r), xlf("=%s%d", c.Amount, r)); err != nil {
 			return err
 		}
 	}
@@ -815,7 +823,15 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 	if err != nil {
 		return nil, err
 	}
+	// The settlement decides what the budget actually funds; the sheet still
+	// prints every hour taught, but รับจริง must not claim more than the payout.
+	settlement, err := s.SettleCourse(ctx, courseID)
+	if err != nil {
+		return nil, err
+	}
 	hoursByTA := map[uuid.UUID]map[string]float64{}
+	fullByTA := map[uuid.UUID]float64{}
+	fundedByTA := map[uuid.UUID]float64{}
 	for _, c := range costs {
 		// Special-track time is เหมาจ่าย and priced at 0 here; only the
 		// regular track is billed by the hour.
@@ -834,6 +850,8 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 			hoursByTA[c.TA] = map[string]float64{}
 		}
 		hoursByTA[c.TA][c.YearMonth] += c.Baht / pr.GraduateRegularHourly
+		fullByTA[c.TA] += c.Baht
+		fundedByTA[c.TA] += c.Baht * settlement.Regular.fundedShare(c.TA, c.Date, c.StartTime)
 		addMonth(c.YearMonth)
 	}
 	for ym := range weights {
@@ -851,9 +869,11 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 			levelTH = "ป.เอก"
 		}
 		if byMonth := hoursByTA[p.id]; len(byMonth) > 0 {
-			d.Regular = append(d.Regular, gradEvidencePerson{
-				Name: p.name, LevelTH: levelTH, ByMonth: byMonth,
-			})
+			gp := gradEvidencePerson{Name: p.name, LevelTH: levelTH, ByMonth: byMonth}
+			if paid := round2(fundedByTA[p.id]); paid+0.005 < round2(fullByTA[p.id]) {
+				gp.PaidBaht = &paid
+			}
+			d.Regular = append(d.Regular, gp)
 		}
 		if gradSpecial[p.id] {
 			// Divided over the WHOLE term, then only the printed months show.

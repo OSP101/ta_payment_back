@@ -280,6 +280,22 @@ func TestCourseHeadcountAndDatesAreStaffOnly(t *testing.T) {
 			t.Fatalf("headcount = %d, want 25+5=30", n)
 		}
 
+		// An explicit 0 is a real answer (nobody enrolled): the track must
+		// read as entered, while a track left out of the body stays as it was.
+		if err := svc.SetNumStudents(f.ctx, staffID, f.CourseID, -1, -1, 0); err != nil {
+			t.Fatalf("staff zero special count must succeed, got %v", err)
+		}
+		tc, err := svc.Get(f.ctx, f.CourseID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.NumStudentsSpecial != 0 || !tc.NumStudentsSpecialEntered {
+			t.Fatalf("special = %d entered=%v, want 0 entered", tc.NumStudentsSpecial, tc.NumStudentsSpecialEntered)
+		}
+		if tc.NumStudentsRegular != 25 || !tc.NumStudentsRegularEntered {
+			t.Fatalf("regular = %d entered=%v, want 25 entered", tc.NumStudentsRegular, tc.NumStudentsRegularEntered)
+		}
+
 		d := "2099-01-01"
 		if err := svc.UpdateSettings(f.ctx, staffID, f.CourseID,
 			UpdateSettingsInput{StartsOn: &d}); err != nil {

@@ -46,6 +46,14 @@ func (h *UserHandler) List(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// A lecturer lists TAs to pick them for a request; that needs name, email
+	// and study level, not every TA's phone number across the faculty (found
+	// in the UAT privacy check — no lecturer screen reads it).
+	if rbac.Has(Roles(c), rbac.RoleLecturer) && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		for i := range users {
+			users[i].Phone = nil
+		}
+	}
 	return c.JSON(fiber.Map{"items": users, "total": total})
 }
 
@@ -1047,11 +1055,17 @@ func (h *TARequestHandler) Detail(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusNotFound, err.Error())
 	}
-	// Staff/admin can view anything; lecturers only their own requests.
+	// Staff/admin can view anything; a lecturer, requests of a course they
+	// teach NOW. Keyed on teaching_lecturers, not ta_requests.lecturer_id: a
+	// lecturer taken off the course kept reading the TAs' details (and a
+	// co-lecturer could not open a request someone else filed).
 	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
-		var owner uuid.UUID
-		if err := h.Svc.Pool.QueryRow(c.Context(),
-			`SELECT lecturer_id FROM ta_requests WHERE id = $1`, id).Scan(&owner); err != nil || owner != UserID(c) {
+		var teaches bool
+		if err := h.Svc.Pool.QueryRow(c.Context(), `
+			SELECT EXISTS (
+			  SELECT 1 FROM ta_requests r
+			  JOIN teaching_lecturers tl ON tl.teaching_course_id = r.teaching_course_id
+			  WHERE r.id = $1 AND tl.lecturer_id = $2)`, id, UserID(c)).Scan(&teaches); err != nil || !teaches {
 			return fiber.NewError(fiber.StatusForbidden, "forbidden")
 		}
 	}
@@ -1391,6 +1405,21 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
+	// Ownership first: answering 410 "purged" before the permission check told
+	// any logged-in user that a given document id exists and whose retention
+	// clock ran out.
+	//
+	// Owner only. Staff used to be let through here too, which returned the
+	// original, unwatermarked ID card / bank book / signature with no password
+	// and no copy limit — around every control of the review path
+	// (docs_review.go: password, maxDocDownloads, PreviewWatermarked). Staff
+	// read documents through /ta-review/... instead; nothing in the UI calls
+	// this route for anyone but the TA themselves.
+	var owner uuid.UUID
+	if err := h.Svc.Pool.QueryRow(c.Context(),
+		`SELECT user_id FROM ta_documents WHERE id = $1`, id).Scan(&owner); err != nil || owner != UserID(c) {
+		return fiber.NewError(fiber.StatusForbidden, "ไม่มีสิทธิ์เข้าถึงเอกสารนี้")
+	}
 	// Retention-policy guard: if the file has been purged from disk (7 days
 	// past approval), fail fast with 410 before trying to open a stale path.
 	deleted, err := h.Svc.Docs.IsFileDeleted(c.Context(), id)
@@ -1406,26 +1435,11 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	}
 	defer rc.Close()
 
-	// Only the owning TA, staff, or admin may fetch the file. Lecturers do
-	// not review documents in this workflow and are blocked to keep PDPA
-	// exposure minimal.
+	// Re-checked against the row OpenStored resolved (belt and braces).
 	caller := UserID(c)
-	if caller != ownerID && !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
-		return fiber.NewError(fiber.StatusForbidden, "forbidden")
-	}
-	// Audited only when someone OTHER than the document's own owner reads
-	// it — an officer pulling up a TA's ID-card photo is exactly the "PII
-	// read back out" event citizen_id.go's RevealCitizenID already treats as
-	// worth a trail; a TA opening their own upload is not.
 	if caller != ownerID {
-		if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{
-			ActorID: &caller, Action: "ta_doc.view", Entity: "ta_document", EntityID: id.String(),
-			IP: c.IP(), UserAgent: c.Get("User-Agent"),
-		}); err != nil {
-			return err
-		}
+		return fiber.NewError(fiber.StatusForbidden, "ไม่มีสิทธิ์เข้าถึงเอกสารนี้")
 	}
-
 	body, err := io.ReadAll(rc)
 	if err != nil {
 		return err
@@ -1735,7 +1749,12 @@ func (h *DocsHandler) PreviewWatermarked(c *fiber.Ctx) error {
 	}
 	stamped, outMime, err := watermark.Apply(body, meta.MIME, text)
 	if err != nil {
-		return err
+		// Files uploaded before the upload-time check (DEF-002) can still be
+		// unreadable: say so instead of "ระบบขัดข้อง", so the officer rejects
+		// the document and the TA uploads it again.
+		log.Printf("preview watermark %s: %v", meta.Filename, err)
+		return fiber.NewError(fiber.StatusUnprocessableEntity,
+			"ไฟล์นี้เสียหายหรือเปิดอ่านไม่ได้ กรุณาส่งกลับให้ผู้ช่วยสอนอัปโหลดใหม่")
 	}
 	c.Set("Content-Type", outMime)
 	c.Set("Content-Disposition", contentDisposition("inline", meta.Filename))
@@ -1764,6 +1783,49 @@ func (h *WorkloadHandler) ListClasses(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(fiber.Map{"blocks": out, "locked": reason != "", "lock_reason": reason})
+}
+
+// ListClassesForTA / ReplaceClassesForTA — staff view and correct a TA's
+// timetable (GET/PUT /users/:id/schedule?term_id=). The TA's own save refuses
+// to remove classes once a request is approved; this is the sanctioned path
+// for a real change, audited under the staff member.
+func (h *WorkloadHandler) ListClassesForTA(c *fiber.Ctx) error {
+	taID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "term_id required")
+	}
+	out, err := h.Svc.Workload.ListClasses(c.Context(), taID, termID)
+	if err != nil {
+		return err
+	}
+	reason, err := h.Svc.Workload.ScheduleLockedReason(c.Context(), taID, termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"blocks": out, "locked": reason != "", "lock_reason": reason})
+}
+
+func (h *WorkloadHandler) ReplaceClassesForTA(c *fiber.Ctx) error {
+	taID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	termID, err := uuid.Parse(c.Query("term_id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "term_id required")
+	}
+	var blocks []service.ClassBlock
+	if err := c.BodyParser(&blocks); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.Workload.ReplaceClassesForTA(c.Context(), UserID(c), taID, termID, blocks); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true, "count": len(blocks)})
 }
 
 func (h *WorkloadHandler) ReplaceClasses(c *fiber.Ctx) error {
@@ -2271,6 +2333,20 @@ func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
 		}
 		if !matched {
 			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+		// Targeting is per person (the feed reads announcement_recipients);
+		// the role test alone let anyone in the audience role read a notice
+		// aimed at a few people once they had its id. Same 404 as not-live so
+		// the id's existence is not confirmed either.
+		var recipient bool
+		if err := h.Svc.Pool.QueryRow(c.Context(), `
+			SELECT EXISTS (SELECT 1 FROM announcement_recipients
+			                WHERE announcement_id = $1 AND user_id = $2)`,
+			id, UserID(c)).Scan(&recipient); err != nil {
+			return err
+		}
+		if !recipient {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
 	}
 	return c.JSON(a)
@@ -2815,9 +2891,16 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// freeze a course's worklogs — irreversibly, since only an admin can
 	// unlock — while transferring no file at all. Verified live on 04/08/2026:
 	// a HEAD returned 200 and left a locked course and a history row behind.
-	if c.Method() == fiber.MethodHead {
+	//
+	// GET is refused too (the route is POST since 27/09/2026): the session
+	// cookie is SameSite=Lax, which a cross-site top-level GET still carries,
+	// and OriginCheck skips GET — so a link on any site opened by a signed-in
+	// staff member locked a course and wrote a PII-access row in their name.
+	// A POST carries an Origin header the check verifies, and Lax withholds
+	// the cookie from a cross-site POST altogether.
+	if c.Method() != fiber.MethodPost {
 		return fiber.NewError(fiber.StatusMethodNotAllowed,
-			"ต้องเรียกด้วย GET เท่านั้น เพราะการดาวน์โหลดมีผลล็อกข้อมูล")
+			"ต้องเรียกด้วย POST เท่านั้น เพราะการดาวน์โหลดมีผลล็อกข้อมูล")
 	}
 	raw := strings.TrimSuffix(c.Params("id"), ".zip")
 	id, err := uuid.Parse(raw)
@@ -2830,6 +2913,10 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// `months && $1` round predicates, which left whole-term exports flagged as
 	// still owing round 2 forever. See ExportService.ResolveCourseMonths.
 	months, err := h.Svc.Export.ResolveCourseMonths(c.Context(), id, monthsParam(c))
+	if err != nil {
+		return err
+	}
+	builtFP, err := h.Svc.SubmissionPeriods.CourseWorklogFingerprint(c.Context(), id, months)
 	if err != nil {
 		return err
 	}
@@ -2846,7 +2933,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// underlying worklogs stayed editable (file silently diverges from the DB).
 	// Fail the request instead so staff retries; months still being worked on
 	// stay editable and lock on a later re-export.
-	if _, err := h.Svc.SubmissionPeriods.MarkCourseExported(c.Context(), actor, id, months); err != nil {
+	if _, err := h.Svc.SubmissionPeriods.MarkCourseExportedAsBuilt(c.Context(), actor, id, months, builtFP); err != nil {
 		return err
 	}
 	// The graduate-special lump each exported month carries is fixed from here
@@ -3490,7 +3577,6 @@ func (h *HolidayHandler) Delete(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
-
 
 // ============================================================================
 // TDBMHandler — the webhook TDBM calls, plus a staff-facing manual trigger

@@ -1355,7 +1355,17 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	}
 	funded := map[taTrackKey]float64{}
 	fullCost := map[taTrackKey]float64{}
+	// A fiscal-year slice (มิ.ย.–ก.ย. / ต.ค.) bills only its own months. The
+	// printed rows and the graduate lump were sliced, but these totals summed
+	// the whole term, so both halves carried the full funded figure.
+	inBook := map[string]bool{}
+	for _, ym := range months {
+		inBook[ym] = true
+	}
 	for _, c := range costs {
+		if len(inBook) > 0 && !inBook[c.YearMonth] {
+			continue
+		}
 		t := settlement.Regular
 		if c.Track == "special" {
 			t = settlement.Special
@@ -1492,11 +1502,21 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 				continue
 			}
 			k := taTrackKey{p.id, side.track}
+			rows := buildClaimSheetRows(mine, side.word)
+			lumpSum := p.level != "undergrad" && side.track == "special"
+			full := fullCost[k]
+			// The sheet's รวมเป็นเงินทั้งสิ้น is SUM(hours) × rate, uncapped. When
+			// the undergrad-special monthly cap cut the pay, the funded figure is
+			// below that total even with the budget fully met, and ขอเบิกจ่ายเพียง
+			// must print the capped figure instead of letting the sheet bill it.
+			if printed := claimRowsHours(rows) * side.rate; !lumpSum && printed > full {
+				full = printed
+			}
 			*side.dst = append(*side.dst, claimant{
 				TAID: p.id, Name: p.name, LevelTH: levelTH,
-				Rows: buildClaimSheetRows(mine, side.word), Rate: side.rate,
-				PaidBaht: round2(funded[k]), FullBaht: round2(fullCost[k]),
-				LumpSum: p.level != "undergrad" && side.track == "special",
+				Rows: rows, Rate: side.rate,
+				PaidBaht: round2(funded[k]), FullBaht: round2(full),
+				LumpSum: lumpSum,
 			})
 		}
 	}

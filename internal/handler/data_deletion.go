@@ -52,7 +52,10 @@ func (h *DataDeletionHandler) ListRequests(c *fiber.Ctx) error {
 }
 
 type reviewDeletionReq struct {
-	Approve bool   `json:"approve"`
+	// A pointer so a missing field is an error, not a silent "reject": a
+	// client that sent the wrong key used to decline a PDPA request and mail
+	// the TA the refusal.
+	Approve *bool  `json:"approve" validate:"required"`
 	Note    string `json:"note" validate:"omitempty,max=1000"`
 }
 
@@ -65,7 +68,7 @@ func (h *DataDeletionHandler) Review(c *fiber.Ctx) error {
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
-	if err := h.Svc.DataDeletion.ReviewDeletion(c.Context(), UserID(c), id, in.Approve, in.Note); err != nil {
+	if err := h.Svc.DataDeletion.ReviewDeletion(c.Context(), UserID(c), id, *in.Approve, in.Note); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -209,7 +210,7 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		      AND st.ta_id = ml.ta_id
 		      AND st.teaching_course_id = tc.id
 		WHERE COALESCE(st.status, 'pending') NOT IN ('finance_sent', 'skipped')
-		ORDER BY sp.year_month, tc.code, u.first_name`, termID)
+		ORDER BY `+periodOrderSQL("sp.year_month")+`, tc.code, u.first_name`, termID)
 	if err != nil {
 		return nil, err
 	}
@@ -237,12 +238,17 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 	// depends on the TA's level and the section's track, which the GROUP BY
 	// would have to carry through every join. Row counts here are per month per
 	// course, so this stays small.
+	costsByCourse := map[uuid.UUID][]taSlotCost{}
 	for i := range out {
-		baht, err := s.approvedBahtForMonth(ctx, out[i].TAID, out[i].TeachingCourseID, out[i].YearMonth)
-		if err != nil {
-			return nil, err
+		costs, ok := costsByCourse[out[i].TeachingCourseID]
+		if !ok {
+			var err error
+			if costs, err = s.approvedCostsForCourse(ctx, out[i].TeachingCourseID); err != nil {
+				return nil, err
+			}
+			costsByCourse[out[i].TeachingCourseID] = costs
 		}
-		out[i].ApprovedBaht = baht
+		out[i].ApprovedBaht = approvedBahtForMonth(costs, out[i].TAID, out[i].YearMonth)
 	}
 	return out, nil
 }
@@ -280,29 +286,37 @@ func (s *SubmissionPeriodService) CountAwaitingAppointment(ctx context.Context, 
 	return n, err
 }
 
-// approvedBahtForMonth totals the approved hourly-billed pay for one TA's month
-// on one course. Grad-special contributes 0 — it is a flat monthly lump sum
-// handled by the export, not an hourly accrual.
-func (s *SubmissionPeriodService) approvedBahtForMonth(ctx context.Context, taID, tcID uuid.UUID, yearMonth string) (float64, error) {
+// approvedCostsForCourse prices a course's approved sittings with the SAME
+// per-sitting ledger the payout uses (claimCostByTASlot): merged co-taught
+// sittings, time on both tracks at once counted once (B2), and the
+// undergrad-special monthly cap. The old inline pricing skipped B2 and the
+// cap, so a row's baht disagreed with the B2-adjusted hours beside it.
+func (s *SubmissionPeriodService) approvedCostsForCourse(ctx context.Context, tcID uuid.UUID) ([]taSlotCost, error) {
+	var pr PayRate
+	if err := s.pool.QueryRow(ctx, `
+		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly, ug_special_monthly_cap
+		FROM `+payRatesInForce).Scan(
+		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly, &pr.UGSpecialMonthlyCap); err != nil {
+		return nil, err
+	}
+	return (&ExportService{pool: s.pool}).claimCostByTASlot(ctx, tcID, pr, mergedSittingsCTE)
+}
+
+// approvedBahtForMonth totals one TA's approved hourly pay for one period
+// month (academic key) out of the course's priced sittings. Grad-special
+// contributes 0: it is a flat lump handled by the export.
+func approvedBahtForMonth(costs []taSlotCost, taID uuid.UUID, periodYM string) float64 {
+	greg, err := gregorianYearMonth(periodYM)
+	if err != nil {
+		return 0
+	}
 	var baht float64
-	err := s.pool.QueryRow(ctx, `
-		WITH latest AS (SELECT * FROM `+payRatesInForce+`),`+
-		mergedSittingsCTE+`
-		-- Priced from SITTINGS, not from work_log rows: the same rule the claim
-		-- form bills by (billable_hours.go).
-		SELECT COALESCE(SUM(st.hours *
-		    CASE
-		        WHEN st.level = 'undergrad' AND st.track = 'regular' THEN pr.undergrad_regular
-		        WHEN st.level = 'undergrad' AND st.track = 'special' THEN pr.undergrad_special
-		        WHEN st.level IN ('master','phd') AND st.track = 'regular' THEN pr.graduate_regular_hourly
-		        ELSE 0
-		    END), 0)
-		FROM sittings st
-		CROSS JOIN latest pr
-		WHERE st.ta_id = $1 AND st.teaching_course_id = $2
-		  AND to_char(st.work_date, 'MM') = RIGHT($3, 2)`,
-		taID, tcID, yearMonth).Scan(&baht)
-	return baht, err
+	for _, c := range costs {
+		if c.TA == taID && c.YearMonth == greg {
+			baht += c.Baht
+		}
+	}
+	return round2(baht)
 }
 
 // MarkStaffReviewed records that staff checked this TA's month and released it
@@ -334,12 +348,14 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 	if err != nil {
 		return err
 	}
-	if total == 0 {
-		return Invalid("เดือนนี้ยังไม่มีรายการบันทึกเวลาที่อนุมัติแล้ว จึงยังตรวจสอบไม่ได้")
-	}
+	// Outstanding work first: it tells staff what is missing, where "nothing
+	// approved yet" would not.
 	if unapproved > 0 {
 		return Invalid(fmt.Sprintf(
 			"ยังมี %d รายการที่อาจารย์ยังไม่อนุมัติ ต้องให้ครบก่อน จึงจะตรวจสอบเบิกจ่ายได้", unapproved))
+	}
+	if total == 0 {
+		return Invalid("เดือนนี้ยังไม่มีรายการบันทึกเวลาที่อนุมัติแล้ว จึงยังตรวจสอบไม่ได้")
 	}
 
 	name := s.userDisplayName(ctx, actor)
@@ -460,8 +476,10 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 	// How much is actually outstanding. Sending "please approve" without the
 	// number is what makes reminders easy to ignore.
 	var openRows int
+	var openMonths []string
 	if err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*)
+		SELECT COUNT(*),
+		       COALESCE(array_agg(DISTINCT to_char(wl.work_date, 'YYYY-MM') ORDER BY to_char(wl.work_date, 'YYYY-MM')), '{}')
 		FROM sections sec
 		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
@@ -471,7 +489,7 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 		  -- ListPending, so a lecturer has no row to approve for them. Leftover
 		  -- 'submitted' rows must not be counted here, or staff would keep
 		  -- reminding a lecturer about hours their own approval screen never shows.
-		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`, tcID).Scan(&openRows); err != nil {
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`, tcID).Scan(&openRows, &openMonths); err != nil {
 		return err
 	}
 	if openRows == 0 {
@@ -501,10 +519,11 @@ func (s *SubmissionPeriodService) RemindLecturerUnapproved(ctx context.Context, 
 	}
 
 	title := "มีบันทึกเวลาผู้ช่วยสอนรอการอนุมัติ"
+	// Name the months: "เดือนดังกล่าว" referred to a month the mail never said.
 	body := fmt.Sprintf(
-		"รายวิชา %s %s มีบันทึกเวลาปฏิบัติงานของผู้ช่วยสอนที่รอการอนุมัติจากท่าน จำนวน %d รายการ "+
+		"รายวิชา %s %s มีบันทึกเวลาปฏิบัติงานของผู้ช่วยสอนที่รอการอนุมัติจากท่าน จำนวน %d รายการ (เดือน%s) "+
 			"ทั้งนี้ เจ้าหน้าที่จะดำเนินการตรวจสอบเพื่อเบิกจ่ายได้เมื่อรายการของเดือนดังกล่าวได้รับการอนุมัติครบถ้วนแล้ว",
-		code, nameTH, openRows)
+		code, nameTH, openRows, strings.Join(thaiMonthLabels(openMonths), ", "))
 	for _, id := range lecturerIDs {
 		// The lecturer approves on .../reports; there is no .../worklog for them.
 		s.notify.SendAction(ctx, id, title, body, "/lecturer/courses/"+tcID.String()+"/reports")

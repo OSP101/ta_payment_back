@@ -132,11 +132,27 @@ func seedSlot(ctx context.Context, svc *service.Container) error {
 	// reads admin_officers by id. Title matches signer_authority.go's
 	// deanTitlePrefix exactly so the printed order shows this person as the
 	// actual dean rather than "ปฏิบัติหน้าที่แทน" (acting for) a vacant seat.
-	if _, err := svc.Pool.Exec(ctx,
-		`INSERT INTO admin_officers (id, academic_prefix, full_name, title, is_active)
-		 SELECT gen_random_uuid(), 'ผู้ช่วยศาสตราจารย์ ดร.', 'สมมติ ตัวอย่างดี', 'คณบดีวิทยาลัยการคอมพิวเตอร์', TRUE
-		 WHERE NOT EXISTS (SELECT 1 FROM admin_officers)`); err != nil {
+	//
+	// Since migration 0101 the migrations themselves create the fixed seats
+	// VACANT (is_active FALSE, empty name), so "insert only when the table is
+	// empty" never ran and a fresh slot had no signer at all — step 6 and the
+	// presentation dataset both failed with "ยังไม่มีผู้ลงนาม". Fill the vacant
+	// dean seat first; insert only if there is no seat to fill.
+	tag, err := svc.Pool.Exec(ctx, `
+		UPDATE admin_officers
+		   SET academic_prefix = 'ผู้ช่วยศาสตราจารย์ ดร.', full_name = 'สมมติ ตัวอย่างดี', is_active = TRUE
+		 WHERE title = 'คณบดีวิทยาลัยการคอมพิวเตอร์' AND NOT is_active AND full_name = ''
+		   AND NOT EXISTS (SELECT 1 FROM admin_officers WHERE is_active)`)
+	if err != nil {
 		return fmt.Errorf("seed admin_officers: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := svc.Pool.Exec(ctx,
+			`INSERT INTO admin_officers (id, academic_prefix, full_name, title, is_active)
+			 SELECT gen_random_uuid(), 'ผู้ช่วยศาสตราจารย์ ดร.', 'สมมติ ตัวอย่างดี', 'คณบดีวิทยาลัยการคอมพิวเตอร์', TRUE
+			 WHERE NOT EXISTS (SELECT 1 FROM admin_officers WHERE is_active)`); err != nil {
+			return fmt.Errorf("seed admin_officers: %w", err)
+		}
 	}
 	return nil
 }

@@ -115,6 +115,33 @@ func monthClosedForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUI
 	return closed, label, true, nil
 }
 
+// assertMonthNotExportedForCourse refuses an edit that would change what an
+// already-issued payout file says: some TA of this course has the month that
+// covers workDate in 'exported' or 'finance_sent'. It is the month-level
+// replacement for the course-wide exported_at lock on paths (makeups) where
+// one exported month must not freeze the rest of the term.
+func assertMonthNotExportedForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) error {
+	var label string
+	err := pool.QueryRow(ctx, `
+		SELECT sp.label
+		FROM teaching_courses tc
+		JOIN academic_terms trm ON trm.id = tc.term_id
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		 AND sp.year_month = trm.academic_year::text || '-' || to_char($2::date, 'MM')
+		JOIN submission_period_status st
+		  ON st.submission_period_id = sp.id AND st.teaching_course_id = tc.id
+		WHERE tc.id = $1 AND st.status IN ('exported','finance_sent')
+		LIMIT 1`, tcID, workDate).Scan(&label)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return Conflict(fmt.Sprintf(
+		"เดือน %s ของรายวิชานี้ส่งออกเอกสารเบิกจ่ายแล้ว จึงเปลี่ยนวันชดเชยที่เกี่ยวกับเดือนนี้ไม่ได้ (เจ้าหน้าที่ตีกลับหรือผู้ดูแลระบบปลดล็อกได้)", label))
+}
+
 // assertMonthOpenForCourse rejects an action dated in a month whose
 // submission_periods row is closed — for call sites (like filing a makeup
 // class) that act on a whole section rather than one TA's worklog.
@@ -269,6 +296,19 @@ func loadBlockedMonths(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.
 		out[mm] = bm
 	}
 	return out, rows.Err()
+}
+
+// submittableRowSQL is what "ส่งอนุมัติ" actually sends among a TA's draft and
+// rejected rows: every row whose month is still open — including days that
+// have not come yet. Advance submission is deliberate (faculty decision,
+// 27/09/2026, answering UAT WL-06/DEF-003): the ประกาศ already has ส.ค. due on
+// 31 ก.ค., and nothing is paid until the lecturer approves and staff sign the
+// month off, so those two gates — not the calendar — decide what is claimed.
+//
+// Shared by WorkLogService.Submit and the assignment tally the TA screen
+// counts with, for the reason given on unsubmittableMonthSQL below.
+func submittableRowSQL(wl string) string {
+	return `NOT ` + unsubmittableMonthSQL(wl)
 }
 
 // unsubmittableMonthSQL is the predicate that decides whether a work_log's month

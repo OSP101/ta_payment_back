@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -186,6 +188,27 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 	isNew := in.ID == uuid.Nil
 	if isNew {
 		in.ID = uuid.New()
+	} else {
+		// The status rows (staff sign-off, export and finance locks) hang off
+		// the period id, so rewriting year_month would move them onto another
+		// month: the signed-off month would lose its period (and with it every
+		// lock — no period reads as unrestricted) while the new month froze.
+		var curYM string
+		var signed int
+		if err := s.pool.QueryRow(ctx, `
+			SELECT sp.year_month,
+			       (SELECT COUNT(*) FROM submission_period_status st
+			         WHERE st.submission_period_id = sp.id
+			           AND st.status IN ('staff_reviewed','exported','finance_sent'))
+			  FROM submission_periods sp WHERE sp.id = $1`, in.ID).Scan(&curYM, &signed); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, Invalid("ไม่พบรอบลงเวลาที่ระบุ")
+			}
+			return nil, err
+		}
+		if curYM != in.YearMonth && signed > 0 {
+			return nil, Conflict("เปลี่ยนเดือนของรอบนี้ไม่ได้ มีผู้ช่วยสอนที่เจ้าหน้าที่ตรวจแล้วหรือส่งออกเอกสารแล้ว กรุณาสร้างรอบของเดือนใหม่แทน")
+		}
 	}
 	// Deadlines decide whether a TA can still submit at all, so "the due date
 	// used to be the 5th" is the answer to "why was my month forfeited". The
@@ -309,16 +332,29 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 		// as we don't rely on absolute time arithmetic). To keep behaviour
 		// predictable across environments we convert Buddhist → Gregorian.
 		gregYear := year - 543
-		// Handle Dec→Jan wrap for the second semester template.
-		dueYear := gregYear
-		if semester == 2 && (t.month == 1 || t.month == 2 || t.month == 3) {
-			dueYear++
-		}
 		ym := fmt.Sprintf("%d-%02d", year, t.month)
-		// starts_on = 1st of that submission month in Gregorian.
+		// starts_on = 1st of that submission month in Gregorian. The academic
+		// year opens in June, so ม.ค.–พ.ค. fall in the NEXT calendar year —
+		// the same rule gregorianYearMonth applies to the year_month key.
 		startYear := gregYear
-		if semester == 2 && (t.month == 1 || t.month == 2 || t.month == 3) {
+		if t.month <= 5 {
 			startYear++
+		}
+		// The due date belongs to the month after the submission month, which
+		// wraps into the next calendar year for ธันวาคม (due 5 ม.ค.). Deriving
+		// it from the due month itself covers that wrap: the old rule only
+		// bumped ม.ค.–มี.ค., so December's window became 1 ม.ค. → 5 ม.ค. of the
+		// SAME year — eleven months before the term started and already
+		// closed, forfeiting every December worklog on creation.
+		dueYear := startYear
+		var dueMonth int
+		fmt.Sscanf(t.due, "%d-", &dueMonth)
+		// Only a real year boundary counts (ธ.ค. → ม.ค., 11 months back). A due
+		// month just before the submission month is the ประกาศ's shared date
+		// (สิงหาคม due 31 ก.ค.) and stays in the same year; starts_on is pulled
+		// back for it below.
+		if t.month-dueMonth > 6 {
+			dueYear++
 		}
 		starts := fmt.Sprintf("%d-%02d-01", startYear, t.month)
 		due := fmt.Sprintf("%d-%s", dueYear, t.due)
@@ -330,7 +366,9 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 		if starts >= due {
 			starts = due[:8] + "01"
 		}
-		label := fmt.Sprintf("%s %d", t.label, year)
+		// Labels carry the calendar Buddhist year a reader expects: มกราคม of
+		// academic year 2568 is มกราคม 2569. year_month stays the academic key.
+		label := fmt.Sprintf("%s %d", t.label, startYear+543)
 		p := SubmissionPeriod{
 			ID: uuid.New(), TermID: termID, YearMonth: ym,
 			StartsOn: starts, DueDate: due, Label: label, RemindDaysBefore: 3, IsClosed: false,
@@ -445,7 +483,7 @@ func (s *SubmissionPeriodService) PendingByTA(ctx context.Context, taID uuid.UUI
 		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')`+outerFilter+`
 		GROUP BY sp.id, sp.label, sp.year_month, sp.starts_on, sp.due_date, sp.is_closed,
 		         tc.id, tc.code, tc.name_th, st.status
-		ORDER BY sp.due_date, tc.code`, args...)
+		ORDER BY `+periodOrderSQL("sp.year_month")+`, tc.code`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -556,9 +594,16 @@ func (s *SubmissionPeriodService) assertPrivileged(ctx context.Context, actor uu
 // course spanning a calendar-year boundary or a reused teaching_courses row
 // would have silently counted the wrong year's work_logs.
 func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taID, tcID uuid.UUID, yearMonth string) (total, unapproved int, err error) {
+	// Rows the TA can no longer send — draft/rejected in a closed period — are
+	// forfeited ("ไม่ประสงค์ลงเวลา", staff decision 03/08/2026). They are
+	// neither work to approve nor work that exists, so they count in neither
+	// figure: counting them as "not yet approved" meant a month holding one
+	// forgotten draft could never be signed off or exported, however complete
+	// the rest was (found in the UAT follow-up review).
 	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(*),
-		       COUNT(*) FILTER (WHERE wl.status IN ('draft','submitted','rejected'))
+		SELECT COUNT(*) FILTER (WHERE wl.status = 'approved'),
+		       COUNT(*) FILTER (WHERE wl.status = 'submitted'
+		                           OR (wl.status IN ('draft','rejected') AND NOT `+unsubmittableMonthSQL("wl")+`))
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
@@ -592,6 +637,45 @@ func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taI
 // months (Gregorian "YYYY-MM", empty = every month) confines the lock to the
 // fiscal slice actually exported — see the SQL comment below.
 func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor, tcID uuid.UUID, months []string) (int, error) {
+	return s.MarkCourseExportedAsBuilt(ctx, actor, tcID, months, "")
+}
+
+// courseWorklogFingerprintSQL digests every work_log row of one course: any
+// insert, edit, status change or delete changes it.
+//
+// Scoped to the months being exported ($2, Gregorian "YYYY-MM", empty = all)
+// and to non-draft rows: the file never prints drafts, and an October draft
+// saved while the มิ.ย.–ก.ย. slice builds must not fail that export.
+const courseWorklogFingerprintSQL = `
+	SELECT COALESCE(md5(string_agg(
+	         wl.id::text || wl.status::text || wl.work_date::text || wl.start_time::text
+	         || wl.end_time::text || wl.hours::text || wl.activity::text,
+	         ',' ORDER BY wl.id)), '')
+	FROM work_logs wl
+	JOIN ta_request_assignments a ON a.id = wl.assignment_id
+	JOIN sections sec ON sec.id = a.section_id
+	WHERE sec.teaching_course_id = $1
+	  AND wl.status <> 'draft'
+	  AND (COALESCE(cardinality($2::text[]), 0) = 0
+	       OR to_char(wl.work_date, 'YYYY-MM') = ANY($2::text[]))`
+
+// CourseWorklogFingerprint is taken before a ZIP is built and handed to
+// MarkCourseExportedAsBuilt, which refuses to lock if the rows moved since.
+func (s *SubmissionPeriodService) CourseWorklogFingerprint(ctx context.Context, tcID uuid.UUID, months []string) (string, error) {
+	var fp string
+	err := s.pool.QueryRow(ctx, courseWorklogFingerprintSQL, tcID, months).Scan(&fp)
+	return fp, err
+}
+
+// MarkCourseExportedAsBuilt locks like MarkCourseExported, but first proves the
+// course's work_logs are still what the file was built from. The ZIP is built
+// before the lock (it has to exist before it can be refused), and worklog
+// writes share no lock with export, so a StaffUpsert landing in between left
+// finance holding a file the database no longer matched. The table lock below
+// waits for in-flight writes and holds new ones until the lock commits; after
+// that the row trigger (migration 0124) refuses writes into locked months.
+// An empty builtFP skips the check.
+func (s *SubmissionPeriodService) MarkCourseExportedAsBuilt(ctx context.Context, actor, tcID uuid.UUID, months []string, builtFP string) (int, error) {
 	name := s.userDisplayName(ctx, actor)
 	// This is the freeze point for a course's payout numbers, so the lock rows
 	// and the record of the lock go in together.
@@ -600,6 +684,19 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
+
+	if builtFP != "" {
+		if _, err := tx.Exec(ctx, `LOCK TABLE work_logs IN SHARE MODE`); err != nil {
+			return 0, err
+		}
+		var nowFP string
+		if err := tx.QueryRow(ctx, courseWorklogFingerprintSQL, tcID, months).Scan(&nowFP); err != nil {
+			return 0, err
+		}
+		if nowFP != builtFP {
+			return 0, Conflict("บันทึกเวลาของรายวิชานี้เปลี่ยนระหว่างสร้างไฟล์ จึงยังไม่ล็อกและไม่ส่งไฟล์ กรุณากดดาวน์โหลดอีกครั้ง")
+		}
+	}
 
 	rows, err := tx.Query(ctx, `
 		INSERT INTO submission_period_status
@@ -644,7 +741,10 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 		        JOIN sections s2 ON s2.id = a2.section_id
 		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
 		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
-		          AND wl.status IN ('draft','submitted','rejected')
+		          -- Forfeited rows (unsent when the period closed) do not hold
+		          -- the month open — same rule as monthWorklogReadiness.
+		          AND (wl.status = 'submitted'
+		               OR (wl.status IN ('draft','rejected') AND NOT `+unsubmittableMonthSQL("wl")+`))
 		          -- Same grad-special exclusion as monthWorklogReadiness: a
 		          -- leftover 'submitted' row on a dead grad-special assignment
 		          -- must not block locking the TA's real (regular-track or
@@ -688,16 +788,59 @@ func (s *SubmissionPeriodService) MarkCourseExported(ctx context.Context, actor,
 	if len(cells) > 0 {
 		// After the commit: notifications reach TAs and cannot be recalled.
 		if s.notify != nil {
+			// One mail per TA naming every month that was locked — the old text
+			// said "เดือนดังกล่าว" without ever saying which month, once per cell.
+			// Months in calendar order (UAT DEF-006): RETURNING hands the cells
+			// back in no particular order, which read as ก.ย., ส.ค., ก.ค., มิ.ย.
+			type month struct {
+				start time.Time
+				label string
+			}
+			byTA := map[uuid.UUID][]month{}
+			var order []uuid.UUID
 			for _, c := range cells {
-				s.notify.Send(ctx, c.taID,
-					"เจ้าหน้าที่จัดทำเอกสารเบิกจ่ายแล้ว",
+				var m month
+				_ = s.pool.QueryRow(ctx, `SELECT starts_on, label FROM submission_periods WHERE id = $1`,
+					c.periodID).Scan(&m.start, &m.label)
+				if _, seen := byTA[c.taID]; !seen {
+					order = append(order, c.taID)
+				}
+				byTA[c.taID] = append(byTA[c.taID], m)
+			}
+			var code string
+			_ = s.pool.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id = $1`, tcID).Scan(&code)
+			for _, taID := range order {
+				ms := byTA[taID]
+				sort.Slice(ms, func(i, j int) bool { return ms[i].start.Before(ms[j].start) })
+				labels := make([]string, len(ms))
+				for i, m := range ms {
+					labels[i] = m.label
+				}
+				// The course code is in the title because unread in-app notices
+				// are folded together by (title, link), and the link is the same
+				// page for every course: a TA whose second course was exported
+				// lost the unread notice about the first.
+				s.notify.Send(ctx, taID,
+					"เจ้าหน้าที่จัดทำเอกสารเบิกจ่ายแล้ว "+code,
 					"เจ้าหน้าที่ได้ตรวจสอบและจัดทำเอกสารเบิกจ่ายค่าตอบแทนรายวิชา "+courseLabelOf(ctx, s.pool, tcID)+
-						" ของท่านเรียบร้อยแล้ว บันทึกเวลาปฏิบัติงานของเดือนดังกล่าวจึงถูกล็อกและไม่สามารถแก้ไขได้",
+						" ของท่าน ประจำเดือน"+strings.Join(labels, ", ")+
+						" เรียบร้อยแล้ว บันทึกเวลาปฏิบัติงานของเดือนดังกล่าวจึงถูกล็อกและไม่สามารถแก้ไขได้",
 					"/ta/reminders")
 			}
 		}
 	}
 	return len(cells), nil
+}
+
+// periodNoticeKeys returns the course code and period label a per-month notice
+// names. Both go into the TITLE, not only the body: unread in-app notices are
+// folded by (title, link), and these links are shared across courses (the TA's
+// /ta/reminders) or across TAs and months (the lecturer's reports page), so a
+// bare title let a later send-back overwrite an unread one about another month.
+func periodNoticeKeys(ctx context.Context, pool *pgxpool.Pool, tcID, periodID uuid.UUID) (code, month string) {
+	_ = pool.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id = $1`, tcID).Scan(&code)
+	_ = pool.QueryRow(ctx, `SELECT label FROM submission_periods WHERE id = $1`, periodID).Scan(&month)
+	return code, month
 }
 
 // MarkFinanceSent is the final step — staff records that the exported paperwork
@@ -759,9 +902,16 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 		return err
 	}
 	if s.notify != nil {
+		// Course and month named, and the code in the title: unread in-app
+		// notices fold by (title, link) and the link is one page for all
+		// courses, so a fixed title let the next handoff overwrite this one.
+		var code, month string
+		_ = s.pool.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id = $1`, tcID).Scan(&code)
+		_ = s.pool.QueryRow(ctx, `SELECT label FROM submission_periods WHERE id = $1`, periodID).Scan(&month)
 		s.notify.Send(ctx, taID,
-			"ส่งเรื่องเบิกจ่ายไปยังงานการเงินแล้ว",
-			"บันทึกเวลาปฏิบัติงานประจำเดือนของท่านได้ถูกส่งไปยังงานการเงินเพื่อดำเนินการเบิกจ่ายเรียบร้อยแล้ว",
+			"ส่งเรื่องเบิกจ่ายไปยังงานการเงินแล้ว "+code,
+			"บันทึกเวลาปฏิบัติงานรายวิชา "+courseLabelOf(ctx, s.pool, tcID)+" ประจำเดือน"+month+
+				" ของท่านได้ถูกส่งไปยังงานการเงินเพื่อดำเนินการเบิกจ่ายเรียบร้อยแล้ว",
 			"/ta/reminders")
 	}
 	return nil
@@ -881,14 +1031,15 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 	}
 	if s.notify != nil {
 		label := courseLabelOf(ctx, s.pool, tcID)
-		body := "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือนรายวิชา " + label + " กลับมาให้ท่านแก้ไข เนื่องจาก " + reason
-		s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข", body, "/ta/reminders")
+		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
+		body := "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน" + month + " รายวิชา " + label + " กลับมาให้ท่านแก้ไข เนื่องจาก " + reason
+		s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month, body, "/ta/reminders")
 		// The course lecturers may need to re-open a worklog for correction.
 		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 			for _, lid := range lects {
 				if lid != actor {
-					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข",
-						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือนของ "+personName(ctx, s.pool, taID)+
+					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
+						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
 							" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เนื่องจาก "+reason,
 						"/lecturer/courses/"+tcID.String()+"/reports")
 				}
@@ -957,13 +1108,14 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 	}
 	if s.notify != nil {
 		label := courseLabelOf(ctx, s.pool, tcID)
-		s.notify.SendAction(ctx, taID, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข",
-			"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือนรายวิชา "+label+" ของท่านเพื่อให้แก้ไข เนื่องจาก "+reason,
+		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
+		s.notify.SendAction(ctx, taID, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข "+code+" "+month,
+			"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+" ของท่านเพื่อให้แก้ไข เนื่องจาก "+reason,
 			"/ta/reminders")
 		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 			for _, lid := range lects {
-				s.notify.Send(ctx, lid, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข",
-					"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือนของ "+personName(ctx, s.pool, taID)+
+				s.notify.Send(ctx, lid, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
+					"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
 						" ผู้ช่วยสอนรายวิชา "+label+" เพื่อให้แก้ไข เนื่องจาก "+reason,
 					"/lecturer/courses/"+tcID.String()+"/reports")
 			}
@@ -1108,7 +1260,7 @@ func (s *SubmissionPeriodService) ListByCourse(ctx context.Context, actor, tcID 
 		         st.status, st.exported_at, st.exported_by, st.exported_name,
 		         st.finance_sent_at, st.finance_sent_by, st.finance_sent_name, st.finance_note,
 		         st.sent_back_at, st.sent_back_by, st.sent_back_name, st.sent_back_reason
-		ORDER BY sp.due_date, u.first_name, u.last_name`, args...)
+		ORDER BY `+periodOrderSQL("sp.year_month")+`, u.first_name, u.last_name`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1164,6 +1316,25 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 			  -- and would fire every 24h forever since st.status never leaves
 			  -- 'pending' for a TA who never submits.
 			  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+			  AND a.state <> 'dropped'
+			  -- A TA whose every row of the month is already sent or approved has
+			  -- nothing left to do; "please log and submit" daily until the due
+			  -- date only teaches them to ignore the reminder. No rows at all, or
+			  -- any draft/rejected row, still counts as pending.
+			  AND NOT (
+			    EXISTS (SELECT 1 FROM work_logs wl
+			              JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+			              JOIN sections s2 ON s2.id = a2.section_id
+			              JOIN academic_terms trm ON trm.id = sp.term_id
+			             WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
+			               AND `+workLogInPeriodSQL("wl", "trm", "sp")+`)
+			    AND NOT EXISTS (SELECT 1 FROM work_logs wl
+			              JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+			              JOIN sections s2 ON s2.id = a2.section_id
+			              JOIN academic_terms trm ON trm.id = sp.term_id
+			             WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
+			               AND wl.status IN ('draft','rejected')
+			               AND `+workLogInPeriodSQL("wl", "trm", "sp")+`))
 		)
 		SELECT period_id, label, TO_CHAR(due_date,'YYYY-MM-DD'), ta_id, tc_id, code, name_th
 		FROM pending`)
@@ -1190,7 +1361,9 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 	for _, it := range items {
 		body := fmt.Sprintf("ขอให้ท่านบันทึกเวลาปฏิบัติงานประจำงวด %s รายวิชา %s %s ให้ครบถ้วน และส่งให้อาจารย์ผู้สอนพิจารณาอนุมัติภายในวันที่ %s",
 			it.label, it.code, it.nm, thaiLongDateISO(it.due))
-		s.notify.SendAction(ctx, it.taID, "ใกล้ครบกำหนดส่งบันทึกเวลาปฏิบัติงาน", body, "/ta/reminders")
+		// Code in the title: unread notices fold by (title, link), so a TA in
+		// two courses otherwise kept only the last course's reminder.
+		s.notify.SendAction(ctx, it.taID, "ใกล้ครบกำหนดส่งบันทึกเวลาปฏิบัติงาน "+it.code, body, "/ta/reminders")
 		_, _ = s.pool.Exec(ctx, `
 			INSERT INTO submission_period_status
 			    (id, submission_period_id, ta_id, teaching_course_id, status, last_reminded_at)

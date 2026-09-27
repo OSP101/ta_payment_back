@@ -569,10 +569,12 @@ func (s *ExportService) settleAs(
 	var pr PayRate
 	if err := s.pool.QueryRow(ctx, `
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
-		       graduate_special_lumpsum, grad_special_term_cap, term_months
+		       graduate_special_lumpsum, grad_special_term_cap, ug_special_monthly_cap, term_months
 		FROM `+payRatesInForce+``).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
-		&pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap, &pr.TermMonths); err != nil {
+		// Without the monthly cap the settlement priced undergrad-special work
+		// uncapped, saw a shortfall that wasn't there and scaled real pay down.
+		&pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap, &pr.UGSpecialMonthlyCap, &pr.TermMonths); err != nil {
 		return nil, err
 	}
 	var capRegular, capSpecial float64
@@ -614,7 +616,7 @@ func (s *ExportService) settleAs(
 		JOIN sections sec ON sec.id = a.section_id AND sec.track = 'special'
 		JOIN users u ON u.id = a.ta_id
 		WHERE sec.teaching_course_id = $1
-		  AND a.level::text IN ('master','phd')`,
+		  AND a.level::text IN ('master','phd') AND a.state <> 'dropped'`,
 		courseID).Scan(&gradSpecialTAs); err != nil {
 		return nil, err
 	}
@@ -1196,6 +1198,7 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT a.ta_id
 		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN sections sec ON sec.id = a.section_id
 		WHERE sec.teaching_course_id = $1 AND a.state <> 'dropped'`, courseID)
 	if err != nil {
@@ -1342,7 +1345,19 @@ func thaiMonthLabelsBE(yms []string) []string {
 			out = append(out, ym)
 			continue
 		}
-		out = append(out, thaiMonthNames[m]+" "+year)
+		// The key's year is the ACADEMIC year, which opens in June: "2568-01"
+		// is มกราคม 2569. Printing the key's year verbatim told staff a
+		// second-semester month belonged to the year before — same rule as
+		// gregorianYearMonth.
+		y, err := strconv.Atoi(year)
+		if err != nil {
+			out = append(out, ym)
+			continue
+		}
+		if m <= 5 {
+			y++
+		}
+		out = append(out, fmt.Sprintf("%s %d", thaiMonthNames[m], y))
 	}
 	return out
 }
@@ -1381,7 +1396,12 @@ func spillAllowance(capRegular, capSpecial, committedSpecial, totalRegular, tota
 // forecast prices everything not yet rejected.
 func b2StatusFilter(sittingsCTE string) string {
 	if sittingsCTE == mergedSittingsForecastCTE {
-		return "w1.status <> 'rejected' AND w2.status <> 'rejected'"
+		// Same forfeit rule as the forecast sittings: a draft in a closed
+		// month can never be sent, so it must not cut hours out of a live
+		// special sitting either.
+		return "w1.status <> 'rejected' AND w2.status <> 'rejected'" +
+			" AND NOT (w1.status = 'draft' AND " + forfeitedDraftMonthSQL("w1", "s1") + ")" +
+			" AND NOT (w2.status = 'draft' AND " + forfeitedDraftMonthSQL("w2", "s2") + ")"
 	}
 	return "w1.status = 'approved' AND w2.status = 'approved'"
 }

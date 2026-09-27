@@ -109,10 +109,17 @@ func write(ctx context.Context, q execer, e Entry) error {
 	if actor != nil && *actor == uuid.Nil {
 		actor = nil
 	}
+	// `at` is stamped with clock_timestamp(), not the column's NOW() default.
+	// NOW() is the moment the TRANSACTION began, and an audited write can wait
+	// on a row lock (snapshotRow's FOR UPDATE) after that: a writer that began
+	// first but queued behind another got the earlier `at`, so the trail —
+	// sorted by `at` — showed two edits of one row in the wrong order, each
+	// "before" apparently skipping the other's change. This insert runs while
+	// the lock is held, so its wall-clock time is the real order of the writes.
 	if _, err := q.Exec(ctx,
-		`INSERT INTO audit_logs (actor_id, actor_role, action, entity, entity_id, ip, user_agent,
+		`INSERT INTO audit_logs (at, actor_id, actor_role, action, entity, entity_id, ip, user_agent,
 		                         before, after, note, request_id, session_id, method, path)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		 VALUES (clock_timestamp(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		actor, role, e.Action, e.Entity, nilIfEmpty(e.EntityID), ip, nilIfEmpty(e.UserAgent),
 		before, after, nilIfEmpty(e.Note),
 		nilIfNilUUID(e.RequestID), nilIfNilUUID(e.SessionID),

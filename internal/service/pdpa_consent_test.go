@@ -88,7 +88,7 @@ func TestUpsertProfile_RefusesWithoutPdpaConsent(t *testing.T) {
 
 	err := svc.UpsertProfile(ctx, userID, TAProfile{
 		StudentID: "653020123-4", Prefix: "นาย", Phone: "0812345678",
-		NationalID: "1234567890123",
+		NationalID: "1234567890121",
 	})
 	if err == nil {
 		t.Fatal("expected UpsertProfile to refuse without PDPA consent")
@@ -106,7 +106,7 @@ func TestUpsertProfile_SucceedsAfterPdpaConsent(t *testing.T) {
 
 	err := svc.UpsertProfile(ctx, userID, TAProfile{
 		StudentID: "653020123-4", Prefix: "นาย", Phone: "0812345678",
-		NationalID: "1234567890123",
+		NationalID: "1234567890121",
 		BankName:   "ธนาคารกสิกรไทย", AccountName: "นาย ทดสอบ ทีเอ", AccountNo: "1234567890",
 		SignatureSVG: "<svg></svg>",
 	})

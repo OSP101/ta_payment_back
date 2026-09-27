@@ -88,41 +88,11 @@ func assertCourseManager(ctx context.Context, pool *pgxpool.Pool, actor, tcID uu
 	return err
 }
 
-// assertMakeupManager gates the compensation-day (วันชดเชย) endpoints. It is
-// deliberately wider than assertCourseManager: a TA holding an approved
-// assignment anywhere in the course may file and remove makeups too.
-//
-// Rationale — the makeup date is operational scheduling, not an approval. The
-// TA is usually the first to know the rescheduled slot, and while only the
-// lecturer could file it, periods sat unresolved and the TA could not log (or
-// be paid for) hours they had actually worked. The nudge endpoint
-// (RemindLecturer) stays as the escalation path for a TA who does not want to
-// decide the date themselves.
-//
-// Scope is the whole course, not just the TA's own sections: a course's TAs
-// coordinate as one team and a section-scoped rule would leave the other
-// sections' periods stuck for exactly the reason above.
-//
-// Callers keep every other guard: assertNotExported still locks an exported
-// course, and DeleteMakeup still refuses to drop a makeup that already carries
-// submitted/approved worklogs.
-func assertMakeupManager(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID) error {
-	err := assertCourseManager(ctx, pool, actor, tcID)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, ErrForbidden) {
-		return err
-	}
-	ok, taErr := taHasApprovedAssignment(ctx, pool, actor, tcID)
-	if taErr != nil {
-		return taErr
-	}
-	if !ok {
-		return ErrForbidden
-	}
-	return nil
-}
+// Makeups (วันชดเชย) are the course's own call: lecturer, staff or admin
+// through assertCourseManager. TAs used to file, waive and delete them too;
+// the faculty decided on 27/09/2026 that makeup dates come from TDBM and the
+// course, never from a TA (who could otherwise declare an ordinary day
+// cancelled and bill a Saturday sitting). A TA's path is RemindLecturer.
 
 // courseAccess is assertCourseManager plus the answer to "which kind of
 // manager". Both may act on the course, but not equally: admin/staff have full

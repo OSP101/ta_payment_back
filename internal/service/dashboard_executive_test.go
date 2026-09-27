@@ -197,6 +197,22 @@ func TestExecutive_CountsCoursesMissingStudentCounts(t *testing.T) {
 	if sum.MissingStudentCounts != 2 {
 		t.Errorf("MissingStudentCounts = %d, want 2 (NO-STUDENTS + SPECIAL-GAP)", sum.MissingStudentCounts)
 	}
+
+	// Staff saving 0 means "nobody enrolled", not "not filled in yet": both
+	// courses leave the count once their zero track is marked entered.
+	if _, err := pool.Exec(ctx, `
+		UPDATE teaching_courses
+		SET num_students_regular_entered = TRUE, num_students_special_entered = TRUE
+		WHERE code LIKE 'NO-STUDENTS-%' OR code LIKE 'SPECIAL-GAP-%'`); err != nil {
+		t.Fatalf("mark entered: %v", err)
+	}
+	sum, err = dash.Executive(ctx, nil, budget, nil)
+	if err != nil {
+		t.Fatalf("Executive: %v", err)
+	}
+	if sum.MissingStudentCounts != 0 {
+		t.Errorf("MissingStudentCounts = %d, want 0 after staff entered 0 on purpose", sum.MissingStudentCounts)
+	}
 }
 
 /* ---------------------------- fixture helpers ---------------------------- */

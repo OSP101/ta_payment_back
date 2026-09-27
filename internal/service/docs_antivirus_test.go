@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -63,8 +64,29 @@ func avFixture(t *testing.T, sc antivirus.Scanner) (*DocsService, *countingStore
 	return svc, store, uid
 }
 
+// pdfBytes is a small but structurally valid one-page PDF. Upload now runs
+// every file through the preview's pdfcpu pass (UAT DEF-002), so a "%PDF"
+// header followed by filler is refused as damaged.
 func pdfBytes() []byte {
-	return append([]byte("%PDF-1.7\n"), bytes.Repeat([]byte("x"), 400)...)
+	objs := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>",
+	}
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.7\n")
+	offsets := make([]int, len(objs))
+	for i, o := range objs {
+		offsets[i] = b.Len()
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", i+1, o)
+	}
+	xref := b.Len()
+	fmt.Fprintf(&b, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for _, off := range offsets {
+		fmt.Fprintf(&b, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xref)
+	return b.Bytes()
 }
 
 func TestUpload_CleanFileIsStored(t *testing.T) {
@@ -191,5 +213,24 @@ func TestUpload_NonPDFRejectedBeforeScanning(t *testing.T) {
 	}
 	if store.saved != 0 {
 		t.Errorf("rejected file reached storage (%d saves)", store.saved)
+	}
+}
+
+// UAT DEF-002: a file with a "%PDF" header but no readable structure (here: no
+// xref, no objects) used to be stored, and every staff preview of it failed
+// with a 500. It is now refused at upload with a message the TA can act on,
+// and nothing is written to storage.
+func TestUpload_DamagedPDFIsRefused(t *testing.T) {
+	sc := &fakeScanner{enabled: true}
+	svc, store, uid := avFixture(t, sc)
+
+	body := append([]byte("%PDF-1.7\n"), bytes.Repeat([]byte("x"), 400)...)
+	_, err := svc.Upload(context.Background(), uid, "national_id", "id.pdf",
+		"application/pdf", int64(len(body)), bytes.NewReader(body))
+	if err == nil || !strings.Contains(err.Error(), "เสียหาย") {
+		t.Fatalf("damaged PDF: err = %v, want the damaged-file refusal", err)
+	}
+	if store.saved != 0 {
+		t.Errorf("stored %d files, want 0", store.saved)
 	}
 }

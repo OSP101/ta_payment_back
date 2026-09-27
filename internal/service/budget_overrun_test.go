@@ -43,8 +43,10 @@ func TestApprove_NoLongerRefusedWhenItWouldExceedTheBudget(t *testing.T) {
 	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID); err != nil {
 		t.Fatal(err)
 	}
-	// Make the course's budget far too small for even this one entry.
-	f.exec(`UPDATE pay_rates SET undergrad_regular = 999999`)
+	// Make the course's budget far too small for even this one entry. The
+	// daily pay cap is switched off: approval re-prices each day against it
+	// (DEF-005), and this test is about the course budget, not the day.
+	f.exec(`UPDATE pay_rates SET undergrad_regular = 999999, daily_pay_cap_baht = 0`)
 
 	if err := f.Svc.Approve(f.ctx, f.LecturerID, f.AssignmentID, "", false); err != nil {
 		t.Fatalf("approval must not be refused on budget any more: %v", err)

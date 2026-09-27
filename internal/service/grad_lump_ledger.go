@@ -74,7 +74,8 @@ func gradSpecialHolderIDs(ctx context.Context, q ledgerQuerier, courseID uuid.UU
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN sections sec ON sec.id = a.section_id
 		WHERE r.teaching_course_id = $1
-		  AND a.level::text IN ('master','phd') AND sec.track = 'special'`, courseID)
+		  AND a.level::text IN ('master','phd') AND sec.track = 'special'
+		  AND a.state <> 'dropped'`, courseID)
 	if err != nil {
 		return nil, err
 	}

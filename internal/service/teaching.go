@@ -49,6 +49,12 @@ type TeachingCourse struct {
 	NumStudents        int     `json:"num_students"` // aggregate (regular + special)
 	NumStudentsRegular int     `json:"num_students_regular"`
 	NumStudentsSpecial int     `json:"num_students_special"`
+	// *Entered tell "not filled in yet" (UI shows "-") apart from an entered 0
+	// (nobody enrolled): true when the count is > 0 or staff saved the track
+	// explicitly. Only a track that is not entered triggers the "ยังไม่กรอก"
+	// reminder; see migration 0122.
+	NumStudentsRegularEntered bool `json:"num_students_regular_entered"`
+	NumStudentsSpecialEntered bool `json:"num_students_special_entered"`
 	// HasSpecial is true when the course has at least one special-track section
 	// (i.e. it runs a special program). When false the "นศ. พิเศษ" count is not
 	// applicable — the UI disables that input to prevent stray data entry.
@@ -458,6 +464,8 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		        TO_CHAR(COALESCE(tc.starts_on, at.starts_on), 'YYYY-MM-DD'),
 		        TO_CHAR(COALESCE(tc.ends_on,   at.ends_on),   'YYYY-MM-DD'),
 		        tc.num_students, tc.num_students_regular, tc.num_students_special,
+		        (tc.num_students_regular > 0 OR tc.num_students_regular_entered),
+		        (tc.num_students_special > 0 OR tc.num_students_special_entered),
 		        TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		        -- คาบที่ตรงวันหยุดและยังไม่กำหนดวันชดเชย see UnresolvedMakeupsSQL.
 		        `+UnresolvedMakeupsSQL("tc")+`,
@@ -474,6 +482,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		&tc.Credits, &tc.LectureHrs, &tc.LabHrs, &tc.SelfHrs,
 		&tc.StartsOn, &tc.EndsOn,
 		&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
+		&tc.NumStudentsRegularEntered, &tc.NumStudentsSpecialEntered,
 		&tc.ExportedAt, &tc.UnresolvedMakeups, &tc.HasMissingSchedule)
 	if err != nil {
 		return nil, err
@@ -639,6 +648,8 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	q := `SELECT tc.id, tc.term_id, tc.code, tc.alt_codes, tc.name_th, tc.name_en, tc.level,
 	             tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 	             tc.num_students, tc.num_students_regular, tc.num_students_special,
+	             (tc.num_students_regular > 0 OR tc.num_students_regular_entered),
+	             (tc.num_students_special > 0 OR tc.num_students_special_entered),
 	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS has_special,
 	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id
 	                    AND NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id=sx.id)) AS has_missing_schedule,
@@ -689,6 +700,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 		if err := rows.Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.AltCodes, &tc.NameTH, &tc.NameEN, &tc.Level,
 			&tc.Credits, &tc.LectureHrs, &tc.LabHrs, &tc.SelfHrs,
 			&tc.NumStudents, &tc.NumStudentsRegular, &tc.NumStudentsSpecial,
+			&tc.NumStudentsRegularEntered, &tc.NumStudentsSpecialEntered,
 			&tc.HasSpecial, &tc.HasMissingSchedule,
 			&tc.NumSectionsRegular, &tc.NumSectionsSpecial, &tc.LecturerNames,
 			&tc.UnresolvedMakeups); err != nil {
@@ -797,19 +809,31 @@ type TAAssignment struct {
 	// it acts on cannot disagree.
 	UnsentCount int `json:"unsent_count"`
 	// SubmittableCount is the part of UnsentCount that pressing the button would
-	// actually send — rows whose month is still open. The difference is stranded:
-	// the TA missed the deadline and only staff can move those now. Counted with
-	// the same predicate Submit skips by (unsubmittableMonthSQL), so the button
-	// can never offer to send something the server will refuse.
+	// actually send — rows whose month is still open (future days included:
+	// advance submission is allowed). The difference is stranded: the TA missed
+	// the deadline and only staff can move those now. Counted with the same
+	// predicate Submit sends by (submittableRowSQL), so the button can never
+	// offer to send something the server will refuse.
 	SubmittableCount int `json:"submittable_count"`
+	// StrandedCount is the forfeited part of UnsentCount: rows whose period has
+	// closed. Sent explicitly so the screen does not have to infer it from
+	// unsent − submittable.
+	StrandedCount int `json:"stranded_count"`
 	// MonthsInReview lists the "YYYY-MM" months of this assignment that have
 	// entered review — anything submitted or approved. Upsert refuses a NEW row
 	// in exactly these, so the screen hides its "+ เพิ่ม" affordance there rather
 	// than offering a button the server will reject. Server-derived on purpose: a
 	// second copy of the rule in the client is a copy that drifts.
 	MonthsInReview []string `json:"months_in_review"`
-	SubmittedCount int      `json:"submitted_count"`
-	ApprovedCount  int      `json:"approved_count"`
+	// LastSentByMonth ("YYYY-MM" → "YYYY-MM-DD") is the latest submitted or
+	// approved day of each month in review, and MakeupDates the section's
+	// non-waived makeup days. Together they are Upsert's new-row rule for a
+	// month in review: a later day, or a makeup day, may still be added
+	// (UAT DEF-004). Server-derived for the same reason as MonthsInReview.
+	LastSentByMonth map[string]string `json:"last_sent_by_month"`
+	MakeupDates     []string          `json:"makeup_dates"`
+	SubmittedCount  int               `json:"submitted_count"`
+	ApprovedCount   int               `json:"approved_count"`
 	// HoursLogged counts everything not rejected, matching the term-ceiling
 	// arithmetic the worklog screen already shows.
 	HoursLogged float64 `json:"hours_logged"`
@@ -843,7 +867,10 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	               WHERE wl.assignment_id = a.id AND wl.status IN ('draft','rejected')),
 	             (SELECT COUNT(*) FROM work_logs wl
 	               WHERE wl.assignment_id = a.id AND wl.status IN ('draft','rejected')
-	                 AND NOT ` + unsubmittableMonthSQL("wl") + `),
+	                 AND ` + submittableRowSQL("wl") + `),
+	             (SELECT COUNT(*) FROM work_logs wl
+	               WHERE wl.assignment_id = a.id AND wl.status IN ('draft','rejected')
+	                 AND ` + unsubmittableMonthSQL("wl") + `),
 	             COALESCE((SELECT ARRAY_AGG(DISTINCT to_char(wl.work_date,'YYYY-MM'))
 	               FROM work_logs wl
 	               WHERE wl.assignment_id = a.id
@@ -854,7 +881,15 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	               WHERE wl.assignment_id = a.id AND wl.status = 'approved'),
 	             (SELECT COALESCE(SUM(wl.hours), 0) FROM work_logs wl
 	               WHERE wl.assignment_id = a.id AND wl.status <> 'rejected'),
-	             hb.lec, hb.lab, hb.rev, hb.mk, hb.oth
+	             hb.lec, hb.lab, hb.rev, hb.mk, hb.oth,
+	             COALESCE((SELECT jsonb_object_agg(m, d) FROM (
+	                 SELECT to_char(wl.work_date,'YYYY-MM') AS m, to_char(MAX(wl.work_date),'YYYY-MM-DD') AS d
+	                 FROM work_logs wl
+	                 WHERE wl.assignment_id = a.id AND wl.status IN ('submitted','approved')
+	                 GROUP BY 1) x), '{}'::jsonb),
+	             COALESCE((SELECT ARRAY_AGG(DISTINCT to_char(ms.makeup_date,'YYYY-MM-DD'))
+	               FROM makeup_schedules ms
+	               WHERE ms.section_id = sec.id AND NOT COALESCE(ms.waived, FALSE)), '{}')
 	      FROM ta_request_assignments a
 	      JOIN sections sec ON sec.id = a.section_id
 	      JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
@@ -895,8 +930,8 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 			&a.SectionID, &a.SecNo, &a.Track, &a.Level, &a.ReimburseScope, &a.HasSchedule,
 			&a.WeeklyCapLecture, &a.WeeklyCapLab, &a.WeeklyCapReview, &a.WeeklyCapOther,
 			&a.WeeklyLectureLabShared, &a.WeeklyCapsSet, &a.State, &a.StateReason,
-			&a.UnsentCount, &a.SubmittableCount, &a.MonthsInReview, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged,
-			&hLec, &hLab, &hRev, &hMk, &hOth); err != nil {
+			&a.UnsentCount, &a.SubmittableCount, &a.StrandedCount, &a.MonthsInReview, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged,
+			&hLec, &hLab, &hRev, &hMk, &hOth, &a.LastSentByMonth, &a.MakeupDates); err != nil {
 			return nil, err
 		}
 		a.HoursByActivity = map[string]float64{
@@ -947,6 +982,20 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 	if !priv {
 		return Forbidden("จำนวนนักศึกษาต้องให้เจ้าหน้าที่กรอก ข้อมูลมาจากไฟล์ทะเบียน")
 	}
+	// Headcount IS the budget ceiling (students × credits × rate). Changing it
+	// after a payout file was issued re-priced the settlement of months already
+	// on paper — ฿18,000 became ฿180,000 on an exported course — so an exported
+	// course keeps the figure it was exported with until an admin unlocks it.
+	if err := s.assertNotExported(ctx, nil, id); err != nil {
+		return err
+	}
+	// A plausibility ceiling, not a policy: the largest real section in the
+	// registrar file is a few hundred. It catches the extra-zero typo that
+	// silently multiplies the budget tenfold.
+	const maxStudentsPerTrack = 3000
+	if regular > maxStudentsPerTrack || special > maxStudentsPerTrack || total > 2*maxStudentsPerTrack {
+		return Invalid(fmt.Sprintf("จำนวนนักศึกษาต่อภาคต้องไม่เกิน %d คน กรุณาตรวจตัวเลขอีกครั้ง", maxStudentsPerTrack))
+	}
 	// Fetch current values so we can preserve untouched fields.
 	var curTotal, curRegular, curSpecial int
 	if err := s.pool.QueryRow(ctx,
@@ -954,6 +1003,9 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 		 FROM teaching_courses WHERE id = $1`, id).Scan(&curTotal, &curRegular, &curSpecial); err != nil {
 		return err
 	}
+	// A track sent in the body counts as entered even when it is 0 — that is
+	// staff saying "nobody enrolled", not "not filled in yet".
+	regularSent, specialSent := regular >= 0, special >= 0
 	if regular < 0 {
 		regular = curRegular
 	}
@@ -980,8 +1032,10 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 				SET num_students = $1,
 				    num_students_regular = $2,
 				    num_students_special = $3,
+				    num_students_regular_entered = num_students_regular_entered OR $5,
+				    num_students_special_entered = num_students_special_entered OR $6,
 				    updated_at = NOW()
-				WHERE id = $4`, total, regular, special, id)
+				WHERE id = $4`, total, regular, special, id, regularSent, specialSent)
 			return err
 		})
 }
@@ -1368,7 +1422,11 @@ func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.U
 
 // ErrCourseLocked is returned when a mutation would change a course whose
 // export snapshot has been taken. Frontend surfaces this as a lock icon.
-var ErrCourseLocked = errors.New("course is locked after export")
+//
+// A *UserError so that every handler — not only the section-CRUD ones that
+// special-case it — answers 409 with a sentence staff can read. As a plain
+// error it reached the makeup endpoints as a bare 500 "ระบบขัดข้อง".
+var ErrCourseLocked error = Conflict("รายวิชานี้ถูกล็อกหลังส่งออกเอกสารเบิกจ่ายแล้ว แก้ไขไม่ได้ (ผู้ดูแลระบบปลดล็อกได้)")
 
 // assertNotExported returns ErrCourseLocked if the course has been exported.
 // All section CRUD mutations gate on this so the export file stays the source
@@ -1603,6 +1661,9 @@ func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tc
 //
 // lectureHrs/labHrs are the course's per-term credit hours (teaching_courses);
 // they gate which schedule kinds are allowed (see validateScheduleKinds).
+// maxSectionSittingMinutes mirrors the undergrad daily hour cap (7 ชม.).
+const maxSectionSittingMinutes = 7 * 60
+
 func validateSectionSchedules(schedules []SectionSchedule, lectureHrs, labHrs int) error {
 	kinds := make([]string, 0, len(schedules))
 	for i, sch := range schedules {
@@ -1617,6 +1678,16 @@ func validateSectionSchedules(schedules []SectionSchedule, lectureHrs, labHrs in
 		}
 		if sch.StartTime >= sch.EndTime {
 			return errors.New("เวลาสิ้นสุดต้องมากกว่าเวลาเริ่ม")
+		}
+		// One sitting longer than a TA may log in a day can never be staffed:
+		// the request rule refuses the section outright, and a lecturer's
+		// once-only timetable entry (e.g. อาทิตย์ 06:00–22:00) left the section
+		// dead until staff stepped in. Refuse it where it is typed.
+		if sm, ok1 := parseHM(sch.StartTime); ok1 {
+			if em, ok2 := parseHM(sch.EndTime); ok2 && em-sm > maxSectionSittingMinutes {
+				return fmt.Errorf("คาบเรียนหนึ่งคาบยาวได้ไม่เกิน %d ชั่วโมง (%s %s–%s) หากเรียนต่อเนื่องนานกว่านั้น ให้แยกเป็นหลายวัน",
+					maxSectionSittingMinutes/60, kindLabelTH(sch.Kind), sch.StartTime, sch.EndTime)
+			}
 		}
 		for j := 0; j < i; j++ {
 			other := schedules[j]
@@ -1935,16 +2006,30 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 		}
 		return err
 	}
-	if err := assertMakeupManager(ctx, s.pool, actor, tcID); err != nil {
-		return err
-	}
-	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
 		return err
 	}
 	origDay, err := time.Parse("2006-01-02", m.OriginalDate)
 	if err != nil {
 		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
 	}
+	if _, err := timeutil.ParseDate(m.MakeupDate); err != nil {
+		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	// The export lock is per MONTH, not per course. The old course-wide
+	// assertNotExported meant that exporting ธันวาคม froze makeups for
+	// มกราคม–มีนาคม too (and surfaced as a bare 500), even though those months
+	// were nowhere near a payout file. Only the two months this makeup touches
+	// matter: the cancelled day's and the replacement day's.
+	for _, d := range []string{m.OriginalDate, m.MakeupDate} {
+		if err := assertMonthNotExportedForCourse(ctx, s.pool, tcID, d); err != nil {
+			return err
+		}
+	}
+	// Makeups are the course's call only — lecturer, staff/admin, or TDBM
+	// (faculty decision 27/09/2026; assertCourseManager above refuses TAs). A
+	// TA who could file one could declare any ordinary teaching day
+	// "cancelled", file a makeup on a Saturday and bill both sittings.
 	// The period being replaced has to exist. Without this check a typo in `kind`
 	// would file a makeup that no reader can ever match — the period would stay
 	// "ยังไม่ได้กำหนดวันชดเชย" while the constraint refused a second attempt, which
@@ -1963,8 +2048,25 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	if !periodExists {
 		return Invalid("กลุ่มนี้ไม่มีคาบชนิดดังกล่าวในวันที่เลือก")
 	}
-	if _, err := timeutil.ParseDate(m.MakeupDate); err != nil {
-		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	// A makeup REPLACES the original sitting. If a TA already sent or had
+	// approved hours for that very sitting, the class evidently ran, and a
+	// makeup on top of it would pay the same period twice — the worklog gate
+	// only refuses the original date AFTER a makeup exists, so the order
+	// "log the class, then file a makeup for it" slipped through.
+	var taughtRows int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		  FROM work_logs wl
+		  JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		 WHERE a.section_id = $1 AND wl.work_date = $2::date AND wl.activity = $3
+		   AND wl.status IN ('submitted','approved')`,
+		sectionID, m.OriginalDate, m.Kind).Scan(&taughtRows); err != nil {
+		return err
+	}
+	if taughtRows > 0 {
+		return Invalid(fmt.Sprintf(
+			"คาบ%sของวันที่ %s มีการลงเวลาปฏิบัติงานที่ส่งหรืออนุมัติแล้ว %d รายการ แสดงว่ามีการสอนตามปกติ จึงกำหนดวันชดเชยไม่ได้ หากคาบนี้ถูกยกเลิกจริง ให้อาจารย์ตีกลับรายการของวันนั้นก่อน",
+			kindLabelTH(m.Kind), m.OriginalDate, taughtRows))
 	}
 	// A makeup whose month's submission period is already closed cannot
 	// produce payable work: the TA's work-log write for that month is frozen,
@@ -2013,7 +2115,7 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 		m.MakeupDate, m.StartTime, m.EndTime).Scan(&nestedHoliday, &nestedWindow)
 	if err == nil {
 		return Invalid(fmt.Sprintf("วันชดเชย %s ตรงกับวันหยุด (%s · %s) กรุณาเลือกวันหรือช่วงเวลาอื่น",
-			m.MakeupDate, nestedHoliday, nestedWindow))
+			thaiLongDateISO(m.MakeupDate), nestedHoliday, nestedWindow))
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
@@ -2024,14 +2126,28 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 				`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note, kind)
 				 VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8)`,
 				uuid.New(), sectionID, m.OriginalDate, m.MakeupDate, m.StartTime, m.EndTime, m.Note, m.Kind)
+			if err != nil && !isUniqueViolation(err) {
+				return err
+			}
 			if err != nil {
 				// UNIQUE (section_id, original_date, kind) violation — this PERIOD already
 				// has a filed makeup. Names the period, because the other period of the
 				// same day is a separate row the lecturer may still need to file.
 				return Invalid(fmt.Sprintf("คาบ%sของวันที่ %s มีวันชดเชยอยู่แล้ว กรุณาลบวันเดิมก่อนแล้วเพิ่มใหม่",
-					kindLabelTH(m.Kind), m.OriginalDate))
+					kindLabelTH(m.Kind), thaiLongDateISO(m.OriginalDate)))
 			}
-			return nil
+			// Unsent drafts for the cancelled sitting (the generator fills every
+			// scheduled day) would otherwise ride along into the next submit and
+			// bill the original day next to its replacement. Mirror of DeleteMakeup,
+			// which clears drafts on a makeup date that goes away.
+			_, err = tx.Exec(ctx, `
+				DELETE FROM work_logs wl
+				 USING ta_request_assignments a
+				 WHERE a.id = wl.assignment_id
+				   AND a.section_id = $1 AND wl.work_date = $2::date
+				   AND wl.activity = $3 AND wl.status = 'draft'`,
+				sectionID, m.OriginalDate, m.Kind)
+			return err
 		})
 }
 
@@ -2045,21 +2161,29 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 	// makeup on another section by URL manipulation.
 	var tcID uuid.UUID
 	var makeupDate *time.Time
+	var originalDate time.Time
 	if err := s.pool.QueryRow(ctx, `
-		SELECT sec.teaching_course_id, m.makeup_date
+		SELECT sec.teaching_course_id, m.makeup_date, m.original_date
 		FROM makeup_schedules m
 		JOIN sections sec ON sec.id = m.section_id
-		WHERE m.id = $1 AND m.section_id = $2`, makeupID, sectionID).Scan(&tcID, &makeupDate); err != nil {
+		WHERE m.id = $1 AND m.section_id = $2`, makeupID, sectionID).Scan(&tcID, &makeupDate, &originalDate); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
-	if err := assertMakeupManager(ctx, s.pool, actor, tcID); err != nil {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
 		return err
 	}
-	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
-		return err
+	// Month-level lock, same as AddMakeup: the months of both days.
+	lockDates := []string{originalDate.Format("2006-01-02")}
+	if makeupDate != nil {
+		lockDates = append(lockDates, makeupDate.Format("2006-01-02"))
+	}
+	for _, d := range lockDates {
+		if err := assertMonthNotExportedForCourse(ctx, s.pool, tcID, d); err != nil {
+			return err
+		}
 	}
 
 	// A waived row (makeup_date NULL — see WaiveMakeup) never had a class
@@ -2149,10 +2273,13 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 			SELECT tc.code || ' ' || COALESCE(tc.name_th, '')
 			  FROM sections sec JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 			 WHERE sec.id = $1`, sectionID).Scan(&label)
+		code, _, _ := strings.Cut(strings.TrimSpace(label), " ")
 		body := fmt.Sprintf("อาจารย์ผู้สอนรายวิชา %s ได้ยกเลิกวันสอนชดเชยวันที่ %s รายการบันทึกเวลาฉบับร่างของวันดังกล่าวจึงถูกลบออกจากระบบ",
 			strings.TrimSpace(label), thaiLongDateISO(makeupDateStr))
 		for _, taID := range notifyTargets {
-			s.notify.Send(ctx, taID, "อาจารย์ผู้สอนยกเลิกวันสอนชดเชย", body, "/ta")
+			// Code in the title: unread notices fold by (title, link) and "/ta"
+			// is shared by every course.
+			s.notify.Send(ctx, taID, strings.TrimSpace("อาจารย์ผู้สอนยกเลิกวันสอนชดเชย "+code), body, "/ta")
 		}
 	}
 	return nil
@@ -2179,15 +2306,29 @@ func (s *TeachingService) WaiveMakeup(ctx context.Context, actor, sectionID uuid
 		}
 		return err
 	}
-	if err := assertMakeupManager(ctx, s.pool, actor, tcID); err != nil {
-		return err
-	}
-	if err := s.assertNotExported(ctx, nil, tcID); err != nil {
+	if err := assertCourseManager(ctx, s.pool, actor, tcID); err != nil {
 		return err
 	}
 	origDay, err := time.Parse("2006-01-02", r.OriginalDate)
 	if err != nil {
 		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	// Month-level lock, same as AddMakeup: only the cancelled day's month.
+	if err := assertMonthNotExportedForCourse(ctx, s.pool, tcID, r.OriginalDate); err != nil {
+		return err
+	}
+	// Waiving over a scheduled makeup would null its date in place and skip
+	// every check DeleteMakeup makes (the makeup month's lock, reviewed rows
+	// on that day, draft cleanup). Delete the makeup first, then waive.
+	var hasMakeup bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM makeup_schedules
+		  WHERE section_id = $1 AND original_date = $2::date AND kind = $3 AND makeup_date IS NOT NULL)`,
+		sectionID, r.OriginalDate, r.Kind).Scan(&hasMakeup); err != nil {
+		return err
+	}
+	if hasMakeup {
+		return Conflict("คาบนี้กำหนดวันชดเชยไว้แล้ว กรุณาลบวันชดเชยเดิมก่อนจึงจะยกเว้นการชดเชยได้")
 	}
 	var periodExists bool
 	if err := s.pool.QueryRow(ctx, `
@@ -2610,6 +2751,7 @@ func curriculumFromReserved(reserved string) string {
 //	errs:     a row that WAS supposed to describe a real class period but
 //	          couldn't be read (unknown session-type text, unparseable day or
 //	          time) — worth an officer's attention, unlike the above.
+//
 // importUnzipLimits bounds what a registrar .xlsx may expand to once
 // decompressed. excelize's defaults are 16GB/16MB, sized for a general-purpose
 // library rather than for this endpoint: a real registrar file is a few hundred
@@ -3668,29 +3810,45 @@ func demoteOtherActiveTerms(ctx context.Context, tx pgx.Tx, keep uuid.UUID, acti
 // reference this term. Callers should delete + recreate if they truly need
 // to rename the (year, semester) key.
 func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Term) (*Term, error) {
+	// Each refusal names the field. A bare "ข้อมูลไม่ถูกต้อง" for all of them
+	// left staff guessing which of nine inputs to change.
 	if in.AcademicYear < 2500 || in.AcademicYear > 2700 {
-		return nil, ErrInvalidInput
+		return nil, Invalid("ปีการศึกษาต้องอยู่ระหว่าง 2500–2700 (พ.ศ.)")
 	}
 	if in.Semester < 1 || in.Semester > 3 {
-		return nil, ErrInvalidInput
+		return nil, Invalid("ภาคเรียนต้องเป็น 1, 2 หรือ 3")
 	}
 	if in.Months == 0 {
 		in.Months = 4
 	}
 	if in.Months < 1 || in.Months > 12 {
-		return nil, ErrInvalidInput
+		return nil, Invalid("จำนวนเดือนต้องอยู่ระหว่าง 1–12")
 	}
-	if in.StartsOn != nil && in.EndsOn != nil && *in.StartsOn != "" && *in.EndsOn != "" && *in.StartsOn >= *in.EndsOn {
-		return nil, ErrInvalidInput
+	if !nonEmpty(in.StartsOn) || !nonEmpty(in.EndsOn) {
+		return nil, Invalid("กรุณาระบุวันเปิดและวันปิดภาคเรียน")
+	}
+	if *in.StartsOn >= *in.EndsOn {
+		return nil, Invalid("วันปิดภาคเรียนต้องอยู่หลังวันเปิดภาคเรียน")
 	}
 	// Exam windows are required and must be closed intervals (start <= end).
 	// Faculty publishes these once per term — no partial saves.
 	if !nonEmpty(in.MidtermStartsOn) || !nonEmpty(in.MidtermEndsOn) ||
 		!nonEmpty(in.FinalStartsOn) || !nonEmpty(in.FinalEndsOn) {
-		return nil, ErrInvalidInput
+		return nil, Invalid("กรุณาระบุช่วงสอบกลางภาคและปลายภาคให้ครบ")
 	}
-	if *in.MidtermStartsOn > *in.MidtermEndsOn || *in.FinalStartsOn > *in.FinalEndsOn {
-		return nil, ErrInvalidInput
+	if *in.MidtermStartsOn > *in.MidtermEndsOn {
+		return nil, Invalid("วันสิ้นสุดสอบกลางภาคต้องไม่ก่อนวันเริ่มสอบ")
+	}
+	if *in.FinalStartsOn > *in.FinalEndsOn {
+		return nil, Invalid("วันสิ้นสุดสอบปลายภาคต้องไม่ก่อนวันเริ่มสอบ")
+	}
+	// The exam windows close the worklog ledger, so a window outside the
+	// term either blocks nothing or blocks the wrong term's days.
+	if *in.MidtermStartsOn < *in.StartsOn || *in.MidtermEndsOn > *in.EndsOn {
+		return nil, Invalid("ช่วงสอบกลางภาคต้องอยู่ภายในช่วงภาคเรียน")
+	}
+	if *in.FinalStartsOn < *in.MidtermEndsOn {
+		return nil, Invalid("ช่วงสอบปลายภาคต้องอยู่หลังช่วงสอบกลางภาค")
 	}
 
 	if in.ID == uuid.Nil {
@@ -3703,6 +3861,20 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 		}
 		if exists {
 			return nil, ErrConflict
+		}
+		// Two terms whose teaching ranges overlap make every date-based rule
+		// (worklog range, submission months, holidays) ambiguous. Checked on
+		// create only, so a term that already overlaps in existing data can
+		// still be edited (e.g. switched active) rather than locked out.
+		var clash string
+		if err := s.pool.QueryRow(ctx, `
+			SELECT academic_year::text || '/' || semester::text FROM academic_terms
+			 WHERE starts_on IS NOT NULL AND ends_on IS NOT NULL
+			   AND starts_on <= $2::date AND ends_on >= $1::date
+			 LIMIT 1`, *in.StartsOn, *in.EndsOn).Scan(&clash); err == nil {
+			return nil, Invalid(fmt.Sprintf("ช่วงภาคเรียนทับซ้อนกับภาคเรียน %s", clash))
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
 		}
 		if err := writeAudited(ctx, s.pool, s.aud,
 			audit.Entry{ActorID: &actor, Action: "term.create", Entity: "term", EntityID: in.ID.String(), After: in},
@@ -3873,4 +4045,22 @@ func (s *TeachingService) LecturerSupervisesTA(ctx context.Context, lecturerID, 
 			  AND (r.lecturer_id = $2 OR tl.lecturer_id = $2)
 		)`, taID, lecturerID, termID).Scan(&ok)
 	return ok, err
+}
+
+// studentCountState backs the export and worklog gates. zero = the course has
+// no students at all; entered = staff filled the count in (an explicit 0 means
+// nobody enrolled), false = still "-". Uses the same rule as the "ยังไม่กรอก"
+// reminder: the regular track, plus the special track when a special section
+// exists. entered is only meaningful when zero is true.
+func studentCountState(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, tcID uuid.UUID) (zero, entered bool, err error) {
+	err = q.QueryRow(ctx, `
+		SELECT tc.num_students <= 0,
+		       (tc.num_students_regular > 0 OR tc.num_students_regular_entered)
+		       AND (tc.num_students_special > 0 OR tc.num_students_special_entered
+		            OR NOT EXISTS (SELECT 1 FROM sections sx
+		                           WHERE sx.teaching_course_id = tc.id AND sx.track = 'special'))
+		FROM teaching_courses tc WHERE tc.id = $1`, tcID).Scan(&zero, &entered)
+	return
 }

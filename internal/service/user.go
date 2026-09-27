@@ -299,6 +299,27 @@ func (s *UserService) SetAvatar(ctx context.Context, actor, id uuid.UUID, key st
 // UserService has no dependency on the rbac package (it would be circular:
 // rbac.Has is what callers use to interpret the result). Used by
 // UploadAvatarFor (AUTHZ-01) to check the TARGET's roles, not the caller's.
+// LecturerMayEditTA reports whether a lecturer may act on a TA account's
+// profile picture: the TA is (or was requested) on one of the lecturer's own
+// courses, or the TA is a brand-new account on no course yet — the "just
+// created from the request form" case the avatar upload exists for. Any other
+// TA in the system belongs to someone else's course.
+func (s *UserService) LecturerMayEditTA(ctx context.Context, lecturerID, taID uuid.UUID) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+		         SELECT 1 FROM ta_request_assignments a
+		           JOIN ta_requests r        ON r.id = a.request_id
+		           JOIN teaching_lecturers l ON l.teaching_course_id = r.teaching_course_id
+		          -- Live requests only: a throwaway request that was auto-rejected
+		          -- or cancelled must not hand a lecturer another course's TA.
+		          WHERE a.ta_id = $2 AND l.lecturer_id = $1
+		            AND r.status IN ('submitted','approved'))
+		    OR NOT EXISTS (SELECT 1 FROM ta_request_assignments a WHERE a.ta_id = $2)`,
+		lecturerID, taID).Scan(&ok)
+	return ok, err
+}
+
 func (s *UserService) RolesOf(ctx context.Context, userID uuid.UUID) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT role::text FROM user_roles WHERE user_id = $1
@@ -639,7 +660,56 @@ type UpdateUserInput struct {
 	AccountNo  *string `json:"account_no,omitempty"`
 }
 
+// assertMayManage keeps the admin account out of staff's reach. Staff run the
+// day-to-day user list, but every reversal in this system (unlocking a course,
+// reverting a finance_sent month, reading the audit log) needs an admin — so a
+// staff member who could switch the admin off, or rewrite its email, could
+// remove the only check on staff. Admin targets therefore need an admin actor
+// for any change at all.
+func (s *UserService) assertMayManage(ctx context.Context, actor, target uuid.UUID) error {
+	targetAdmin, err := hasRole(ctx, s.pool, target, "admin")
+	if err != nil || !targetAdmin {
+		return err
+	}
+	actorAdmin, err := hasRole(ctx, s.pool, actor, "admin")
+	if err != nil {
+		return err
+	}
+	if !actorAdmin {
+		return Forbidden("เฉพาะผู้ดูแลระบบ (admin) เท่านั้นที่จัดการบัญชีผู้ดูแลระบบได้")
+	}
+	return nil
+}
+
 func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in UpdateUserInput) (*User, error) {
+	if err := s.assertMayManage(ctx, actor, id); err != nil {
+		return nil, err
+	}
+	// KKU SSO signs a person in by EMAIL, so the email of a privileged account
+	// is its key. Staff could free their own address, write it onto another
+	// staff or executive account and then SSO straight into it — the same
+	// takeover ResetPassword already refuses for these roles. Admin only.
+	if in.Email != nil && actor != id {
+		var cur string
+		if err := s.pool.QueryRow(ctx, `SELECT email FROM users WHERE id=$1`, id).Scan(&cur); err != nil {
+			return nil, err
+		}
+		if !strings.EqualFold(cur, strings.TrimSpace(*in.Email)) {
+			privileged, err := hasRole(ctx, s.pool, id, "admin", "staff", "executive")
+			if err != nil {
+				return nil, err
+			}
+			if privileged {
+				actorAdmin, err := hasRole(ctx, s.pool, actor, "admin")
+				if err != nil {
+					return nil, err
+				}
+				if !actorAdmin {
+					return nil, Forbidden("เปลี่ยนอีเมลของบัญชีผู้ดูแลหรือเจ้าหน้าที่ ต้องให้ผู้ดูแลระบบดำเนินการ")
+				}
+			}
+		}
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -775,6 +845,22 @@ func (s *UserService) Deactivate(ctx context.Context, actor, id uuid.UUID) error
 	if actor == id {
 		return Invalid("ไม่สามารถปิดใช้งานบัญชีของตนเองได้")
 	}
+	if err := s.assertMayManage(ctx, actor, id); err != nil {
+		return err
+	}
+	// Never leave the system without an active admin — nobody could then
+	// unlock a course, revert a finance month or reset another admin's 2FA.
+	var otherAdmins int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM users u JOIN user_roles r ON r.user_id = u.id AND r.role = 'admin'
+		 WHERE u.is_active AND u.deleted_at IS NULL AND u.id <> $1`, id).Scan(&otherAdmins); err != nil {
+		return err
+	}
+	if targetAdmin, err := hasRole(ctx, s.pool, id, "admin"); err != nil {
+		return err
+	} else if targetAdmin && otherAdmins == 0 {
+		return Conflict("บัญชีนี้เป็นผู้ดูแลระบบที่ใช้งานอยู่คนสุดท้าย ปิดใช้งานไม่ได้ กรุณาเพิ่มผู้ดูแลระบบอีกคนก่อน")
+	}
 	// The before-image carries is_active and the account's own details, so a
 	// deactivation can be told apart from one that was already off.
 	return writeAuditedRow(ctx, s.pool, s.aud,
@@ -788,6 +874,9 @@ func (s *UserService) Deactivate(ctx context.Context, actor, id uuid.UUID) error
 
 // Activate re-enables a previously deactivated account.
 func (s *UserService) Activate(ctx context.Context, actor, id uuid.UUID) error {
+	if err := s.assertMayManage(ctx, actor, id); err != nil {
+		return err
+	}
 	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "user.activate", Entity: "user", EntityID: id.String()},
 		"users", id,
@@ -892,15 +981,24 @@ func (s *UserService) ChangePassword(ctx context.Context, userID uuid.UUID, curr
 	if err != nil {
 		return err
 	}
-	if hash == "" {
-		return &UserError{Status: 500, Msg: "ไม่สามารถตรวจสอบรหัสผ่านได้"}
-	}
-	if !u.MustChangePassword {
+	// No local password at all (an SSO account whose temporary password was
+	// retired on its KKU login): there is nothing to verify, the signed-in
+	// session is the proof, so setting a first password skips the check.
+	if !u.MustChangePassword && hash != "" {
 		if currentPassword == "" {
 			return Invalid("กรุณากรอกรหัสผ่านปัจจุบัน")
 		}
-		if !auth.CheckPassword(hash, currentPassword) {
-			return &UserError{Status: 401, Msg: "รหัสผ่านปัจจุบันไม่ถูกต้อง"}
+		// Through the shared password gate, not a bare compare: a stolen
+		// session could otherwise guess the current password here without
+		// limit (only the global rate cap), side-stepping the lockout that
+		// guards 2FA disable, the ZIP download and approved-row edits — and a
+		// right guess sets a password the attacker knows.
+		if err := VerifyUserPassword(ctx, s.pool, userID, currentPassword); err != nil {
+			var ue *UserError
+			if errors.As(err, &ue) && ue.Msg == "รหัสผ่านไม่ถูกต้อง" {
+				return &UserError{Status: 401, Msg: "รหัสผ่านปัจจุบันไม่ถูกต้อง"}
+			}
+			return err
 		}
 	}
 	if auth.CheckPassword(hash, newPassword) {

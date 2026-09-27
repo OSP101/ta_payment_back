@@ -162,11 +162,116 @@ func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, term
 	return "", nil
 }
 
+// assertNoClassRemovedAfterApproval keeps a TA from winning back pay by editing
+// their own timetable after a request was decided. The decision trims every
+// period that clashes with a class the TA attends; deleting that class
+// afterwards made the period loggable again (and regenerate refilled it),
+// while the assignment still read "trimmed" and the printed timetable form
+// showed no clash for the lecturer to notice.
+//
+// The rule is one-way on purpose: once any assignment of this term is
+// approved (active/trimmed), every existing non-WBA class block must still be
+// covered by the new timetable. Adding classes — which can only cost the TA
+// hours — stays self-service; removing or shortening one needs staff.
+func assertNoClassRemovedAfterApproval(ctx context.Context, tx pgx.Tx, userID, termID uuid.UUID, blocks []ClassBlock) error {
+	var approved bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM ta_request_assignments a
+		    JOIN ta_requests r      ON r.id = a.request_id AND r.status = 'approved'
+		    JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		   WHERE a.ta_id = $1 AND tc.term_id = $2 AND a.state IN ('active','trimmed'))`,
+		userID, termID).Scan(&approved); err != nil {
+		return err
+	}
+	if !approved {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT day_of_week, to_char(start_time,'HH24:MI'), to_char(end_time,'HH24:MI'),
+		       COALESCE(NULLIF(course_code,''), course_label, '')
+		  FROM ta_class_schedules
+		 WHERE user_id = $1 AND term_id = $2 AND NOT is_wba`, userID, termID)
+	if err != nil {
+		return err
+	}
+	type span struct{ day, start, end int }
+	var old []span
+	var names []string
+	for rows.Next() {
+		var d int
+		var st, en, name string
+		if err := rows.Scan(&d, &st, &en, &name); err != nil {
+			rows.Close()
+			return err
+		}
+		sm, _ := parseHM(st)
+		em, _ := parseHM(en)
+		old = append(old, span{d, sm, em})
+		names = append(names, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i, o := range old {
+		if o.end <= o.start {
+			continue // malformed legacy row; nothing to protect
+		}
+		// Minute-level coverage of [start, end) by the new blocks of that day.
+		covered := make([]bool, o.end-o.start)
+		for _, b := range blocks {
+			if b.IsWBA || b.DayOfWeek != o.day {
+				continue
+			}
+			bs, ok1 := parseHM(b.StartTime)
+			be, ok2 := parseHM(b.EndTime)
+			if !ok1 || !ok2 {
+				continue
+			}
+			for m := max(bs, o.start); m < min(be, o.end); m++ {
+				covered[m-o.start] = true
+			}
+		}
+		for _, c := range covered {
+			if !c {
+				return Invalid(fmt.Sprintf(
+					"มีคำขอ TA ที่อนุมัติแล้วในภาคเรียนนี้ จึงลบหรือลดเวลาคาบเรียนเดิม (%s %s–%s) เองไม่ได้ เพิ่มคาบใหม่ได้ตามปกติ หากตารางเรียนเปลี่ยนจริง กรุณาติดต่อเจ้าหน้าที่",
+					names[i], hmString(o.start), hmString(o.end)))
+			}
+		}
+	}
+	return nil
+}
+
+func hmString(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
+
 // maxClassBlocksPerTerm bounds the self-service timetable a TA may submit.
 const maxClassBlocksPerTerm = 200
 
-// ReplaceClasses swaps the whole schedule for a term.
+// ReplaceClasses swaps the whole schedule for a term — the TA's own save.
 func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uuid.UUID, blocks []ClassBlock) error {
+	return s.replaceClasses(ctx, userID, userID, termID, blocks)
+}
+
+// ReplaceClassesForTA is staff correcting a TA's timetable — the path the
+// TA-facing lock message points at when a real class was dropped or moved
+// after a request was approved. Staff may remove or shorten blocks; the save
+// is audited under the staff member's id, and requests are re-evaluated the
+// same way as on a TA save.
+func (s *WorkloadService) ReplaceClassesForTA(ctx context.Context, actor, taID, termID uuid.UUID, blocks []ClassBlock) error {
+	var isTA bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1 AND role = 'ta')`, taID).Scan(&isTA); err != nil {
+		return err
+	}
+	if !isTA {
+		return Invalid("บัญชีนี้ไม่ใช่ผู้ช่วยสอน")
+	}
+	return s.replaceClasses(ctx, actor, taID, termID, blocks)
+}
+
+func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, termID uuid.UUID, blocks []ClassBlock) error {
 	// A term's real timetable is a couple of dozen blocks. The cap is here
 	// because everything downstream scales with this count and none of it is
 	// bounded on its own: the insert below is one round trip per row inside a
@@ -199,6 +304,11 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 	before, err := classScheduleSnapshot(ctx, tx, userID, termID)
 	if err != nil {
 		return err
+	}
+	if actor == userID {
+		if err := assertNoClassRemovedAfterApproval(ctx, tx, userID, termID, blocks); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM ta_class_schedules WHERE user_id=$1 AND term_id=$2`, userID, termID); err != nil {
@@ -242,7 +352,7 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 	}
 	for _, b := range blocks {
 		if b.DayOfWeek < 0 || b.DayOfWeek > 6 {
-			return errors.New("invalid day_of_week")
+			return Invalid("วันในสัปดาห์ของคาบเรียนไม่ถูกต้อง")
 		}
 		// BUG B12: times must be compared as minutes-from-midnight, not as raw
 		// strings ("9:00" > "10:00" lexicographically). Validating here also
@@ -258,11 +368,11 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 			// (0..1439 min) range; reject anything where start is not strictly
 			// before end.
 			if startMin >= endMin {
-				return errors.New("เวลาสิ้นสุดของคาบเรียนต้องมากกว่าเวลาเริ่ม")
+				return Invalid("เวลาสิ้นสุดของคาบเรียนต้องมากกว่าเวลาเริ่ม")
 			}
 		}
 		if b.Kind != "" && b.Kind != "lecture" && b.Kind != "lab" {
-			return errors.New("invalid kind")
+			return Invalid("ประเภทคาบเรียนต้องเป็นบรรยายหรือปฏิบัติการ")
 		}
 		// Legacy callers that only send course_label are still accepted:
 		// treat the label as course_name so it isn't silently dropped.
@@ -315,7 +425,7 @@ func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uui
 		return err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
-		ActorID: &userID, Action: "ta_class_schedule.replace",
+		ActorID: &actor, Action: "ta_class_schedule.replace",
 		Entity: "ta_class_schedule", EntityID: termID.String(),
 		Note:   "ta=" + userID.String(),
 		Before: map[string]any{"blocks": before},

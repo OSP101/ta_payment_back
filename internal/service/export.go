@@ -117,24 +117,17 @@ type ExportPreview struct {
 // 1234.5600000001) never reaches the spreadsheet.
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
-// isReturningTA reports whether the TA had an approved assignment in any prior
-// academic term. Used by exports to badge each row as "เก่า/ใหม่". Q&A rule:
-// "old" = held any approved ta_request_assignment in a term whose start_date
-// is earlier than the current course's term.
+// isReturningTA is the "เก่า/ใหม่" badge on the export preview. It defers to
+// UserService.TASeniority — the rule the transfer cover prints for finance,
+// including staff's per-TA override — so the two documents can never label
+// the same person differently. (A separate "any approved assignment in an
+// earlier term" query here used to say ใหม่ where the cover said เก่า.)
 func (s *ExportService) isReturningTA(ctx context.Context, taID, currentTermID uuid.UUID) bool {
-	var yes bool
-	_ = s.pool.QueryRow(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM ta_request_assignments a
-			JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
-			JOIN sections sec ON sec.id=a.section_id
-			JOIN teaching_courses tc ON tc.id=sec.teaching_course_id
-			JOIN academic_terms t  ON t.id=tc.term_id
-			JOIN academic_terms cur ON cur.id=$2
-			WHERE a.ta_id=$1 AND (t.academic_year < cur.academic_year
-			     OR (t.academic_year = cur.academic_year AND t.semester < cur.semester))
-		)`, taID, currentTermID).Scan(&yes)
-	return yes
+	if s.users == nil {
+		return false
+	}
+	sen, err := s.users.TASeniority(ctx, taID, currentTermID)
+	return err == nil && sen != "new"
 }
 
 // BuildCourseZip builds a zip archive containing per-TA .xlsx files for a course.
@@ -365,9 +358,20 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 	// the selected months' slices are what this document carries, so the
 	// slices always sum back to the undivided lump.
 	_ = monthShare
+	// A holder dropped from the section is off the appointment order and the
+	// evidence roster, so the lump is not theirs either (their logged hourly
+	// work above is still paid).
+	holders, err := gradSpecialHolderIDs(ctx, s.pool, teachingCourseID)
+	if err != nil {
+		return nil, err
+	}
+	isHolder := map[uuid.UUID]bool{}
+	for _, id := range holders {
+		isHolder[id] = true
+	}
 	for _, taID := range order {
 		agg := byTA[taID]
-		if !agg.hasGradSpecial {
+		if !agg.hasGradSpecial || !isHolder[taID] {
 			continue
 		}
 		byMonth, err := s.gradLumpByMonth(ctx, teachingCourseID, taID, gradLump, true)
@@ -537,16 +541,18 @@ func (s *ExportService) buildCourseZip(ctx context.Context, teachingCourseID uui
 		return nil, "", 0, err
 	}
 	// Student-count gate: the per-course budget is derived from the enrolled
-	// student count (budget.go). If staff never filled it in, num_students is 0,
-	// the budget cap is 0, and everyone would be pro-rata'd down to ฿0 silently.
-	// Refuse the export with a clear pointer to where to fix it.
-	var numStudents int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT num_students FROM teaching_courses WHERE id=$1`, teachingCourseID).Scan(&numStudents); err != nil {
+	// student count (budget.go). With 0 students the budget cap is 0, and
+	// everyone would be pro-rata'd down to ฿0 silently. Refuse the export, with
+	// a message that tells "not filled in yet" apart from "nobody enrolled".
+	zero, entered, err := studentCountState(ctx, s.pool, teachingCourseID)
+	if err != nil {
 		return nil, "", 0, err
 	}
-	if numStudents <= 0 {
+	if zero && !entered {
 		return nil, "", 0, Invalid("ยังไม่ได้กรอกจำนวนนักศึกษาของวิชานี้ กรุณากรอกที่หน้า “วิชาที่เปิดสอน” ก่อนส่งออก (งบเบิกจ่ายคำนวณจากจำนวนนักศึกษา)")
+	}
+	if zero {
+		return nil, "", 0, Invalid("วิชานี้ไม่มีนักศึกษาลงทะเบียน (0 คน) งบเบิกจ่ายจึงเป็น 0 บาท ส่งออกเอกสารไม่ได้ หากจำนวนไม่ถูกต้อง กรุณาแก้ไขที่หน้า “วิชาที่เปิดสอน”")
 	}
 	// Payout readiness gate: refuse to build reimbursement documents while any
 	// TA in the course has an unapproved or incomplete profile — otherwise the

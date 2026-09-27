@@ -100,7 +100,7 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
 		   OR (approved > 0 AND staff_status NOT IN ('staff_reviewed','exported','finance_sent'))
-		ORDER BY sort_name, ta_name, year_month`, courseID, months)
+		ORDER BY sort_name, ta_name, `+periodOrderSQL("year_month")+``, courseID, months)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +358,7 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 		FROM months
 		WHERE waiting_ta > 0 OR waiting_lecturer > 0
 		   OR (approved > 0 AND staff_status NOT IN ('exported','finance_sent'))
-		ORDER BY course_code, sort_name, ta_name, year_month`, termID, months, level)
+		ORDER BY course_code, sort_name, ta_name, `+periodOrderSQL("year_month")+``, termID, months, level)
 	if err != nil {
 		return nil, err
 	}

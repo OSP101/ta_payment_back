@@ -175,8 +175,8 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 		}
 
 		if mustChange &&
-			!strings.HasSuffix(p, "/me") &&
-			!strings.HasSuffix(p, "/me/password") &&
+			!isOwnAccountPath(p, "/me") &&
+			!isOwnAccountPath(p, "/me/password") &&
 			!strings.HasSuffix(p, "/auth/heartbeat") {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "password_change_required"})
 		}
@@ -213,10 +213,17 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 		// factor is still checked at login (LoginTwoFactor) regardless of
 		// this flag, which only controls whether NOT having one yet blocks
 		// every other endpoint.
-		mustEnroll := svc.Cfg.MFAMandatoryEnforced && !svc.Cfg.IsDemoSlot &&
+		//
+		// !mustChange: while a password change is pending the gate above has
+		// already narrowed the request to /me, /me/password or heartbeat.
+		// Enforcing enrolment on top of that refused /me/password with
+		// mfa_setup_required while /me/2fa/setup was refused with
+		// password_change_required — a brand-new staff account could do
+		// neither (UAT DEF-001). Enrolment starts once the password is set.
+		mustEnroll := svc.Cfg.MFAMandatoryEnforced && !svc.Cfg.IsDemoSlot && !mustChange &&
 			totpEnabledAt == nil && mfaMandatoryFor(Roles(c), isExecutive)
 		if mustEnroll &&
-			!strings.HasSuffix(p, "/me") &&
+			!isOwnAccountPath(p, "/me") &&
 			!strings.Contains(p, "/me/2fa/") &&
 			!strings.HasSuffix(p, "/auth/heartbeat") {
 			// strings.Contains, not HasPrefix: demo mounts these same routes
@@ -399,6 +406,13 @@ func errorResponse(err error) (int, string) {
 			return fiber.StatusConflict, "ไม่สามารถดำเนินการได้เพราะมีข้อมูลอ้างอิงอยู่"
 		case "23514", "22001", "22003", "22007", "22P02": // check/length/numeric/datetime/text-repr
 			return fiber.StatusBadRequest, "ข้อมูลที่กรอกไม่ถูกต้องตามรูปแบบที่กำหนด"
+		case "P0001": // RAISE EXCEPTION from our own triggers
+			// Only the Thai ones (migration 0124's export lock) are written for
+			// users; the English audit append-only guards stay a generic 500.
+			if strings.ContainsFunc(pgErr.Message, func(r rune) bool { return r >= 0x0E00 && r <= 0x0E7F }) {
+				return fiber.StatusConflict, pgErr.Message
+			}
+			return fiber.StatusInternalServerError, "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
 		default:
 			return fiber.StatusInternalServerError, "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
 		}
@@ -487,3 +501,19 @@ func OriginCheck(allowedOrigins string) fiber.Handler {
 	}
 }
 
+// isOwnAccountPath reports whether p is exactly the API route tail (e.g.
+// "/me") under /api/v1 or a demo slot's /api/demo/w/<n>. A bare HasSuffix
+// also matched /dashboard/ta/me and /dashboard/lecturer/me, so a session
+// holding only a temporary password (or an admin still owing 2FA) could read
+// those dashboards through the forced-change allowlist.
+func isOwnAccountPath(p, tail string) bool {
+	if !strings.HasSuffix(p, tail) {
+		return false
+	}
+	base := strings.TrimSuffix(p, tail)
+	if strings.HasSuffix(base, "/api/v1") {
+		return true
+	}
+	i := strings.LastIndex(base, "/")
+	return i >= 0 && strings.HasSuffix(base[:i], "/api/demo/w")
+}

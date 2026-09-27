@@ -631,6 +631,18 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 	if owner != lecturerID {
 		return errors.New("คุณไม่ใช่เจ้าของคำขอนี้ จึงยกเลิกไม่ได้")
 	}
+	// ...and must still teach the course: a lecturer taken off it could
+	// otherwise drop the TAs of a course that is no longer theirs.
+	var teaches bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM ta_requests r
+		  JOIN teaching_lecturers tl ON tl.teaching_course_id = r.teaching_course_id
+		  WHERE r.id = $1 AND tl.lecturer_id = $2)`, reqID, lecturerID).Scan(&teaches); err != nil {
+		return err
+	}
+	if !teaches {
+		return errors.New("คุณไม่ได้เป็นอาจารย์ผู้สอนรายวิชานี้แล้ว จึงยกเลิกคำขอไม่ได้ กรุณาติดต่อเจ้าหน้าที่")
+	}
 	if !cancellableStatuses[status] {
 		label := statusLabelTH[status]
 		if label == "" {
@@ -651,6 +663,30 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 	if hasWorkLogs {
 		return errors.New(
 			"ยกเลิกไม่ได้ เพราะมีการบันทึกเวลาทำงานของ TA ในคำขอนี้แล้ว กรุณาติดต่อเจ้าหน้าที่เพื่อดำเนินการ")
+	}
+
+	// Graduate-special TAs never log hours, so the work_logs test above always
+	// passes for them. Anything already issued on paper — an appointment order
+	// naming the TA, a frozen lump, or an exported/finance month of the course
+	// — means documents finance holds would disagree with a re-issue.
+	var issued bool
+	if err := tx.QueryRow(ctx, `
+		WITH r AS (SELECT teaching_course_id FROM ta_requests WHERE id = $1),
+		     tas AS (SELECT ta_id FROM ta_request_assignments WHERE request_id = $1)
+		SELECT EXISTS (SELECT 1 FROM appointment_order_items i, r
+		                WHERE i.teaching_course_id = r.teaching_course_id
+		                  AND i.ta_id IN (SELECT ta_id FROM tas))
+		    OR EXISTS (SELECT 1 FROM grad_lump_ledger g, r
+		                WHERE g.teaching_course_id = r.teaching_course_id
+		                  AND g.ta_id IN (SELECT ta_id FROM tas))
+		    OR EXISTS (SELECT 1 FROM submission_period_status st, r
+		                WHERE st.teaching_course_id = r.teaching_course_id
+		                  AND st.ta_id IN (SELECT ta_id FROM tas)
+		                  AND st.status IN ('exported','finance_sent'))`, reqID).Scan(&issued); err != nil {
+		return err
+	}
+	if issued {
+		return Conflict("ยกเลิกไม่ได้ เพราะออกคำสั่งแต่งตั้งหรือส่งออกเอกสารเบิกจ่ายของรายวิชานี้แล้ว กรุณาติดต่อเจ้าหน้าที่เพื่อดำเนินการ")
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -860,7 +896,7 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 	}
 	code, nameTH := s.courseLabel(ctx, courseID)
 	if verdict == "approved" {
-		s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนได้รับการอนุมัติ",
+		s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนได้รับการอนุมัติ "+code,
 			fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอดังกล่าวได้รับการอนุมัติเรียบร้อยแล้ว", code, nameTH), "/lecturer")
 		rows, err := s.pool.Query(ctx,
 			`SELECT DISTINCT a.ta_id FROM ta_request_assignments a WHERE a.request_id = $1`, reqID)
@@ -873,12 +909,12 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 			if err := rows.Scan(&taID); err != nil {
 				return
 			}
-			s.notify.Send(ctx, taID, "ท่านได้รับการแต่งตั้งเป็นผู้ช่วยสอน",
+			s.notify.Send(ctx, taID, "ท่านได้รับการแต่งตั้งเป็นผู้ช่วยสอน "+code,
 				fmt.Sprintf("ท่านได้รับการอนุมัติให้เป็นผู้ช่วยสอนรายวิชา %s %s และสามารถบันทึกเวลาปฏิบัติงานในระบบได้แล้ว", code, nameTH), "/ta")
 		}
 		return
 	}
-	s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ",
+	s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ "+code,
 		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบแล้ว คำขอดังกล่าวไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/lecturer")
 	// The named TAs deserve to hear the outcome too — previously only the
 	// lecturer was told and a rejected TA never learned.
@@ -893,7 +929,7 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 		if err := rows.Scan(&taID); err != nil {
 			return
 		}
-		s.notify.Send(ctx, taID, "คำขอแต่งตั้งผู้ช่วยสอนไม่ผ่านการอนุมัติ",
+		s.notify.Send(ctx, taID, "คำขอแต่งตั้งผู้ช่วยสอนไม่ผ่านการอนุมัติ "+code,
 			fmt.Sprintf("คำขอผู้ช่วยสอนรายวิชา %s %s ซึ่งระบุชื่อท่านเป็นผู้ช่วยสอน ไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/ta")
 	}
 	if err := rows.Err(); err != nil {
@@ -2150,7 +2186,18 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		       u.first_name || ' ' || u.last_name,
 		       (SELECT COUNT(DISTINCT a.ta_id) FROM ta_request_assignments a WHERE a.request_id = r.id),
 		       tc.term_id, at.academic_year, at.semester,
-		       r.decision_checks, r.reimburse_scope::text
+		       r.decision_checks, r.reimburse_scope::text,
+		       -- The summary fields the list fills (requestSummarySelect). Detail
+		       -- embeds TARequestSummary, so leaving them out served is_late,
+		       -- trimmed/dropped counts and can_cancel as zero values — a late
+		       -- request read as on time (UAT DEF-009).
+		       r.is_late,
+		       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'trimmed'),
+		       (SELECT COUNT(*) FROM ta_request_assignments a WHERE a.request_id = r.id AND a.state = 'dropped'),
+		       r.status::text IN ('submitted','approved') AND NOT EXISTS (
+		           SELECT 1 FROM work_logs wl
+		           JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		           WHERE a.request_id = r.id)
 		FROM ta_requests r
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 		JOIN academic_terms at ON at.id = tc.term_id
@@ -2159,7 +2206,8 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		&d.ID, &d.Code, &d.NameTH, &d.Status, &d.SubmittedAt, &d.DecidedAt, &d.DecidedBy, &d.RejectReason,
 		&d.TeachingCourseID, &d.LecturerName, &d.TACount,
 		&d.TermID, &d.AcademicYear, &d.Semester,
-		&checksRaw, &d.ReimburseScope)
+		&checksRaw, &d.ReimburseScope,
+		&d.IsLate, &d.TrimmedCount, &d.DroppedCount, &d.CanCancel)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("ไม่พบคำขอนี้")

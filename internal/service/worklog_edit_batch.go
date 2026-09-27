@@ -272,11 +272,13 @@ func (s *WorkLogService) notifyEditBatch(ctx context.Context, in EditBatchInput,
 		`SELECT code, COALESCE(name_th,'') FROM teaching_courses WHERE id=$1`,
 		in.TeachingCourseID).Scan(&code, &nameTH)
 
-	title := "เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน " + code
 	month := thaiYearMonth(in.YearMonth)
 	if month == "" {
 		month = in.YearMonth
 	}
+	// Month and TA in the title: unread notices fold by (title, link), and the
+	// lecturer's link is one page for every TA of the course.
+	title := "เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน " + code + " " + month + " " + personName(ctx, s.pool, in.TAID)
 	body := fmt.Sprintf("เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานของ %s รายวิชา %s %s ประจำเดือน%s จำนวน %d รายการ เนื่องจาก %s",
 		personName(ctx, s.pool, in.TAID), code, nameTH, month, applied, strings.TrimSpace(in.Reason))
 	if files > 0 {

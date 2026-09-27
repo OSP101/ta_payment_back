@@ -75,12 +75,15 @@ func TestSubmit_CountsAndActionAgreeWhenAMonthIsClosed(t *testing.T) {
 // draft in a closed month cannot be allowed to wedge the months still open.
 func TestSubmit_SendsTheOpenMonthAndLeavesTheClosedOne(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
-	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2)) // month gets closed below
-	// A row in the FOLLOWING month, which stays open.
-	next := monthStart().AddDate(0, 1, 9).Format("2006-01-02")
-	f.mustUpsert(f.entry(next, "09:00", "11:00", 2))
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2)) // this month stays open
+	// A stale draft in the PREVIOUS month, whose period is closed. Inserted
+	// directly: Upsert refuses back-dating into a past month, which is the
+	// point — this is a row left over from before the deadline passed.
+	prev := monthStart().AddDate(0, -1, 9).Format("2006-01-02")
+	f.exec(`INSERT INTO work_logs (assignment_id, work_date, start_time, end_time, hours, activity, status)
+	        VALUES ($1, $2, '09:00', '11:00', 2, 'lecture', 'draft')`, f.AssignmentID, prev)
 
-	f.closeMonth(t, day(10)[5:7])
+	f.closeMonth(t, prev[5:7])
 
 	unsent, submittable := f.submittableCountOf(t)
 	if unsent != 2 || submittable != 1 {
@@ -106,5 +109,31 @@ func TestSubmit_SendsTheOpenMonthAndLeavesTheClosedOne(t *testing.T) {
 	unsent, submittable = f.submittableCountOf(t)
 	if unsent != 1 || submittable != 0 {
 		t.Errorf("after submit: unsent=%d submittable=%d, want 1/0", unsent, submittable)
+	}
+}
+
+// Advance submission is allowed (faculty decision 27/09/2026, UAT WL-06): a
+// day that has not come yet is sent with the rest of the open month — the
+// lecturer's approval and the staff sign-off are the gates, not the calendar.
+func TestSubmit_SendsDaysThatHaveNotHappenedYet(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	next := monthStart().AddDate(0, 1, 9).Format("2006-01-02")
+	f.mustUpsert(f.entry(next, "09:00", "11:00", 2)) // written ahead
+
+	if unsent, submittable := f.submittableCountOf(t); unsent != 2 || submittable != 2 {
+		t.Fatalf("unsent=%d submittable=%d, want 2/2 — future days are sendable", unsent, submittable)
+	}
+	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID); err != nil {
+		t.Fatal(err)
+	}
+	var drafts int
+	if err := f.Pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status <> 'submitted'`,
+		f.AssignmentID).Scan(&drafts); err != nil {
+		t.Fatal(err)
+	}
+	if drafts != 0 {
+		t.Errorf("%d rows left unsent, want 0 — the future day goes too", drafts)
 	}
 }

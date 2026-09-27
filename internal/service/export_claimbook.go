@@ -54,6 +54,9 @@ type claimSheetRow struct {
 	Group string // "ปกติ Sec1-2"
 	Range string // "13.00 - 17.00"
 	Note  string // "สอนปฏิบัติ"
+	// startMin/endMin carry the merged sitting so the book can total what the
+	// sheet prints (SUM × rate) without re-parsing Range.
+	startMin, endMin int
 }
 
 func claimNote(activity string, makeup bool) string {
@@ -111,6 +114,7 @@ func buildClaimSheetRows(rows []claimLogRow, trackWord string) []claimSheetRow {
 			out = append(out, claimSheetRow{
 				Date: k.date, Group: trackWord + " " + secRunLabel(secs),
 				Range: fmtClaimRange(curS, curE), Note: k.note,
+				startMin: curS, endMin: curE,
 			})
 		}
 		for _, r := range g[1:] {
@@ -133,6 +137,15 @@ func buildClaimSheetRows(rows []claimLogRow, trackWord string) []claimSheetRow {
 		return out[i].Range < out[j].Range
 	})
 	return out
+}
+
+// claimRowsHours is the hour total a claim sheet prints for these rows.
+func claimRowsHours(rows []claimSheetRow) float64 {
+	var m int
+	for _, r := range rows {
+		m += r.endMin - r.startMin
+	}
+	return float64(m) / 60
 }
 
 // ttColOf maps minutes-from-midnight onto the grid column (C = 08:00, one

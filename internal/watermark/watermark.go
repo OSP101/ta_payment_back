@@ -109,7 +109,23 @@ func tiledText(text string) string {
 // dense mark buys is different and still useful: every capture carries the
 // identity of the officer who opened it, so a leak is attributable and a forged
 // reuse is obvious.
-func applyPDF(src []byte, text string) ([]byte, error) {
+// CheckPDF reports whether src survives the same pdfcpu pass the staff
+// preview stamps it with. Called at upload (UAT DEF-002): a PDF with a broken
+// structure (no xref table, truncated body) used to be accepted and then turned
+// every preview of it into a 500 — the TA had no idea anything was wrong.
+func CheckPDF(src []byte) error {
+	_, err := applyPDF(src, "check")
+	return err
+}
+
+func applyPDF(src []byte, text string) (out []byte, err error) {
+	// pdfcpu panics on some malformed input instead of returning an error
+	// (same reason docs_review.go's merge recovers).
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = nil, fmt.Errorf("pdfcpu panicked while watermarking: %v", r)
+		}
+	}()
 	// Faint enough that the form underneath stays readable, repeated often
 	// enough that no crop escapes it — legibility is governed by opacity here,
 	// not by density. mode:2 is fill+stroke, which keeps thin glyphs visible
@@ -121,12 +137,12 @@ func applyPDF(src []byte, text string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out bytes.Buffer
+	var buf bytes.Buffer
 	conf := pdfmodel.NewDefaultConfiguration()
-	if err := pdfapi.AddWatermarks(bytes.NewReader(src), &out, nil, wm, conf); err != nil {
+	if err := pdfapi.AddWatermarks(bytes.NewReader(src), &buf, nil, wm, conf); err != nil {
 		return nil, err
 	}
-	return out.Bytes(), nil
+	return buf.Bytes(), nil
 }
 
 // applyImage draws the text tiled across the image at a low opacity so it is

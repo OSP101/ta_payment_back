@@ -91,3 +91,34 @@ func TestLecturerOverview_HoursAreSittingsSplitByTrack(t *testing.T) {
 			"sitting was counted per section", found.HoursPending, found.HoursPendingRegular, found.HoursPendingSpecial)
 	}
 }
+
+// UAT DEF-007: the card priced ภาคพิเศษ hours without the monthly cap, so
+// CP423324 read ฿3,950 while the claim paid ฿3,400. 45 approved special hours
+// at ฿50 in one month are ฿2,250 raw but ฿2,000 paid; 10 hours the next month
+// are under the cap and count in full.
+func TestTaOverview_SpecialTrackIsCappedPerMonth(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Track: "special", Rates: rateOverrides{UndergradSpecial: 50}})
+	f.exec(`UPDATE pay_rates SET ug_special_monthly_cap = 2000`)
+	next := monthStart().AddDate(0, 1, 0)
+	for i := 0; i < 9; i++ { // 9 × 5h = 45h this month
+		f.exec(`INSERT INTO work_logs (assignment_id, work_date, start_time, end_time, hours, activity, status)
+		        VALUES ($1, $2, '08:00', '13:00', 5, 'lecture', 'approved')`, f.AssignmentID, day(i+1))
+	}
+	for i := 0; i < 2; i++ { // 2 × 5h = 10h next month
+		f.exec(`INSERT INTO work_logs (assignment_id, work_date, start_time, end_time, hours, activity, status)
+		        VALUES ($1, $2, '08:00', '13:00', 5, 'lecture', 'approved')`,
+			f.AssignmentID, next.AddDate(0, 0, i).Format("2006-01-02"))
+	}
+
+	dash := &DashboardService{pool: f.Pool}
+	rows, err := dash.TaOverview(f.ctx, f.TAID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if r := rows[0]; r.EstimatedBahtSpecial != 2500 || r.EstimatedBaht != 2500 {
+		t.Errorf("special baht = %.0f (total %.0f), want 2500 = 2000 capped + 500", r.EstimatedBahtSpecial, r.EstimatedBaht)
+	}
+}

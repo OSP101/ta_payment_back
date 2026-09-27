@@ -190,8 +190,8 @@ func (s *DashboardService) staffing(ctx context.Context, out *TermAnalytics, tid
 		                                  ORDER BY tl.is_primary DESC, u.first_name)
 		                  FROM teaching_lecturers tl JOIN users u ON u.id = tl.lecturer_id
 		                  WHERE tl.teaching_course_id = tc.id), '{}'),
-		       (tc.num_students_regular = 0
-		        OR (tc.num_students_special = 0
+		       ((tc.num_students_regular = 0 AND NOT tc.num_students_regular_entered)
+		        OR (tc.num_students_special = 0 AND NOT tc.num_students_special_entered
 		            AND EXISTS (SELECT 1 FROM sections sx
 		                        WHERE sx.teaching_course_id = tc.id AND sx.track = 'special'))),
 		       COALESCE(live.requested, 0), COALESCE(live.approved, 0), COALESCE(live.pending, FALSE),
@@ -354,7 +354,7 @@ func (s *DashboardService) monthFlow(ctx context.Context, out *TermAnalytics, ti
 	meta := map[uuid.UUID]periodMeta{}
 	prow, err := s.pool.Query(ctx, `
 		SELECT id, year_month, COALESCE(label, ''), due_date, remind_days_before, is_closed
-		FROM submission_periods WHERE term_id = $1 ORDER BY year_month`, tid)
+		FROM submission_periods WHERE term_id = $1 ORDER BY `+periodOrderSQL("year_month"), tid)
 	if err != nil {
 		return err
 	}

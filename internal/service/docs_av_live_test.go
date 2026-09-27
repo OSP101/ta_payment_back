@@ -70,7 +70,7 @@ func TestLiveAV_InfectedUploadRefusedAndNotStored(t *testing.T) {
 	}
 
 	// A clean PDF goes through the real scanner and is stored.
-	clean := append([]byte("%PDF-1.7\n"), bytes.Repeat([]byte("clean "), 500)...)
+	clean := pdfBytes()
 	if _, err := svc.Upload(ctx, uid, "national_id", "clean.pdf",
 		"application/pdf", int64(len(clean)), bytes.NewReader(clean)); err != nil {
 		t.Fatalf("clean upload refused by the live scanner: %v", err)

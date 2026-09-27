@@ -371,8 +371,10 @@ func TestUpsert_EditExcludesOwnRowFromCaps(t *testing.T) {
 	}
 }
 
-// Once any row has been submitted or approved the assignment stops accepting
-// new rows, so hours cannot be inflated after review has begun.
+// Once part of a month is under review, a new row may not be back-filled
+// before the sent days, so hours cannot be inflated after review has begun.
+// (A later day, or a makeup day, may still be added — UAT DEF-004, see
+// TestUpsert_NewRowInAPartlySentMonth.)
 func TestUpsert_NoNewRowsAfterSubmission(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	d := day(10)
@@ -380,9 +382,9 @@ func TestUpsert_NoNewRowsAfterSubmission(t *testing.T) {
 	f.mustUpsert(f.entry(d, "08:00", "10:00", 2))
 	f.exec(`UPDATE work_logs SET status='submitted' WHERE assignment_id=$1`, f.AssignmentID)
 
-	_, err := f.upsert(f.entry(day(11), "08:00", "10:00", 2))
+	_, err := f.upsert(f.entry(day(9), "08:00", "10:00", 2))
 	if err == nil {
-		t.Fatal("new rows must be refused once the assignment is under review")
+		t.Fatal("a day before the sent ones must be refused once the month is under review")
 	}
 }
 

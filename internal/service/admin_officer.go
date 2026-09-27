@@ -39,6 +39,10 @@ type AdminOfficer struct {
 	// IsHead marks the head-of-department seat, which certifies claim forms.
 	// Derived the same way and for the same reason as IsDean.
 	IsHead bool `json:"is_head"`
+	// CanSignForDean is signer_authority's CanSignForDean for this seat, so the
+	// appointment-order screen lists only officers the order will accept
+	// instead of offering a head of department and failing on submit.
+	CanSignForDean bool `json:"can_sign_for_dean"`
 	// LinkedEmail/LinkedActive describe the account UserID points at, so the
 	// settings screen can show which account backs a seat and flag one whose
 	// account has since been deactivated. Nil only for a pre-migration row
@@ -114,6 +118,7 @@ func (s *AdminOfficerService) List(ctx context.Context, includeInactive, privile
 			o.LinkedActive = nil
 		}
 		o.IsDean = IsDeanTitle(o.Title)
+		o.CanSignForDean = CanSignForDean(o.Title)
 		o.IsHead = IsHeadTitle(o.Title)
 		out = append(out, o)
 	}
@@ -157,6 +162,7 @@ func (s *AdminOfficerService) Upsert(ctx context.Context, actor uuid.UUID, in Ad
 	}
 	// Derived, so a client that posts it back cannot contradict the title.
 	in.IsDean = IsDeanTitle(in.Title)
+	in.CanSignForDean = CanSignForDean(in.Title)
 	in.IsHead = IsHeadTitle(in.Title)
 
 	// An administrative seat changing hands decides who signs the claim

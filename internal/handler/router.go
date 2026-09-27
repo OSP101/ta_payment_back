@@ -135,7 +135,20 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// the body is never trusted for anything beyond "sync now", so accepting
 	// an unauthenticated ping costs at most one extra pull against TDBM.
 	tdbmH := &TDBMHandler{Svc: svc}
-	api.Post("/tdbm-webhook", tdbmH.Webhook)
+	// Unauthenticated by design, so it gets its own per-IP ceiling: each ping
+	// starts a full pull the moment the previous one finishes, and without a
+	// limit anyone could keep TDBM (and our sync log) busy back-to-back.
+	webhookLimiter := limiter.New(limiter.Config{
+		Max:        6,
+		Expiration: time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP()
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.SendStatus(fiber.StatusTooManyRequests)
+		},
+	})
+	api.Post("/tdbm-webhook", webhookLimiter, tdbmH.Webhook)
 
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
@@ -313,15 +326,12 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Patch("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.UpdateSection)
 	authed.Delete("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.DeleteSection)
 	authed.Put("/teaching-courses/:id/sections/:sectionId/schedules", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.ReplaceSectionSchedules)
-	// Makeups (วันชดเชย) admit TA as well: the TA who works the rescheduled
-	// class may file its date instead of waiting on the lecturer, otherwise the
-	// period stays unresolved and the TA cannot log the hours. taApproved keeps
-	// an unapproved TA profile out (it passes non-TA roles straight through);
-	// service.assertMakeupManager then requires an approved assignment in THIS
-	// course, so the role alone does not open other people's courses.
-	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.AddMakeup)
-	authed.Post("/teaching-courses/:id/makeup/:sectionId/waive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.WaiveMakeup)
-	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer, rbac.RoleTA), taApproved, th.DeleteMakeup)
+	// Makeups (วันชดเชย) are lecturer/staff/admin only (faculty decision
+	// 27/09/2026: dates come from TDBM and the course, not from TAs). A TA
+	// asks the lecturer through holiday-impacts/:date/remind below.
+	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddMakeup)
+	authed.Post("/teaching-courses/:id/makeup/:sectionId/waive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.WaiveMakeup)
+	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.DeleteMakeup)
 	authed.Get("/teaching-courses/:id/holiday-impacts", th.HolidayImpacts)
 	authed.Post("/teaching-courses/:id/holiday-impacts/:originalDate/remind", RequireRole(rbac.RoleTA), taApproved, th.RemindLecturerAboutMakeup)
 	authed.Post("/teaching-courses/:id/review-date/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddReviewDate)
@@ -419,6 +429,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// TAs can build their weekly class timetable while their documents are
 	// still under review. Worklog submission stays gated below.
 	authed.Put("/me/schedule", RequireRole(rbac.RoleTA), wh.ReplaceClasses)
+	// Staff correction of a TA's timetable after approval (the TA's own save
+	// can only add classes once a request is approved — see
+	// assertNoClassRemovedAfterApproval).
+	authed.Get("/users/:id/schedule", adminOrStaff, wh.ListClassesForTA)
+	authed.Put("/users/:id/schedule", adminOrStaff, wh.ReplaceClassesForTA)
 
 	// Work logs — writes are gated, GET stays open so the TA can preview.
 	wl := &WorkLogHandler{Svc: svc}
@@ -504,7 +519,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 
 	// Export
 	eh := &ExportHandler{Svc: svc}
-	authed.Get("/exports/course/:id.zip", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.CourseZip)
+	authed.Post("/exports/course/:id.zip", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.CourseZip)
 	// Admin-only escape hatch to undo an accidental export lock.
 	authed.Post("/exports/course/:id/unlock", RequireRole(rbac.RoleAdmin), eh.UnlockCourse)
 	// Read-only payout preview — review the numbers before the locking download.

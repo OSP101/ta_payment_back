@@ -58,6 +58,11 @@ type TDBMService struct {
 	// webhook ping) picks it up within the hour regardless.
 	syncMu  sync.Mutex
 	syncing bool
+	// lastWebhook throttles webhook-triggered pulls service-wide. The route is
+	// unauthenticated by decision (see TDBMHandler.Webhook) and its limiter is
+	// per IP, so many addresses could otherwise keep a sync running back to
+	// back and decide when data is re-imported.
+	lastWebhook time.Time
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +261,7 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 	}
 	res.Fetched = len(rows)
 
+	var blocked []string
 	for _, r := range rows {
 		// h_type is undocumented upstream (docs/TDBM-API-requirements.md §3.2),
 		// but confirmed with the college: 'D' is an exam day, not a holiday.
@@ -276,14 +282,39 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 			continue
 		}
 		note := fmt.Sprintf("นำเข้าจาก TDBM (holiday_id=%d, h_type=%s, status=%s)", r.HolidayID, r.HType, r.Status)
-		tag, err := s.pool.Exec(ctx, `
+		// A closure that is new (or moved to a new date) cancels class sittings
+		// exactly like one staff add by hand, so it goes through the same
+		// clearHolidayClasses: unsent lecture/lab drafts on that day are removed,
+		// and sent/approved ones refuse the closure. Without this a TDBM holiday
+		// left the cancelled class billable next to its makeup. A holiday we
+		// already hold on the same date is only renamed — re-checking it every
+		// hour would re-raise the same warning forever.
+		var curDate *string
+		if err := s.pool.QueryRow(ctx,
+			`SELECT holiday_date::text FROM public_holidays WHERE tdbm_holiday_id = $1`, r.HolidayID).Scan(&curDate); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			res.Error = err.Error()
+			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
+			return res
+		}
+		newClosure := curDate == nil || *curDate != r.HDate
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			res.Error = err.Error()
+			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
+			return res
+		}
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO public_holidays (holiday_date, name_th, source, note, tdbm_holiday_id)
 			VALUES ($1::date, $2, 'tdbm', $3, $4)
 			ON CONFLICT (tdbm_holiday_id) DO UPDATE
 			   SET holiday_date = EXCLUDED.holiday_date,
 			       name_th      = EXCLUDED.name_th`,
 			r.HDate, r.Title, note, r.HolidayID)
+		if err == nil && newClosure {
+			err = clearHolidayClasses(ctx, tx, r.HDate, nil, nil)
+		}
 		if err != nil {
+			_ = tx.Rollback(ctx)
 			if isUniqueViolation(err) {
 				// Collided with the (date, source, window) index instead — a second
 				// tdbm_holiday_id landing all-day on a date TDBM already gave us.
@@ -292,6 +323,19 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 				res.Skipped++
 				continue
 			}
+			var ue *UserError
+			if errors.As(err, &ue) {
+				// Sent/approved sittings on the day: not ours to delete. Skip the
+				// holiday and say so in the sync log, where staff look.
+				res.Skipped++
+				blocked = append(blocked, r.HDate)
+				continue
+			}
+			res.Error = err.Error()
+			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
+			return res
+		}
+		if err := tx.Commit(ctx); err != nil {
 			res.Error = err.Error()
 			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 			return res
@@ -303,6 +347,13 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 			// row's fetched/skipped counts are what staff actually check.
 			res.Inserted++
 		}
+	}
+	if len(blocked) > 0 {
+		warn := fmt.Errorf("ข้ามวันหยุดจาก TDBM %d วัน (%s) เพราะมีบันทึกเวลาคาบบรรยาย/ปฏิบัติการที่ส่งหรืออนุมัติแล้วในวันนั้น ให้อาจารย์ตีกลับรายการเหล่านั้นก่อน แล้วซิงก์อีกครั้ง",
+			len(blocked), strings.Join(blocked, ", "))
+		res.Error = warn.Error()
+		s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, warn)
+		return res
 	}
 	s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, nil)
 	return res
@@ -798,17 +849,42 @@ func (s *TDBMService) pairAndApply(ctx context.Context, sectionID uuid.UUID, g h
 	return filled
 }
 
-// applyOneMakeup inserts one makeup_schedules row from one TDBM candidate and
-// marks that candidate consumed, both non-transactionally (a crash between
+// applyOneMakeup inserts one makeup_schedules row from one TDBM candidate
+// (with the cancelled sitting's drafts cleared in the same transaction) and
+// then marks that candidate consumed, non-transactionally (a crash between
 // the two leaves the makeup filed and the TDBM row eligible to be picked up
 // again — resolveSectionMatches + this function's ON CONFLICT DO NOTHING mean
 // the retry is a safe no-op, not a duplicate). Returns 1 on a genuine new
 // insert, 0 if the slot was already filled by something else (a manual entry,
 // or a previous run that didn't get to mark this row applied).
 func (s *TDBMService) applyOneMakeup(ctx context.Context, sectionID uuid.UUID, kindNeeded unresolvedPeriod, entry tdbmCandidate) (int, error) {
+	// Same sitting rules as TeachingService.AddMakeup, now that TDBM is the
+	// only source of makeups besides the lecturer. If the original sitting
+	// already has sent/approved hours the class evidently ran, and a makeup on
+	// top would pay the period twice: leave it for the lecturer to sort out.
+	var taughtRows int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		  FROM work_logs wl
+		  JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		 WHERE a.section_id = $1 AND wl.work_date = $2::date AND wl.activity = $3
+		   AND wl.status IN ('submitted','approved')`,
+		sectionID, kindNeeded.HolidayDate, kindNeeded.Kind).Scan(&taughtRows); err != nil {
+		return 0, err
+	}
+	if taughtRows > 0 {
+		log.Printf("tdbm: auto-fill skip section=%s date=%s kind=%s — %d sent/approved row(s) on the original sitting",
+			sectionID, kindNeeded.HolidayDate, kindNeeded.Kind, taughtRows)
+		return 0, nil
+	}
 	makeupID := uuid.New()
 	note := fmt.Sprintf("นำเข้าอัตโนมัติจาก TDBM (extra_class_id=%d)", entry.ExtraClassID)
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note, kind)
 		VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8)
 		ON CONFLICT (section_id, original_date, kind) DO NOTHING`,
@@ -818,6 +894,20 @@ func (s *TDBMService) applyOneMakeup(ctx context.Context, sectionID uuid.UUID, k
 	}
 	if tag.RowsAffected() == 0 {
 		return 0, nil
+	}
+	// Unsent drafts of the cancelled sitting would ride along into the next
+	// submit next to the makeup — the same cleanup AddMakeup does.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM work_logs wl
+		 USING ta_request_assignments a
+		 WHERE a.id = wl.assignment_id
+		   AND a.section_id = $1 AND wl.work_date = $2::date
+		   AND wl.activity = $3 AND wl.status = 'draft'`,
+		sectionID, kindNeeded.HolidayDate, kindNeeded.Kind); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE tdbm_extra_teachings SET applied_makeup_id = $1 WHERE extra_class_id = $2`,
@@ -934,12 +1024,23 @@ func (s *TDBMService) SyncAll(ctx context.Context, triggerKind string) ([]TDBMSy
 // of holding the connection open for however long three upstream pulls take.
 // A ping that arrives while a sync is already in flight is dropped; see the
 // syncing field's doc comment.
+// webhookSyncCooldown is the least time between two webhook-triggered pulls.
+const webhookSyncCooldown = 2 * time.Minute
+
 func (s *TDBMService) TriggerAsync(triggerKind string) {
 	s.syncMu.Lock()
 	if s.syncing {
 		s.syncMu.Unlock()
 		log.Printf("tdbm: sync already in flight, dropping %s trigger", triggerKind)
 		return
+	}
+	if triggerKind == "webhook" {
+		if time.Since(s.lastWebhook) < webhookSyncCooldown {
+			s.syncMu.Unlock()
+			log.Printf("tdbm: webhook within %s of the last one, dropping", webhookSyncCooldown)
+			return
+		}
+		s.lastWebhook = time.Now()
 	}
 	s.syncing = true
 	s.syncMu.Unlock()

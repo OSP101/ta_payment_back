@@ -91,11 +91,19 @@ type TACourseStatus struct {
 	HoursPending         float64 `json:"hours_pending"`
 	HoursPendingRegular  float64 `json:"hours_pending_regular"`
 	HoursPendingSpecial  float64 `json:"hours_pending_special"`
-	// approved-hours × per-track rate (grad-special = flat, not counted here).
+	// What the approved hours are worth, priced by the export's own per-sitting
+	// ledger (claimCostByTASlot — see TaOverview): co-taught sittings once, B2
+	// overlap off the special side, ป.ตรี-พิเศษ monthly cap. Grad-special = flat,
+	// not counted here.
 	EstimatedBaht        float64 `json:"estimated_baht"`
 	EstimatedBahtRegular float64 `json:"estimated_baht_regular"`
 	EstimatedBahtSpecial float64 `json:"estimated_baht_special"`
-	Level                string  `json:"level"`
+	// LumpsumBaht is the graduate-special flat amount for this course (0 when
+	// the TA is not on a special section as ป.โท/เอก). Hours never price it, so
+	// without this field the TA home card showed ฿0 for a course the budget
+	// screens count at the full lump.
+	LumpsumBaht float64 `json:"lumpsum_baht"`
+	Level       string  `json:"level"`
 }
 
 // TaOverview aggregates every course the TA is on. Read-only. Meant for the
@@ -201,9 +209,59 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 		default:
 			r.Stage = "draft"
 		}
+		if r.Level == "master" || r.Level == "phd" {
+			_ = s.pool.QueryRow(ctx, `
+				SELECT COALESCE(MAX(LEAST(pay_rates.graduate_special_lumpsum, pay_rates.grad_special_term_cap)), 0)
+				  FROM ta_request_assignments a
+				  JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+				  JOIN sections sec  ON sec.id = a.section_id AND sec.track = 'special'
+				  CROSS JOIN `+payRatesInForce+`
+				 WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
+				   AND a.level::text IN ('master','phd') AND a.state <> 'dropped'`, taID, r.TeachingCourseID).Scan(&r.LumpsumBaht)
+		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	// Price the approved work with the claim's own ledger, as budget.go does
+	// for the lecturer card. The sitting sums above are kept only as a
+	// fallback: they merge co-taught sections but miss the B2 overlap between
+	// regular and special sittings at the same clock time and the monthly
+	// cap, so CP423324 read ฿3,950 (then ฿3,450) while the claim paid ฿3,400
+	// (UAT DEF-007).
+	var pr PayRate
+	if err := s.pool.QueryRow(ctx, `
+		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
+		       ug_special_monthly_cap, graduate_special_lumpsum, grad_special_term_cap
+		FROM `+payRatesInForce).Scan(
+		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
+		&pr.UGSpecialMonthlyCap, &pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap); err == nil {
+		exp := &ExportService{pool: s.pool}
+		for i := range out {
+			costs, err := exp.claimCostByTASlot(ctx, out[i].TeachingCourseID, pr, mergedSittingsCTE)
+			if err != nil {
+				continue
+			}
+			var reg, spec float64
+			for _, c := range costs {
+				if c.TA != taID {
+					continue
+				}
+				if c.Track == "regular" {
+					reg += c.Baht
+				} else {
+					spec += c.Baht
+				}
+			}
+			out[i].EstimatedBahtRegular = round2(reg)
+			out[i].EstimatedBahtSpecial = round2(spec)
+			out[i].EstimatedBaht = round2(reg + spec)
+		}
+	}
+	return out, nil
 }
 
 // LecturerCourseStatus is a per-course summary for the lecturer landing page:
@@ -384,8 +442,8 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 	_ = s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM teaching_courses tc
 		WHERE tc.term_id = $1
-		  AND (tc.num_students_regular = 0
-		       OR (tc.num_students_special = 0
+		  AND ((tc.num_students_regular = 0 AND NOT tc.num_students_regular_entered)
+		       OR (tc.num_students_special = 0 AND NOT tc.num_students_special_entered
 		           AND EXISTS (SELECT 1 FROM sections sx
 		                       WHERE sx.teaching_course_id = tc.id AND sx.track = 'special')))`,
 		tid).Scan(&sum.MissingStudentCounts)

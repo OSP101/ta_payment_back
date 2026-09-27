@@ -72,6 +72,15 @@ func (h *UserHandler) UploadAvatarFor(c *fiber.Ctx) error {
 			rbac.Has(targetRoles, rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer) {
 			return fiber.NewError(fiber.StatusForbidden, "forbidden")
 		}
+		// …and only a TA of the lecturer's own courses (or one not on any
+		// course yet). Any-TA let every lecturer replace any student's photo.
+		ok, err := h.Svc.Users.LecturerMayEditTA(c.Context(), UserID(c), id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
 	}
 	return h.uploadAvatarFor(c, id)
 }

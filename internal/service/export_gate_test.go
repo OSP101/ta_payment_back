@@ -209,7 +209,9 @@ func TestExportGate_ExcludesGradSpecialLeftoverRows(t *testing.T) {
 // submission_periods.year_month is Buddhist-era already. Reusing the settlement's
 // Gregorian labeller on it printed "สิงหาคม 3112" — 2569 + 543.
 func TestExportBlockers_MonthLabelsStayBuddhistEra(t *testing.T) {
-	got := thaiMonthLabelsBE([]string{"2569-08", "2569-12", "2570-01"})
+	// Keys are academic-year keys: "2569-01" is มกราคม of academic year 2569,
+	// i.e. calendar มกราคม 2570.
+	got := thaiMonthLabelsBE([]string{"2569-08", "2569-12", "2569-01"})
 	want := []string{"สิงหาคม 2569", "ธันวาคม 2569", "มกราคม 2570"}
 	for i := range want {
 		if got[i] != want[i] {

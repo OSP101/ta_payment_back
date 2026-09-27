@@ -987,6 +987,21 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if s.notify == nil {
 		return 0, nil
 	}
+	// Once per term per round every 12 hours. Each press mails every unsigned
+	// lecturer (or TA); unthrottled, an impatient double-click or a stuck
+	// button sent the whole list again each time.
+	var recent bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM audit_logs
+		                WHERE action = 'signature_checklist.remind'
+		                  AND entity_id = $1 AND note = $2
+		                  AND at > NOW() - INTERVAL '12 hours')`,
+		termID.String(), fmt.Sprintf("round=%d", round)).Scan(&recent); err != nil {
+		return 0, err
+	}
+	if recent {
+		return 0, Invalid("ส่งแจ้งเตือนรอบนี้ไปแล้วภายใน 12 ชั่วโมงที่ผ่านมา กรุณารอก่อนส่งซ้ำ")
+	}
 	var rows pgx.Rows
 	switch round {
 	case 1:
@@ -1055,10 +1070,10 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 		body := "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนที่รอการลงนามของท่าน ในรายวิชา " +
 			strings.Join(byUser[uid], ", ") + roundNote +
 			"\n\nขอให้ท่านลงนามในเอกสารดังกล่าว เพื่อให้สามารถดำเนินการเบิกจ่ายในขั้นตอนต่อไปได้"
-		s.notify.SendAction(ctx, uid, "เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม", body, "/document-progress")
+		s.notify.SendAction(ctx, uid, fmt.Sprintf("เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม รอบที่ %d", round), body, "/document-progress")
 	}
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind",
-		Entity: "academic_term", EntityID: termID.String(),
+		Entity: "academic_term", EntityID: termID.String(), Note: fmt.Sprintf("round=%d", round),
 		After: map[string]any{"notified": len(order), "round": round}}); err != nil {
 		return 0, err
 	}

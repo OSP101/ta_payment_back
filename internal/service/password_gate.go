@@ -210,11 +210,11 @@ func VerifyUserPassword(ctx context.Context, pool *pgxpool.Pool, actor uuid.UUID
 		// slip lock an officer out.
 		return &UserError{Status: 401, Msg: "ต้องกรอกรหัสผ่านเพื่อยืนยันตัวตน"}
 	}
-	var hash string
+	var hashPtr *string
 	err := pool.QueryRow(ctx,
 		`SELECT password_hash FROM users WHERE id = $1 AND is_active AND deleted_at IS NULL`,
 		actor,
-	).Scan(&hash)
+	).Scan(&hashPtr)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Also not counted: there is no password to find here, so no amount of
 		// trying reveals one.
@@ -223,6 +223,12 @@ func VerifyUserPassword(ctx context.Context, pool *pgxpool.Pool, actor uuid.UUID
 	if err != nil {
 		return err
 	}
+	// An SSO account whose temporary password was retired has no local
+	// password at all. Not counted as a guess; tell them how to get one.
+	if hashPtr == nil || *hashPtr == "" {
+		return &UserError{Status: 401, Msg: "บัญชีนี้ยังไม่ได้ตั้งรหัสผ่านของระบบ กรุณาตั้งรหัสผ่านที่หน้าบัญชีของฉันก่อน"}
+	}
+	hash := *hashPtr
 	if !auth.CheckPassword(hash, password) {
 		pwGateFail(actor)
 		return &UserError{Status: 401, Msg: "รหัสผ่านไม่ถูกต้อง"}

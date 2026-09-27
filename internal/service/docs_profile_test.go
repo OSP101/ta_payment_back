@@ -139,7 +139,7 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 
 	if err := svc.UpsertProfile(ctx, uid, TAProfile{
 		StudentID: "653020111-1", Prefix: "นาย", Phone: "0812345678",
-		NationalID: "1-2345-67890-12-3",
+		NationalID: "1-2345-67890-12-1",
 		BankName:   "ธนาคารไทยพาณิชย์", BankBranch: "สาขามหาวิทยาลัยขอนแก่น",
 		BranchCode: "1234", AccountNo: "4091290303", AccountName: "นาย สุพพิธาน ภักสวัสดิ์",
 		SignatureSVG: "<svg><path d='M0 0 L9 9'/></svg>", SignaturePNGB64: "iVBORw0KGgo=",
@@ -188,9 +188,9 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 		t.Error("citizen_id_enc was not written")
 	}
 	// NationalID is stripped to digits before storage (see validateProfileInput)
-	// — "1-2345-67890-12-3" becomes "1234567890123", so last4 is "0123".
-	if last4 != "0123" {
-		t.Errorf("citizen_id_last4 = %q, want 0123 (digits-only form of ...12-3)", last4)
+	// — "1-2345-67890-12-1" becomes "1234567890121", so last4 is "0121".
+	if last4 != "0121" {
+		t.Errorf("citizen_id_last4 = %q, want 0121 (digits-only form of ...12-1)", last4)
 	}
 
 	// The workflow state IS recorded, so the checklist can tell a submitted

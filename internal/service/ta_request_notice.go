@@ -111,7 +111,10 @@ func (s *TARequestService) sweepWindowNotices(ctx context.Context, only []uuid.U
 		       'ภาคการศึกษาที่ ' || t.semester::text || ' ปีการศึกษา ' || t.academic_year::text
 		  FROM (`+noticeWindowsSQL+`) w
 		  JOIN academic_terms t ON t.id = w.term_id
-		 WHERE `+noticeWindowLive)
+		 WHERE `+noticeWindowLive+`
+		   -- A term that has already finished teaching has nothing to request
+		   -- TAs for; re-saving an old window must not mail every lecturer.
+		   AND (t.ends_on IS NULL OR t.ends_on >= CURRENT_DATE)`)
 	if err != nil {
 		return 0, err
 	}
@@ -304,7 +307,9 @@ func noticeCourseTable(title string, courses []noticeCourse) *MailTable {
 		if c.requested {
 			status = "ยื่นคำขอแล้ว"
 		}
-		t.Rows = append(t.Rows, []string{c.code, c.name, fmt.Sprintf("%d", c.sections), status})
+		// The unit travels with the number: the plain-text part of the mail
+		// has no header row, and a bare "2" there read as nothing.
+		t.Rows = append(t.Rows, []string{c.code, c.name, fmt.Sprintf("%d กลุ่ม", c.sections), status})
 	}
 	return t
 }

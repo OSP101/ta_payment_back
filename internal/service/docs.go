@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"ta-payment-back/internal/pdfgen"
 	"ta-payment-back/internal/pii"
 	"ta-payment-back/internal/storage"
+	"ta-payment-back/internal/watermark"
 )
 
 type DocsService struct {
@@ -213,30 +215,39 @@ var AllowedPrefixes = map[string]bool{
 func validateProfileInput(in *TAProfile) error {
 	nid := stripNonDigits(in.NationalID)
 	if len(nid) != 13 {
-		return errors.New("national_id must be 13 digits")
+		return Invalid("เลขบัตรประชาชนต้องเป็นตัวเลข 13 หลัก")
+	}
+	// The 13th digit is a check digit. A single mistyped digit otherwise went
+	// straight onto the creditor form and the transfer cover sent to finance,
+	// and surfaced only as a failed bank transfer weeks later.
+	if !validThaiCitizenID(nid) {
+		return Invalid("เลขบัตรประชาชนไม่ถูกต้อง (หลักตรวจสอบไม่ตรง) กรุณาตรวจสอบอีกครั้ง")
 	}
 	in.NationalID = nid
 
 	sid := strings.TrimSpace(in.StudentID)
 	if !studentIDPattern(sid) {
-		return errors.New("student_id must be in the form XXXXXXXXX-X (11 chars incl. dash)")
+		return Invalid("รหัสนักศึกษาต้องอยู่ในรูปแบบ XXXXXXXXX-X")
 	}
 	in.StudentID = sid
 	if !AllowedPrefixes[in.Prefix] {
-		return errors.New("prefix must be one of นาย, นาง, or นางสาว")
+		return Invalid("คำนำหน้าต้องเป็น นาย, นาง หรือ นางสาว")
 	}
 	// Phone goes onto the creditor form, so require a dialable TH number:
 	// 9 digits (landline) or 10 (mobile).
 	phone := stripNonDigits(in.Phone)
 	if len(phone) != 9 && len(phone) != 10 {
-		return errors.New("phone must be 9-10 digits")
+		return Invalid("เบอร์โทรศัพท์ต้องเป็นตัวเลข 9–10 หลัก")
 	}
 	in.Phone = phone
 	if err := validateBank(*in); err != nil {
 		return err
 	}
 	if strings.TrimSpace(in.SignatureSVG) == "" {
-		return errors.New("signature is required")
+		return Invalid("กรุณาเซ็นชื่อในช่องลายเซ็น")
+	}
+	if !safeSignatureSVG(in.SignatureSVG) {
+		return Invalid("ข้อมูลลายเซ็นไม่ถูกต้อง กรุณาเซ็นใหม่")
 	}
 	// Signature payloads are user-controlled and otherwise unbounded; cap both
 	// the SVG path data and the rasterized PNG so a client can't wedge a request.
@@ -547,7 +558,7 @@ func (s *DocsService) assertMayStoreDocument(ctx context.Context, userID uuid.UU
 
 func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filename, mime string, size int64, r io.Reader) (uuid.UUID, error) {
 	if !DocKinds[kind] {
-		return uuid.Nil, errors.New("invalid document kind")
+		return uuid.Nil, Invalid("ประเภทเอกสารไม่ถูกต้อง")
 	}
 	// Both rules below live HERE, at the one function every document write goes
 	// through, rather than on individual routes. They used to be enforced only
@@ -604,6 +615,14 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 	// indexed, and briefly downloadable.
 	if err := s.scanUpload(ctx, userID, kind, filename, buf); err != nil {
 		return uuid.Nil, err
+	}
+
+	// A "%PDF" header is not a readable PDF. Run the file through the same
+	// pass the staff preview uses, so what is accepted here is what an officer
+	// can open (UAT DEF-002). After the scan, so pdfcpu never parses bytes the
+	// scanner has not cleared.
+	if err := watermark.CheckPDF(buf); err != nil {
+		return uuid.Nil, Invalid("ไฟล์ PDF นี้เสียหาย ตั้งรหัสผ่านไว้ หรือเปิดอ่านไม่ได้ กรุณาบันทึกหรือส่งออกเป็น PDF ใหม่ (ไม่ตั้งรหัสผ่าน) แล้วอัปโหลดอีกครั้ง")
 	}
 
 	key, savedSize, err := s.store.Save("ta_docs", filename, bytes.NewReader(buf))
@@ -1351,21 +1370,53 @@ func (s *DocsService) AttachGeneratedCreditorForm(ctx context.Context, userID uu
 	return s.Upload(ctx, userID, "creditor_form", filename, "application/pdf", int64(len(body)), bytes.NewReader(body))
 }
 
+// validThaiCitizenID checks the mod-11 check digit of a 13-digit Thai citizen
+// ID: digit 13 = (11 − Σ dᵢ·(14−i) mod 11) mod 10 over the first 12 digits.
+func validThaiCitizenID(nid string) bool {
+	if len(nid) != 13 || !isAllDigits(nid) {
+		return false
+	}
+	sum := 0
+	for i := 0; i < 12; i++ {
+		sum += int(nid[i]-'0') * (13 - i)
+	}
+	return (11-sum%11)%10 == int(nid[12]-'0')
+}
+
+// safeSignatureSVG accepts only the path-only drawing the signature pad emits.
+// The SVG is stored and could one day be rendered for review; anything able to
+// run or fetch — scripts, event handlers, links, foreign content — is refused
+// up front rather than trusted to every future renderer to strip.
+func safeSignatureSVG(svg string) bool {
+	low := strings.ToLower(svg)
+	if !strings.HasPrefix(strings.TrimSpace(low), "<svg") {
+		return false
+	}
+	for _, bad := range []string{"<script", "javascript:", "foreignobject", "href", "<iframe", "<image", "<use", "data:"} {
+		if strings.Contains(low, bad) {
+			return false
+		}
+	}
+	return !signatureEventAttr.MatchString(low)
+}
+
+var signatureEventAttr = regexp.MustCompile(`\son[a-z]+\s*=`)
+
 func validateBank(p TAProfile) error {
 	name := strings.TrimSpace(p.BankName)
 	if name == "" {
-		return errors.New("bank_name is required")
+		return Invalid("กรุณาเลือกธนาคาร")
 	}
 	bank := lookupBank(name)
 	if bank == nil {
-		return errors.New("bank_name is not in the accepted list")
+		return Invalid("ธนาคารที่เลือกไม่อยู่ในรายการที่รองรับ")
 	}
 	if strings.TrimSpace(p.AccountName) == "" {
-		return errors.New("account_name is required")
+		return Invalid("กรุณากรอกชื่อบัญชี")
 	}
 	acct := stripNonDigits(p.AccountNo)
 	if !acceptsAccountLen(bank, len(acct)) {
-		return errors.New("account_no length does not match the selected bank")
+		return Invalid("จำนวนหลักของเลขที่บัญชีไม่ตรงกับธนาคารที่เลือก กรุณาตรวจสอบอีกครั้ง")
 	}
 	return nil
 }

@@ -402,7 +402,7 @@ func stepTADocs(ctx context.Context, svc *service.Container) (string, error) {
 			StudentID:    fmt.Sprintf("64500000%d-%d", i+1, i+1),
 			Prefix:       "นาย",
 			Phone:        "0800000000",
-			NationalID:   "1234567890123",
+			NationalID:   "1234567890121", // passes the check digit, belongs to no one
 			BankName:     "ธนาคารกรุงไทย",
 			BankBranch:   "สาขามหาวิทยาลัยขอนแก่น",
 			BranchCode:   "0000",

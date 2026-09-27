@@ -187,6 +187,12 @@ func (h *AuthHandler) SSOExchange(c *fiber.Ctx) error {
 		switch {
 		case errors.Is(err, service.ErrSSORejected):
 			return fiber.NewError(fiber.StatusUnauthorized, ssoRejectedMsg)
+		case errors.As(err, &noAcct) && noAcct.Inactive:
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error":     "บัญชี " + noAcct.Email + " ถูกปิดการใช้งาน กรุณาติดต่อเจ้าหน้าที่วิทยาลัยหากต้องการเปิดใช้งานอีกครั้ง",
+				"code":      "sso_account_inactive",
+				"kku_email": noAcct.Email,
+			})
 		case errors.As(err, &noAcct):
 			// The address goes in the message itself: the frontend's
 			// ApiError only carries `error`, and the address is the one
@@ -303,6 +309,10 @@ func (h *AuthHandler) Heartbeat(c *fiber.Ctx) error {
 type meResponse struct {
 	*service.User
 	SelectedEnrollmentID *uuid.UUID `json:"selected_enrollment_id,omitempty"`
+	// MFASetupRequired is AccountGuard's own verdict, so the frontend redirect
+	// to /setup-2fa follows the same rule — including MFA_MANDATORY_ENFORCED —
+	// instead of re-deriving it from roles and ignoring the kill switch.
+	MFASetupRequired bool `json:"mfa_setup_required"`
 }
 
 func (h *AuthHandler) Me(c *fiber.Ctx) error {
@@ -310,7 +320,9 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return c.JSON(meResponse{User: u, SelectedEnrollmentID: SelectedEnrollmentID(c)})
+	need := !u.TOTPEnabled && h.Svc.Cfg.MFAMandatoryEnforced && !h.Svc.Cfg.IsDemoSlot &&
+		mfaMandatoryFor(u.Roles, u.IsExecutive)
+	return c.JSON(meResponse{User: u, SelectedEnrollmentID: SelectedEnrollmentID(c), MFASetupRequired: need})
 }
 
 // DataExport answers the PDPA "what do you have on me" request — see

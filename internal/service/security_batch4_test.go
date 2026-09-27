@@ -129,9 +129,13 @@ func TestAuditBeforeImages_ChainUnderConcurrentEdits(t *testing.T) {
 func TestReplaceClasses_IsAudited(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	svc := &WorkloadService{pool: f.Pool, aud: audit.New(f.Pool)}
-	if err := svc.ReplaceClasses(f.ctx, f.TAID, f.TermID, []ClassBlock{{
-		CourseCode: "ZZ111", Kind: "lecture", DayOfWeek: 2, StartTime: "13:00", EndTime: "15:00",
-	}}); err != nil {
+	// The fixture's TA already holds an approved assignment, so the save keeps
+	// the existing ZZ000 class and ADDS one — removing a class after approval
+	// is refused (see TestReplaceClasses_RefusesRemovalAfterApproval).
+	if err := svc.ReplaceClasses(f.ctx, f.TAID, f.TermID, []ClassBlock{
+		{CourseCode: "ZZ000", Kind: "lecture", DayOfWeek: 0, StartTime: "07:00", EndTime: "08:00"},
+		{CourseCode: "ZZ111", Kind: "lecture", DayOfWeek: 2, StartTime: "13:00", EndTime: "15:00"},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var before, after string
@@ -145,6 +149,37 @@ func TestReplaceClasses_IsAudited(t *testing.T) {
 	}
 	if !strings.Contains(after, "ZZ111") {
 		t.Errorf("after-image should hold the new timetable, got %s", after)
+	}
+}
+
+// A TA with an approved assignment cannot win back trimmed periods by deleting
+// or shortening a class from their own timetable; staff can
+// (ReplaceClassesForTA), and adding classes stays self-service.
+func TestReplaceClasses_RefusesRemovalAfterApproval(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	svc := &WorkloadService{pool: f.Pool, aud: audit.New(f.Pool)}
+	err := svc.ReplaceClasses(f.ctx, f.TAID, f.TermID, []ClassBlock{{
+		CourseCode: "ZZ111", Kind: "lecture", DayOfWeek: 2, StartTime: "13:00", EndTime: "15:00",
+	}})
+	if err == nil {
+		t.Fatal("a TA removed a class from their timetable after approval")
+	}
+	// Shortening counts as removal too.
+	if err := svc.ReplaceClasses(f.ctx, f.TAID, f.TermID, []ClassBlock{{
+		CourseCode: "ZZ000", Kind: "lecture", DayOfWeek: 0, StartTime: "07:00", EndTime: "07:30",
+	}}); err == nil {
+		t.Fatal("a TA shortened a class after approval")
+	}
+	// Staff may make the correction, audited under the staff member.
+	if err := svc.ReplaceClassesForTA(f.ctx, f.StaffID, f.TAID, f.TermID, []ClassBlock{{
+		CourseCode: "ZZ111", Kind: "lecture", DayOfWeek: 2, StartTime: "13:00", EndTime: "15:00",
+	}}); err != nil {
+		t.Fatalf("staff correction refused: %v", err)
+	}
+	var n int
+	if err := f.Pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM audit_logs
+		WHERE action = 'ta_class_schedule.replace' AND actor_id = $1`, f.StaffID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("staff correction not audited under staff: n=%d err=%v", n, err)
 	}
 }
 

@@ -99,8 +99,9 @@ func TestApproveMany_ApprovesEvenWhenItExceedsTheCourseBudget(t *testing.T) {
 	f, sibling := twoSectionFixture(t, fixtureOpts{
 		Rates: rateOverrides{UGRegularDailyCap: 24},
 	})
-	// Price an hour so this batch cannot possibly fit the course budget.
-	f.exec(`UPDATE pay_rates SET undergrad_regular = 999999`)
+	// Price an hour so this batch cannot possibly fit the course budget. Daily
+	// pay cap off: this is about the course budget (see DEF-005's day re-check).
+	f.exec(`UPDATE pay_rates SET undergrad_regular = 999999, daily_pay_cap_baht = 0`)
 
 	if err := f.Svc.ApproveMany(f.ctx, f.LecturerID,
 		[]uuid.UUID{f.AssignmentID, sibling}, "", false); err != nil {

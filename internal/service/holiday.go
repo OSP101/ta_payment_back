@@ -175,18 +175,48 @@ func (s *HolidayService) Create(ctx context.Context, actor uuid.UUID, in Holiday
 				`INSERT INTO public_holidays (id, holiday_date, name_th, name_en, source, note, start_time, end_time, created_by)
 				 VALUES ($1, $2::date, $3, $4, $5, $6, $7::time, $8::time, $9)`,
 				id, in.HolidayDate, in.NameTH, in.NameEN, source, in.Note, startT, endT, actor)
+			if err != nil && !isUniqueViolation(err) {
+				return err
+			}
 			if err != nil {
 				// Postgres 23505 = unique_violation on (date, source, window). Two windows
 				// on one date are allowed, so name the window in the message — otherwise
 				// "มีวันหยุดอยู่แล้ว" reads as a lie to someone adding the afternoon half.
-				return Invalid(fmt.Sprintf("มีวันหยุดสำหรับวันที่ %s (%s, %s) อยู่แล้ว",
-					in.HolidayDate, source, holidayWindowLabelTH(startT, endT)))
+				return Invalid(fmt.Sprintf("มีวันหยุดสำหรับวันที่ %s (ประเภท%s, %s) อยู่แล้ว",
+					thaiLongDateISO(in.HolidayDate), holidaySourceLabelTH(source), holidayWindowLabelTH(startT, endT)))
 			}
-			return nil
+			return clearHolidayClasses(ctx, tx, in.HolidayDate, startT, endT)
 		}); err != nil {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+// clearHolidayClasses runs in the same transaction as a new closure. Work
+// logged for a class sitting that the closure now cancels would otherwise
+// stay payable: Submit does not re-validate drafts, and sent/approved rows
+// are never re-checked at all — so a holiday added after the fact paid the
+// cancelled class AND, once the holiday page asked for one, its makeup.
+//
+// Sent or approved sittings refuse the closure (a lecturer has to bounce them
+// first, so the decision is visible); unsent drafts of lecture/lab sittings
+// inside the closure are removed.
+func clearHolidayClasses(ctx context.Context, tx pgx.Tx, date string, startT, endT *string) error {
+	overlap := `wl.work_date = $1::date AND wl.activity IN ('lecture','lab')
+	            AND ($2::time IS NULL OR $3::time IS NULL
+	                 OR (wl.start_time < $3::time AND wl.end_time > $2::time))`
+	var sent int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM work_logs wl WHERE `+overlap+
+		` AND wl.status IN ('submitted','approved')`, date, startT, endT).Scan(&sent); err != nil {
+		return err
+	}
+	if sent > 0 {
+		return Conflict(fmt.Sprintf(
+			"วันที่ %s มีบันทึกเวลาคาบบรรยาย/ปฏิบัติการที่ส่งหรืออนุมัติแล้ว %d รายการ ถ้าวันนั้นเป็นวันหยุดจริง ให้อาจารย์ตีกลับรายการเหล่านั้นก่อน แล้วจึงเพิ่มวันหยุด",
+			date, sent))
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM work_logs wl WHERE `+overlap+` AND wl.status = 'draft'`, date, startT, endT)
+	return err
 }
 
 // BulkCreate inserts many holidays at once, silently skipping duplicates via
@@ -230,6 +260,11 @@ func (s *HolidayService) BulkCreate(ctx context.Context, actor uuid.UUID, ins []
 		if err != nil {
 			return 0, err
 		}
+		if tag.RowsAffected() > 0 {
+			if err := clearHolidayClasses(ctx, tx, in.HolidayDate, startT, endT); err != nil {
+				return 0, err
+			}
+		}
 		inserted += int(tag.RowsAffected())
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "holiday.bulk_create", Entity: "holiday", Note: fmt.Sprintf("inserted %d/%d", inserted, len(ins))}); err != nil {
@@ -261,19 +296,24 @@ func (s *HolidayService) Patch(ctx context.Context, actor, id uuid.UUID, nameTH 
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "holiday.patch", Entity: "holiday", EntityID: id.String()},
 		func(tx pgx.Tx) error {
-			tag, err := tx.Exec(ctx,
+			var date string
+			err := tx.QueryRow(ctx,
 				`UPDATE public_holidays SET name_th=$1, name_en=$2, note=$3, start_time=$4::time, end_time=$5::time
-				 WHERE id=$6`,
-				nameTH, nameEN, note, startT, endT, id)
-			if err != nil {
-				// Only reachable via the unique index: the edited window now collides with
-				// another row on the same date+source.
-				return Invalid(fmt.Sprintf("มีวันหยุดของวันนี้ในช่วงเวลา %s อยู่แล้ว", holidayWindowLabelTH(startT, endT)))
-			}
-			if tag.RowsAffected() == 0 {
+				 WHERE id=$6 RETURNING holiday_date::text`,
+				nameTH, nameEN, note, startT, endT, id).Scan(&date)
+			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrNotFound
 			}
-			return nil
+			if isUniqueViolation(err) {
+				// The edited window now collides with another row on the same date+source.
+				return Invalid(fmt.Sprintf("มีวันหยุดของวันนี้ในช่วงเวลา %s อยู่แล้ว", holidayWindowLabelTH(startT, endT)))
+			}
+			if err != nil {
+				return err
+			}
+			// Widening the window (or making it whole-day) cancels more sittings,
+			// exactly like a new closure — same refusal and draft cleanup as Create.
+			return clearHolidayClasses(ctx, tx, date, startT, endT)
 		})
 }
 
@@ -496,6 +536,18 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 	if !owns {
 		return ErrForbidden
 	}
+	// Only a real closure can need a makeup. Without this the throttle below —
+	// keyed by date — was trivially sidestepped by picking another date, and a
+	// TA could mail the lecturer once per calendar day of the term.
+	var isHoliday bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM public_holidays WHERE holiday_date = $1::date)`,
+		originalDate).Scan(&isHoliday); err != nil {
+		return err
+	}
+	if !isHoliday {
+		return Invalid("วันที่เลือกไม่ใช่วันหยุด จึงไม่ต้องกำหนดวันชดเชย")
+	}
 	// Throttle: reject if we sent a reminder for this trio in the last 24h.
 	var lastSent *time.Time
 	if err := s.pool.QueryRow(ctx, `
@@ -558,14 +610,11 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		body += "\nหมายเหตุ: " + note
 	}
 	link := fmt.Sprintf("/lecturer/courses/%s/holidays", tcID.String())
-	if s.notify != nil {
-		for _, lid := range lecturerIDs {
-			s.notify.SendAction(ctx, lid, "ผู้ช่วยสอนแจ้งให้กำหนดวันสอนชดเชย", body, link)
-		}
-	}
-	// Audit + rate-limit ledger. The ledger is what stops a TA sending the same
-	// reminder repeatedly, so it and its audit row have to agree.
-	return writeAudited(ctx, s.pool, s.aud,
+	// Audit + rate-limit ledger FIRST. The ledger is what stops a TA sending the
+	// same reminder repeatedly; mailing before it was written meant a failed
+	// insert returned an error, the TA retried, and the lecturers were mailed
+	// again with nothing recorded.
+	if err := writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &taID, Action: "holiday.remind", Entity: "teaching_course", EntityID: tcID.String(), Note: originalDate},
 		func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx,
@@ -573,7 +622,15 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 				 VALUES ($1, $2, $3::date, $4)`,
 				taID, tcID, originalDate, nilStrOrEmpty(note))
 			return err
-		})
+		}); err != nil {
+		return err
+	}
+	if s.notify != nil {
+		for _, lid := range lecturerIDs {
+			s.notify.SendAction(ctx, lid, "ผู้ช่วยสอนแจ้งให้กำหนดวันสอนชดเชย "+thaiLongDateISO(originalDate), body, link)
+		}
+	}
+	return nil
 }
 
 func nilStrOrEmpty(s string) any {
@@ -583,3 +640,20 @@ func nilStrOrEmpty(s string) any {
 	return s
 }
 
+// holidaySourceLabelTH is the staff holiday page's own wording for a source
+// (SOURCE_OPTIONS in app/staff/holidays/page.tsx); the raw enum ("custom")
+// leaked into a Thai error message.
+func holidaySourceLabelTH(source string) string {
+	switch source {
+	case "national":
+		return "ราชการ"
+	case "university":
+		return "มหาวิทยาลัย"
+	case "faculty":
+		return "คณะ"
+	case "tdbm":
+		return "TDBM"
+	default:
+		return "อื่นๆ"
+	}
+}

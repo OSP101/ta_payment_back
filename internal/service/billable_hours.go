@@ -94,7 +94,25 @@ var mergedSittingsCTE = mergedSittingsWith("wl.status = 'approved'")
 // mergedSittingsForecastCTE is everything still in play — approved, submitted
 // and draft. A rejected row is excluded: it is not work anybody intends to pay
 // for unless the TA fixes and resends it.
-var mergedSittingsForecastCTE = mergedSittingsWith("wl.status <> 'rejected'")
+//
+// Nor is a draft in a month whose submission period has closed: that row can
+// never be sent ("ไม่ประสงค์ลงเวลา"), yet the lecturer's monthly table counted
+// it — ฿160 for a forfeited พฤศจิกายน — under a caption claiming the figures
+// match the claim form. Same closed-month test as resolvePeriodState.
+var mergedSittingsForecastCTE = mergedSittingsWith(`wl.status <> 'rejected'
+	      AND NOT (wl.status = 'draft' AND ` + forfeitedDraftMonthSQL("wl", "sec") + `)`)
+
+// forfeitedDraftMonthSQL is true when the work_log's month (wl alias) on the
+// section's course (sec alias) has a closed submission period.
+func forfeitedDraftMonthSQL(wl, sec string) string {
+	return `EXISTS (
+	          SELECT 1 FROM teaching_courses tcx
+	            JOIN academic_terms tx      ON tx.id = tcx.term_id
+	            JOIN submission_periods spx ON spx.term_id = tcx.term_id
+	             AND spx.year_month = tx.academic_year::text || '-' || to_char(` + wl + `.work_date, 'MM')
+	           WHERE tcx.id = ` + sec + `.teaching_course_id
+	             AND (spx.is_closed OR CURRENT_DATE > spx.due_date + INTERVAL '1 day'))`
+}
 
 // billableHoursGo is the Go side of the same rule, expressed through the code
 // the form itself uses. Kept here so the cross-check test has one call to make

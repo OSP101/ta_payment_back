@@ -55,9 +55,14 @@ func TestMonthsInReview_TrackWhatUpsertActuallyAccepts(t *testing.T) {
 	if !f.monthClosed(t, thisMonth) {
 		t.Error("month still open in the payload, but Upsert now refuses it")
 	}
-	if _, err := f.Svc.Upsert(f.ctx, f.TAID, f.entry(day(12), "09:00", "11:00", 2)); err == nil {
+	// Back-filling before the sent day is what stays refused (a later day may
+	// still be added — DEF-004; the screen gets that from last_sent_by_month).
+	if _, err := f.Svc.Upsert(f.ctx, f.TAID, f.entry(day(8), "09:00", "11:00", 2)); err == nil {
 		t.Fatal("Upsert accepted a row it was expected to refuse — the screen and the " +
 			"rule have drifted apart")
+	}
+	if got := f.lastSentOf(t, thisMonth); got != day(10) {
+		t.Errorf("last_sent_by_month[%s] = %q, want %s", thisMonth, got, day(10))
 	}
 
 	// The whole point of scoping it: a later month is untouched. Submitting June
@@ -78,4 +83,21 @@ func TestMonthsInReview_TrackWhatUpsertActuallyAccepts(t *testing.T) {
 	if !f.monthClosed(t, thisMonth) {
 		t.Error("a month the lecturer has approved must not offer to add rows")
 	}
+}
+
+// lastSentOf reads the TA screen's last_sent_by_month entry for ym.
+func (f *fixture) lastSentOf(t *testing.T, ym string) string {
+	t.Helper()
+	teaching := &TeachingService{pool: f.Pool}
+	list, err := teaching.ListAssignmentsForTA(f.ctx, f.TAID, &f.CourseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range list {
+		if a.ID == f.AssignmentID {
+			return a.LastSentByMonth[ym]
+		}
+	}
+	t.Fatal("assignment not listed")
+	return ""
 }

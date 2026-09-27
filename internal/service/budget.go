@@ -192,59 +192,47 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	//                 at grad_special_term_cap as a safety ceiling. Counted per assignment,
 	//                 independently per course — a TA on 3 special-track courses gets up
 	//                 to 3 × 4,000, there is no cross-course aggregate cap.
-	_ = s.pool.QueryRow(ctx, `
-        WITH latest AS (SELECT * FROM `+payRatesInForce+`),
-        ug_reg AS (
-            SELECT COALESCE(SUM(wl.hours * pr.undergrad_regular), 0) AS baht
-            FROM work_logs wl
-            JOIN ta_request_assignments a ON a.id = wl.assignment_id
-            JOIN ta_requests r  ON r.id = a.request_id
-            JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'regular'
-            JOIN users u        ON u.id = a.ta_id
-            CROSS JOIN latest pr
-            WHERE r.teaching_course_id = $1 AND wl.status = 'approved' AND a.level = 'undergrad'
-        ),
-        -- ป.ตรี ภาคพิเศษ: รายชั่วโมงแต่ไม่เกิน ug_special_monthly_cap ต่อคน/เดือน
-        -- (ประกาศ: "50 บาท/ชั่วโมง หรือ 2,000 บาท/เดือน") คิดทีละเดือนแล้วรวม
-        ug_sp AS (
-            SELECT COALESCE(SUM(LEAST(m.hrs * (SELECT undergrad_special FROM latest),
-                                       (SELECT ug_special_monthly_cap FROM latest))), 0) AS baht
-            FROM (
-                SELECT a.ta_id, to_char(wl.work_date,'YYYY-MM') AS ym, SUM(wl.hours) AS hrs
-                FROM work_logs wl
-                JOIN ta_request_assignments a ON a.id = wl.assignment_id
-                JOIN ta_requests r  ON r.id = a.request_id
-                JOIN sections sec   ON sec.id = a.section_id AND sec.track = 'special'
-                JOIN users u        ON u.id = a.ta_id
-                WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
-                  AND a.level = 'undergrad'
-                GROUP BY a.ta_id, to_char(wl.work_date,'YYYY-MM')
-            ) m
-        ),
-        grad_reg AS (
-            SELECT COALESCE(SUM(wl.hours * pr.graduate_regular_hourly), 0) AS baht
-            FROM work_logs wl
-            JOIN ta_request_assignments a ON a.id = wl.assignment_id
-            JOIN ta_requests r  ON r.id = a.request_id
-            JOIN sections sec   ON sec.id = a.section_id
-            JOIN users u        ON u.id = a.ta_id
-            CROSS JOIN latest pr
-            WHERE r.teaching_course_id = $1 AND wl.status = 'approved'
-              AND a.level IN ('master','phd') AND sec.track = 'regular'
-        ),
-        grad_sp AS (
-            SELECT COALESCE(SUM(LEAST(pr.graduate_special_lumpsum, pr.grad_special_term_cap)), 0) AS baht
-            FROM ta_request_assignments a
-            JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
-            JOIN sections sec   ON sec.id = a.section_id
-            JOIN users u        ON u.id = a.ta_id
-            CROSS JOIN latest pr
-            WHERE r.teaching_course_id = $1 AND a.level IN ('master','phd')
-              AND sec.track = 'special'
-        )
-        SELECT (SELECT baht FROM ug_reg) + (SELECT baht FROM grad_reg),
-               (SELECT baht FROM ug_sp)  + (SELECT baht FROM grad_sp)`,
-		tcID).Scan(&snap.UsedBahtRegular, &snap.UsedBahtSpecial)
+	//
+	// Hourly work is priced by the SAME per-sitting ledger the settlement and
+	// the payout use (claimCostByTASlot over merged approved sittings): a
+	// co-taught sitting counts once, time on both tracks at once counts once
+	// (B2), and the undergrad-special monthly cap applies. Summing raw
+	// work_log hours here double-counted co-taught sections, so the lecturer
+	// card and the executive dashboard disagreed with the settlement.
+	var pr PayRate
+	if err := s.pool.QueryRow(ctx, `
+		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
+		       ug_special_monthly_cap, graduate_special_lumpsum, grad_special_term_cap
+		FROM `+payRatesInForce).Scan(
+		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
+		&pr.UGSpecialMonthlyCap, &pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap); err == nil {
+		if costs, err := (&ExportService{pool: s.pool}).claimCostByTASlot(ctx, tcID, pr, mergedSittingsCTE); err == nil {
+			for _, c := range costs {
+				if c.Track == "regular" {
+					snap.UsedBahtRegular += c.Baht
+				} else {
+					snap.UsedBahtSpecial += c.Baht
+				}
+			}
+		}
+		// ONE lump per TA per course. ta_request_assignments holds a row per
+		// SECTION, so summing rows billed a PhD covering special sec 3 and
+		// sec 4 twice. A holder dropped from the section gets no lump.
+		var holders int
+		if err := s.pool.QueryRow(ctx, `
+			SELECT COUNT(DISTINCT a.ta_id)
+			FROM ta_request_assignments a
+			JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
+			JOIN sections sec   ON sec.id = a.section_id
+			WHERE r.teaching_course_id = $1 AND a.level IN ('master','phd')
+			  AND sec.track = 'special' AND a.state <> 'dropped'`, tcID).Scan(&holders); err == nil {
+			lump := pr.GraduateSpecialLumpsum
+			if pr.GradSpecialTermCap > 0 && lump > pr.GradSpecialTermCap {
+				lump = pr.GradSpecialTermCap
+			}
+			snap.UsedBahtSpecial += float64(holders) * lump
+		}
+	}
 	snap.UsedBaht = snap.UsedBahtRegular + snap.UsedBahtSpecial
 
 	snap.RemainingBaht = snap.PerCourseMaxBaht - snap.UsedBaht

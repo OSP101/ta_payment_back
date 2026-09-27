@@ -165,6 +165,24 @@ func Mount(app *fiber.App, m *Manager) {
 			}
 			return c.JSON(fiber.Map{"message": message})
 		})
+		// "ชุดข้อมูลนำเสนอผู้บริหาร" — see scenario_presentation.go. Its own
+		// button, not a step: it loads a separate term and never advances the
+		// walkthrough. SeedPresentation re-checks that slot is a demo slot
+		// before every write.
+		scenario.Get("/scenario/presentation", func(c *fiber.Ctx) error {
+			loaded, label, err := PresentationStatus(c.Context(), slot)
+			if err != nil {
+				return err
+			}
+			return c.JSON(fiber.Map{"loaded": loaded, "term_label": label})
+		})
+		scenario.Post("/scenario/presentation", func(c *fiber.Ctx) error {
+			message, err := SeedPresentation(c.Context(), slot)
+			if err != nil {
+				return err
+			}
+			return c.JSON(fiber.Map{"message": message})
+		})
 		// "เริ่มใหม่ทั้งหมด" — wipes and reseeds THIS slot without needing the
 		// claim email back (unlike /api/demo/reset): the slot is already
 		// resolved by which authed route this request reached. Every

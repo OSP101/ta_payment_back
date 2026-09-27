@@ -164,7 +164,7 @@ func (s *ExportService) gradSpecialTAIDs(ctx context.Context, courseID uuid.UUID
 		JOIN sections sec  ON sec.id = a.section_id AND sec.track = 'special'
 		JOIN users u       ON u.id = a.ta_id
 		WHERE sec.teaching_course_id = $1
-		  AND a.level::text IN ('master','phd')`, courseID)
+		  AND a.level::text IN ('master','phd') AND a.state <> 'dropped'`, courseID)
 	if err != nil {
 		return nil, err
 	}
@@ -238,10 +238,12 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 	var pr PayRate
 	if err := s.pool.QueryRow(ctx, `
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
-		       graduate_special_lumpsum, grad_special_term_cap, term_months
+		       graduate_special_lumpsum, grad_special_term_cap, ug_special_monthly_cap, term_months
 		FROM `+payRatesInForce+``).Scan(
 		&pr.UndergradRegular, &pr.UndergradSpecial, &pr.GraduateRegularHourly,
-		&pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap, &pr.TermMonths); err != nil {
+		// The monthly cap must come along: claimCostByTASlot only caps when it
+		// is > 0, so leaving it out paid the uncapped figure on the cover.
+		&pr.GraduateSpecialLumpsum, &pr.GradSpecialTermCap, &pr.UGSpecialMonthlyCap, &pr.TermMonths); err != nil {
 		return nil, nil, err
 	}
 

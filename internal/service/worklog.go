@@ -756,15 +756,18 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		return nil, err
 	}
 	// Refuse to regenerate once anything has been submitted/approved, otherwise
-	// the wipe-and-recreate below would silently drop reviewed rows.
+	// the wipe-and-recreate below would silently drop reviewed rows. Rejected
+	// rows count too: the wipe keeps them (only drafts go) while the running
+	// daily totals below don't see them, so every rejected slot came back as a
+	// fresh draft beside it and Submit sent both.
 	var locked int
 	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status IN ('submitted','approved')`,
+		`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status IN ('submitted','approved','rejected')`,
 		assignmentID).Scan(&locked); err != nil {
 		return nil, err
 	}
 	if locked > 0 {
-		return nil, Invalid("ไม่สามารถสร้างใหม่ได้ เนื่องจากมีรายการที่ส่งอนุมัติหรืออนุมัติแล้ว")
+		return nil, Invalid("ไม่สามารถสร้างใหม่ได้ เนื่องจากมีรายการที่ส่งอนุมัติ อนุมัติแล้ว หรือถูกตีกลับ กรุณาแก้ไขรายการที่ถูกตีกลับแทน")
 	}
 	var sectionID uuid.UUID
 	var startsOn, endsOn time.Time
@@ -2226,8 +2229,11 @@ func (s *WorkLogService) assignmentRate(ctx context.Context, assignmentID uuid.U
 // elsewhere via /teaching-courses/:id/budget-settlement, which this page
 // already shows as its own unpaid/partial-month banners) and whether a row
 // still needs to clear the lecturer's review. It only answers "hours × rate,
-// with the same monthly/term ceiling the real payout would apply" — the
-// arithmetic a TA can do in their head once they know the rate, done for them.
+// with the monthly ceiling applied to THIS section" — the arithmetic a TA can
+// do in their head once they know the rate, done for them. The payout caps per
+// TA × course × month over merged sittings with rule B2, so a TA on two
+// special sections, or on a special section co-taught with a regular one, is
+// paid less than the per-section estimates add up to.
 type PayRateEstimate struct {
 	Level string `json:"level"`
 	Track string `json:"track"`
@@ -2560,7 +2566,10 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 	}
 	if len(badDays) > 0 {
 		return Conflict(fmt.Sprintf(
-			"อนุมัติไม่ได้ ชั่วโมงรวมต่อวันเกิน %.1f ชม. ในวันที่: %s", dailyCap, strings.Join(badDays, ", ")))
+			"อนุมัติไม่ได้ ชั่วโมงรวมต่อวันเกิน %.1f ชม. ในวันที่: %s", dailyCap, thaiDateList(badDays)))
+	}
+	if err := s.recheckDailyBahtForApproval(ctx, tx, ac.TAID, assignmentID, yearMonth); err != nil {
+		return err
 	}
 	// Before the workload-form early return below: the own-class rule applies
 	// whether or not the course filed a workload form.
@@ -2611,10 +2620,102 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 		if len(badWeeks) > 0 {
 			return Conflict(fmt.Sprintf(
 				"อนุมัติไม่ได้ เกินโควตา %s ประจำสัปดาห์ (%.1f ชม.) ในสัปดาห์ที่เริ่ม: %s",
-				b.label, b.cap, strings.Join(badWeeks, ", ")))
+				b.label, b.cap, thaiDateList(badWeeks)))
 		}
 	}
 	return nil
+}
+
+// recheckDailyBahtForApproval re-prices, inside the approval transaction, every
+// day on which this assignment has submitted or approved rows, against
+// pay_rates.daily_pay_cap_baht (Q&A rule 6a). The cap is otherwise only checked
+// when a row is written, so a rate raised or a cap lowered between logging and
+// approval let an over-cap day become billable (UAT DEF-005).
+//
+// Priced like enforceDailyBahtCap — one sitting per co-taught group, regular
+// wins (rule B2), across all of the TA's courses — but over submitted and
+// approved rows only: drafts are not being approved and may still change.
+//
+// Only the days being approved NOW are priced: those holding a 'submitted' row
+// of this assignment (in yearMonth, when given). Re-pricing already approved or
+// exported days at today's rate would refuse every later approval over a July
+// day nobody can edit any more, just because the rate rose in October.
+func (s *WorkLogService) recheckDailyBahtForApproval(ctx context.Context, tx pgx.Tx, taID, assignmentID uuid.UUID, yearMonth string) error {
+	var capBaht float64
+	if err := tx.QueryRow(ctx, `SELECT daily_pay_cap_baht FROM `+payRatesInForce).Scan(&capBaht); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if capBaht <= 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
+		days AS (
+		    SELECT DISTINCT work_date FROM work_logs
+		    WHERE assignment_id = $2 AND status = 'submitted'
+		      AND ($4 = '' OR to_char(work_date, 'YYYY-MM') = $4)
+		),
+		day_rows AS (
+		    SELECT wl.id, wl.work_date, wl.start_time, wl.end_time, wl.hours, a.request_id,
+		           a.cotaught_group, a.level::text AS level, sec.track::text AS track
+		    FROM work_logs wl
+		    JOIN days d ON d.work_date = wl.work_date
+		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		    JOIN sections sec ON sec.id = a.section_id
+		    WHERE a.ta_id = $1 AND wl.status IN ('submitted','approved')
+		),
+		sitting AS (
+		    SELECT DISTINCT ON (work_date, COALESCE(cotaught_group::text, id::text),
+		                        request_id, start_time, end_time)
+		           work_date, hours, level, track
+		    FROM day_rows
+		    ORDER BY work_date, COALESCE(cotaught_group::text, id::text),
+		             request_id, start_time, end_time, (track = 'regular') DESC
+		)
+		SELECT TO_CHAR(work_date,'YYYY-MM-DD')
+		FROM sitting CROSS JOIN latest pr
+		GROUP BY work_date
+		HAVING SUM(hours * CASE
+		        WHEN level='undergrad' AND track='regular' THEN pr.undergrad_regular
+		        WHEN level='undergrad' AND track='special' THEN pr.undergrad_special
+		        WHEN level IN ('master','phd') AND track='regular' THEN pr.graduate_regular_hourly
+		        ELSE 0 END) > $3 + 0.01
+		ORDER BY work_date`, taID, assignmentID, capBaht, yearMonth)
+	if err != nil {
+		return err
+	}
+	var bad []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			rows.Close()
+			return err
+		}
+		bad = append(bad, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(bad) > 0 {
+		return Conflict(fmt.Sprintf(
+			"อนุมัติไม่ได้ ค่าตอบแทนรวมต่อวันเกิน %.0f บาท ในวันที่: %s", capBaht, thaiDateList(bad)))
+	}
+	return nil
+}
+
+// thaiDateList renders "YYYY-MM-DD" days the way the rest of the Thai UI
+// writes dates ("3 กันยายน 2569, 10 กันยายน 2569"); raw ISO dates in an error
+// message read as a system code to a lecturer (UAT DEF-008).
+func thaiDateList(days []string) string {
+	out := make([]string, len(days))
+	for i, d := range days {
+		out[i] = thaiLongDateISO(d)
+	}
+	return strings.Join(out, ", ")
 }
 
 // otherActivityCapHours returns the per-session credit-hour cap for an "อื่นๆ"
@@ -2695,13 +2796,15 @@ func (s *WorkLogService) assertOwnScheduleForCourse(ctx context.Context, ac *ass
 // entries before it is set would bill against a zero budget. Mirrors the export
 // gate in BuildCourseZip.
 func (s *WorkLogService) assertStudentCountFilled(ctx context.Context, teachingCourseID uuid.UUID) error {
-	var numStudents int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT num_students FROM teaching_courses WHERE id=$1`, teachingCourseID).Scan(&numStudents); err != nil {
+	zero, entered, err := studentCountState(ctx, s.pool, teachingCourseID)
+	if err != nil {
 		return err
 	}
-	if numStudents <= 0 {
+	if zero && !entered {
 		return Invalid("ยังไม่ได้กรอกจำนวนนักศึกษาของวิชานี้ กรุณาให้เจ้าหน้าที่กรอกจำนวนนักศึกษาก่อน จึงจะลงบันทึกเวลาได้")
+	}
+	if zero {
+		return Invalid("วิชานี้ไม่มีนักศึกษาลงทะเบียน (0 คน) จึงลงบันทึกเวลาไม่ได้ หากจำนวนไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่")
 	}
 	return nil
 }
@@ -2868,7 +2971,7 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 	}
 	if len(legal) == 0 {
 		return Invalid(fmt.Sprintf(
-			"วันที่ %s ไม่มีคาบ%sตามตารางสอนจริงของกลุ่มนี้ ลงเวลาไม่ได้", w.WorkDate, label))
+			"วันที่ %s ไม่มีคาบ%sตามตารางสอนจริงของกลุ่มนี้ ลงเวลาไม่ได้", thaiLongDateISO(w.WorkDate), label))
 	}
 	// Duplicates are common (two identical periods filed twice); show each once.
 	seen := map[string]bool{}
@@ -3130,16 +3233,33 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		// month is the unit everything downstream uses — approval, staff review
 		// and export are all per (assignment, month) — so it is the unit that
 		// should close.
+		//
+		// Two additions are not inflation and stay open (UAT DEF-004):
+		//   - a day AFTER everything already sent this month. Submit only sends
+		//     days that have happened (DEF-003), so a TA who sent the 1st–27th
+		//     must still be able to log the 29th;
+		//   - a day the lecturer (or TDBM) scheduled as a makeup for this
+		//     section, which may be filed after the TA has already sent the
+		//     month.
+		// Either way the new row goes through lecturer approval like any other,
+		// and the work_logs trigger sends a staff-reviewed month back to pending.
 		var reviewed int
+		var allowedLate bool
 		if err := s.pool.QueryRow(ctx,
-			`SELECT COUNT(*) FROM work_logs
-			 WHERE assignment_id=$1 AND status IN ('submitted','approved')
-			   AND to_char(work_date, 'YYYY-MM') = $2`,
-			w.AssignmentID, w.WorkDate[:7]).Scan(&reviewed); err != nil {
+			`SELECT COUNT(*),
+			        COALESCE($3::date > MAX(wl.work_date), TRUE)
+			        OR EXISTS (SELECT 1 FROM makeup_schedules ms
+			                   JOIN ta_request_assignments a ON a.section_id = ms.section_id
+			                   WHERE a.id = $1 AND ms.makeup_date = $3::date
+			                     AND NOT COALESCE(ms.waived, FALSE))
+			 FROM work_logs wl
+			 WHERE wl.assignment_id=$1 AND wl.status IN ('submitted','approved')
+			   AND to_char(wl.work_date, 'YYYY-MM') = $2`,
+			w.AssignmentID, w.WorkDate[:7], w.WorkDate).Scan(&reviewed, &allowedLate); err != nil {
 			return uuid.Nil, err
 		}
-		if reviewed > 0 {
-			return uuid.Nil, Invalid("เดือนนี้ส่งอนุมัติหรืออนุมัติไปแล้ว เพิ่มรายการใหม่ในเดือนนี้ไม่ได้")
+		if reviewed > 0 && !allowedLate {
+			return uuid.Nil, Invalid("วันนี้อยู่ก่อนรายการที่ส่งอนุมัติแล้วในเดือนนี้ เพิ่มย้อนหลังไม่ได้ (ยกเว้นวันชดเชยที่อาจารย์กำหนด)")
 		}
 		w.ID = uuid.New()
 		if err := writeAudited(ctx, s.pool, s.aud,
@@ -3200,21 +3320,24 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE work_logs wl SET status='submitted', submitted_at=NOW(), reject_reason=NULL
 		WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')
-		  AND NOT `+unsubmittableMonthSQL("wl"), assignmentID)
+		  AND `+submittableRowSQL("wl"), assignmentID)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		// Distinguish "nothing to submit" from "everything is in a locked month"
 		// so the TA isn't left guessing why the button did nothing.
-		var candidates int
-		if err := s.pool.QueryRow(ctx,
-			`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status IN ('draft','rejected')`,
-			assignmentID).Scan(&candidates); err == nil && candidates > 0 {
-			// No back-dated submission (staff decision, 03/08/2026): a month
-			// whose deadline passed unsent is a month the TA did not claim. The
-			// message says so instead of offering an appeal that will be refused.
-			return Invalid("รายการทั้งหมดอยู่ในงวดที่ปิดไปแล้ว ถือว่าไม่ประสงค์ลงเวลา ส่งย้อนหลังไม่ได้")
+		var locked int
+		if err := s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FILTER (WHERE `+unsubmittableMonthSQL("wl")+`)
+			FROM work_logs wl WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')`,
+			assignmentID).Scan(&locked); err == nil {
+			if locked > 0 {
+				// No back-dated submission (staff decision, 03/08/2026): a month
+				// whose deadline passed unsent is a month the TA did not claim. The
+				// message says so instead of offering an appeal that will be refused.
+				return Invalid("รายการทั้งหมดอยู่ในงวดที่ปิดไปแล้ว ถือว่าไม่ประสงค์ลงเวลา ส่งย้อนหลังไม่ได้")
+			}
 		}
 		return Invalid("ไม่มีรายการที่ส่งอนุมัติได้")
 	}
@@ -4364,7 +4487,7 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 			when = " ประจำเดือน" + when
 		}
 		s.notify.SendAction(ctx, ac.TAID,
-			"บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข "+t.Code,
+			strings.TrimSpace("บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข "+t.Code+" "+thaiYearMonth(yearMonth)),
 			"อาจารย์ผู้สอนได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา "+t.Label()+when+" กลับมาให้ท่านแก้ไข เนื่องจาก "+reason,
 			t.Link)
 	}

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -33,11 +34,20 @@ func newUpsertSvc(t *testing.T) (*TeachingService, context.Context, uuid.UUID) {
 
 func termInput(year, sem int, active bool) Term {
 	d := func(s string) *string { return &s }
+	// Real, non-overlapping ranges per semester: UpsertTerm refuses a new
+	// term whose teaching range overlaps an existing one.
+	g := year - 543
+	ranges := map[int][6]string{
+		1: {fmt.Sprintf("%d-06-22", g), fmt.Sprintf("%d-10-18", g), fmt.Sprintf("%d-08-01", g), fmt.Sprintf("%d-08-07", g), fmt.Sprintf("%d-10-12", g), fmt.Sprintf("%d-10-18", g)},
+		2: {fmt.Sprintf("%d-11-16", g), fmt.Sprintf("%d-03-14", g+1), fmt.Sprintf("%d-01-11", g+1), fmt.Sprintf("%d-01-15", g+1), fmt.Sprintf("%d-03-15", g+1), fmt.Sprintf("%d-03-26", g+1)},
+		3: {fmt.Sprintf("%d-04-05", g+1), fmt.Sprintf("%d-05-30", g+1), fmt.Sprintf("%d-04-25", g+1), fmt.Sprintf("%d-04-26", g+1), fmt.Sprintf("%d-05-31", g+1), fmt.Sprintf("%d-06-02", g+1)},
+	}
+	r := ranges[sem]
 	return Term{
 		AcademicYear: year, Semester: sem, Months: 4, IsActive: active,
-		StartsOn: d("2026-06-22"), EndsOn: d("2026-10-18"),
-		MidtermStartsOn: d("2026-08-01"), MidtermEndsOn: d("2026-08-07"),
-		FinalStartsOn: d("2026-10-12"), FinalEndsOn: d("2026-10-18"),
+		StartsOn: d(r[0]), EndsOn: d(r[1]),
+		MidtermStartsOn: d(r[2]), MidtermEndsOn: d(r[3]),
+		FinalStartsOn: d(r[4]), FinalEndsOn: d(r[5]),
 	}
 }
 

@@ -80,7 +80,11 @@ var (
 
 // SSONoAccountError carries the KKU email so the handler can show it — the
 // address is the user's own, and it is exactly what they need to tell staff.
-type SSONoAccountError struct{ Email string }
+type SSONoAccountError struct {
+	Email string
+	// Inactive: an account with this address exists but is switched off.
+	Inactive bool
+}
 
 func (e *SSONoAccountError) Error() string { return "sso: no account for " + e.Email }
 
@@ -114,19 +118,22 @@ func (s *SSOService) Exchange(ctx context.Context, code, ip, userAgent string) (
 				Action: "auth.sso_unknown_account", Entity: "user",
 				IP: ip, UserAgent: userAgent, Note: attemptedIdentifier(id.Email),
 			})
-			return nil, &SSONoAccountError{Email: id.Email}
+			// KKU has just proven this person owns the address, so telling
+			// them their account exists but is switched off leaks nothing —
+			// and "not registered" sent them to ask staff for a NEW account.
+			var inactive bool
+			_ = s.users.pool.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM users WHERE email = $1 AND NOT is_active AND deleted_at IS NULL)`,
+				id.Email).Scan(&inactive)
+			return nil, &SSONoAccountError{Email: id.Email, Inactive: inactive}
 		}
 		return nil, err
 	}
-	// The per-account lockout applies here too: SSO must not be a way
-	// around a lock that password guessing earned.
-	if err := loginGateCheck(u.ID); err != nil {
-		_ = s.aud.Log(ctx, audit.Entry{
-			ActorID: &u.ID, Action: "auth.login_locked", Entity: "user",
-			EntityID: u.ID.String(), IP: ip, UserAgent: userAgent,
-		})
-		return nil, err
-	}
+	// The per-account password lockout deliberately does NOT apply here. It
+	// exists to stop guessing OUR password; a KKU SSO ticket proves identity
+	// through the university instead, so there is nothing to guess. Applying
+	// it let anyone who knew a staff email keep that person out entirely by
+	// sending 7 wrong passwords every 15 minutes — SSO included.
 
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -174,6 +181,23 @@ func (s *SSOService) Redeem(ctx context.Context, ticket, ip, userAgent string) (
 		ActorID: &u.ID, Action: "auth.login", Entity: "user",
 		EntityID: u.ID.String(), IP: ip, UserAgent: userAgent, Note: "sso",
 	})
+	// A pending "set a new password" belongs to a temporary password someone
+	// else (the lecturer who created the account, or staff after a reset) has
+	// seen. The KKU login just proved who this is, so that temporary password
+	// is retired instead of forcing a KKU user to invent a local one: it can
+	// no longer be used by whoever saw it, and the account continues on SSO.
+	if u.MustChangePassword {
+		if _, err := s.users.pool.Exec(ctx,
+			`UPDATE users SET password_hash = NULL, must_change_password = FALSE, updated_at = NOW() WHERE id = $1`,
+			u.ID); err != nil {
+			return nil, err
+		}
+		_ = s.aud.Log(ctx, audit.Entry{
+			ActorID: &u.ID, Action: "user.temp_password_retired", Entity: "user",
+			EntityID: u.ID.String(), IP: ip, UserAgent: userAgent, Note: "sso login",
+		})
+		u.MustChangePassword = false
+	}
 	return u, nil
 }
 
