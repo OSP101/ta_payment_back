@@ -3665,6 +3665,14 @@ type PendingReport struct {
 	// client can render it in Thai like every other date in the app.
 	FirstDate string `json:"first_date,omitempty"`
 	LastDate  string `json:"last_date,omitempty"`
+	// DraftMonths ("YYYY-MM") are months holding rows the TA saved but never
+	// sent, while that month's period is still open — work the lecturer can
+	// expect to arrive later. The queue itself never shows drafts, so without
+	// this a TA who sent July–October and left June as a draft looked done
+	// with June. ForfeitedMonths are the same, past the period's close: they
+	// will never be sent ("ไม่ประสงค์ลงเวลา") and must not read as outstanding.
+	DraftMonths     []string `json:"draft_months"`
+	ForfeitedMonths []string `json:"forfeited_months"`
 }
 
 // ListPending returns assignments with submitted (awaiting-review) work-logs.
@@ -3718,7 +3726,15 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		            WHEN sec.track = 'special' THEN COALESCE(SUM(wl.hours), 0) ELSE 0 END,
 		       MIN(wl.work_date),
 		       MAX(wl.work_date),
-		       MIN(wl.submitted_at)
+		       MIN(wl.submitted_at),
+		       ARRAY(SELECT DISTINCT TO_CHAR(d.work_date, 'YYYY-MM') FROM work_logs d
+		              WHERE d.assignment_id = a.id AND d.status = 'draft'
+		                AND NOT `+forfeitedDraftMonthSQL("d", "sec")+`
+		              ORDER BY 1),
+		       ARRAY(SELECT DISTINCT TO_CHAR(d.work_date, 'YYYY-MM') FROM work_logs d
+		              WHERE d.assignment_id = a.id AND d.status = 'draft'
+		                AND `+forfeitedDraftMonthSQL("d", "sec")+`
+		              ORDER BY 1)
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
@@ -3741,7 +3757,7 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		    WHERE tl.teaching_course_id = tc.id AND tl.lecturer_id = $2
 		  ))
 		GROUP BY a.id, a.ta_id, u.first_name, u.last_name, a.level, tc.code, tc.id,
-		         sec.sec_no, sec.track, a.cotaught_group
+		         sec.sec_no, sec.track, sec.teaching_course_id, a.cotaught_group
 		ORDER BY MIN(wl.submitted_at) ASC NULLS LAST, tc.code, sec.sec_no`,
 		privileged, actor)
 	if err != nil {
@@ -3758,7 +3774,7 @@ func (s *WorkLogService) ListPending(ctx context.Context, actor uuid.UUID, privi
 		if err := rows.Scan(&p.ID, &p.TAID, &p.TAName, &p.StudyLevel, &p.CourseCode, &p.TeachingCourseID,
 			&p.SecNo, &p.Track, &p.CoTaughtGroup,
 			&p.TotalHours, &p.GroupHours, &p.GroupRegularHours, &p.GroupSpecialHours,
-			&minD, &maxD, &submittedAt); err != nil {
+			&minD, &maxD, &submittedAt, &p.DraftMonths, &p.ForfeitedMonths); err != nil {
 			return nil, err
 		}
 		p.FirstDate = minD.Format("2006-01-02")
