@@ -736,6 +736,23 @@ type GenerateResult struct {
 	// the TA just gets fewer rows than their timetable has, with no reason given.
 	StoppedAtTermCeiling bool    `json:"stopped_at_term_ceiling,omitempty"`
 	TermHourCeiling      float64 `json:"term_hour_ceiling,omitempty"`
+	// SkippedDailyBaht lists the days on which generation shortened or left out
+	// sessions because they would have taken the TA past the faculty's per-day pay cap
+	// (rule 6a, every course they assist counted together). Per day rather
+	// than grouped: the TA needs to see WHICH days came out short, and there
+	// are only as many as they have crowded days.
+	SkippedDailyBaht []DailyCapSkip `json:"skipped_daily_baht,omitempty"`
+	DailyBahtCap     float64        `json:"daily_baht_cap,omitempty"`
+}
+
+// DailyCapSkip is one day Generate trimmed to stay within the daily pay cap:
+// Hours is what it cut (the shortened part of trimmed sessions plus any session
+// dropped whole); Existing is what the day already held from other
+// courses (and rows kept from earlier) before this run added anything.
+type DailyCapSkip struct {
+	Date     string  `json:"date"`
+	Hours    float64 `json:"hours"`
+	Existing float64 `json:"existing_baht"`
 }
 
 // attendanceDutyHours is how long เช็คชื่อ is billed for inside a lecture period,
@@ -846,8 +863,34 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		}
 		return hrs * genRate
 	}
-	bahtBlocks := func(dkey, start, end string, hrs float64) bool {
-		return genRate > 0 && dailyBahtCap > 0 && dailyBaht[dkey]+bahtCost(dkey, start, end, hrs) > dailyBahtCap+0.01
+	// What each day held before this run wrote anything — snapshotted from
+	// dailyBaht once it is prefilled, for the "already had" figure the TA sees.
+	existingBaht := map[string]float64{}
+	skippedBahtHrs := map[string]float64{}
+	// bahtFit is how much of a session fits under the day's pay cap. A session
+	// that would cross it is SHORTENED (end moved earlier, start kept) rather
+	// than dropped, so the TA still claims as much of the day as the rule
+	// allows: 280฿ already on a 300฿ day leaves room for 0.5 ชม. at 40฿, not
+	// nothing. Trimmed in whole 30-minute steps — the unit the claim forms and
+	// every hand-entered row use — so a trimmed row is one a TA could have
+	// typed. Returns 0 when not even one step fits; the new end otherwise.
+	bahtFit := func(dkey, start, end string, hrs float64) (float64, string) {
+		if genRate <= 0 || dailyBahtCap <= 0 ||
+			dailyBaht[dkey]+bahtCost(dkey, start, end, hrs) <= dailyBahtCap+0.01 {
+			return hrs, end
+		}
+		room := (dailyBahtCap - dailyBaht[dkey]) / genRate
+		fit := math.Floor(room*2+0.001) / 2
+		sm, ok := parseHM(start)
+		if !ok || fit <= 0 {
+			skippedBahtHrs[dkey] += hrs
+			return 0, end
+		}
+		if fit > hrs {
+			fit = hrs
+		}
+		skippedBahtHrs[dkey] += hrs - fit
+		return fit, hhmm(sm + int(fit*60+0.5))
 	}
 	// Total hours already committed by this run. Generate enforced every OTHER
 	// limit — daily hours, daily baht, activity scope, holidays, own-class clashes
@@ -896,6 +939,9 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	if genRate > 0 && dailyBahtCap > 0 {
 		if err := s.loadGenerateDayBaht(ctx, ac.TAID, assignmentID, blockedMM, dailyBaht, sharedSitting); err != nil {
 			return nil, err
+		}
+		for d, b := range dailyBaht {
+			existingBaht[d] = b
 		}
 	}
 	// Rows that will SURVIVE the wipe below — submitted/approved ones, plus
@@ -1245,8 +1291,10 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if dailyHrs[useDate.Format("2006-01-02")]+rowHours > dailyHourCap {
 				continue
 			}
-			if bahtBlocks(useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours) {
+			if fit, fitEnd := bahtFit(useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours); fit <= 0 {
 				continue
+			} else {
+				rowHours, rowEnd = fit, fitEnd
 			}
 			if termBlocks(rowHours) {
 				continue
@@ -1321,8 +1369,10 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if dailyHrs[dstr]+hrs > dailyHourCap {
 				continue
 			}
-			if bahtBlocks(dstr, start, end, hrs) {
+			if fit, fitEnd := bahtFit(dstr, start, end, hrs); fit <= 0 {
 				continue
+			} else {
+				hrs, end = fit, fitEnd
 			}
 			if termBlocks(hrs) {
 				continue
@@ -1453,8 +1503,10 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				if dailyHrs[dkey]+r.hours > dailyHourCap {
 					continue
 				}
-				if bahtBlocks(dkey, r.start, r.end, r.hours) {
+				if fit, fitEnd := bahtFit(dkey, r.start, r.end, r.hours); fit <= 0 {
 					continue
+				} else {
+					r.hours, r.end = fit, fitEnd
 				}
 				if termBlocks(r.hours) {
 					continue
@@ -1510,13 +1562,23 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		}
 		return weeklyCapSkips[i].Reason < weeklyCapSkips[j].Reason
 	})
-	return &GenerateResult{
+	var bahtSkips []DailyCapSkip
+	for d, h := range skippedBahtHrs {
+		bahtSkips = append(bahtSkips, DailyCapSkip{Date: d, Hours: h, Existing: existingBaht[d]})
+	}
+	sort.Slice(bahtSkips, func(i, j int) bool { return bahtSkips[i].Date < bahtSkips[j].Date })
+	res := &GenerateResult{
 		Entries:              out,
 		SkippedOwnClass:      skips,
 		SkippedWeeklyCap:     weeklyCapSkips,
 		StoppedAtTermCeiling: stoppedAtCeiling,
 		TermHourCeiling:      termCeiling,
-	}, nil
+		SkippedDailyBaht:     bahtSkips,
+	}
+	if len(bahtSkips) > 0 {
+		res.DailyBahtCap = dailyBahtCap
+	}
+	return res, nil
 }
 
 // -----------------------------------------------------------------------------
