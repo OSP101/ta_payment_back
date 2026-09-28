@@ -830,6 +830,9 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 		if err := validateUndergradSectionCaps(in, name, secNo, weekly[sectionID]); err != nil {
 			return err
 		}
+		if err := s.checkInClassDuties(ctx, tx, taID, sectionID, in, name, secNo); err != nil {
+			return err
+		}
 	} else {
 		if err := validateGradWorkloadCaps(in, name, secNo); err != nil {
 			return err
@@ -1081,6 +1084,42 @@ func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, hrs se
 // worklog system, mirroring undergrad's simplicity, and never more than this
 // per week regardless of what a lecturer might try to declare.
 const gradReviewHourCap = 2.0
+
+// checkInClassDuties refuses an in-class duty declared on a session kind whose
+// EVERY meeting collides with the TA's own class: เช็คชื่อ (attendance_hrs)
+// against the lectures, สอนปฏิบัติการ (lab_hrs) against the labs.
+//
+// Used by the staff correction path only. Create does NOT refuse on it: that
+// would make the verdict depend on whether the TA filed their timetable before
+// or after the lecturer pressed Send (see applyClashOutcome, 3ก). There the same
+// rule is applied by zeroing the hours instead — stripBlockedInClassHours — which
+// runs identically in both orders. A correction happens after the verdict, when
+// the timetable is already known, so refusing it carries no order-dependence.
+//
+// Only a FULL collision refuses — a partial one leaves workable sessions (see
+// kindClash.fullyBlocked). Off-slot duties (ตรวจงาน, อื่น ๆ) are never refused.
+func (s *TARequestService) checkInClassDuties(ctx context.Context, q rowQuerier, taID, sectionID uuid.UUID, w WorkloadInput, name, secLabel string) error {
+	byKind, err := sectionClashByKind(ctx, q, taID, sectionID)
+	if err != nil {
+		return err
+	}
+	return validateInClassDuties(w, byKind, name, secLabel)
+}
+
+// validateInClassDuties is the pure half of checkInClassDuties.
+func validateInClassDuties(w WorkloadInput, byKind kindClash, name, secLabel string) error {
+	if w.AttendanceHrs > 0.001 && byKind.fullyBlocked("lecture") {
+		return fmt.Errorf(
+			"คาบบรรยายทุกคาบของ Sec %s ตรงกับตารางเรียนของ %s จึงระบุชั่วโมง 'เช็คชื่อ / เก็บใบงาน' ไม่ได้",
+			secLabel, name)
+	}
+	if w.LabHrs > 0.001 && byKind.fullyBlocked("lab") {
+		return fmt.Errorf(
+			"คาบปฏิบัติการทุกคาบของ Sec %s ตรงกับตารางเรียนของ %s จึงระบุชั่วโมง 'สอนปฏิบัติการ' ไม่ได้",
+			secLabel, name)
+	}
+	return nil
+}
 
 // validateGradWorkloadCaps enforces the graduate-TA equivalent of
 // validateUndergradSectionCaps: grade_hrs (ตรวจการบ้าน) is capped at a flat

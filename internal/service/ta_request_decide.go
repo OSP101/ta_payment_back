@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -354,7 +355,7 @@ type rowQuerier interface {
 func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) (map[uuid.UUID][]string, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT a.id, a.ta_id, a.section_id, sec.sec_no,
-		       u.first_name || ' ' || u.last_name
+		       u.first_name || ' ' || u.last_name, a.level::text
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN users u ON u.id = a.ta_id
@@ -364,13 +365,13 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 		return nil, err
 	}
 	type asg struct {
-		id, taID, secID uuid.UUID
-		secNo, taName   string
+		id, taID, secID      uuid.UUID
+		secNo, taName, level string
 	}
 	var all []asg
 	for rows.Next() {
 		var a asg
-		if err := rows.Scan(&a.id, &a.taID, &a.secID, &a.secNo, &a.taName); err != nil {
+		if err := rows.Scan(&a.id, &a.taID, &a.secID, &a.secNo, &a.taName, &a.level); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -436,6 +437,18 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 					lines...), "\n")
 			}
 		}
+		// An in-class duty declared on a kind the TA can never attend is zeroed
+		// here rather than refused at Create, so the declared figures match what
+		// the form allows whichever order the timetable arrived in. The lines go
+		// to the notice only: state_reason must keep matching the wording
+		// migration 0048 rebuilds (TestMigration0048_MatchesGoWording).
+		var stripped []string
+		if state != "dropped" && a.level == "undergrad" {
+			stripped, err = stripBlockedInClassHours(ctx, tx, a.id, a.taID, a.secID)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE ta_request_assignments
 			SET state = $1::ta_assignment_state, state_reason = $2, state_decided_at = NOW()
@@ -443,8 +456,57 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 			return nil, err
 		}
 		notices[a.taID] = append(notices[a.taID], reason)
+		notices[a.taID] = append(notices[a.taID], stripped...)
 	}
 	return notices, nil
+}
+
+// stripBlockedInClassHours zeroes the in-class duty of every session kind whose
+// EVERY meeting collides with the TA's own class — เช็คชื่อ for lecture,
+// สอนปฏิบัติการ for lab — and returns one line per duty removed, for the notice.
+// It is the server-side twin of the request form greying those fields out
+// (PreviewConflicts.BlockedKinds), so a call that skips the form ends up with
+// the same declaration. Undergrad only: the grad form has no per-kind duty.
+func stripBlockedInClassHours(ctx context.Context, tx pgx.Tx, assignmentID, taID, sectionID uuid.UUID) ([]string, error) {
+	byKind, err := sectionClashByKind(ctx, tx, taID, sectionID)
+	if err != nil {
+		return nil, err
+	}
+	lec, lab := byKind.fullyBlocked("lecture"), byKind.fullyBlocked("lab")
+	if !lec && !lab {
+		return nil, nil
+	}
+	var attendance, labHrs float64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(attendance_hrs,0), COALESCE(lab_hrs,0)
+		FROM ta_workload_forms WHERE assignment_id = $1`, assignmentID).Scan(&attendance, &labHrs); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var lines []string
+	if lec && attendance > 0.001 {
+		lines = append(lines, fmt.Sprintf("ตัดชั่วโมงเช็คชื่อ/เก็บใบงาน %.1f ชม./สัปดาห์ออก เพราะคาบบรรยายทุกคาบตรงกับตารางเรียน", attendance))
+	} else {
+		lec = false
+	}
+	if lab && labHrs > 0.001 {
+		lines = append(lines, fmt.Sprintf("ตัดชั่วโมงสอนปฏิบัติการ %.1f ชม./สัปดาห์ออก เพราะคาบปฏิบัติการทุกคาบตรงกับตารางเรียน", labHrs))
+	} else {
+		lab = false
+	}
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ta_workload_forms
+		SET attendance_hrs = CASE WHEN $2 THEN 0 ELSE attendance_hrs END,
+		    lab_hrs        = CASE WHEN $3 THEN 0 ELSE lab_hrs END
+		WHERE assignment_id = $1`, assignmentID, lec, lab); err != nil {
+		return nil, err
+	}
+	return lines, nil
 }
 
 // ReevaluateForTA finishes every request that was waiting on this TA's

@@ -84,6 +84,9 @@ func (s *TARequestService) upcomingPeriods(ctx context.Context, courseID uuid.UU
 		}
 		out = append(out, p)
 	}
+	if rows.Err() != nil {
+		return nil
+	}
 	return out
 }
 
