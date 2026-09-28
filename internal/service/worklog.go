@@ -760,9 +760,19 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	// rows count too: the wipe keeps them (only drafts go) while the running
 	// daily totals below don't see them, so every rejected slot came back as a
 	// fresh draft beside it and Submit sent both.
+	//
+	// Except a rejected row in a month the TA can no longer reach (period
+	// closed, or exported / sent to finance). It is forfeited: the TA cannot
+	// fix, resend or delete it, and Generate writes nothing into that month
+	// (blockedMonths below), so it can collide with nothing. Counting it left a
+	// TA whose bounced June ran past its deadline unable to generate the rest
+	// of the term, ever — with no action on screen that could clear it.
 	var locked int
 	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND status IN ('submitted','approved','rejected')`,
+		`SELECT COUNT(*) FROM work_logs wl
+		  WHERE wl.assignment_id=$1
+		    AND (wl.status IN ('submitted','approved')
+		         OR (wl.status = 'rejected' AND NOT `+unsubmittableMonthSQL("wl")+`))`,
 		assignmentID).Scan(&locked); err != nil {
 		return nil, err
 	}
