@@ -46,3 +46,45 @@ func TestGenerate_IgnoresRejectedRowsInClosedMonth(t *testing.T) {
 		t.Errorf("rejected rows in the closed month = %d, want the 1 forfeited row kept", rejected)
 	}
 }
+
+// The ฿300/day cap is per TA per day across every course (rule 6a). Generate
+// used to count only the rows it was writing, so a TA already carrying a day in
+// another course got a generated row that pushed it over — and the lecturer's
+// approval then failed on a day their own course priced well under the cap.
+func TestGenerate_DailyBahtCountsOtherCourses(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Rates: rateOverrides{UndergradRegular: 40, DailyPayCapBaht: 300}, Workload: workloadHours{CheckWork: 2}})
+	f.addDutySlot(DutyReview, 3, "17:00", "18:00") // Wednesday evening
+
+	rows, err := f.Svc.Generate(f.ctx, f.TAID, f.AssignmentID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var target string
+	for _, r := range rows.Entries {
+		if r.Activity == "review" {
+			target = r.WorkDate
+			break
+		}
+	}
+	if target == "" {
+		t.Fatal("fixture generated no review row to collide with")
+	}
+
+	// Another course already fills that day to 280฿ (7 ชม. × 40).
+	other := f.secondCourseAssignment(fixtureOpts{})
+	f.exec(`INSERT INTO work_logs (assignment_id, work_date, start_time, end_time, hours, activity, status)
+	        VALUES ($1, $2, '08:00', '15:00', 7, 'review', 'approved')`, other, target)
+
+	if _, err := f.Svc.Generate(f.ctx, f.TAID, f.AssignmentID); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	var n int
+	if err := f.Pool.QueryRow(f.ctx,
+		`SELECT COUNT(*) FROM work_logs WHERE assignment_id = $1 AND work_date = $2`,
+		f.AssignmentID, target).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("Generate wrote %d row(s) on %s, where another course already holds 280฿ of a 300฿ day", n, target)
+	}
+}

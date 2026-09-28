@@ -827,9 +827,27 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		_ = s.pool.QueryRow(ctx,
 			`SELECT daily_pay_cap_baht FROM `+payRatesInForce+``).Scan(&dailyBahtCap)
 	}
+	// dailyBaht starts from what each day ALREADY holds across every
+	// assignment this TA has (filled in below, once blockedMM is known) — the
+	// cap is per TA per day (rule 6a), the same scope enforceDailyBahtCap and
+	// recheckDailyBahtForApproval use. It used to start at zero, so a TA with
+	// two courses could generate a Saturday that the save-time check would
+	// have refused; Submit does not re-price, and the lecturer's approval then
+	// failed with "ค่าตอบแทนรวมต่อวันเกิน 300 บาท" on a day that, on their own
+	// screen, held only 160฿ of their course.
 	dailyBaht := map[string]float64{}
-	bahtBlocks := func(dkey string, hrs float64) bool {
-		return genRate > 0 && dailyBahtCap > 0 && dailyBaht[dkey]+hrs*genRate > dailyBahtCap+0.01
+	// sharedSitting marks date|start|end slots a co-taught sibling assignment
+	// already bills. Rule B2 pays such a sitting once, so the copy generated
+	// here adds nothing to the day.
+	sharedSitting := map[string]bool{}
+	bahtCost := func(dkey, start, end string, hrs float64) float64 {
+		if sharedSitting[dkey+"|"+hhmmPrefix(start)+"|"+hhmmPrefix(end)] {
+			return 0
+		}
+		return hrs * genRate
+	}
+	bahtBlocks := func(dkey, start, end string, hrs float64) bool {
+		return genRate > 0 && dailyBahtCap > 0 && dailyBaht[dkey]+bahtCost(dkey, start, end, hrs) > dailyBahtCap+0.01
 	}
 	// Total hours already committed by this run. Generate enforced every OTHER
 	// limit — daily hours, daily baht, activity scope, holidays, own-class clashes
@@ -873,6 +891,11 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	for mm, bm := range blockedMonths {
 		if bm.IsClosed || bm.Locked {
 			blockedMM = append(blockedMM, mm)
+		}
+	}
+	if genRate > 0 && dailyBahtCap > 0 {
+		if err := s.loadGenerateDayBaht(ctx, ac.TAID, assignmentID, blockedMM, dailyBaht, sharedSitting); err != nil {
+			return nil, err
 		}
 	}
 	// Rows that will SURVIVE the wipe below — submitted/approved ones, plus
@@ -1222,7 +1245,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if dailyHrs[useDate.Format("2006-01-02")]+rowHours > dailyHourCap {
 				continue
 			}
-			if bahtBlocks(useDate.Format("2006-01-02"), rowHours) {
+			if bahtBlocks(useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours) {
 				continue
 			}
 			if termBlocks(rowHours) {
@@ -1248,7 +1271,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				WorkDate: useDate.Format("2006-01-02"), StartTime: rowStart, EndTime: rowEnd,
 				Hours: rowHours, Activity: sc.kind, Note: &note, Status: "draft"})
 			dailyHrs[useDate.Format("2006-01-02")] += rowHours
-			dailyBaht[useDate.Format("2006-01-02")] += rowHours * genRate
+			dailyBaht[useDate.Format("2006-01-02")] += bahtCost(useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours)
 			termHours += rowHours
 		}
 	}
@@ -1298,7 +1321,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if dailyHrs[dstr]+hrs > dailyHourCap {
 				continue
 			}
-			if bahtBlocks(dstr, hrs) {
+			if bahtBlocks(dstr, start, end, hrs) {
 				continue
 			}
 			if termBlocks(hrs) {
@@ -1323,7 +1346,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				WorkDate: dstr, StartTime: start, EndTime: end,
 				Hours: hrs, Activity: "review", Note: &note, Status: "draft"})
 			dailyHrs[dstr] += hrs
-			dailyBaht[dstr] += hrs * genRate
+			dailyBaht[dstr] += bahtCost(dstr, start, end, hrs)
 			termHours += hrs
 		}
 		if err := reviewRows.Err(); err != nil {
@@ -1430,7 +1453,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				if dailyHrs[dkey]+r.hours > dailyHourCap {
 					continue
 				}
-				if bahtBlocks(dkey, r.hours) {
+				if bahtBlocks(dkey, r.start, r.end, r.hours) {
 					continue
 				}
 				if termBlocks(r.hours) {
@@ -1453,7 +1476,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 					Hours: r.hours, Activity: r.activity, ParentKind: r.parentKind,
 					Note: &note, Status: "draft"})
 				dailyHrs[dkey] += r.hours
-				dailyBaht[dkey] += r.hours * genRate
+				dailyBaht[dkey] += bahtCost(dkey, r.start, r.end, r.hours)
 				termHours += r.hours
 			}
 		}
@@ -2636,6 +2659,75 @@ func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, 
 	return nil
 }
 
+// loadGenerateDayBaht fills Generate's per-day baht running totals with what
+// each day already holds across ALL of the TA's assignments, priced like
+// enforceDailyBahtCap: one sitting per co-taught group, regular wins (rule B2),
+// grad-special free. Rows Generate is about to wipe — this assignment's drafts
+// outside blocked months — are left out, since the run replaces them.
+//
+// It also records into shared the slots a co-taught sibling of this assignment
+// already bills, so the copy Generate writes for the same sitting is not
+// charged a second time.
+func (s *WorkLogService) loadGenerateDayBaht(ctx context.Context, taID, assignmentID uuid.UUID, blockedMM []string,
+	perDay map[string]float64, shared map[string]bool) error {
+	rows, err := s.pool.Query(ctx, `
+		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
+		me AS (SELECT request_id, cotaught_group FROM ta_request_assignments WHERE id = $2),
+		day_rows AS (
+		    SELECT wl.id, wl.work_date, wl.start_time, wl.end_time, wl.hours, a.request_id,
+		           a.cotaught_group, a.level::text AS level, sec.track::text AS track
+		    FROM work_logs wl
+		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		    JOIN sections sec ON sec.id = a.section_id
+		    WHERE a.ta_id = $1 AND wl.status <> 'rejected'
+		      AND NOT (wl.assignment_id = $2 AND wl.status = 'draft'
+		               AND to_char(wl.work_date,'MM') <> ALL($3))
+		),
+		sitting AS (
+		    SELECT DISTINCT ON (work_date, COALESCE(cotaught_group::text, id::text),
+		                        request_id, start_time, end_time)
+		           work_date, start_time, end_time, hours, level, track, request_id, cotaught_group
+		    FROM day_rows
+		    ORDER BY work_date, COALESCE(cotaught_group::text, id::text),
+		             request_id, start_time, end_time, (track = 'regular') DESC
+		)
+		SELECT TO_CHAR(st.work_date,'YYYY-MM-DD'), LEFT(st.start_time::text, 5), LEFT(st.end_time::text, 5),
+		       st.hours * CASE
+		           WHEN st.level='undergrad' AND st.track='regular' THEN pr.undergrad_regular
+		           WHEN st.level='undergrad' AND st.track='special' THEN pr.undergrad_special
+		           WHEN st.level IN ('master','phd') AND st.track='regular' THEN pr.graduate_regular_hourly
+		           ELSE 0 END,
+		       (me.cotaught_group IS NOT NULL AND st.cotaught_group = me.cotaught_group
+		        AND st.request_id = me.request_id)
+		FROM sitting st CROSS JOIN latest pr CROSS JOIN me`, taID, assignmentID, blockedMM)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d, start, end string
+		var baht float64
+		var sibling bool
+		if err := rows.Scan(&d, &start, &end, &baht, &sibling); err != nil {
+			return err
+		}
+		perDay[d] += baht
+		if sibling {
+			shared[d+"|"+start+"|"+end] = true
+		}
+	}
+	return rows.Err()
+}
+
+// hhmmPrefix trims "15:00:00" / "15:00" to "15:00" so generated slots and
+// stored rows compare on the same key.
+func hhmmPrefix(t string) string {
+	if len(t) >= 5 {
+		return t[:5]
+	}
+	return t
+}
+
 // recheckDailyBahtForApproval re-prices, inside the approval transaction, every
 // day on which this assignment has submitted or approved rows, against
 // pay_rates.daily_pay_cap_baht (Q&A rule 6a). The cap is otherwise only checked
@@ -2670,49 +2762,71 @@ func (s *WorkLogService) recheckDailyBahtForApproval(ctx context.Context, tx pgx
 		),
 		day_rows AS (
 		    SELECT wl.id, wl.work_date, wl.start_time, wl.end_time, wl.hours, a.request_id,
-		           a.cotaught_group, a.level::text AS level, sec.track::text AS track
+		           a.cotaught_group, a.level::text AS level, sec.track::text AS track,
+		           tc.code
 		    FROM work_logs wl
 		    JOIN days d ON d.work_date = wl.work_date
 		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		    JOIN sections sec ON sec.id = a.section_id
+		    JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 		    WHERE a.ta_id = $1 AND wl.status IN ('submitted','approved')
 		),
 		sitting AS (
 		    SELECT DISTINCT ON (work_date, COALESCE(cotaught_group::text, id::text),
 		                        request_id, start_time, end_time)
-		           work_date, hours, level, track
+		           work_date, hours, level, track, code
 		    FROM day_rows
 		    ORDER BY work_date, COALESCE(cotaught_group::text, id::text),
 		             request_id, start_time, end_time, (track = 'regular') DESC
+		),
+		per_course AS (
+		    SELECT work_date, code, SUM(hours) AS hours,
+		           SUM(hours * CASE
+		               WHEN level='undergrad' AND track='regular' THEN pr.undergrad_regular
+		               WHEN level='undergrad' AND track='special' THEN pr.undergrad_special
+		               WHEN level IN ('master','phd') AND track='regular' THEN pr.graduate_regular_hourly
+		               ELSE 0 END) AS baht
+		    FROM sitting CROSS JOIN latest pr
+		    GROUP BY work_date, code
 		)
-		SELECT TO_CHAR(work_date,'YYYY-MM-DD')
-		FROM sitting CROSS JOIN latest pr
+		SELECT TO_CHAR(work_date,'YYYY-MM-DD'), SUM(baht),
+		       STRING_AGG(code || ' ' || TO_CHAR(hours, 'FM990.0') || ' ชม. ' || TO_CHAR(baht, 'FM999990') || ' บาท',
+		                  ', ' ORDER BY code)
+		FROM per_course
 		GROUP BY work_date
-		HAVING SUM(hours * CASE
-		        WHEN level='undergrad' AND track='regular' THEN pr.undergrad_regular
-		        WHEN level='undergrad' AND track='special' THEN pr.undergrad_special
-		        WHEN level IN ('master','phd') AND track='regular' THEN pr.graduate_regular_hourly
-		        ELSE 0 END) > $3 + 0.01
+		HAVING SUM(baht) > $3 + 0.01
 		ORDER BY work_date`, taID, assignmentID, capBaht, yearMonth)
 	if err != nil {
 		return err
 	}
+	// Each over-cap day is spelled out per course. The cap is per TA per day
+	// across every course they assist, so the lecturer's own screen can show a
+	// day well under it ("4 ชม. × 40 = 160") while another course's rows push
+	// the day over — the bare date left them unable to see why.
 	var bad []string
+	multiCourse := false
 	for rows.Next() {
-		var d string
-		if err := rows.Scan(&d); err != nil {
+		var d, breakdown string
+		var total float64
+		if err := rows.Scan(&d, &total, &breakdown); err != nil {
 			rows.Close()
 			return err
 		}
-		bad = append(bad, d)
+		if strings.Contains(breakdown, ", ") {
+			multiCourse = true
+		}
+		bad = append(bad, fmt.Sprintf("%s รวม %.0f บาท (%s)", thaiLongDateISO(d), total, breakdown))
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	if len(bad) > 0 {
-		return Conflict(fmt.Sprintf(
-			"อนุมัติไม่ได้ ค่าตอบแทนรวมต่อวันเกิน %.0f บาท ในวันที่: %s", capBaht, thaiDateList(bad)))
+		msg := fmt.Sprintf("อนุมัติไม่ได้ ค่าตอบแทนรวมต่อวันเกิน %.0f บาท ในวันที่: %s", capBaht, strings.Join(bad, "; "))
+		if multiCourse {
+			msg += " เพดานนี้นับรวมทุกวิชาที่ TA ปฏิบัติงานในวันเดียวกัน"
+		}
+		return Conflict(msg)
 	}
 	return nil
 }
