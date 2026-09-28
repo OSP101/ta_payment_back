@@ -898,20 +898,7 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 	if verdict == "approved" {
 		s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนได้รับการอนุมัติ "+code,
 			fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอดังกล่าวได้รับการอนุมัติเรียบร้อยแล้ว", code, nameTH), "/lecturer")
-		rows, err := s.pool.Query(ctx,
-			`SELECT DISTINCT a.ta_id FROM ta_request_assignments a WHERE a.request_id = $1`, reqID)
-		if err != nil {
-			return
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var taID uuid.UUID
-			if err := rows.Scan(&taID); err != nil {
-				return
-			}
-			s.notify.Send(ctx, taID, "ท่านได้รับการแต่งตั้งเป็นผู้ช่วยสอน "+code,
-				fmt.Sprintf("ท่านได้รับการอนุมัติให้เป็นผู้ช่วยสอนรายวิชา %s %s และสามารถบันทึกเวลาปฏิบัติงานในระบบได้แล้ว", code, nameTH), "/ta")
-		}
+		s.notifyTAsAppointed(ctx, reqID, courseID, code, nameTH)
 		return
 	}
 	s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ "+code,

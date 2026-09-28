@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"ta-payment-back/internal/ssonext"
@@ -120,4 +122,101 @@ func TestSSOAppIDFallsBackToClientID(t *testing.T) {
 			t.Errorf("AppID = %q", c.SSOAppID)
 		}
 	})
+}
+
+// The university's SMTP sheet, pasted into .env exactly as it arrived.
+const kkuMailSheet = `SMTP_HOST=smtp.kku.ac.th
+SMTP_PORT=587
+SMTP_ENCRYPTION=tls
+SMTP_USER=        # ว่างได้ถ้า relay อนุญาตตาม IP
+SMTP_PASS=        # ว่างได้ถ้า relay อนุญาตตาม IP
+MAILER_FROM=no-reply-coco-tas@kku.ac.th   # ต้องเป็นโดเมน kku.ac.th
+MAILER_FROM_NAME= COCO TAS
+QUOTED_HASH="pa #ss"
+BARE_HASH=pa#ss
+`
+
+func TestLoadDotEnv_UniversityMailSheet(t *testing.T) {
+	for _, k := range []string{"SMTP_HOST", "SMTP_PORT", "SMTP_ENCRYPTION", "SMTP_USER", "SMTP_PASS",
+		"MAILER_FROM", "MAILER_FROM_NAME", "MAIL_FROM", "QUOTED_HASH", "BARE_HASH"} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte(kkuMailSheet), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	LoadDotEnv(path)
+
+	want := map[string]string{
+		"SMTP_HOST": "smtp.kku.ac.th", "SMTP_PORT": "587", "SMTP_ENCRYPTION": "tls",
+		// The comments must not become the credentials.
+		"SMTP_USER": "", "SMTP_PASS": "",
+		"MAILER_FROM": "no-reply-coco-tas@kku.ac.th", "MAILER_FROM_NAME": "COCO TAS",
+		"QUOTED_HASH": "pa #ss", "BARE_HASH": "pa#ss",
+	}
+	for k, v := range want {
+		if got := os.Getenv(k); got != v {
+			t.Errorf("%s = %q, want %q", k, got, v)
+		}
+	}
+
+	t.Setenv("JWT_SECRET", "test")
+	t.Setenv("PII_ENC_KEY", "test")
+	t.Setenv("TOTP_ENC_KEY", "test")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.MailFrom != "no-reply-coco-tas@kku.ac.th" || c.MailFromName != "COCO TAS" {
+		t.Errorf("from = %q name = %q", c.MailFrom, c.MailFromName)
+	}
+	if c.SMTPEncryption != "starttls" || c.SMTPPort != 587 || c.SMTPUser != "" {
+		t.Errorf("encryption=%q port=%d user=%q", c.SMTPEncryption, c.SMTPPort, c.SMTPUser)
+	}
+}
+
+func TestNormalizeSMTPEncryption(t *testing.T) {
+	for in, want := range map[string]string{
+		"tls": "starttls", "STARTTLS": "starttls", "ssl": "ssl", "smtps": "ssl",
+		"none": "none", "": "", "weird": "",
+	} {
+		if got := normalizeSMTPEncryption(in); got != want {
+			t.Errorf("normalizeSMTPEncryption(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The other KKU systems' spelling (SMTP_SECURE, EMAIL_FROM "Name <addr>")
+// must configure this one the same way.
+func TestLoad_OtherKKUSystemsMailNames(t *testing.T) {
+	cases := []struct {
+		secure, port, want string
+	}{
+		{"true", "587", "starttls"},
+		{"true", "465", "ssl"},
+		{"false", "25", "none"},
+	}
+	for _, c := range cases {
+		t.Run(c.secure+"/"+c.port, func(t *testing.T) {
+			t.Setenv("JWT_SECRET", "test")
+			t.Setenv("PII_ENC_KEY", "test")
+			t.Setenv("TOTP_ENC_KEY", "test")
+			t.Setenv("SMTP_ENCRYPTION", "")
+			t.Setenv("SMTP_SECURE", c.secure)
+			t.Setenv("SMTP_PORT", c.port)
+			t.Setenv("MAILER_FROM", "")
+			t.Setenv("EMAIL_FROM", "ชื่อระบบ <noreply@kku.ac.th>")
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SMTPEncryption != c.want {
+				t.Errorf("SMTP_SECURE=%s port %s -> %q, want %q", c.secure, c.port, cfg.SMTPEncryption, c.want)
+			}
+			if cfg.MailFrom != "ชื่อระบบ <noreply@kku.ac.th>" {
+				t.Errorf("MailFrom = %q", cfg.MailFrom)
+			}
+		})
+	}
 }

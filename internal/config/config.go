@@ -35,14 +35,34 @@ func LoadDotEnv(path string) {
 		}
 		k := strings.TrimSpace(line[:i])
 		v := strings.TrimSpace(line[i+1:])
-		// Strip optional quotes
+		// Strip optional quotes; an unquoted value loses a trailing comment.
 		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
 			v = v[1 : len(v)-1]
+		} else {
+			v = stripInlineComment(v)
 		}
 		if _, exists := os.LookupEnv(k); !exists {
 			_ = os.Setenv(k, v)
 		}
 	}
+}
+
+// stripInlineComment drops "# ..." after an unquoted value, as Docker
+// Compose's env_file does. Settings sheets arrive written that way, e.g.
+// "SMTP_USER=        # ว่างได้ถ้า relay อนุญาตตาม IP"; kept verbatim, that
+// comment became the SMTP user name and every send tried to log in with it.
+// A "#" only starts a comment at the start of the value or after whitespace,
+// so "pa#ss" survives; a value that needs " #" must be quoted.
+func stripInlineComment(v string) string {
+	if strings.HasPrefix(v, "#") {
+		return ""
+	}
+	for i := 1; i < len(v); i++ {
+		if v[i] == '#' && (v[i-1] == ' ' || v[i-1] == '\t') {
+			return strings.TrimSpace(v[:i])
+		}
+	}
+	return v
 }
 
 type Config struct {
@@ -76,8 +96,21 @@ type Config struct {
 	SMTPPort      int
 	SMTPUser      string
 	SMTPPass      string
-	MailFrom      string
-	AppBaseURL    string
+	// SMTPEncryption: "starttls" (upgrade after connecting, port 587),
+	// "ssl" (TLS from the first byte, port 465), "none" (plain relay), or ""
+	// for STARTTLS whenever the server offers it. From SMTP_ENCRYPTION; the
+	// university's own settings sheet writes "tls" for STARTTLS on 587.
+	SMTPEncryption string
+	// SMTPTLSLegacyCiphers also offers the RSA key-exchange suites Go leaves
+	// out by default. smtp.kku.ac.th accepts only those, so without it every
+	// handshake fails; the mailer also retries with them automatically.
+	SMTPTLSLegacyCiphers bool
+	// MailFrom is the sender address (MAILER_FROM, formerly MAIL_FROM); it
+	// must be a kku.ac.th address for the university relay to accept it.
+	MailFrom string
+	// MailFromName is the display name shown beside it (MAILER_FROM_NAME).
+	MailFromName string
+	AppBaseURL   string
 	// CookieSecure gates the auth cookie's Secure attribute. Derived from
 	// AppBaseURL's scheme rather than the inbound request's protocol: this
 	// process sits behind Next.js behind a TLS-terminating reverse proxy (see
@@ -223,17 +256,21 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
-		Port:                 env("PORT", "8080"),
-		DatabaseURL:          resolveDatabaseURL(),
-		JWTSecret:            env("JWT_SECRET", ""),
-		JWTIssuer:            env("JWT_ISSUER", "ta-payment"),
-		CORSOrigins:          env("CORS_ORIGINS", "http://localhost:3000"),
-		UploadDir:            env("UPLOAD_DIR", "./data/uploads"),
-		AppEnv:               env("APP_ENV", "development"),
-		SMTPHost:             env("SMTP_HOST", ""),
-		SMTPUser:             env("SMTP_USER", ""),
-		SMTPPass:             env("SMTP_PASS", ""),
-		MailFrom:             env("MAIL_FROM", "no-reply@coco.kku.ac.th"),
+		Port:        env("PORT", "8080"),
+		DatabaseURL: resolveDatabaseURL(),
+		JWTSecret:   env("JWT_SECRET", ""),
+		JWTIssuer:   env("JWT_ISSUER", "ta-payment"),
+		CORSOrigins: env("CORS_ORIGINS", "http://localhost:3000"),
+		UploadDir:   env("UPLOAD_DIR", "./data/uploads"),
+		AppEnv:      env("APP_ENV", "development"),
+		SMTPHost:    env("SMTP_HOST", ""),
+		SMTPUser:    env("SMTP_USER", ""),
+		SMTPPass:    env("SMTP_PASS", ""),
+		// MAILER_FROM (the university's sheet) > EMAIL_FROM (the other KKU
+		// systems' name, may be "Name <addr>") > MAIL_FROM (this system's old one).
+		MailFrom:             env("MAILER_FROM", env("EMAIL_FROM", env("MAIL_FROM", "no-reply@coco.kku.ac.th"))),
+		MailFromName:         strings.TrimSpace(env("MAILER_FROM_NAME", "")),
+		SMTPEncryption:       normalizeSMTPEncryption(env("SMTP_ENCRYPTION", "")),
 		AppBaseURL:           env("APP_BASE_URL", "http://localhost:3000"),
 		SSOAppID:             env("KKU_SSO_APP_ID", ""),
 		SSOClientID:          env("KKU_SSO_CLIENT_ID", ""),
@@ -305,6 +342,25 @@ func Load() (Config, error) {
 	}
 	c.JWTLifetime = envDuration("JWT_LIFETIME", 12*time.Hour)
 	c.SMTPPort = envInt("SMTP_PORT", 587)
+	// SMTP_SECURE is how the other KKU systems say it: true means encrypted,
+	// which is STARTTLS on 587 and TLS-from-the-start on 465. SMTP_ENCRYPTION
+	// wins when both are set.
+	if c.SMTPEncryption == "" {
+		if v := strings.TrimSpace(os.Getenv("SMTP_SECURE")); v != "" {
+			switch secure := envBool("SMTP_SECURE", false); {
+			case secure && c.SMTPPort == 465:
+				c.SMTPEncryption = "ssl"
+			case secure:
+				c.SMTPEncryption = "starttls"
+			default:
+				c.SMTPEncryption = "none"
+			}
+		}
+	}
+	if c.SMTPEncryption == "" && c.SMTPPort == 465 {
+		c.SMTPEncryption = "ssl"
+	}
+	c.SMTPTLSLegacyCiphers = envBool("SMTP_TLS_LEGACY_CIPHERS", false)
 	c.MaxUploadMB = envInt("MAX_UPLOAD_MB", 20)
 	c.ClamAVTimeout = envDuration("CLAMAV_TIMEOUT", 30*time.Second)
 	c.CookieSecure = strings.HasPrefix(c.AppBaseURL, "https://")
@@ -327,6 +383,21 @@ func Load() (Config, error) {
 	return c, nil
 }
 
+// normalizeSMTPEncryption maps the spellings mail settings sheets use onto
+// the three modes the mailer knows. Unknown values fall back to "" (STARTTLS
+// when offered), the safest default for port 587.
+func normalizeSMTPEncryption(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "tls", "starttls":
+		return "starttls"
+	case "ssl", "smtps", "implicit":
+		return "ssl"
+	case "none", "plain", "false", "off":
+		return "none"
+	}
+	return ""
+}
+
 func env(k, def string) string {
 	if v, ok := os.LookupEnv(k); ok && v != "" {
 		return v
@@ -345,6 +416,10 @@ func envInt(k string, def int) int {
 
 // primaryBaseURL is the first origin in APP_BASE_URL, without its trailing
 // slash — the one a browser is actually sent to.
+// PrimaryBaseURL is the first address of a comma-separated APP_BASE_URL, the
+// one to put in links that leave the system (e-mail, SSO redirects).
+func PrimaryBaseURL(raw string) string { return primaryBaseURL(raw) }
+
 func primaryBaseURL(raw string) string {
 	first, _, _ := strings.Cut(raw, ",")
 	return strings.TrimRight(strings.TrimSpace(first), "/")

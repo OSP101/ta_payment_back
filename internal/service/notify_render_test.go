@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/mail"
 )
 
@@ -124,5 +125,14 @@ func TestThaiDateHelpers(t *testing.T) {
 		if got := thaiBaht(in); got != want {
 			t.Errorf("thaiBaht(%v) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// E-mail links take the first address of a comma-separated APP_BASE_URL;
+// prepending the whole list produced "http://a,http://b/ta".
+func TestAbsoluteLink_CommaSeparatedBase(t *testing.T) {
+	base := config.PrimaryBaseURL("https://tas.coco.kku.ac.th/, http://10.199.10.10:3000")
+	if got := absoluteLink(base, "/ta"); got != "https://tas.coco.kku.ac.th/ta" {
+		t.Errorf("link = %q", got)
 	}
 }

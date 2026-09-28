@@ -3,6 +3,7 @@ package mail
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/x509"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -10,7 +11,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
-	"net/smtp"
+	netmail "net/mail"
 	"net/textproto"
 	"strings"
 	"time"
@@ -19,8 +20,9 @@ import (
 )
 
 // logoPNG is the college symbol in white, for the brand-coloured e-mail
-// header (160 px square, shown at 56 for sharp high-DPI rendering). It travels inside the message as an inline part rather than as a
-// link to the web server: mail clients block remote images by default, and
+// header (160 px square, shown at 56 for sharp high-DPI rendering). It
+// travels inside the message as an inline part rather than as a link to the
+// web server: mail clients block remote images by default, and
 // the site may only be reachable on the campus network.
 //
 //go:embed logo.png
@@ -33,7 +35,12 @@ const LogoCID = "college-logo@ta-payment"
 // LogoPNG returns the embedded logo, for previews that cannot use cid:.
 func LogoPNG() []byte { return logoPNG }
 
-type Mailer struct{ cfg config.Config }
+type Mailer struct {
+	cfg config.Config
+	// rootCAs overrides the system roots; nil in production. Tests set it to
+	// trust their own fake relay's certificate.
+	rootCAs *x509.CertPool
+}
 
 func New(cfg config.Config) *Mailer { return &Mailer{cfg: cfg} }
 
@@ -69,17 +76,40 @@ func (m *Mailer) SendMessage(msg Message) error {
 		return nil
 	}
 	to := stripCRLF(strings.TrimSpace(msg.To))
-	raw, err := buildMessage(m.cfg.MailFrom, msg, time.Now())
+	raw, err := buildMessage(m.fromHeader(), msg, time.Now())
 	if err != nil {
 		return err
 	}
-	addr := fmt.Sprintf("%s:%d", m.cfg.SMTPHost, m.cfg.SMTPPort)
-	var auth smtp.Auth
-	if m.cfg.SMTPUser != "" {
-		auth = smtp.PlainAuth("", m.cfg.SMTPUser, m.cfg.SMTPPass, m.cfg.SMTPHost)
-	}
-	return smtp.SendMail(addr, auth, m.cfg.MailFrom, []string{to}, raw)
+	return m.deliver(to, raw)
 }
+
+// envelopeFrom is the bare sender address for MAIL FROM. MailFrom may be
+// written "Name <addr>"; the envelope takes only the address.
+func (m *Mailer) envelopeFrom() string {
+	if a, err := netmail.ParseAddress(m.cfg.MailFrom); err == nil {
+		return a.Address
+	}
+	return strings.TrimSpace(m.cfg.MailFrom)
+}
+
+// fromHeader is the From: line, "COCO TAS <no-reply-coco-tas@kku.ac.th>",
+// with a non-ASCII name RFC 2047-encoded so receivers do not drop or garble it.
+//
+// Name precedence: MAILER_FROM_NAME, then a name written in the address itself
+// ("ชื่อระบบ <noreply@kku.ac.th>", as EMAIL_FROM is), then the system's name.
+func (m *Mailer) fromHeader() string {
+	name := strings.TrimSpace(m.cfg.MailFromName)
+	if a, err := netmail.ParseAddress(m.cfg.MailFrom); err == nil && name == "" {
+		name = a.Name
+	}
+	if name == "" {
+		name = defaultFromName
+	}
+	return (&netmail.Address{Name: name, Address: m.envelopeFrom()}).String()
+}
+
+// defaultFromName is the sender name when the settings give none.
+const defaultFromName = "COCO TAS"
 
 // buildMessage renders the full RFC 5322 message:
 //

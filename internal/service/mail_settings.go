@@ -40,8 +40,9 @@ type MailSettings struct {
 }
 
 type MailSettingsService struct {
-	pool *pgxpool.Pool
-	aud  *audit.Auditor
+	pool   *pgxpool.Pool
+	aud    *audit.Auditor
+	mailer *mail.Mailer
 }
 
 // loadMailContact reads the footer. Any failure falls back to the default so

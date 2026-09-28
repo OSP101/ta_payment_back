@@ -59,7 +59,10 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Audit = &AuditService{pool: pool, store: store}
 	c.Users = &UserService{pool: pool, aud: auditor}
 	c.Courses = &CourseService{pool: pool, aud: auditor}
-	c.Notify = &NotifyService{pool: pool, mailer: mailer, baseURL: cfg.AppBaseURL}
+	// APP_BASE_URL may list several addresses (dev: localhost and the LAN
+	// IP); e-mail links take the first, as the SSO redirect does. The whole
+	// list used to be prepended, giving "http://a,http://b/ta" links.
+	c.Notify = &NotifyService{pool: pool, mailer: mailer, baseURL: config.PrimaryBaseURL(cfg.AppBaseURL)}
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}
 	c.Budget = &BudgetService{pool: pool}
 	c.TARequest = &TARequestService{pool: pool, aud: auditor, budget: c.Budget, notify: c.Notify}
@@ -109,6 +112,6 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	// doc comment.
 	c.Teaching.tdbm = c.TDBM
 	c.Teaching.requests = c.TARequest
-	c.MailSettings = &MailSettingsService{pool: pool, aud: auditor}
+	c.MailSettings = &MailSettingsService{pool: pool, aud: auditor, mailer: mailer}
 	return c
 }

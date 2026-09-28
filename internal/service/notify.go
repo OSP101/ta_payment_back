@@ -14,7 +14,7 @@ import (
 type NotifyService struct {
 	pool   *pgxpool.Pool
 	mailer *mail.Mailer
-	// baseURL is config.AppBaseURL. Links are stored as in-app paths
+	// baseURL is the first address of config.AppBaseURL. Links are stored as in-app paths
 	// ("/lecturer"), which the bell resolves against the current origin; a mail
 	// client has no origin, so the e-mail copy needs the absolute URL.
 	baseURL string
