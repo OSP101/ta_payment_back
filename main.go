@@ -234,14 +234,16 @@ func main() {
 		// ta_payment_front/app/lib/api.ts) whenever NEXT_PUBLIC_API_ORIGIN is
 		// configured.
 		//
-		// Cross-Origin-Embedder-Policy/Opener-Policy are left at fiber's
-		// defaults (require-corp / same-origin) rather than fought — the
-		// helmet middleware has no "off" value for them, only "unset field
-		// falls back to the default". Both only matter for a response the
-		// browser treats as a navigable top-level document; nothing here
-		// currently opens this API as one (no window.open()+postMessage flow
-		// against it, no page embeds its JSON/PDF/ZIP responses as a
-		// document), so they're inert today. Revisit if that changes.
+		// Cross-Origin-Embedder-Policy is "unsafe-none" (the browser's own
+		// default, i.e. no policy) rather than fiber's "require-corp". This
+		// API DOES serve documents: the inline PDFs — the staff review
+		// preview embedded by PdfFrame's <iframe>, the creditor form, the
+		// TA's own uploads. Chromium's PDF viewer loads its own resources
+		// into that document, and require-corp blocks them, so Edge/Chrome
+		// showed staff a blank white page instead of the file. COEP only
+		// buys cross-origin isolation (SharedArrayBuffer and friends), which
+		// nothing here uses. Opener-Policy stays at fiber's "same-origin".
+		CrossOriginEmbedderPolicy: "unsafe-none",
 		CrossOriginResourcePolicy: "cross-origin",
 	}))
 	app.Use(cors.New(cors.Config{
