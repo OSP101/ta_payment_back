@@ -319,3 +319,52 @@ func TestListPending_LoneSectionHoursLandOnItsOwnTrack(t *testing.T) {
 			rows[0].GroupRegularHours, rows[0].GroupSpecialHours)
 	}
 }
+
+// The review queue never shows drafts, so the row has to say which months the
+// TA saved but never sent — otherwise a month left as a draft looked finished
+// to the lecturer. Once the month's period closes the draft is forfeited
+// ("ไม่ประสงค์ลงเวลา") and moves to ForfeitedMonths: it will never arrive.
+func TestListPending_ReportsDraftMonths(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	pid := f.addSubmissionPeriod(currentMonthMM(), openDueDate(), "", false)
+	f.exec(`INSERT INTO work_logs (assignment_id, work_date, start_time, end_time, hours, activity, status, submitted_at)
+	        VALUES ($1, $2, '09:00', '11:00', 2, 'review', 'submitted', now()),
+	               ($1, $3, '09:00', '10:00', 1, 'review', 'draft', NULL)`,
+		f.AssignmentID, day(10), day(12))
+	ym := day(12)[:7]
+
+	find := func() PendingReport {
+		t.Helper()
+		rows, err := f.Svc.ListPending(f.ctx, f.LecturerID, false)
+		if err != nil {
+			t.Fatalf("ListPending: %v", err)
+		}
+		for _, r := range rows {
+			if r.ID == f.AssignmentID {
+				return r
+			}
+		}
+		t.Fatal("assignment with a submitted row is missing from the queue")
+		return PendingReport{}
+	}
+
+	r := find()
+	if len(r.DraftMonths) != 1 || r.DraftMonths[0] != ym {
+		t.Errorf("open period: draft_months = %v, want [%s]", r.DraftMonths, ym)
+	}
+	if len(r.ForfeitedMonths) != 0 {
+		t.Errorf("open period: forfeited_months = %v, want none", r.ForfeitedMonths)
+	}
+	if r.TotalHours != 2 {
+		t.Errorf("total_hours = %v, want 2 — the draft hour must not count as waiting", r.TotalHours)
+	}
+
+	f.exec(`UPDATE submission_periods SET is_closed = TRUE WHERE id = $1`, pid)
+	r = find()
+	if len(r.DraftMonths) != 0 {
+		t.Errorf("closed period: draft_months = %v, want none", r.DraftMonths)
+	}
+	if len(r.ForfeitedMonths) != 1 || r.ForfeitedMonths[0] != ym {
+		t.Errorf("closed period: forfeited_months = %v, want [%s]", r.ForfeitedMonths, ym)
+	}
+}

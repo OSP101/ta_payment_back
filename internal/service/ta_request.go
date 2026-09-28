@@ -1684,6 +1684,11 @@ type TACandidate struct {
 	// waits for the timetable and any clashing session will be dropped — the
 	// form shows that warning before the lecturer commits.
 	HasSchedule bool `json:"has_schedule"`
+	// When AlreadyInCourse: the live request the TA is on (newest if several)
+	// and every section of this course they already cover. The form uses them
+	// to add sections to that request (AddSections) instead of refusing the TA.
+	ExistingRequestID *uuid.UUID  `json:"existing_request_id,omitempty"`
+	HeldSectionIDs    []uuid.UUID `json:"held_section_ids,omitempty"`
 }
 
 // Candidates lists every TA with their approved-course count in the given
@@ -1732,7 +1737,45 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 		c.AtQuota = c.ApprovedCourseCount >= maxApprovedCoursesPerTerm
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	idx := map[uuid.UUID]int{}
+	for i := range out {
+		if out[i].AlreadyInCourse {
+			idx[out[i].ID] = i
+		}
+	}
+	if len(idx) == 0 {
+		return out, nil
+	}
+	held, err := s.pool.Query(ctx, `
+		SELECT a.ta_id, a.section_id, r.id
+		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id
+		WHERE r.teaching_course_id = $1
+		  AND r.status IN ('submitted', 'approved')
+		  AND a.state <> 'dropped'
+		ORDER BY r.submitted_at`, tcID)
+	if err != nil {
+		return nil, err
+	}
+	defer held.Close()
+	for held.Next() {
+		var taID, secID, reqID uuid.UUID
+		if err := held.Scan(&taID, &secID, &reqID); err != nil {
+			return nil, err
+		}
+		i, ok := idx[taID]
+		if !ok {
+			continue
+		}
+		out[i].HeldSectionIDs = append(out[i].HeldSectionIDs, secID)
+		out[i].ExistingRequestID = &reqID // ordered by submitted_at: newest wins
+	}
+	return out, held.Err()
 }
 
 // reservedCourseCount counts distinct courses (other than courseID) in the term

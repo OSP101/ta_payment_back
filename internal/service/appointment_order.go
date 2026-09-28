@@ -23,6 +23,8 @@ type AppointmentOrderService struct {
 	pool    *pgxpool.Pool
 	aud     *audit.Auditor
 	fontDir string
+	// notify sends the timetable reminders (appointment_remind.go).
+	notify *NotifyService
 }
 
 // AppointmentOrderInput is the request payload from staff.

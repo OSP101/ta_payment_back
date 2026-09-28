@@ -368,6 +368,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), rh.Detail)
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer), rh.Create)
 	authed.Post("/ta-requests/:id/cancel", RequireRole(rbac.RoleLecturer), rh.Cancel)
+	authed.Post("/ta-requests/:id/sections", RequireRole(rbac.RoleLecturer), rh.AddSections)
 	// Workload correction — staff/admin only. Cancel above refuses once
 	// work_logs exist and its own error message says "contact staff"; this is
 	// the tool that message used to point at without one existing.
@@ -568,6 +569,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/exports/transfer-cover/:id/reprint", adminOrStaff, heavyLimiter, eh.TransferCoverReprint)
 	authed.Get("/exports/appointment-order/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentPreview)
 	authed.Get("/exports/appointment-order/rounds", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRounds)
+	authed.Post("/exports/appointment-order/remind-timetable", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRemindTimetable)
 	authed.Post("/exports/appointment-order", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), heavyLimiter, eh.AppointmentOrder)
 	// Re-issue a copy of an order already printed. Separate from the POST above
 	// because that one CREATES a round; this one only re-renders a stored

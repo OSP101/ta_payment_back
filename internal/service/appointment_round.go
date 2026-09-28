@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -36,8 +37,19 @@ type SkippedCourse struct {
 	CourseNameTH     string    `json:"course_name_th"`
 	Reason           string    `json:"reason"`
 	// PendingTAs names who is holding it up, so the reason is actionable
-	// rather than a bare "not ready".
+	// rather than a bare "not ready". Same people as Waiting, names only.
 	PendingTAs []string `json:"pending_tas,omitempty"`
+	// Waiting are the TAs on the request with no class timetable for the
+	// term, the one thing a pending request waits on, with when staff last
+	// reminded each of them.
+	Waiting []WaitingTA `json:"waiting"`
+}
+
+// WaitingTA is one TA holding up a course's TA request.
+type WaitingTA struct {
+	TAID       uuid.UUID  `json:"ta_id"`
+	Name       string     `json:"name"`
+	RemindedAt *time.Time `json:"reminded_at,omitempty"`
 }
 
 // AppointmentPreview is what staff see BEFORE committing a round: exactly who
@@ -157,18 +169,31 @@ func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID)
 // skippedCourses lists courses with a TA request still waiting on a decision.
 // Those TAs are not approved yet, so they cannot be appointed — and staff need
 // to know the course exists rather than wonder why it is missing.
+//
+// A pending request waits only for its TAs' class timetables, so the people
+// named are the TAs with no timetable for the term. It used to name every TA
+// on the request, sending staff to chase people who had already done their
+// part.
 func (s *AppointmentOrderService) skippedCourses(ctx context.Context, termID uuid.UUID) ([]SkippedCourse, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT tc.id, tc.code, tc.name_th,
-		       ARRAY_AGG(DISTINCT u.first_name || ' ' || u.last_name)
-		FROM ta_requests r
-		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
-		JOIN ta_request_assignments a ON a.request_id = r.id AND a.state <> 'dropped'
-		JOIN users u ON u.id = a.ta_id
+		SELECT tc.id, tc.code, tc.name_th, w.ta_id, w.name, w.reminded_at
+		FROM teaching_courses tc
+		LEFT JOIN LATERAL (
+			SELECT DISTINCT a.ta_id, `+personNameSQL+` AS name,
+			       (SELECT MAX(tr.sent_at) FROM timetable_reminders tr
+			         WHERE tr.ta_id = a.ta_id AND tr.term_id = $1) AS reminded_at
+			FROM ta_requests r
+			JOIN ta_request_assignments a ON a.request_id = r.id AND a.state <> 'dropped'
+			JOIN users u ON u.id = a.ta_id
+			LEFT JOIN ta_profiles tp ON tp.user_id = u.id
+			WHERE r.teaching_course_id = tc.id AND r.status = 'submitted'
+			  AND NOT EXISTS (SELECT 1 FROM ta_class_schedules cs
+			                   WHERE cs.user_id = a.ta_id AND cs.term_id = $1)
+		) w ON TRUE
 		WHERE tc.term_id = $1
-		  AND r.status = 'submitted'
-		GROUP BY tc.id, tc.code, tc.name_th
-		ORDER BY tc.code`, termID)
+		  AND EXISTS (SELECT 1 FROM ta_requests r
+		               WHERE r.teaching_course_id = tc.id AND r.status = 'submitted')
+		ORDER BY tc.code, w.name`, termID)
 	if err != nil {
 		return nil, err
 	}
@@ -176,12 +201,33 @@ func (s *AppointmentOrderService) skippedCourses(ctx context.Context, termID uui
 
 	out := []SkippedCourse{}
 	for rows.Next() {
-		var c SkippedCourse
-		if err := rows.Scan(&c.TeachingCourseID, &c.CourseCode, &c.CourseNameTH, &c.PendingTAs); err != nil {
+		var (
+			id         uuid.UUID
+			code, name string
+			taID       *uuid.UUID
+			taName     *string
+			remindedAt *time.Time
+		)
+		if err := rows.Scan(&id, &code, &name, &taID, &taName, &remindedAt); err != nil {
 			return nil, err
 		}
-		c.Reason = "คำขอ TA ยังไม่ได้รับการตัดสิน รอตารางเรียนของผู้ช่วยสอน"
-		out = append(out, c)
+		if len(out) == 0 || out[len(out)-1].TeachingCourseID != id {
+			out = append(out, SkippedCourse{TeachingCourseID: id, CourseCode: code, CourseNameTH: name,
+				Waiting: []WaitingTA{}})
+		}
+		c := &out[len(out)-1]
+		if taID != nil && taName != nil {
+			c.Waiting = append(c.Waiting, WaitingTA{TAID: *taID, Name: *taName, RemindedAt: remindedAt})
+			c.PendingTAs = append(c.PendingTAs, *taName)
+		}
+	}
+	for i := range out {
+		if len(out[i].Waiting) > 0 {
+			out[i].Reason = "คำขอ TA ยังไม่ได้รับการตัดสิน รอตารางเรียนของผู้ช่วยสอน"
+		} else {
+			// Every timetable is in; the hourly sweep decides the request.
+			out[i].Reason = "ผู้ช่วยสอนบันทึกตารางเรียนครบแล้ว ระบบจะพิจารณาคำขอภายใน 1 ชั่วโมง"
+		}
 	}
 	return out, rows.Err()
 }

@@ -1072,6 +1072,28 @@ func (h *TARequestHandler) Detail(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// AddSections puts more sections of the same course on a TA already on the
+// request, without cancelling it (a TA may have logged hours already).
+func (h *TARequestHandler) AddSections(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.AddSectionsInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	res, err := h.Svc.TARequest.AddSections(c.Context(), UserID(c), id, in)
+	if err != nil {
+		var ue *service.UserError
+		if errors.As(err, &ue) {
+			return err // carries its own status (409 for a frozen grad lump)
+		}
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	return c.JSON(res)
+}
+
 func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 	var in service.CreateTARequestInput
 	if err := Bind(c, &in); err != nil {
@@ -3196,6 +3218,23 @@ func (h *ExportHandler) AppointmentPreview(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "term_id is required")
 	}
 	out, err := h.Svc.Appointment.Preview(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// AppointmentRemindTimetable reminds TAs whose missing class timetable holds
+// a course out of the appointment order. ta_ids empty means all of them.
+func (h *ExportHandler) AppointmentRemindTimetable(c *fiber.Ctx) error {
+	var in struct {
+		TermID uuid.UUID   `json:"term_id" validate:"required"`
+		TAIDs  []uuid.UUID `json:"ta_ids" validate:"max=200"`
+	}
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	out, err := h.Svc.Appointment.RemindTimetable(c.Context(), UserID(c), in.TermID, in.TAIDs)
 	if err != nil {
 		return err
 	}
