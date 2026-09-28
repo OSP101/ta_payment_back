@@ -743,6 +743,9 @@ type GenerateResult struct {
 	// are only as many as they have crowded days.
 	SkippedDailyBaht []DailyCapSkip `json:"skipped_daily_baht,omitempty"`
 	DailyBahtCap     float64        `json:"daily_baht_cap,omitempty"`
+	// KeptMonths ("YYYY-MM") are months left exactly as they were because they
+	// are in review — submitted, approved, or bounced and not yet cleared.
+	KeptMonths []string `json:"kept_months,omitempty"`
 }
 
 // DailyCapSkip is one day Generate trimmed to stay within the daily pay cap:
@@ -772,29 +775,48 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	if err := s.assertStudentCountFilled(ctx, ac.TeachingCourseID); err != nil {
 		return nil, err
 	}
-	// Refuse to regenerate once anything has been submitted/approved, otherwise
-	// the wipe-and-recreate below would silently drop reviewed rows. Rejected
-	// rows count too: the wipe keeps them (only drafts go) while the running
-	// daily totals below don't see them, so every rejected slot came back as a
-	// fresh draft beside it and Submit sent both.
+	// Months already in review are KEPT, not refused. A month is in review when
+	// it holds a submitted or approved row, or a rejected row the TA can still
+	// fix (period open). Generate neither wipes nor writes there — the drafts a
+	// TA added to such a month survive too — and works only on the months that
+	// are still entirely the TA's.
 	//
-	// Except a rejected row in a month the TA can no longer reach (period
-	// closed, or exported / sent to finance). It is forfeited: the TA cannot
-	// fix, resend or delete it, and Generate writes nothing into that month
-	// (blockedMonths below), so it can collide with nothing. Counting it left a
-	// TA whose bounced June ran past its deadline unable to generate the rest
-	// of the term, ever — with no action on screen that could clear it.
-	var locked int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM work_logs wl
-		  WHERE wl.assignment_id=$1
-		    AND (wl.status IN ('submitted','approved')
-		         OR (wl.status = 'rejected' AND NOT `+unsubmittableMonthSQL("wl")+`))`,
-		assignmentID).Scan(&locked); err != nil {
-		return nil, err
-	}
-	if locked > 0 {
-		return nil, Invalid("ไม่สามารถสร้างใหม่ได้ เนื่องจากมีรายการที่ส่งอนุมัติ อนุมัติแล้ว หรือถูกตีกลับ กรุณาแก้ไขรายการที่ถูกตีกลับแทน")
+	// It used to refuse the whole run if ANY such row existed anywhere. A
+	// lecturer who approved September and bounced July then left the TA unable
+	// to regenerate July at all: after deleting the bounced rows the only way
+	// back was typing a month of sessions by hand.
+	//
+	// A rejected row keeps its month for the same reason the whole run was
+	// once refused over it: the wipe spares it (only drafts go) and a fresh
+	// draft would be generated beside it, so Submit sent both. Deleting the
+	// rejected rows releases the month. A rejected row in a month the TA can no
+	// longer reach is forfeited and holds nothing — that month is kept anyway,
+	// as a blocked month below.
+	reviewMonths := map[string]bool{} // "MM"
+	var keptMonths []string           // "YYYY-MM", for the result
+	{
+		rows, err := s.pool.Query(ctx,
+			`SELECT DISTINCT to_char(wl.work_date,'YYYY-MM') FROM work_logs wl
+			  WHERE wl.assignment_id=$1
+			    AND (wl.status IN ('submitted','approved')
+			         OR (wl.status = 'rejected' AND NOT `+unsubmittableMonthSQL("wl")+`))
+			  ORDER BY 1`, assignmentID)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var ym string
+			if err := rows.Scan(&ym); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			keptMonths = append(keptMonths, ym)
+			reviewMonths[ym[5:7]] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 	var sectionID uuid.UUID
 	var startsOn, endsOn time.Time
@@ -926,15 +948,22 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	if err != nil {
 		return nil, err
 	}
+	// Months in review (above) are kept the same way: not wiped, not written.
 	monthBlocked := func(mm string) bool {
+		if reviewMonths[mm] {
+			return true
+		}
 		bm, ok := blockedMonths[mm]
 		return ok && (bm.IsClosed || bm.Locked)
 	}
 	blockedMM := []string{} // non-nil: `<> ALL(NULL)` would delete nothing
 	for mm, bm := range blockedMonths {
-		if bm.IsClosed || bm.Locked {
+		if (bm.IsClosed || bm.Locked) && !reviewMonths[mm] {
 			blockedMM = append(blockedMM, mm)
 		}
+	}
+	for mm := range reviewMonths {
+		blockedMM = append(blockedMM, mm)
 	}
 	if genRate > 0 && dailyBahtCap > 0 {
 		if err := s.loadGenerateDayBaht(ctx, ac.TAID, assignmentID, blockedMM, dailyBaht, sharedSitting); err != nil {
@@ -1098,6 +1127,45 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		}
 	}
 	weeklyHrs := map[string]float64{}
+	// Rows kept in months this run does not touch still fill their weeks. A
+	// week straddling a kept month and a generated one (31 ส.ค.–6 ก.ย.) would
+	// otherwise get a full week's quota on each side. Counted the way
+	// enforceWeeklyActivityCap counts: every status, bar generated makeup rows,
+	// which belong to the week they replace.
+	if len(bucketByActivity) > 0 {
+		krows, err := s.pool.Query(ctx, `
+			SELECT TO_CHAR(work_date,'YYYY-MM-DD'), activity, hours FROM work_logs
+			 WHERE assignment_id = $1
+			   AND (status <> 'draft' OR to_char(work_date,'MM') = ANY($2))
+			   AND NOT (source = 'auto' AND EXISTS (
+			         SELECT 1 FROM makeup_schedules ms
+			          WHERE ms.section_id = $3
+			            AND ms.makeup_date = work_logs.work_date
+			            AND ms.kind = work_logs.activity))`,
+			assignmentID, blockedMM, ac.SectionID)
+		if err != nil {
+			return nil, err
+		}
+		for krows.Next() {
+			var ds, act string
+			var hrs float64
+			if err := krows.Scan(&ds, &act, &hrs); err != nil {
+				krows.Close()
+				return nil, err
+			}
+			b, ok := bucketByActivity[act]
+			if !ok || b.cap <= 0 {
+				continue
+			}
+			if d, perr := time.Parse("2006-01-02", ds); perr == nil {
+				weeklyHrs[weekStart(d).Format("2006-01-02")+"|"+b.label] += hrs
+			}
+		}
+		krows.Close()
+		if err := krows.Err(); err != nil {
+			return nil, err
+		}
+	}
 	skippedByWeeklyCap := map[string]int{}
 	// weeklyCapReserve reports whether adding hrs of actType on date d would
 	// push that activity's weekly bucket past its cap; on success it also
@@ -1574,6 +1642,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		StoppedAtTermCeiling: stoppedAtCeiling,
 		TermHourCeiling:      termCeiling,
 		SkippedDailyBaht:     bahtSkips,
+		KeptMonths:           keptMonths,
 	}
 	if len(bahtSkips) > 0 {
 		res.DailyBahtCap = dailyBahtCap

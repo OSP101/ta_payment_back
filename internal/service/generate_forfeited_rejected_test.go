@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -20,10 +21,19 @@ func TestGenerate_IgnoresRejectedRowsInClosedMonth(t *testing.T) {
 	        VALUES ($1, $2, '09:00', '10:00', 1, 'review', 'rejected', 'ไม่ถูกต้อง')`,
 		f.AssignmentID, day(12))
 
-	// Still inside an open period the TA can fix it, so regenerating stays
-	// refused — it would mint a fresh draft beside the rejected slot.
-	if _, err := f.Svc.Generate(ctx, f.TAID, f.AssignmentID); err == nil {
-		t.Fatal("a rejected row in an OPEN month must still block Generate")
+	// Still inside an open period the TA can fix it, so the month is kept as
+	// it is — a fresh draft beside the rejected slot would be sent twice.
+	res, err := f.Svc.Generate(ctx, f.TAID, f.AssignmentID)
+	if err != nil {
+		t.Fatalf("Generate with a fixable rejected row: %v", err)
+	}
+	if len(res.KeptMonths) != 1 || res.KeptMonths[0] != day(12)[:7] {
+		t.Errorf("kept_months = %v, want [%s]", res.KeptMonths, day(12)[:7])
+	}
+	for _, e := range res.Entries {
+		if e.WorkDate[:7] == day(12)[:7] {
+			t.Fatalf("Generate wrote %s into the month holding a fixable rejected row", e.WorkDate)
+		}
 	}
 
 	f.exec(`UPDATE submission_periods SET is_closed = TRUE WHERE id = $1`, pid)
@@ -134,5 +144,72 @@ func TestGenerate_DailyBahtCountsOtherCourses(t *testing.T) {
 				t.Errorf("daily_baht_cap = %v, want 300", res.DailyBahtCap)
 			}
 		})
+	}
+}
+
+// A lecturer approved one month and bounced another. The TA deletes the
+// bounced rows to regenerate them — Generate used to refuse the whole run over
+// the approved month, so the only way back was typing the month by hand.
+// Months in review are now kept untouched and only the rest is regenerated.
+func TestGenerate_KeepsReviewedMonthsAndRegeneratesTheRest(t *testing.T) {
+	f := newFixture(t, fixtureOpts{Workload: workloadHours{CheckWork: 2}})
+	f.addDutySlot(DutyReview, 3, "17:00", "18:00") // Wednesday evening
+
+	first, err := f.Svc.Generate(f.ctx, f.TAID, f.AssignmentID)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	m0 := monthStart().Format("2006-01")
+	m1 := monthStart().AddDate(0, 1, 0).Format("2006-01")
+	m2 := monthStart().AddDate(0, 2, 0).Format("2006-01")
+	perMonth := map[string]int{}
+	for _, e := range first.Entries {
+		perMonth[e.WorkDate[:7]]++
+	}
+	if perMonth[m0] == 0 || perMonth[m1] == 0 || perMonth[m2] == 0 {
+		t.Fatalf("fixture must generate into all three months, got %v", perMonth)
+	}
+
+	count := func(ym, status string) int {
+		t.Helper()
+		var n int
+		if err := f.Pool.QueryRow(f.ctx,
+			`SELECT COUNT(*) FROM work_logs WHERE assignment_id=$1 AND to_char(work_date,'YYYY-MM')=$2 AND status=$3`,
+			f.AssignmentID, ym, status).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	f.exec(`UPDATE work_logs SET status='approved' WHERE assignment_id=$1 AND to_char(work_date,'YYYY-MM')=$2`, f.AssignmentID, m0)
+	f.exec(`UPDATE work_logs SET status='rejected', reject_reason='แก้ไข' WHERE assignment_id=$1 AND to_char(work_date,'YYYY-MM')=$2`, f.AssignmentID, m1)
+	f.exec(`DELETE FROM work_logs WHERE assignment_id=$1 AND to_char(work_date,'YYYY-MM')=$2`, f.AssignmentID, m2)
+
+	res, err := f.Svc.Generate(f.ctx, f.TAID, f.AssignmentID)
+	if err != nil {
+		t.Fatalf("Generate must run beside an approved and a bounced month: %v", err)
+	}
+	if got := strings.Join(res.KeptMonths, ","); got != m0+","+m1 {
+		t.Errorf("kept_months = %s, want %s,%s", got, m0, m1)
+	}
+	if count(m0, "approved") != perMonth[m0] || count(m0, "draft") != 0 {
+		t.Errorf("approved month changed: approved %d (want %d), drafts %d", count(m0, "approved"), perMonth[m0], count(m0, "draft"))
+	}
+	if count(m1, "rejected") != perMonth[m1] || count(m1, "draft") != 0 {
+		t.Errorf("bounced month must be left for the TA to fix: rejected %d (want %d), drafts %d", count(m1, "rejected"), perMonth[m1], count(m1, "draft"))
+	}
+	if count(m2, "draft") != perMonth[m2] {
+		t.Errorf("free month regenerated %d drafts, want %d", count(m2, "draft"), perMonth[m2])
+	}
+
+	// Deleting the bounced rows releases the month.
+	f.exec(`DELETE FROM work_logs WHERE assignment_id=$1 AND status='rejected'`, f.AssignmentID)
+	if _, err := f.Svc.Generate(f.ctx, f.TAID, f.AssignmentID); err != nil {
+		t.Fatalf("Generate after clearing the bounced month: %v", err)
+	}
+	if count(m1, "draft") != perMonth[m1] {
+		t.Errorf("cleared month regenerated %d drafts, want %d", count(m1, "draft"), perMonth[m1])
+	}
+	if count(m0, "approved") != perMonth[m0] {
+		t.Errorf("approved month changed on the second run")
 	}
 }
