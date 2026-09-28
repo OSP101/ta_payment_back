@@ -353,25 +353,42 @@ type rowQuerier interface {
 // meeting was explicit that a TA who must be in class for part of a session
 // cannot cover that session at all.
 func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) (map[uuid.UUID][]string, error) {
+	return s.applyClashOutcomeFor(ctx, tx, reqID, uuid.Nil, false)
+}
+
+// applyClashOutcomeFor is applyClashOutcome narrowed to one TA (onlyTA; Nil =
+// everyone) and, with recheck set, to assignments whose verdict actually
+// changes. recheck is the path for a request that was already decided: the
+// timetable page autosaves after every edit, so the verdict was reached on
+// whatever the TA had entered by then, and every later save must be able to
+// correct it without re-notifying on saves that change nothing.
+//
+// A recheck never drops an assignment that already has logged hours. Exports
+// skip dropped assignments, so dropping it would silently remove those hours
+// from pay; it stays 'trimmed' with the new reason for staff to settle.
+func (s *TARequestService) applyClashOutcomeFor(ctx context.Context, tx pgx.Tx, reqID, onlyTA uuid.UUID, recheck bool) (map[uuid.UUID][]string, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT a.id, a.ta_id, a.section_id, sec.sec_no,
-		       u.first_name || ' ' || u.last_name, a.level::text
+		       u.first_name || ' ' || u.last_name, a.level::text,
+		       a.state::text, COALESCE(a.state_reason, '')
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN users u ON u.id = a.ta_id
 		WHERE a.request_id = $1 AND a.state <> 'dropped'
-		ORDER BY a.ta_id, sec.sec_no`, reqID)
+		  AND ($2::uuid = '00000000-0000-0000-0000-000000000000' OR a.ta_id = $2)
+		ORDER BY a.ta_id, sec.sec_no`, reqID, onlyTA)
 	if err != nil {
 		return nil, err
 	}
 	type asg struct {
 		id, taID, secID      uuid.UUID
 		secNo, taName, level string
+		oldState, oldReason  string
 	}
 	var all []asg
 	for rows.Next() {
 		var a asg
-		if err := rows.Scan(&a.id, &a.taID, &a.secID, &a.secNo, &a.taName, &a.level); err != nil {
+		if err := rows.Scan(&a.id, &a.taID, &a.secID, &a.secNo, &a.taName, &a.level, &a.oldState, &a.oldReason); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -437,6 +454,16 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 					lines...), "\n")
 			}
 		}
+		if recheck && state == "dropped" {
+			var logged bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM work_logs WHERE assignment_id = $1)`, a.id).Scan(&logged); err != nil {
+				return nil, err
+			}
+			if logged {
+				state = "trimmed"
+			}
+		}
 		// An in-class duty declared on a kind the TA can never attend is zeroed
 		// here rather than refused at Create, so the declared figures match what
 		// the form allows whichever order the timetable arrived in. The lines go
@@ -448,6 +475,9 @@ func (s *TARequestService) applyClashOutcome(ctx context.Context, tx pgx.Tx, req
 			if err != nil {
 				return nil, err
 			}
+		}
+		if recheck && state == a.oldState && reason == a.oldReason && len(stripped) == 0 {
+			continue // nothing new since the last verdict
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE ta_request_assignments
@@ -546,6 +576,94 @@ func (s *TARequestService) ReevaluateForTA(ctx context.Context, taID, termID uui
 			// schedule save (the caller) must still succeed.
 			log.Printf("ta_request %s: reevaluate failed: %v", id, err)
 		}
+	}
+
+	// Requests already decided for this TA. The timetable page autosaves after
+	// every edit, so a request can be decided on a half-entered timetable — the
+	// first class saved finishes it, and the classes added a moment later were
+	// never checked. Re-apply the clash rule to this TA's part of each one.
+	rows, err = s.pool.Query(ctx, `
+		SELECT DISTINCT r.id
+		FROM ta_requests r
+		JOIN ta_request_assignments a ON a.request_id = r.id
+		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		WHERE a.ta_id = $1 AND tc.term_id = $2 AND r.status = 'approved'
+		  AND a.state <> 'dropped'`, taID, termID)
+	if err != nil {
+		return err
+	}
+	ids = ids[:0]
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := s.recheckApproved(ctx, id, taID); err != nil {
+			log.Printf("ta_request %s: recheck after timetable change failed: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// recheckApproved re-applies the clash rule to one TA's part of an approved
+// request after their timetable changed. When that leaves nobody on the request
+// able to work, the request is rejected — the verdict it would have had if the
+// whole timetable had been there when it was first decided.
+func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid.UUID) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var status string
+	if err := tx.QueryRow(ctx,
+		`SELECT status::text FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&status); err != nil {
+		return err
+	}
+	if status != "approved" {
+		return nil
+	}
+	notices, err := s.applyClashOutcomeFor(ctx, tx, reqID, taID, true)
+	if err != nil {
+		return err
+	}
+	if len(notices) == 0 {
+		return nil
+	}
+
+	var surviving int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ta_request_assignments WHERE request_id = $1 AND state <> 'dropped'`,
+		reqID).Scan(&surviving); err != nil {
+		return err
+	}
+	const reason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
+	rejected := surviving == 0
+	if rejected {
+		if _, err := tx.Exec(ctx, `
+			UPDATE ta_requests SET
+			  status = 'rejected', decided_at = NOW(), decided_by = NULL,
+			  reject_reason = $1, updated_at = NOW()
+			WHERE id = $2`, reason, reqID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	s.notifyClashOutcome(ctx, reqID, notices)
+	if rejected {
+		s.notifyDecision(ctx, reqID, "rejected", reason)
 	}
 	return nil
 }
