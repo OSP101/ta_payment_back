@@ -174,5 +174,6 @@ func timetableReminderContent(term string, courses []waitingCourse) (string, str
 		Table:       table,
 		After:       after,
 		ButtonLabel: "บันทึกตารางเรียน",
+		Guides:      taTimetableGuides,
 	}
 }

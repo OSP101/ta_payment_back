@@ -5,7 +5,28 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+
+	"ta-payment-back/internal/service"
 )
+
+type transferCoverStepUpReq struct {
+	Password string `json:"password"`
+}
+
+// transferCoverStepUp re-checks the caller's own password before any
+// ปะหน้าจ่ายตรง file leaves the server. The file carries every TA's full
+// citizen ID (the PromptPay column), so a session left open on an office
+// machine must not be enough to walk away with it — the same step-up
+// RevealCitizenID asks of a TA viewing only their own number. The password
+// travels in a POST body, never the query string, so it stays out of access
+// logs and browser history.
+func (h *ExportHandler) transferCoverStepUp(c *fiber.Ctx) error {
+	var in transferCoverStepUpReq
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	return service.VerifyUserPassword(c.Context(), h.Svc.Pool, UserID(c), in.Password)
+}
 
 // monthsParam reads the ?months=2026-06,2026-07 selection shared by the
 // transfer-cover endpoints. Absent or blank means the whole term, which is
@@ -46,11 +67,14 @@ func levelLabelTH(level string) string {
 	return "ปตรี"
 }
 
-// TransferCoverXLSX — GET /exports/terms/:id/transfer-cover.xlsx — the
+// TransferCoverXLSX — POST /exports/terms/:id/transfer-cover.xlsx — the
 // "ปะหน้าจ่ายตรง" (แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร) document. Refuses outright
 // (400, not a 200 with a warnings list) if any course in the term has not
 // reached finance_sent — see ExportService.TermExportBlockers.
 func (h *ExportHandler) TransferCoverXLSX(c *fiber.Ctx) error {
+	if err := h.transferCoverStepUp(c); err != nil {
+		return err
+	}
 	termID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
@@ -85,12 +109,15 @@ func (h *ExportHandler) TransferCoverXLSX(c *fiber.Ctx) error {
 	return c.Send(body)
 }
 
-// TransferCoverBundleZIP — GET /exports/terms/:id/transfer-cover-bundle.zip —
+// TransferCoverBundleZIP — POST /exports/terms/:id/transfer-cover-bundle.zip —
 // one click, one zip, both level files inside (whichever are ready). Staff
 // asked for a single download button instead of two separate ones crowding
 // the header (12/08/2026) — the two documents are still built, gated, and
 // ledgered independently exactly as before; only the button is merged.
 func (h *ExportHandler) TransferCoverBundleZIP(c *fiber.Ctx) error {
+	if err := h.transferCoverStepUp(c); err != nil {
+		return err
+	}
 	termID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
@@ -179,10 +206,13 @@ func (h *ExportHandler) TransferCoverHistory(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-// TransferCoverReprint — GET /exports/transfer-cover/:id/reprint — re-renders
+// TransferCoverReprint — POST /exports/transfer-cover/:id/reprint — re-renders
 // a past generation from its frozen snapshot rather than recomputing from
 // today's tables.
 func (h *ExportHandler) TransferCoverReprint(c *fiber.Ctx) error {
+	if err := h.transferCoverStepUp(c); err != nil {
+		return err
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")

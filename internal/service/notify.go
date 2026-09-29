@@ -108,6 +108,8 @@ func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, bo
 		 WHERE u.id = $1`, userID).Scan(&email, &prefix, &first, &last); err != nil {
 		return
 	}
+	// Manual links are in-app paths too; the mail client needs them absolute.
+	layout.Guides = absoluteGuides(s.baseURL, layout.Guides)
 	m := mailContent{
 		Title: title, Body: body, Link: absoluteLink(s.baseURL, link),
 		Recipient: recipientName(prefix, first, last), Closing: closing,
@@ -191,6 +193,20 @@ func (s *NotifyService) MarkAllRead(ctx context.Context, userID uuid.UUID) (int6
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// absoluteGuides returns a copy of guides with every path made absolute; the
+// caller's slice (often a shared package-level set) is never modified.
+func absoluteGuides(baseURL string, guides []MailGuide) []MailGuide {
+	if len(guides) == 0 {
+		return guides
+	}
+	out := make([]MailGuide, len(guides))
+	for i, g := range guides {
+		g.Path = absoluteLink(baseURL, g.Path)
+		out[i] = g
+	}
+	return out
 }
 
 // absoluteLink turns an in-app path into a URL a mail client can open. Anything

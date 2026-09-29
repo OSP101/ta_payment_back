@@ -1149,8 +1149,9 @@ func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid
 				openNotice = append(openNotice, l.ID)
 				continue
 			}
-			s.notify.Send(ctx, l.ID, "ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอน "+code,
-				"ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอนรายวิชา "+code+" "+name+" ในระบบแล้ว", link)
+			s.notify.SendLaidOut(ctx, l.ID, "ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอน "+code,
+				"ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอนรายวิชา "+code+" "+name+" ในระบบแล้ว", link, false,
+				MailLayout{Guides: lecturerStartGuides})
 		}
 		if len(openNotice) > 0 {
 			if _, err := s.requests.SweepWindowNoticesFor(ctx, openNotice); err != nil {

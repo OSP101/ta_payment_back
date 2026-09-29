@@ -77,6 +77,18 @@ type MailLayout struct {
 	// After is text below the table, before the closing.
 	After       string
 	ButtonLabel string
+	// Guides are manual pages worth reading for this notice, e.g. the
+	// getting-started page on a first contact. Paths are in-app ("/docs/ta/
+	// start"); delivery makes them absolute like the main link. /docs asks
+	// for login and returns the reader to the page afterwards (?next=).
+	Guides []MailGuide
+}
+
+// MailGuide is one manual page linked from an e-mail.
+type MailGuide struct {
+	Label string
+	Path  string
+	Note  string // one line on what the page covers; optional
 }
 
 // mailContent is everything one notification e-mail shows.
@@ -268,6 +280,21 @@ func renderMailHTML(m mailContent) string {
 		b.WriteString(`<tr><td style="padding:0 0 20px"></td></tr>`)
 	}
 
+	// Manual pages for this notice.
+	if len(L.Guides) > 0 {
+		b.WriteString(`<tr><td style="padding:0 30px 28px">`)
+		b.WriteString(`<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:` + mailBrandSoft + `;border-left:4px solid ` + mailBrand + `;border-radius:0 6px 6px 0;padding:16px 20px;font-size:14px;line-height:1.7">`)
+		b.WriteString(`<div style="font-weight:bold;color:` + mailBrandDark + `;margin-bottom:6px">คู่มือการใช้งาน</div>`)
+		for _, g := range L.Guides {
+			b.WriteString(`<div style="margin:6px 0"><a href="` + mailEsc(g.Path) + `" style="color:` + mailBrand + `;font-weight:bold">` + mailEsc(g.Label) + `</a>`)
+			if g.Note != "" {
+				b.WriteString(`<div style="color:` + mailMuted + `;font-size:13px">` + mailEsc(g.Note) + `</div>`)
+			}
+			b.WriteString(`</div>`)
+		}
+		b.WriteString(`</td></tr></table></td></tr>`)
+	}
+
 	// Footer: who sent this and whom to ask.
 	b.WriteString(`<tr><td style="background:` + mailGrey + `;border-top:1px solid #eef0f2;border-radius:0 0 8px 8px;padding:22px 30px;font-size:13px;line-height:1.7;color:#4b5563">`)
 	c := m.contact()
@@ -327,6 +354,13 @@ func renderMailText(m mailContent) string {
 			label = mailButtonLabel
 		}
 		b.WriteString(label + ": " + m.Link + "\n\n")
+	}
+	if len(L.Guides) > 0 {
+		b.WriteString("คู่มือการใช้งาน\n")
+		for _, g := range L.Guides {
+			b.WriteString(g.Label + ": " + g.Path + "\n")
+		}
+		b.WriteString("\n")
 	}
 	c := m.contact()
 	b.WriteString(c.Heading + "\n" + c.Unit + "\n")

@@ -281,6 +281,7 @@ func openNoticeLayout(w noticeWindow, courses []noticeCourse) MailLayout {
 		After: "หากยื่นคำขอภายหลังกำหนด ระบบยังคงรับคำขอ แต่การเบิกจ่ายค่าตอบแทนจะล่าช้ากว่ากำหนด " +
 			"และหากรายวิชาข้างต้นไม่ครบถ้วนหรือไม่ถูกต้อง กรุณาแจ้งเจ้าหน้าที่\n\n" + windowNoticeFooter,
 		ButtonLabel: "ยื่นคำขอผู้ช่วยสอน",
+		Guides:      lecturerRequestGuides,
 	}
 }
 
@@ -293,6 +294,7 @@ func closingNoticeLayout(w noticeWindow, pending []noticeCourse) MailLayout {
 		After: "หากยื่นคำขอภายหลังกำหนด ระบบยังคงรับคำขอ แต่การเบิกจ่ายค่าตอบแทนจะล่าช้ากว่ากำหนด\n\n" +
 			windowNoticeFooter,
 		ButtonLabel: "ยื่นคำขอผู้ช่วยสอน",
+		Guides:      lecturerRequestGuides,
 	}
 }
 

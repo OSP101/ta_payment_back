@@ -107,6 +107,7 @@ func appointNoticeContent(course string, sections []string, logsMonthly bool, pe
 			{"กลุ่มเรียน", secText},
 		},
 		ButtonLabel: "บันทึกเวลาปฏิบัติงาน",
+		Guides:      taAppointedGuides,
 	}
 
 	var b strings.Builder

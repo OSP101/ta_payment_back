@@ -565,14 +565,16 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/exports/terms/:id/certifier", adminOrStaff, eh.Certifier)
 	authed.Put("/exports/terms/:id/certifier", adminOrStaff, eh.SetCertifier)
 	// ปะหน้าจ่ายตรง (แจ้งโอนจ่ายตรงเข้าบัญชีบุคลากร) — gated on every course in
-	// the term reaching finance_sent, unlike the course-summary above.
+	// the term reaching finance_sent, unlike the course-summary above. The
+	// three routes that hand over the FILE are POST with the caller's password
+	// in the body (see transferCoverStepUp): it carries full citizen IDs.
 	authed.Get("/exports/terms/:id/transfer-cover/blockers", adminOrStaff, eh.TransferCoverBlockers)
-	authed.Get("/exports/terms/:id/transfer-cover.xlsx", adminOrStaff, heavyLimiter, eh.TransferCoverXLSX)
-	authed.Get("/exports/terms/:id/transfer-cover-bundle.zip", adminOrStaff, heavyLimiter, eh.TransferCoverBundleZIP)
+	authed.Post("/exports/terms/:id/transfer-cover.xlsx", adminOrStaff, heavyLimiter, eh.TransferCoverXLSX)
+	authed.Post("/exports/terms/:id/transfer-cover-bundle.zip", adminOrStaff, heavyLimiter, eh.TransferCoverBundleZIP)
 	authed.Get("/exports/terms/:id/transfer-cover/preview", adminOrStaff, eh.TransferCoverPreview)
 	authed.Get("/exports/terms/:id/transfer-cover/coverage", adminOrStaff, eh.TransferCoverCoverage)
 	authed.Get("/exports/terms/:id/transfer-cover/history", adminOrStaff, eh.TransferCoverHistory)
-	authed.Get("/exports/transfer-cover/:id/reprint", adminOrStaff, heavyLimiter, eh.TransferCoverReprint)
+	authed.Post("/exports/transfer-cover/:id/reprint", adminOrStaff, heavyLimiter, eh.TransferCoverReprint)
 	authed.Get("/exports/appointment-order/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentPreview)
 	authed.Get("/exports/appointment-order/rounds", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRounds)
 	authed.Post("/exports/appointment-order/remind-timetable", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.AppointmentRemindTimetable)
