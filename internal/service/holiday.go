@@ -88,11 +88,13 @@ type HolidayInput struct {
 	EndTime   *string `json:"end_time,omitempty" validate:"omitempty,datetime=15:04"`
 }
 
-// validHolidaySource reports whether s is one of the allowed holiday types.
-// Must stay in sync with the CHECK constraint on public_holidays.source.
+// validHolidaySource reports whether s is a type staff may enter by hand.
+// Official closures come from TDBM only (migration 0126), so the CHECK
+// constraint's 'national'/'university' stay valid for old rows but are no
+// longer accepted here — typing one in would re-create the TDBM duplicates.
 func validHolidaySource(s string) bool {
 	switch s {
-	case "national", "university", "faculty", "custom":
+	case "faculty", "custom":
 		return true
 	}
 	return false

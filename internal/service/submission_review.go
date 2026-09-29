@@ -93,6 +93,9 @@ type ReviewQueueRow struct {
 	// already skipped it while the payout LIST still counted it, so two courses
 	// sat under "รอคุณดำเนินการ" over months worth ฿0 with no way to clear them.
 	NeedsStaff bool `json:"needs_staff"`
+	// PeriodOpen: the month still takes submissions. Sending an unsigned month
+	// back to the TA only works while it does — see sendBackUnsignedMonth.
+	PeriodOpen bool `json:"period_open"`
 }
 
 // needsStaff decides whether this month is work for the officer. Kept as one
@@ -193,7 +196,8 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 		       COALESCE(ml.waiting_ta, 0),
 		       COALESCE(ml.waiting_lecturer, 0),
 		       COALESCE(ml.row_count, 0),
-		       COALESCE(ml.manual_count, 0)
+		       COALESCE(ml.manual_count, 0),
+		       NOT `+periodClosedSQL("sp")+`
 		FROM month_logs ml
 		LEFT JOIN month_sittings ms
 		       ON ms.ta_id = ml.ta_id AND ms.teaching_course_id = ml.tc_id
@@ -223,7 +227,7 @@ func (s *SubmissionPeriodService) ListReviewQueue(ctx context.Context, termID uu
 			&r.TAID, &r.TAName, &r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
 			&r.Status, &r.ApprovedHoursRegular, &r.ApprovedHoursSpecial, &r.Forfeited, &r.OpenRows,
 			&r.WaitingTA, &r.WaitingLecturer,
-			&r.RowCount, &r.ManualCount); err != nil {
+			&r.RowCount, &r.ManualCount, &r.PeriodOpen); err != nil {
 			return nil, err
 		}
 		r.ApprovedHours = r.ApprovedHoursRegular + r.ApprovedHoursSpecial

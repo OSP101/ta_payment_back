@@ -52,6 +52,12 @@ func workLogInPeriodSQL(wlAlias, termAlias, spAlias string) string {
 		termAlias, wlAlias, spAlias)
 }
 
+// periodClosedSQL is "this period no longer takes submissions": the is_closed
+// flag, or past due_date plus the one-day grace AutoCloseExpired allows.
+func periodClosedSQL(spAlias string) string {
+	return fmt.Sprintf("(%[1]s.is_closed OR CURRENT_DATE > %[1]s.due_date + INTERVAL '1 day')", spAlias)
+}
+
 // periodState is the resolved submission-period condition covering one
 // (teaching_course, ta, work_date). Found=false when the term simply has no
 // period defined for that month — treated as unrestricted for backward

@@ -957,6 +957,11 @@ func (s *SubmissionPeriodService) assertPayoutReady(ctx context.Context, taID uu
 // have no monthly action in this flow (their review is the daily approve/
 // reject), so send-back is staff/admin only. finance_sent rows can only be
 // reopened via the admin-only RevertFinanceSent.
+//
+// A month nobody has signed off yet (no status row, or 'pending') has no
+// status to move back, and the grid offered ตีกลับ on exactly those months —
+// every press was refused. There the send-back is the month's approved rows
+// going back to the TA as rejected; see sendBackUnsignedMonth.
 func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, periodID, taID, tcID uuid.UUID, toStatus, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -990,10 +995,13 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 		WHERE submission_period_id=$1 AND ta_id=$2 AND teaching_course_id=$3
 		FOR UPDATE`, periodID, taID, tcID).Scan(&cur)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Invalid("ยังไม่มีสถานะให้ตีกลับ (เดือนนี้ยังไม่ถูกส่งออก)")
+		cur, err = "pending", nil
 	}
 	if err != nil {
 		return err
+	}
+	if cur == "pending" && toStatus == "pending" {
+		return s.sendBackUnsignedMonth(ctx, tx, actor, periodID, taID, tcID, reason)
 	}
 	curRank, known := statusRank[cur]
 	if !known {
@@ -1041,6 +1049,95 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
 						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
 							" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เนื่องจาก "+reason,
+						"/lecturer/courses/"+tcID.String()+"/reports")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// sendBackUnsignedMonth returns a not-yet-signed-off month to the TA: its
+// approved rows become rejected with the officer's reason, so the TA corrects
+// and resends them and the lecturer approves them again. The TA can only edit
+// draft/rejected rows, so nothing short of this lets them fix anything.
+//
+// Refused once the period has closed: a rejected row in a closed month is
+// forfeited (ไม่ประสงค์ลงเวลา) and can never be resent, so the "send-back"
+// would silently cancel the TA's pay for the month. Corrections there are
+// made by staff directly in the review modal.
+func (s *SubmissionPeriodService) sendBackUnsignedMonth(ctx context.Context, tx pgx.Tx, actor, periodID, taID, tcID uuid.UUID, reason string) error {
+	var closed bool
+	if err := tx.QueryRow(ctx,
+		`SELECT `+periodClosedSQL("sp")+` FROM submission_periods sp WHERE sp.id = $1`,
+		periodID).Scan(&closed); err != nil {
+		return err
+	}
+	if closed {
+		return Invalid("เดือนนี้ปิดรับบันทึกเวลาแล้ว ถ้าตีกลับ TA จะส่งใหม่ไม่ได้ กรุณาแก้ไขรายการผ่านปุ่ม \"ดู\" แทน")
+	}
+	rows, err := tx.Query(ctx, `
+		UPDATE work_logs wl SET status = 'rejected', reject_reason = $4,
+		       approved_at = NULL, approved_by = NULL
+		FROM ta_request_assignments a
+		JOIN sections sec         ON sec.id = a.section_id
+		JOIN teaching_courses tc  ON tc.id = sec.teaching_course_id
+		JOIN academic_terms trm   ON trm.id = tc.term_id
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		WHERE wl.assignment_id = a.id
+		  AND sp.id = $1 AND a.ta_id = $2 AND tc.id = $3
+		  AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
+		  AND wl.status = 'approved'
+		  -- Same exclusion as the review queue: grad-special rows are dead.
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		RETURNING wl.id, TO_CHAR(wl.work_date, 'YYYY-MM-DD'), wl.hours`,
+		periodID, taID, tcID, reason)
+	if err != nil {
+		return err
+	}
+	moved := []map[string]any{}
+	var hours float64
+	for rows.Next() {
+		var id uuid.UUID
+		var date string
+		var h float64
+		if err := rows.Scan(&id, &date, &h); err != nil {
+			rows.Close()
+			return err
+		}
+		moved = append(moved, map[string]any{"id": id, "work_date": date, "hours": h})
+		hours += h
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(moved) == 0 {
+		return Invalid("เดือนนี้ไม่มีรายการที่อนุมัติแล้วให้ตีกลับ")
+	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.sent_back",
+		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
+		Note:   reason,
+		Before: map[string]any{"status": "approved", "rows": moved},
+		After:  map[string]any{"status": "rejected", "count": len(moved), "hours": hours}}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.notify != nil {
+		label := courseLabelOf(ctx, s.pool, tcID)
+		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
+		s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month,
+			"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+
+				" กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก "+reason,
+			"/ta/courses/"+tcID.String()+"/worklog")
+		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
+			for _, lid := range lects {
+				if lid != actor {
+					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
+						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
+							" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เมื่อผู้ช่วยสอนส่งใหม่แล้ว ขอให้ท่านอนุมัติอีกครั้ง เนื่องจาก "+reason,
 						"/lecturer/courses/"+tcID.String()+"/reports")
 				}
 			}
