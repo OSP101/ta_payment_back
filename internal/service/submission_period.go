@@ -1078,7 +1078,7 @@ func (s *SubmissionPeriodService) sendBackUnsignedMonth(ctx context.Context, tx 
 	}
 	rows, err := tx.Query(ctx, `
 		UPDATE work_logs wl SET status = 'rejected', reject_reason = $4,
-		       approved_at = NULL, approved_by = NULL
+		       rejected_by_role = 'staff', approved_at = NULL, approved_by = NULL
 		FROM ta_request_assignments a
 		JOIN sections sec         ON sec.id = a.section_id
 		JOIN teaching_courses tc  ON tc.id = sec.teaching_course_id

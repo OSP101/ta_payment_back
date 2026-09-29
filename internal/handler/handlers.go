@@ -1999,6 +1999,66 @@ func (h *WorkLogHandler) ApproveBatch(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"ok": true})
 }
 
+// ReviewEdit — POST /worklogs/:logId/review-edit — the lecturer corrects the
+// clock/hours of a submitted sitting (every co-taught copy) with a reason.
+func (h *WorkLogHandler) ReviewEdit(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("logId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		StartTime string  `json:"start_time" validate:"required"`
+		EndTime   string  `json:"end_time" validate:"required"`
+		Hours     float64 `json:"hours" validate:"gt=0"`
+		Reason    string  `json:"reason" validate:"required,max=1000"`
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if err := h.Svc.WorkLog.LecturerAdjust(c.Context(), UserID(c), privileged, service.LecturerAdjustInput{
+		LogID: id, StartTime: body.StartTime, EndTime: body.EndTime, Hours: body.Hours, Reason: body.Reason,
+	}); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// ReviewCut — POST /worklogs/:logId/review-cut — the lecturer removes a
+// submitted sitting from the claim, with a reason the TA sees.
+func (h *WorkLogHandler) ReviewCut(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("logId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Reason string `json:"reason" validate:"required,max=1000"`
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	if err := h.Svc.WorkLog.LecturerCut(c.Context(), UserID(c), privileged, id, body.Reason); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// Changes — GET /assignments/:id/worklog/changes — lecturer corrections to
+// this assignment's rows, for the review screen and the TA's own page.
+func (h *WorkLogHandler) Changes(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	out, err := h.Svc.WorkLog.ListChanges(c.Context(), UserID(c), id, privileged)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 func (h *WorkLogHandler) PendingReports(c *fiber.Ctx) error {
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
 	out, err := h.Svc.WorkLog.ListPending(c.Context(), UserID(c), privileged)

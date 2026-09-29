@@ -655,7 +655,8 @@ type WorkLog struct {
 	Note *string `json:"note,omitempty" validate:"omitempty,max=500"`
 	// Status, RejectReason and Source below are never read from the request
 	// body by Upsert/StaffUpsert — both hardcode status='draft' on write, leave
-	// source at its DB default, and only Reject() ever sets reject_reason. A
+	// source at its DB default, and only the reject paths (Reject, and the
+	// staff send-back of an unsigned month) set reject_reason. A
 	// validate tag on them would police a value the service silently discards.
 	Status string `json:"status"`
 	// RejectReason is populated when the lecturer sends the batch back to the
@@ -663,6 +664,9 @@ type WorkLog struct {
 	// reason so the TA-facing UI can surface the message on entry — otherwise
 	// they only see "rejected" chips with no explanation.
 	RejectReason *string `json:"reject_reason,omitempty"`
+	// RejectedByRole is who sent the row back: "lecturer" or "staff" (nil on
+	// rows rejected before migration 0127 — read as the lecturer).
+	RejectedByRole *string `json:"rejected_by_role,omitempty"`
 	// Source is 'auto' (generated from the section timetable) or 'manual' (typed
 	// by the TA). The payout-review screen shows the two differently: a generated
 	// row is a copy of times the lecturer entered, so there is nothing in it to
@@ -2281,6 +2285,13 @@ func (s *WorkLogService) dailyHourCapFor(ctx context.Context, assignmentID uuid.
 // Skips grad-special (flat monthly, not billed hourly). Excludes the row
 // currently being upserted so re-saves aren't penalised.
 func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID, w WorkLog) error {
+	return s.enforceDailyBahtCapExcluding(ctx, taID, w, nil)
+}
+
+// enforceDailyBahtCapExcluding is enforceDailyBahtCap with extra rows left out
+// of the day — the other copies of a co-taught sitting changed in the same act.
+func (s *WorkLogService) enforceDailyBahtCapExcluding(ctx context.Context, taID uuid.UUID, w WorkLog, exclude []uuid.UUID) error {
+	skip := append([]uuid.UUID{w.ID}, exclude...)
 	var capBaht float64
 	if err := s.pool.QueryRow(ctx,
 		`SELECT daily_pay_cap_baht FROM `+payRatesInForce+``).Scan(&capBaht); err != nil {
@@ -2329,7 +2340,7 @@ func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID
 		    JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		    JOIN sections sec ON sec.id = a.section_id
 		    WHERE a.ta_id = $1 AND wl.work_date = $2::date
-		      AND wl.status <> 'rejected' AND wl.id <> $3
+		      AND wl.status <> 'rejected' AND wl.id <> ALL($8::uuid[])
 		    UNION ALL
 		    SELECT * FROM cand
 		),
@@ -2353,7 +2364,7 @@ func (s *WorkLogService) enforceDailyBahtCap(ctx context.Context, taID uuid.UUID
 		        ELSE 0  -- grad special = flat monthly, does not count toward daily cap
 		    END), 0)
 		FROM sitting CROSS JOIN latest pr`,
-		taID, w.WorkDate, w.ID, w.StartTime, w.EndTime, w.Hours, w.AssignmentID).Scan(&total); err != nil {
+		taID, w.WorkDate, w.ID, w.StartTime, w.EndTime, w.Hours, w.AssignmentID, skip).Scan(&total); err != nil {
 		return err
 	}
 	if total > capBaht+0.01 {
@@ -2991,7 +3002,7 @@ func (s *WorkLogService) List(ctx context.Context, actor, assignmentID uuid.UUID
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, assignment_id, TO_CHAR(work_date,'YYYY-MM-DD'), start_time::text, end_time::text, hours, activity, parent_kind, room, note, status::text, reject_reason, source
+		`SELECT id, assignment_id, TO_CHAR(work_date,'YYYY-MM-DD'), start_time::text, end_time::text, hours, activity, parent_kind, room, note, status::text, reject_reason, rejected_by_role, source
 		 FROM work_logs WHERE assignment_id=$1 ORDER BY work_date, start_time`, assignmentID)
 	if err != nil {
 		return nil, err
@@ -3000,7 +3011,7 @@ func (s *WorkLogService) List(ctx context.Context, actor, assignmentID uuid.UUID
 	out := []WorkLog{}
 	for rows.Next() {
 		var w WorkLog
-		if err := rows.Scan(&w.ID, &w.AssignmentID, &w.WorkDate, &w.StartTime, &w.EndTime, &w.Hours, &w.Activity, &w.ParentKind, &w.Room, &w.Note, &w.Status, &w.RejectReason, &w.Source); err != nil {
+		if err := rows.Scan(&w.ID, &w.AssignmentID, &w.WorkDate, &w.StartTime, &w.EndTime, &w.Hours, &w.Activity, &w.ParentKind, &w.Room, &w.Note, &w.Status, &w.RejectReason, &w.RejectedByRole, &w.Source); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
@@ -4354,112 +4365,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 			return uuid.Nil, err
 		}
 	}
-	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
-		return uuid.Nil, err
-	}
-	if err := s.assertStudentCountFilled(ctx, ac.TeachingCourseID); err != nil {
-		return uuid.Nil, err
-	}
-	termStart, termEnd, err := s.courseDateRange(ctx, ac.TeachingCourseID)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	midterm, final, err := s.courseExamWindows(ctx, ac.TeachingCourseID)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	holidays, err := s.loadHolidaysInRange(ctx, termStart, termEnd)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	mk, err := s.loadMakeupIndex(ctx, ac.SectionID)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	if err := validateWorkLogEntry(w, activityGate{
-		Scope:        ac.ReimburseScope,
-		AllowLecture: ac.AllowLecture,
-		AllowLab:     ac.AllowLab,
-		AllowReview:  ac.AllowReview,
-		AllowOther:   ac.AllowOther,
-		// periodOpen is irrelevant here: todayRef is already the zero value
-		// below (staff/lecturer override, per the comment on that param),
-		// which disables the calendar rule outright regardless of what's
-		// passed for periodOpen.
-	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}, false); err != nil {
-		return uuid.Nil, err
-	}
-	if err := s.validateClassWindow(ctx, ac, w, mk); err != nil {
-		return uuid.Nil, err
-	}
-	// validateReviewWindow is deliberately NOT applied here, unlike the class
-	// window above. Its prerequisite — ta_review_schedules — is writable only by
-	// the TA (RequireRole(RoleTA) on /assignments/:id/review-schedules), so staff
-	// correcting a ตรวจงาน row for a TA who declared no slot could neither save
-	// the correction nor create what the rule demands: a dead end with no action
-	// available to the person holding the problem. The class grid has no such
-	// trap, because staff own that table and can fix it.
-	//
-	// This is not a hole in the rule: TAs cannot reach this path (it is staff and
-	// lecturer only), and every write through it is password-confirmed, reasoned,
-	// audited, and notified to both the TA and the lecturer.
-	// Staff get no exemption from the monthly deadline. A closed month is closed
-	// for them too (03/08/2026, at the staff's own request): the only way to
-	// correct a month after it closes is to move the period's due date in
-	// settings, which is a deliberate, visible act rather than a quiet edit.
-	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate); err != nil {
-		return uuid.Nil, err
-	}
-	if w.ID != uuid.Nil {
-		var oldDate string
-		if err := s.pool.QueryRow(ctx,
-			`SELECT TO_CHAR(work_date,'YYYY-MM-DD') FROM work_logs WHERE id=$1 AND assignment_id=$2`,
-			w.ID, w.AssignmentID).Scan(&oldDate); err == nil && oldDate[:7] != w.WorkDate[:7] {
-			if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, oldDate); err != nil {
-				return uuid.Nil, err
-			}
-		}
-	}
-	dailyHourCap := s.dailyHourCapFor(ctx, w.AssignmentID)
-	var dayTotal float64
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(SUM(hours),0) FROM work_logs
-		 WHERE assignment_id=$1 AND work_date=$2::date AND id <> $3`,
-		w.AssignmentID, w.WorkDate, w.ID).Scan(&dayTotal); err != nil {
-		return uuid.Nil, err
-	}
-	if dayTotal+w.Hours > dailyHourCap+0.01 {
-		return uuid.Nil, Invalid(fmt.Sprintf(
-			"รวมชั่วโมงของวันนี้เกิน %.1f ชม. (มีอยู่แล้ว %.2f ชม.)", dailyHourCap, dayTotal))
-	}
-	if err := s.enforceWeeklyActivityCap(ctx, ac, w); err != nil {
-		return uuid.Nil, err
-	}
-	if err := s.enforceTermHourCeiling(ctx, ac, w.AssignmentID, w.ID, w.Hours); err != nil {
-		return uuid.Nil, err
-	}
-	if w.Activity == "other" && w.ParentKind != nil {
-		capHrs, err := s.otherActivityCapHours(ctx, w.AssignmentID, *w.ParentKind)
-		if err == nil && capHrs > 0 && w.Hours > capHrs+0.01 {
-			kindTH := "บรรยาย"
-			if *w.ParentKind == "lab" {
-				kindTH = "ปฏิบัติการ"
-			}
-			return uuid.Nil, Invalid(fmt.Sprintf(
-				"กิจกรรมอื่นๆ (คู่กับ%s) ต้องไม่เกิน %.1f ชั่วโมง/ครั้ง", kindTH, capHrs))
-		}
-	}
-	if err := s.enforceDailyBahtCap(ctx, ac.TAID, w); err != nil {
-		return uuid.Nil, err
-	}
-	if err := s.enforceNoOverlap(ctx, ac.TAID, w); err != nil {
-		return uuid.Nil, err
-	}
-	// Staff edit on the TA's behalf. The class-timetable rule still applies —
-	// the TA physically cannot be in two rooms, so staff must not be able to
-	// enter hours the TA could not have worked. (Staff DO keep the back-dating
-	// override above; that one is a paperwork concession, not a physical one.)
-	if err := s.enforceNoOwnClassConflict(ctx, ac, w); err != nil {
+	if err := s.validateOnBehalfWrite(ctx, ac, w, onBehalfOpts{}); err != nil {
 		return uuid.Nil, err
 	}
 
@@ -4529,6 +4435,139 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		}
 	}
 	return w.ID, nil
+}
+
+// onBehalfOpts tunes validateOnBehalfWrite for the lecturer's review path.
+type onBehalfOpts struct {
+	// reviewOnly: the row is a submitted one under the lecturer's review, so
+	// the monthly deadline does not apply — only the export lock does.
+	reviewOnly bool
+	// sameSitting: the other copies of a co-taught sitting being changed in
+	// the same act. Left out of the daily pay total, or the candidate would be
+	// priced beside its own old copies as if they were a second sitting.
+	sameSitting []uuid.UUID
+}
+
+// validateOnBehalfWrite is every rule a staff or lecturer write on a TA's row
+// must pass — the checks StaffUpsert has always run, shared with the
+// lecturer's in-review corrections so the two can never drift apart.
+func (s *WorkLogService) validateOnBehalfWrite(ctx context.Context, ac *assignmentContext, w WorkLog, opt onBehalfOpts) error {
+	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
+		return err
+	}
+	if err := s.assertStudentCountFilled(ctx, ac.TeachingCourseID); err != nil {
+		return err
+	}
+	termStart, termEnd, err := s.courseDateRange(ctx, ac.TeachingCourseID)
+	if err != nil {
+		return err
+	}
+	midterm, final, err := s.courseExamWindows(ctx, ac.TeachingCourseID)
+	if err != nil {
+		return err
+	}
+	holidays, err := s.loadHolidaysInRange(ctx, termStart, termEnd)
+	if err != nil {
+		return err
+	}
+	mk, err := s.loadMakeupIndex(ctx, ac.SectionID)
+	if err != nil {
+		return err
+	}
+	if err := validateWorkLogEntry(w, activityGate{
+		Scope:        ac.ReimburseScope,
+		AllowLecture: ac.AllowLecture,
+		AllowLab:     ac.AllowLab,
+		AllowReview:  ac.AllowReview,
+		AllowOther:   ac.AllowOther,
+		// periodOpen is irrelevant here: todayRef is already the zero value
+		// below (staff/lecturer override, per the comment on that param),
+		// which disables the calendar rule outright regardless of what's
+		// passed for periodOpen.
+	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}, false); err != nil {
+		return err
+	}
+	if err := s.validateClassWindow(ctx, ac, w, mk); err != nil {
+		return err
+	}
+	// validateReviewWindow is deliberately NOT applied here, unlike the class
+	// window above. Its prerequisite — ta_review_schedules — is writable only by
+	// the TA (RequireRole(RoleTA) on /assignments/:id/review-schedules), so staff
+	// correcting a ตรวจงาน row for a TA who declared no slot could neither save
+	// the correction nor create what the rule demands: a dead end with no action
+	// available to the person holding the problem. The class grid has no such
+	// trap, because staff own that table and can fix it.
+	//
+	// This is not a hole in the rule: TAs cannot reach this path (it is staff and
+	// lecturer only), and every write through it is password-confirmed, reasoned,
+	// audited, and notified to both the TA and the lecturer.
+	// Staff get no exemption from the monthly deadline. A closed month is closed
+	// for them too (03/08/2026, at the staff's own request): the only way to
+	// correct a month after it closes is to move the period's due date in
+	// settings, which is a deliberate, visible act rather than a quiet edit.
+	// A lecturer correcting a row that is still waiting for them is reviewing
+	// work the TA sent in time, and routinely does so after the period has
+	// closed; only a month already exported or sent to finance is out of reach.
+	writable := assertWorklogWritable
+	if opt.reviewOnly {
+		writable = assertWorklogNotExported
+	}
+	if err := writable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate); err != nil {
+		return err
+	}
+	if w.ID != uuid.Nil {
+		var oldDate string
+		if err := s.pool.QueryRow(ctx,
+			`SELECT TO_CHAR(work_date,'YYYY-MM-DD') FROM work_logs WHERE id=$1 AND assignment_id=$2`,
+			w.ID, w.AssignmentID).Scan(&oldDate); err == nil && oldDate[:7] != w.WorkDate[:7] {
+			if err := writable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, oldDate); err != nil {
+				return err
+			}
+		}
+	}
+	dailyHourCap := s.dailyHourCapFor(ctx, w.AssignmentID)
+	var dayTotal float64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(hours),0) FROM work_logs
+		 WHERE assignment_id=$1 AND work_date=$2::date AND id <> $3`,
+		w.AssignmentID, w.WorkDate, w.ID).Scan(&dayTotal); err != nil {
+		return err
+	}
+	if dayTotal+w.Hours > dailyHourCap+0.01 {
+		return Invalid(fmt.Sprintf(
+			"รวมชั่วโมงของวันนี้เกิน %.1f ชม. (มีอยู่แล้ว %.2f ชม.)", dailyHourCap, dayTotal))
+	}
+	if err := s.enforceWeeklyActivityCap(ctx, ac, w); err != nil {
+		return err
+	}
+	if err := s.enforceTermHourCeiling(ctx, ac, w.AssignmentID, w.ID, w.Hours); err != nil {
+		return err
+	}
+	if w.Activity == "other" && w.ParentKind != nil {
+		capHrs, err := s.otherActivityCapHours(ctx, w.AssignmentID, *w.ParentKind)
+		if err == nil && capHrs > 0 && w.Hours > capHrs+0.01 {
+			kindTH := "บรรยาย"
+			if *w.ParentKind == "lab" {
+				kindTH = "ปฏิบัติการ"
+			}
+			return Invalid(fmt.Sprintf(
+				"กิจกรรมอื่นๆ (คู่กับ%s) ต้องไม่เกิน %.1f ชั่วโมง/ครั้ง", kindTH, capHrs))
+		}
+	}
+	if err := s.enforceDailyBahtCapExcluding(ctx, ac.TAID, w, opt.sameSitting); err != nil {
+		return err
+	}
+	if err := s.enforceNoOverlap(ctx, ac.TAID, w); err != nil {
+		return err
+	}
+	// Staff edit on the TA's behalf. The class-timetable rule still applies —
+	// the TA physically cannot be in two rooms, so staff must not be able to
+	// enter hours the TA could not have worked. (Staff DO keep the back-dating
+	// override above; that one is a paperwork concession, not a physical one.)
+	if err := s.enforceNoOwnClassConflict(ctx, ac, w); err != nil {
+		return err
+	}
+	return nil
 }
 
 // approvedEditNote records WHY a signed-off row was changed, next to the
@@ -4732,11 +4771,19 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 	if err != nil {
 		return err
 	}
+	// The route also admits staff/admin. The course's own lecturer is still
+	// "the lecturer" when they happen to hold a staff role too.
+	byRole := "lecturer"
+	if owns, err := lecturerOwnsCourse(ctx, s.pool, actor, ac.TeachingCourseID); err != nil {
+		return err
+	} else if !owns {
+		byRole = "staff"
+	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE work_logs SET status='rejected', reject_reason=$1
+		`UPDATE work_logs SET status='rejected', reject_reason=$1, rejected_by_role=$4
 		 WHERE assignment_id=$2 AND status='submitted'
 		   AND ($3 = '' OR to_char(work_date, 'YYYY-MM') = $3)`,
-		reason, assignmentID, yearMonth)
+		reason, assignmentID, yearMonth, byRole)
 	if err != nil {
 		return err
 	}
@@ -4759,7 +4806,8 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 		}
 		s.notify.SendAction(ctx, ac.TAID,
 			strings.TrimSpace("บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข "+t.Code+" "+thaiYearMonth(yearMonth)),
-			"อาจารย์ผู้สอนได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา "+t.Label()+when+" กลับมาให้ท่านแก้ไข เนื่องจาก "+reason,
+			map[string]string{"lecturer": "อาจารย์ผู้สอน", "staff": "เจ้าหน้าที่"}[byRole]+
+				"ได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา "+t.Label()+when+" กลับมาให้ท่านแก้ไข เนื่องจาก "+reason,
 			t.Link)
 	}
 	return nil

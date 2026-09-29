@@ -211,6 +211,22 @@ func assertWorklogWritable(ctx context.Context, pool *pgxpool.Pool, tcID, taID u
 	return nil
 }
 
+// assertWorklogNotExported is assertWorklogWritable without the deadline: only
+// a month exported or sent to finance refuses the write. For a lecturer
+// correcting rows the TA sent in time, which they review after the period
+// closes as a matter of course.
+func assertWorklogNotExported(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.UUID, workDate string) error {
+	st, err := resolvePeriodState(ctx, pool, tcID, taID, workDate)
+	if err != nil || !st.Found {
+		return err
+	}
+	if st.Status == "finance_sent" || st.Status == "exported" {
+		return Conflict(fmt.Sprintf(
+			"บันทึกเวลาเดือน %s ถูกส่งออกเบิกจ่ายแล้ว แก้ไขไม่ได้", st.Label))
+	}
+	return nil
+}
+
 // financeLockedMonths returns the labels of every locked (exported or
 // finance_sent) month that contains at least one of the assignment's work_logs
 // in the given statuses. Used as a batch pre-check by Approve/Reject so a

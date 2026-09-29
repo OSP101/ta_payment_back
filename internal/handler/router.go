@@ -456,6 +456,12 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// unit here, not any one assignment.
 	authed.Post("/worklog/approve-batch", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.ApproveBatch)
 	authed.Post("/assignments/:id/worklog/reject", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.Reject)
+	// Lecturer corrections during review: fix or cut a submitted sitting with a
+	// reason the TA sees (work_log_lecturer_changes). Course ownership is
+	// checked in the service.
+	authed.Post("/worklogs/:logId/review-edit", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.ReviewEdit)
+	authed.Post("/worklogs/:logId/review-cut", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), wl.ReviewCut)
+	authed.Get("/assignments/:id/worklog/changes", wl.Changes)
 	// TA-owned weekly review pattern — TA self-service, seeds review entries
 	// on auto-generate. Approval gate mirrors the worklog write endpoints so
 	// unapproved TAs can't seed a schedule that later blows past caps.

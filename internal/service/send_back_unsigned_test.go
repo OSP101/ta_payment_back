@@ -17,12 +17,17 @@ func TestSendBack_UnsignedOpenMonthRejectsApprovedRows(t *testing.T) {
 	if err := f.Periods.MarkSentBack(f.ctx, staff, pid, f.TAID, f.CourseID, "pending", "ชั่วโมงไม่ตรงตาราง"); err != nil {
 		t.Fatalf("MarkSentBack on an unsigned open month: %v", err)
 	}
-	var status, reason string
+	var status, reason, byRole string
 	var approvedAt *string
 	if err := f.Pool.QueryRow(f.ctx,
-		`SELECT status::text, COALESCE(reject_reason,''), approved_at::text FROM work_logs WHERE assignment_id=$1`,
-		f.AssignmentID).Scan(&status, &reason, &approvedAt); err != nil {
+		`SELECT status::text, COALESCE(reject_reason,''), COALESCE(rejected_by_role,''), approved_at::text
+		 FROM work_logs WHERE assignment_id=$1`,
+		f.AssignmentID).Scan(&status, &reason, &byRole, &approvedAt); err != nil {
 		t.Fatal(err)
+	}
+	// The TA screen names the sender from this; it said "อาจารย์" for staff.
+	if byRole != "staff" {
+		t.Errorf("rejected_by_role = %q, want staff", byRole)
 	}
 	if status != "rejected" || reason != "ชั่วโมงไม่ตรงตาราง" {
 		t.Fatalf("row = %s / %q, want rejected with the officer's reason", status, reason)
