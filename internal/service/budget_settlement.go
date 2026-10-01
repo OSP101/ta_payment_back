@@ -662,9 +662,15 @@ func (s *ExportService) settleAs(
 	if capSpecial <= 0 {
 		specialLeft = capSpecial // genuinely unconfigured; leave it that way
 	}
+	// Exported months keep the share their document paid; only what is left of
+	// each pool is shared over the open months (export_month_ledger.go).
+	frozen, err := loadFrozenMonths(ctx, s.pool, courseID)
+	if err != nil {
+		return nil, err
+	}
 	out := &CourseSettlement{
-		Regular: settleTrack(mode, "regular", capRegular+spill, 0, byTrack["regular"]),
-		Special: settleTrack(mode, "special", specialLeft, committedSpecial, byTrack["special"]),
+		Regular: settleTrackFrozen(mode, "regular", capRegular+spill, 0, byTrack["regular"], frozen),
+		Special: settleTrackFrozen(mode, "special", specialLeft, committedSpecial, byTrack["special"], frozen),
 	}
 	out.SpilledBaht = round2(spill)
 	out.DroppedBaht = round2(out.Regular.DroppedBaht + out.Special.DroppedBaht)
@@ -1589,7 +1595,13 @@ func (s *ExportService) claimCostByTASlot(
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	// An exported month is priced from what its document said, not from the
+	// rate in force (export_month_ledger.go).
+	return s.frozenCostsFor(ctx, courseID, out)
 }
 
 // slotLedger groups per-TA คาบ costs into the course-wide slots the cutoff

@@ -137,6 +137,7 @@ func TestExportSummary_EligibilityNeedsOrderAndCompletedReview(t *testing.T) {
 	// Review signed off: now it qualifies.
 	staff := f.insertUser("staff", "officer")
 	pid := mustUUID(t, f.periodID(t, month))
+	payoutReady(f) // the sign-off requires approved TA documents (WP3)
 	if err := f.Periods.MarkStaffReviewed(f.ctx, staff, pid, f.TAID, f.CourseID, ""); err != nil {
 		t.Fatalf("MarkStaffReviewed: %v", err)
 	}
@@ -223,6 +224,7 @@ func TestExportSummary_UnappointedWorkBlocksUntilTheirOrderIsPrinted(t *testing.
 
 	// Not forever: print their order, sign their month off, and it clears.
 	f.addAppointmentOrderFor(other)
+	payoutReadyFor(f, other)
 	if err := f.Periods.MarkStaffReviewed(f.ctx, staff, pid, other, f.CourseID, ""); err != nil {
 		t.Fatalf("MarkStaffReviewed after appointing: %v", err)
 	}

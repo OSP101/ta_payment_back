@@ -187,6 +187,34 @@ func actorRoleFor(privileged bool) string {
 	return "lecturer"
 }
 
+// actorRoleTH is how a notice names WHO changed a TA's hours, from the actor's
+// real role rather than from which endpoint they used. Both the /staff/worklogs
+// path and the review-edit path are reachable by lecturers AND staff/admin, and
+// each used to hard-code one word — a lecturer editing through the staff path
+// was announced as "เจ้าหน้าที่", an admin using review-edit as "อาจารย์". The
+// TA reads this to know whom to ask, so it has to be right.
+//
+// privileged=false means the handler already established a lecturer. Otherwise
+// admin wins over staff; a lookup failure falls back to the neutral word.
+func actorRoleTH(ctx context.Context, q querier, actor uuid.UUID, privileged bool) string {
+	if !privileged {
+		return "อาจารย์"
+	}
+	var isAdmin, isStaff bool
+	if err := q.QueryRow(ctx, `
+		SELECT COALESCE(BOOL_OR(role = 'admin'), FALSE), COALESCE(BOOL_OR(role = 'staff'), FALSE)
+		  FROM user_roles WHERE user_id = $1`, actor).Scan(&isAdmin, &isStaff); err != nil {
+		return "เจ้าหน้าที่"
+	}
+	switch {
+	case isAdmin:
+		return "ผู้ดูแลระบบ"
+	case isStaff:
+		return "เจ้าหน้าที่"
+	}
+	return "อาจารย์"
+}
+
 func (s *WorkLogService) recordChange(ctx context.Context, tx pgx.Tx, c sittingCopy, action string,
 	before changeSnapshot, after *changeSnapshot, reason string, actor uuid.UUID, actorName, role string) error {
 	b, err := json.Marshal(before)
@@ -283,7 +311,7 @@ func (s *WorkLogService) LecturerAdjust(ctx context.Context, actor uuid.UUID, pr
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		c := copies[0]
 		s.notify.Send(ctx, ac.TAID,
-			fmt.Sprintf("อาจารย์แก้ไขบันทึกเวลา %s วันที่ %s", t.Code, thaiLongDateISO(c.WorkDate)),
+			fmt.Sprintf("%sแก้ไขบันทึกเวลา %s วันที่ %s", actorRoleTH(ctx, s.pool, actor, privileged), t.Code, thaiLongDateISO(c.WorkDate)),
 			fmt.Sprintf("%s ได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s จาก%s (%.2f ชั่วโมง) เป็น%s (%.2f ชั่วโมง) เนื่องจาก %s",
 				actorName, t.Label(), thaiLongDateISO(c.WorkDate),
 				thaiTimeRange(c.StartTime, c.EndTime), c.Hours, thaiTimeRange(start, end), in.Hours,
@@ -332,7 +360,7 @@ func (s *WorkLogService) LecturerCut(ctx context.Context, actor uuid.UUID, privi
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		c := copies[0]
 		s.notify.Send(ctx, ac.TAID,
-			fmt.Sprintf("อาจารย์ตัดบันทึกเวลาออก %s วันที่ %s", t.Code, thaiLongDateISO(c.WorkDate)),
+			fmt.Sprintf("%sตัดบันทึกเวลาออก %s วันที่ %s", actorRoleTH(ctx, s.pool, actor, privileged), t.Code, thaiLongDateISO(c.WorkDate)),
 			fmt.Sprintf("%s ได้ตัดบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s (%.2f ชั่วโมง) ออกจากการเบิก เนื่องจาก %s",
 				actorName, t.Label(), thaiLongDateISO(c.WorkDate),
 				thaiTimeRange(c.StartTime, c.EndTime), c.Hours, strings.TrimSpace(reason)),

@@ -315,6 +315,7 @@ func seedPresentationAt(ctx context.Context, slot *Slot, now time.Time) (string,
 		{"รอบส่งรายเดือน", p.periods},
 		{"บันทึกเวลาย้อนหลัง", p.worklogs},
 		{"อนุมัติ ตรวจ และส่งออก", p.workflow},
+		{"เอกสาร TA ที่ถูกตีกลับ", p.returnProfiles},
 		{"ปิดรอบที่เลยกำหนด", p.closePeriods},
 	}
 	for _, st := range steps {
@@ -335,6 +336,11 @@ func seedPresentationAt(ctx context.Context, slot *Slot, now time.Time) (string,
 
 type presBuilder struct {
 	slot *Slot
+	// returned are the TAs whose documents the dashboard shows as sent back.
+	// They are seeded approved and returned only after the workflow step,
+	// because staff-review refuses a month for a TA whose documents are not
+	// approved — the case is "paid months, then a document bounced".
+	returned []returnedProfile
 	svc  *service.Container
 	now  time.Time
 
@@ -395,9 +401,17 @@ func (p *presBuilder) term(ctx context.Context) error {
 	p.midEnd = p.midStart.AddDate(0, 0, 4)
 	finalStart := p.end.AddDate(0, 0, -12)
 	p.year = p.start.Year() + 543
-	months := 0
-	for m := time.Date(p.start.Year(), p.start.Month(), 1, 0, 0, 0, 0, timeutil.Bangkok); !m.After(p.end); m = m.AddDate(0, 1, 0) {
-		months++
+	// Fixed, not counted off the calendar: 18 weeks touch five or six calendar
+	// months depending on where the anchor week falls, and every budget cap in
+	// presentationCourses is tuned for six.
+	const months = 6
+	// UpsertTerm bounds months by the calendar months the dates touch (a
+	// real term's months multiplies every budget), so on a five-month anchor
+	// the term is created with five and then set to the six the caps are tuned
+	// for, by SQL like the rest of this dataset's history.
+	created := months
+	if span := service.TermMonthSpan(p.start, p.end); span < created {
+		created = span
 	}
 	in := service.Term{
 		AcademicYear:    p.year,
@@ -408,10 +422,12 @@ func (p *presBuilder) term(ctx context.Context) error {
 		MidtermEndsOn:   strPtr(isoDate(p.midEnd)),
 		FinalStartsOn:   strPtr(isoDate(finalStart)),
 		FinalEndsOn:     strPtr(isoDate(finalStart.AddDate(0, 0, 4))),
-		Months:          months,
+		Months:          created,
 		IsActive:        false, // never takes over the happy path's term
 	}
-	t, err := p.svc.Teaching.UpsertTerm(ctx, p.adminID, in)
+	// Overlap allowed: this term and the walkthrough's are both anchored on
+	// today by design (see service.AllowTermOverlap).
+	t, err := p.svc.Teaching.UpsertTerm(service.AllowTermOverlap(ctx), p.adminID, in)
 	if err != nil {
 		if errors.Is(err, service.ErrConflict) {
 			return fmt.Errorf("มีภาคเรียน %d/%d อยู่แล้ว (ไม่ใช่ชุดข้อมูลนำเสนอ) กรุณารีเซ็ตห้องทดลองก่อน", p.year, PresentationSemester)
@@ -419,6 +435,11 @@ func (p *presBuilder) term(ctx context.Context) error {
 		return err
 	}
 	p.termID = t.ID
+	if created != months {
+		if _, err := p.slot.Pool.Exec(ctx, `UPDATE academic_terms SET months = $2 WHERE id = $1`, t.ID, months); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -686,6 +707,12 @@ func (p *presBuilder) appointment(ctx context.Context) error {
 	return err
 }
 
+type returnedProfile struct {
+	ta     uuid.UUID
+	status string
+	reason string
+}
+
 // profiles: status rows only — the shape DocsService.ReviewProfile leaves
 // behind, without any of the personal data or documents behind a real one.
 // Most approved; two sent back for fixes, one rejected (the dashboard's
@@ -717,6 +744,10 @@ func (p *presBuilder) profiles(ctx context.Context) error {
 				}
 				reason = &r
 			}
+			if status != "approved" {
+				p.returned = append(p.returned, returnedProfile{ta: ta, status: status, reason: *reason})
+				status, reason = "approved", nil
+			}
 			submitted := p.start.AddDate(0, 0, -10+i%5)
 			reviewed := submitted.AddDate(0, 0, 2)
 			prefix := "นาย"
@@ -734,6 +765,19 @@ func (p *presBuilder) profiles(ctx context.Context) error {
 				VALUES (gen_random_uuid(),$1,1,$2,$3::doc_status,$4,$5,$6,$7)`,
 				ta, submitted, status, reviewed, p.staffID, reason, prefix); err != nil {
 				return err
+			}
+			// Staff-review now certifies the TA's documents too (payoutIssue
+			// wants an approved creditor form), so an approved profile carries
+			// its approved form. Status row only — no file behind it, like
+			// the profile itself.
+			if status == "approved" {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO ta_documents (user_id, kind, filename, mime, size_bytes, storage_key, status, uploaded_at)
+					VALUES ($1, 'creditor_form', 'creditor_form.pdf', 'application/pdf', 0,
+					        $3, 'approved', $2)`,
+					ta, submitted, "presentation/creditor_form/"+ta.String()); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -961,6 +1005,17 @@ func (p *presBuilder) workflow(ctx context.Context) error {
 			if countRows(pr.a, m.ym, "approved") == 0 {
 				continue // no class that month (term started late in it)
 			}
+			// In the first days of a month the six-day draft window reaches
+			// back into last month, and staff cannot sign off a month the TA
+			// has not finished sending.
+			if countRows(pr.a, m.ym, "draft") > 0 {
+				continue
+			}
+			// A TA who has not sent documents yet cannot be signed off
+			// (staff-review certifies the documents too); their months wait.
+			if !p.hasApprovedProfile(ctx, pr.a.ta) {
+				continue
+			}
 			if err := p.svc.SubmissionPeriods.MarkStaffReviewed(ctx, p.staffID, sp.ID, pr.a.ta, p.courseIDs[pr.code], ""); err != nil {
 				return fmt.Errorf("ตรวจเบิกจ่าย %s %s: %w", pr.code, m.ym, err)
 			}
@@ -991,6 +1046,14 @@ func (p *presBuilder) workflow(ctx context.Context) error {
 		for _, pr := range pairs {
 			if pr.code == "DM110102" {
 				sp := p.periodByYM[past[k-2].ym]
+				// Send-back refuses a closed month (the TA could not resend and
+				// the rows would be forfeited), so do what staff are told to:
+				// extend the due date first.
+				if _, err := p.svc.Pool.Exec(ctx,
+					`UPDATE submission_periods SET due_date = $2::date, is_closed = FALSE WHERE id = $1`,
+					sp.ID, isoDate(p.now.AddDate(0, 0, 14))); err != nil {
+					return fmt.Errorf("ขยายกำหนดส่ง %s: %w", pr.code, err)
+				}
 				if err := p.svc.SubmissionPeriods.MarkSentBack(ctx, p.adminID, sp.ID, pr.a.ta, p.courseIDs[pr.code],
 					"pending", "จำนวนชั่วโมงไม่ตรงกับเอกสารลงนาม ขอให้ตรวจสอบใหม่ (สมมติ)"); err != nil {
 					return fmt.Errorf("ส่งกลับ %s: %w", pr.code, err)
@@ -1000,6 +1063,33 @@ func (p *presBuilder) workflow(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (p *presBuilder) hasApprovedProfile(ctx context.Context, ta uuid.UUID) bool {
+	var ok bool
+	_ = p.svc.Pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ta_profiles WHERE user_id = $1 AND status = 'approved')`, ta).Scan(&ok)
+	return ok
+}
+
+// returnProfiles sends back the documents chosen in profiles(), after the
+// months that were already paid have been reviewed and exported.
+func (p *presBuilder) returnProfiles(ctx context.Context) error {
+	return slotExec(ctx, p.slot, func(tx pgx.Tx) error {
+		for _, r := range p.returned {
+			if _, err := tx.Exec(ctx,
+				`UPDATE ta_profiles SET status = $2::doc_status, reject_reason = $3 WHERE user_id = $1`,
+				r.ta, r.status, r.reason); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE ta_profile_submissions SET status = $2::doc_status, reject_reason = $3 WHERE user_id = $1`,
+				r.ta, r.status, r.reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // closePeriods closes every month whose due date has passed — what the

@@ -148,10 +148,17 @@ func TestTermExportBlockers_LevelIsolated(t *testing.T) {
 // already covered, and vice versa.
 func TestTransferCoverCoverage_LevelIsolated(t *testing.T) {
 	f := newTCFixture(t)
-	f.addPeriod("2569-09")
+	// Pinned to one month inside the fixture's term (Jun–Oct 2026) and inside
+	// ONE fiscal year. It used to follow the real calendar (day()/f.ym), which
+	// broke on 1 October — the term then spanned two fiscal years and the
+	// all-months file was (rightly) refused — and would drift outside the term
+	// entirely once the real date passes October 2026.
+	const ym, workDate = "2569-08", "2026-08-03"
+	f.ym = ym // financeSend/ensurePeriod key on f.ym
+	f.addPeriod(ym)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP470", Curriculum: "CY", LectureHrs: 100})
 	ta := f.newTA("ออกแล้ว ปตรี", "undergrad")
-	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
+	f.assignTAOn(ta, courseA, regA, "undergrad", []string{workDate})
 	f.financeSend(courseA)
 
 	if _, _, err := f.svc.BuildTransferCoverWorkbook(f.ctx, f.actor(), f.termID, nil, "undergrad"); err != nil {
@@ -161,6 +168,9 @@ func TestTransferCoverCoverage_LevelIsolated(t *testing.T) {
 	ugCov, err := f.svc.TransferCoverCoverage(f.ctx, f.termID, "undergrad")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(ugCov.Months) == 0 {
+		t.Fatal("undergrad coverage lists no months — the pinned month did not register")
 	}
 	for _, m := range ugCov.Months {
 		if !m.Issued {

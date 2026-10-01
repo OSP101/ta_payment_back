@@ -10,32 +10,36 @@ package service
 //
 // Shape of a rule:
 //
-//	base    = roles ∪ courses ∪ named people      (a union: "any of these")
-//	final   = base ∩ every narrowing filter        (an intersection: "and also")
+//	group   = roles ∩ courses ∩ every condition   (each piece given narrows)
+//	final   = group ∪ named people                 (names are always reached)
 //
-// So "ผู้ช่วยสอน" + "ยังไม่ส่งเอกสาร" means TAs who are missing documents, not
-// TAs plus everyone missing documents. Officers describe targets that way, and
+// So "ผู้ช่วยสอน" + a course means that course's TAs, and adding "ยังไม่ส่งเอกสาร"
+// means those of them who are missing documents. A rule with nothing chosen
+// selects nobody. Officers describe targets that way, and
 // the preview lets them check it rather than trust it.
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // AudienceRule is the composer's targeting choice.
 type AudienceRule struct {
-	// Roles is the coarse group. Empty AND no courses AND no people means
-	// "everyone with an account" (see IsEveryone), so this is not required —
-	// only non-empty values are constrained to the four known roles.
+	// Roles is the coarse group. Not required: a rule may select by course, by
+	// condition or by name alone. Only non-empty values are constrained to the
+	// four known roles.
 	Roles []string `json:"roles" validate:"omitempty,dive,oneof=admin staff lecturer ta"`
-	// CourseIDs pulls in everyone attached to a teaching course: its lecturers
-	// and the TAs appointed to it.
+	// CourseIDs keeps only people attached to one of these teaching courses:
+	// its lecturers and the TAs appointed to it. Together with Roles it NARROWS
+	// ("TA" + a course = that course's TAs), it does not add.
 	CourseIDs []uuid.UUID `json:"course_ids"`
-	// UserIDs are named people, for an announcement aimed at one person.
+	// UserIDs are named people. They are always reached, on top of whatever the
+	// group part selects — naming someone is as explicit as targeting gets, so no
+	// role or condition filters them back out.
 	UserIDs []uuid.UUID `json:"user_ids"`
 	// Filters narrow whatever the above selected. Closed set — see
 	// announceFilters and validateRule below, which this tag mirrors.
@@ -44,9 +48,22 @@ type AudienceRule struct {
 	TermID *uuid.UUID `json:"term_id"`
 }
 
-// IsEveryone reports the "no base selected" case, which means all accounts.
+// IsEmpty reports a rule that selects nothing at all. It used to mean "every
+// account", which made clearing the role chips the widest target on the form —
+// an officer who unticked everything to send to one named person, and then
+// forgot the name, mailed the whole faculty. Everyone is now reached only by
+// ticking every role.
+func (r AudienceRule) IsEmpty() bool {
+	return len(r.Roles) == 0 && len(r.CourseIDs) == 0 && len(r.UserIDs) == 0 && len(r.Filters) == 0
+}
+
+// IsEveryone reports the deliberate "all four roles, nothing narrowing" rule.
 func (r AudienceRule) IsEveryone() bool {
-	return len(r.Roles) == 0 && len(r.CourseIDs) == 0 && len(r.UserIDs) == 0
+	seen := map[string]bool{}
+	for _, role := range r.Roles {
+		seen[role] = true
+	}
+	return len(seen) == len(validAudienceRoles) && len(r.CourseIDs) == 0 && len(r.Filters) == 0
 }
 
 // announceFilter is one narrowing condition: a label for the composer and the
@@ -203,16 +220,20 @@ func resolveAudienceSQL(r AudienceRule, termID uuid.UUID) (string, []any) {
 		return fmt.Sprintf("$%d", len(args))
 	}
 
-	var base []string
+	// The group part: every piece given must hold. Role, course and condition
+	// each cut the set down further. They used to be ORed ("bases"), under a
+	// heading that read "เจาะกลุ่มให้แคบลง" — so adding a course to the default
+	// three roles narrowed nothing and the notice still went to everybody.
+	var group []string
 	if len(r.Roles) > 0 {
-		base = append(base, `EXISTS (SELECT 1 FROM user_roles ur
+		group = append(group, `EXISTS (SELECT 1 FROM user_roles ur
 		                              WHERE ur.user_id = u.id AND ur.role::text = ANY(`+add(r.Roles)+`))`)
 	}
 	if len(r.CourseIDs) > 0 {
 		ids := add(r.CourseIDs)
 		// Everyone attached to the course: the lecturers who teach it and the
 		// TAs actually appointed to it (a dropped assignment is not on it).
-		base = append(base, `(
+		group = append(group, `(
 			EXISTS (SELECT 1 FROM teaching_lecturers tl
 			         WHERE tl.lecturer_id = u.id AND tl.teaching_course_id = ANY(`+ids+`))
 			OR EXISTS (SELECT 1 FROM ta_request_assignments a
@@ -221,20 +242,31 @@ func resolveAudienceSQL(r AudienceRule, termID uuid.UUID) (string, []any) {
 			              AND r2.teaching_course_id = ANY(`+ids+`))
 		)`)
 	}
-	if len(r.UserIDs) > 0 {
-		base = append(base, `u.id = ANY(`+add(r.UserIDs)+`)`)
-	}
-
-	where := []string{"u.is_active", "u.deleted_at IS NULL"}
-	if len(base) > 0 {
-		where = append(where, "("+strings.Join(base, " OR ")+")")
-	}
 	for _, f := range r.Filters {
 		// Validated at save time; a name that reached here without a query
 		// would be a bug, and matching nobody is the safe direction.
 		if def, ok := announceFilters[f]; ok {
-			where = append(where, "("+def.SQL+")")
+			group = append(group, "("+def.SQL+")")
+		} else {
+			group = append(group, "FALSE")
 		}
+	}
+
+	// Named people are added on top of the group, never filtered by it.
+	var either []string
+	if len(group) > 0 {
+		either = append(either, "("+strings.Join(group, "\n           AND ")+")")
+	}
+	if len(r.UserIDs) > 0 {
+		either = append(either, `u.id = ANY(`+add(r.UserIDs)+`)`)
+	}
+
+	where := []string{"u.is_active", "u.deleted_at IS NULL"}
+	if len(either) == 0 {
+		// Nothing chosen selects nobody. See IsEmpty.
+		where = append(where, "FALSE")
+	} else {
+		where = append(where, "("+strings.Join(either, " OR ")+")")
 	}
 
 	return `SELECT u.id, u.email,
@@ -296,12 +328,16 @@ func (s *AnnounceService) ResolveAudience(ctx context.Context, r AudienceRule) (
 
 // AudiencePreview is what the composer shows before anything is sent.
 type AudiencePreview struct {
-	Total int              `json:"total"`
+	Total int `json:"total"`
+	// Names is the whole list, not a sample: the pre-publish check lets the
+	// officer read every name, and compares it with who already has the notice.
 	Names []AudienceMember `json:"names"`
-	// Everyone reports that the rule selected no base group, so the answer is
-	// "every account". Shown as a warning rather than a number, because 400
-	// people is not a target an officer should reach by leaving fields blank.
+	// Everyone reports the "all four roles, nothing narrowing" rule, so the
+	// composer can say "ทุกคนในระบบ" instead of a bare number.
 	Everyone bool `json:"everyone"`
+	// Empty reports that nothing was chosen at all — a different message from
+	// "your conditions matched nobody".
+	Empty bool `json:"empty"`
 }
 
 // PreviewAudience answers "who will get this" with a count and the first names,
@@ -311,44 +347,69 @@ func (s *AnnounceService) PreviewAudience(ctx context.Context, r AudienceRule) (
 	if err != nil {
 		return nil, err
 	}
-	const sample = 25
-	out := &AudiencePreview{Total: len(members), Everyone: r.IsEveryone() && len(r.Filters) == 0}
-	if len(members) > sample {
-		out.Names = members[:sample]
-	} else {
-		out.Names = members
-	}
-	return out, nil
+	return &AudiencePreview{
+		Total: len(members), Names: members,
+		Everyone: r.IsEveryone(), Empty: r.IsEmpty(),
+	}, nil
 }
 
-// materializeAudience writes the resolved audience into the recipient ledger.
-//
-// Called once, when the announcement goes live. Freezing it is deliberate: the
-// feed and the email then agree forever, and a TA who uploads their documents
-// tomorrow does not lose an announcement they were already told about.
-func (s *AnnounceService) materializeAudience(ctx context.Context, id uuid.UUID) error {
-	var (
-		roles     []string
-		courseIDs []uuid.UUID
-		userIDs   []uuid.UUID
-		filters   []string
-		termID    *uuid.UUID
-	)
-	if err := s.pool.QueryRow(ctx, `
-		SELECT audience, target_course_ids, target_user_ids, target_filters, target_term_id
+// storedRule reads an announcement's targeting rule as saved.
+func (s *AnnounceService) storedRule(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, id uuid.UUID) (AudienceRule, error) {
+	var r AudienceRule
+	err := q.QueryRow(ctx, `
+		SELECT audience::text[], target_course_ids, target_user_ids, target_filters, target_term_id
 		  FROM announcements WHERE id = $1`, id).Scan(
-		&roles, &courseIDs, &userIDs, &filters, &termID); err != nil {
+		&r.Roles, &r.CourseIDs, &r.UserIDs, &r.Filters, &r.TermID)
+	return r, err
+}
+
+// sameAudience reports whether two rules select by the same things. The frozen
+// term is left out: it is filled in by the first publish, not by the officer.
+func sameAudience(a, b AudienceRule) bool {
+	return sameSet(a.Roles, b.Roles) && sameSet(a.Filters, b.Filters) &&
+		sameSet(a.CourseIDs, b.CourseIDs) && sameSet(a.UserIDs, b.UserIDs)
+}
+
+func sameSet[T comparable](a, b []T) bool {
+	seen := map[T]bool{}
+	for _, v := range a {
+		seen[v] = true
+	}
+	other := map[T]bool{}
+	for _, v := range b {
+		if !seen[v] {
+			return false
+		}
+		other[v] = true
+	}
+	return len(seen) == len(other)
+}
+
+// syncAudience makes the recipient ledger equal to what the rule selects now.
+//
+// Called when an announcement goes live, and again only when an officer changes
+// the rule of a live one. Between those two moments the ledger is frozen on
+// purpose: the feed and the email then agree forever, and a TA who uploads
+// their documents tomorrow does not lose an announcement they were already told
+// about.
+//
+// It both adds and REMOVES. It used to only add, so narrowing the target of a
+// published notice changed nothing: everyone already on the ledger kept seeing
+// it in their feed.
+func (s *AnnounceService) syncAudience(ctx context.Context, id uuid.UUID) error {
+	rule, err := s.storedRule(ctx, s.pool, id)
+	if err != nil {
 		return err
 	}
-	rule := AudienceRule{Roles: roles, CourseIDs: courseIDs, UserIDs: userIDs, Filters: filters, TermID: termID}
-
-	term, err := s.activeTermID(ctx, termID)
+	term, err := s.activeTermID(ctx, rule.TermID)
 	if err != nil {
 		return err
 	}
 	// Freeze the term the rule was evaluated against, so a re-send later in the
 	// year cannot quietly retarget a different cohort.
-	if termID == nil && term != uuid.Nil {
+	if rule.TermID == nil && term != uuid.Nil {
 		_, _ = s.pool.Exec(ctx, `UPDATE announcements SET target_term_id=$2 WHERE id=$1 AND target_term_id IS NULL`, id, term)
 	}
 
@@ -356,22 +417,69 @@ func (s *AnnounceService) materializeAudience(ctx context.Context, id uuid.UUID)
 	if err != nil {
 		return err
 	}
+	keep := make([]uuid.UUID, 0, len(members))
 	for _, m := range members {
-		if _, err := s.pool.Exec(ctx, `
+		keep = append(keep, m.ID)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Rows with no user_id are addresses typed by hand under the older design;
+	// no rule ever selected them, so no rule change removes them.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM announcement_recipients
+		 WHERE announcement_id = $1 AND user_id IS NOT NULL AND NOT (user_id = ANY($2))`,
+		id, keep); err != nil {
+		return err
+	}
+	for _, m := range members {
+		// Keyed on the person first: someone whose address changed since the
+		// last sync is still the same recipient, not a second one.
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO announcement_recipients (announcement_id, email, user_id)
-			VALUES ($1, lower($2), $3)
+			SELECT $1, lower($2), $3
+			 WHERE NOT EXISTS (SELECT 1 FROM announcement_recipients
+			                    WHERE announcement_id = $1 AND user_id = $3)
 			ON CONFLICT (announcement_id, lower(email)) DO NOTHING`,
 			id, m.Email, m.ID); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // ErrNoAudience is returned when a rule selects nobody. Publishing to an empty
 // audience is nearly always a mistake in the rule, and silence is exactly what
 // it looks like from the officer's side.
-var ErrNoAudience = errors.New("ยังไม่มีผู้รับตามเงื่อนไขที่เลือก กรุณาตรวจสอบกลุ่มเป้าหมายอีกครั้ง")
+var ErrNoAudience = Invalid("ยังไม่มีผู้รับตามเงื่อนไขที่เลือก กรุณาตรวจสอบกลุ่มเป้าหมายอีกครั้ง")
+
+// requireAudience refuses to publish an announcement that reaches nobody.
+//
+// One exception: an announcement opened to the public has its share link as a
+// channel of its own, so "posted for outside readers, nobody inside notified"
+// is a real choice rather than a mistake.
+func (s *AnnounceService) requireAudience(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, id uuid.UUID, r AudienceRule) error {
+	var public bool
+	if err := q.QueryRow(ctx, `SELECT is_public FROM announcements WHERE id = $1`, id).Scan(&public); err != nil {
+		return err
+	}
+	if public {
+		return nil
+	}
+	members, err := s.ResolveAudience(ctx, r)
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		return ErrNoAudience
+	}
+	return nil
+}
 
 // derefSlice reads an optional slice field: nil (absent from the payload)
 // yields nil, which every caller treats as "not specified".

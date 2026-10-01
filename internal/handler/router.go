@@ -152,7 +152,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 
 	// Authenticated. AccountGuard re-checks live account state (active +
 	// must-change-password) on every protected request.
-	authed := api.Group("", authMiddleware, AccountGuard(svc), AuditContext())
+	// AuditDenied sits innermost so it sees the 403 a role guard or a service
+	// returns, with the user and session AuditContext has just published.
+	authed := api.Group("", authMiddleware, AccountGuard(svc), AuditContext(), AuditDenied(aud))
 
 	// Applied below to routes that generate a PDF/XLSX/ZIP or accept an
 	// upload — every one of those costs real CPU, memory, or (for uploads)
@@ -509,11 +511,14 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// them and try to parse "audience-filters" as a UUID.
 	authed.Post("/announcements/preview-audience", adminOrStaff, ah.AudiencePreview)
 	authed.Get("/announcements/audience-filters", adminOrStaff, ah.AudienceFilters)
+	authed.Post("/announcements/send-test", adminOrStaff, heavyLimiter, ah.SendTest)
 	authed.Get("/announcements/:id", ah.Get)
 	authed.Delete("/announcements/:id", adminOrStaff, ah.Delete)
 	authed.Post("/announcements/:id/publish", adminOrStaff, ah.Publish)
 	authed.Post("/announcements/:id/unpublish", adminOrStaff, ah.Unpublish)
 	authed.Post("/announcements/:id/send-email", adminOrStaff, ah.Resend)
+	authed.Post("/announcements/:id/remind", adminOrStaff, ah.Remind)
+	authed.Post("/announcements/:id/read", ah.MarkRead)
 
 	// Dashboard
 	dashH := &DashboardHandler{Svc: svc}
@@ -674,6 +679,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// names is itself a map of what the system records.
 	authed.Get("/audit-logs/actions", RequireRole(rbac.RoleAdmin), audH.Actions)
 	authed.Get("/audit-logs/summary", RequireRole(rbac.RoleAdmin), audH.Summary)
+	authed.Get("/audit-logs/catalog", RequireRole(rbac.RoleAdmin), audH.Catalog)
+	authed.Get("/audit-logs/sessions", RequireRole(rbac.RoleAdmin), audH.Sessions)
+	authed.Get("/audit-logs/export", RequireRole(rbac.RoleAdmin), audH.Export)
 }
 
 // authed_forSelfOrStaff allows the user to fetch their own profile OR staff/admin.

@@ -242,19 +242,27 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 }
 
 // Delete removes a period (cascades status rows). Only staff/admin.
-// Refuses when any month of the period has already been exported or sent to
-// finance — deleting it would cascade away the lock rows, silently reopening
-// frozen worklogs and destroying the audit snapshot the payout file relies on.
-// Such a period must be sent back / admin-unlocked before it can be removed.
+// Refuses when any TA's month in the period has been signed off by staff,
+// exported or sent to finance — deleting it would cascade away those rows:
+// a sign-off would vanish without trace (the month silently back to "not
+// reviewed"), and a lock would silently reopen frozen worklogs and destroy the
+// snapshot the payout file relies on. Such a month must be sent back (or
+// admin-unlocked) first.
 func (s *SubmissionPeriodService) Delete(ctx context.Context, actor, id uuid.UUID) error {
-	var lockedCount int
+	var reviewed, lockedCount int
 	if err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM submission_period_status
-		WHERE submission_period_id=$1 AND status IN ('exported','finance_sent')`, id).Scan(&lockedCount); err != nil {
+		SELECT COUNT(*) FILTER (WHERE status = 'staff_reviewed'),
+		       COUNT(*) FILTER (WHERE status IN ('exported','finance_sent'))
+		FROM submission_period_status
+		WHERE submission_period_id=$1`, id).Scan(&reviewed, &lockedCount); err != nil {
 		return err
 	}
 	if lockedCount > 0 {
 		return Conflict("ลบงวดนี้ไม่ได้ มีเดือนที่ส่งออกไฟล์หรือส่งการเงินไปแล้ว กรุณาตีกลับหรือให้ผู้ดูแลระบบปลดล็อกก่อน")
+	}
+	if reviewed > 0 {
+		return Conflict(fmt.Sprintf("ลบงวดนี้ไม่ได้ มีผู้ช่วยสอน %d คนที่เจ้าหน้าที่ตรวจสอบเบิกจ่ายเดือนนี้แล้ว "+
+			"การลบจะทำให้ผลการตรวจหายไป กรุณาตีกลับเดือนดังกล่าวก่อน", reviewed))
 	}
 	return writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "submission_period.delete",
@@ -276,44 +284,53 @@ func validYearMonth(ym string, acadYear int) bool {
 	return err == nil && mm >= 1 && mm <= 12
 }
 
-// BulkCreateForTerm auto-generates 5 periods for a term (มิ.ย. → ต.ค.) with
-// due-dates matching the KKU 2569 rulebook (first three months share a due
-// date, months 4/5 have month+5-day due dates). Staff can then edit them.
-// Idempotent — ON CONFLICT preserves existing rows.
+// BulkCreateForTerm generates one submission period per calendar month the
+// term actually covers (academic_terms.starts_on..ends_on), each opening on
+// the 1st of ITS OWN month. Staff can then edit them. Idempotent — ON CONFLICT
+// preserves existing rows.
+//
+// It used to stamp a fixed template — มิ.ย.–ต.ค. for ภาคต้น, พ.ย.–มี.ค. for
+// everything else — whatever the term's real dates were, and opened สิงหาคม on
+// 1 ก.ค. because the ประกาศ's shared 31 ก.ค. due date fell before the month
+// began. The due dates keep the ประกาศ's convention where it applies (ภาคต้น:
+// มิ.ย. and ก.ค. due 31 ก.ค.); every other month — and สิงหาคม, whose shared
+// date would close it before it opens — is due on the 5th of the month after.
 func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, termID uuid.UUID) ([]SubmissionPeriod, error) {
-	// Fetch term for its academic_year (Buddhist) and semester.
 	var year, semester int
+	var startsOn, endsOn *time.Time
 	if err := s.pool.QueryRow(ctx,
-		`SELECT academic_year, semester FROM academic_terms WHERE id=$1`, termID).
-		Scan(&year, &semester); err != nil {
+		`SELECT academic_year, semester, starts_on, ends_on FROM academic_terms WHERE id=$1`, termID).
+		Scan(&year, &semester, &startsOn, &endsOn); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, Invalid("ไม่พบภาคเรียนที่ระบุ")
+		}
 		return nil, err
 	}
-
-	// First semester runs มิ.ย.–ต.ค. Second runs พ.ย.–มี.ค. We only ship the
-	// first-semester template here (Q&A rule 2569); staff can add manually.
+	if startsOn == nil || endsOn == nil || endsOn.Before(*startsOn) {
+		return nil, Invalid("ภาคเรียนนี้ยังไม่ได้กำหนดวันเปิดและวันปิดภาค จึงสร้างรอบลงเวลาอัตโนมัติไม่ได้ กรุณากำหนดวันของภาคเรียนก่อน")
+	}
+	// The ประกาศ's own dates (MM-DD), ภาคต้น only. Applied only when they fall
+	// on or after the month's 1st — otherwise the window would close before it
+	// opens.
+	sharedDue := map[int]string{}
+	if semester == 1 {
+		sharedDue = map[int]string{6: "07-31", 7: "07-31", 8: "07-31"}
+	}
 	type tpl struct {
-		month int
-		due   string // MM-DD in Buddhist year (year set below)
-		label string
+		start time.Time
+		due   string
 	}
 	var templates []tpl
-	if semester == 1 {
-		templates = []tpl{
-			{6, "07-31", "มิถุนายน"},
-			{7, "07-31", "กรกฎาคม"},
-			{8, "07-31", "สิงหาคม"}, // matches ประกาศ: 3 months share 31 ก.ค. due
-			{9, "10-05", "กันยายน"},
-			{10, "11-05", "ตุลาคม"},
+	first := time.Date(startsOn.Year(), startsOn.Month(), 1, 0, 0, 0, 0, time.UTC)
+	for m := first; !m.After(*endsOn); m = m.AddDate(0, 1, 0) {
+		start := m.Format("2006-01-02")
+		due := m.AddDate(0, 1, 4).Format("2006-01-02") // 5th of the next month
+		if mmdd, ok := sharedDue[int(m.Month())]; ok {
+			if d := fmt.Sprintf("%d-%s", m.Year(), mmdd); d > start {
+				due = d
+			}
 		}
-	} else {
-		// Second-semester template (skeleton — staff will adjust dates).
-		templates = []tpl{
-			{11, "12-05", "พฤศจิกายน"},
-			{12, "01-05", "ธันวาคม"},
-			{1, "02-05", "มกราคม"},
-			{2, "03-05", "กุมภาพันธ์"},
-			{3, "04-05", "มีนาคม"},
-		}
+		templates = append(templates, tpl{start: m, due: due})
 	}
 
 	out := []SubmissionPeriod{}
@@ -326,52 +343,16 @@ func (s *SubmissionPeriodService) BulkCreateForTerm(ctx context.Context, actor, 
 	}
 	defer tx.Rollback(ctx)
 	for _, t := range templates {
-		// year_month is the SUBMISSION month (Buddhist); due_date uses the same
-		// Buddhist year but is a Gregorian DATE — Postgres will interpret e.g.
-		// '2569-07-31' as year 2569 A.D. (which pgxpool converts fine so long
-		// as we don't rely on absolute time arithmetic). To keep behaviour
-		// predictable across environments we convert Buddhist → Gregorian.
-		gregYear := year - 543
-		ym := fmt.Sprintf("%d-%02d", year, t.month)
-		// starts_on = 1st of that submission month in Gregorian. The academic
-		// year opens in June, so ม.ค.–พ.ค. fall in the NEXT calendar year —
-		// the same rule gregorianYearMonth applies to the year_month key.
-		startYear := gregYear
-		if t.month <= 5 {
-			startYear++
-		}
-		// The due date belongs to the month after the submission month, which
-		// wraps into the next calendar year for ธันวาคม (due 5 ม.ค.). Deriving
-		// it from the due month itself covers that wrap: the old rule only
-		// bumped ม.ค.–มี.ค., so December's window became 1 ม.ค. → 5 ม.ค. of the
-		// SAME year — eleven months before the term started and already
-		// closed, forfeiting every December worklog on creation.
-		dueYear := startYear
-		var dueMonth int
-		fmt.Sscanf(t.due, "%d-", &dueMonth)
-		// Only a real year boundary counts (ธ.ค. → ม.ค., 11 months back). A due
-		// month just before the submission month is the ประกาศ's shared date
-		// (สิงหาคม due 31 ก.ค.) and stays in the same year; starts_on is pulled
-		// back for it below.
-		if t.month-dueMonth > 6 {
-			dueYear++
-		}
-		starts := fmt.Sprintf("%d-%02d-01", startYear, t.month)
-		due := fmt.Sprintf("%d-%s", dueYear, t.due)
-		// Months whose shared due date lands BEFORE the month itself (ประกาศ:
-		// มิ.ย.–ส.ค. all close 31 ก.ค., so August's window would be 1 ส.ค. →
-		// 31 ก.ค. — never open, and MarkTASigned could never pass). Pull
-		// starts_on back to the 1st of the due month so the window is valid;
-		// staff can fine-tune via the period editor.
-		if starts >= due {
-			starts = due[:8] + "01"
-		}
+		// year_month is the academic key: the term's Buddhist academic year and
+		// the calendar month, e.g. มกราคม of academic year 2568 is "2568-01".
+		ym := fmt.Sprintf("%d-%02d", year, int(t.start.Month()))
 		// Labels carry the calendar Buddhist year a reader expects: มกราคม of
-		// academic year 2568 is มกราคม 2569. year_month stays the academic key.
-		label := fmt.Sprintf("%s %d", t.label, startYear+543)
+		// academic year 2568 is มกราคม 2569.
+		label := fmt.Sprintf("%s %d", thaiMonthNames[int(t.start.Month())], t.start.Year()+543)
 		p := SubmissionPeriod{
 			ID: uuid.New(), TermID: termID, YearMonth: ym,
-			StartsOn: starts, DueDate: due, Label: label, RemindDaysBefore: 3, IsClosed: false,
+			StartsOn: t.start.Format("2006-01-02"), DueDate: t.due, Label: label,
+			RemindDaysBefore: 3, IsClosed: false,
 		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label, remind_days_before, is_closed)
@@ -594,13 +575,20 @@ func (s *SubmissionPeriodService) assertPrivileged(ctx context.Context, actor uu
 // course spanning a calendar-year boundary or a reused teaching_courses row
 // would have silently counted the wrong year's work_logs.
 func (s *SubmissionPeriodService) monthWorklogReadiness(ctx context.Context, taID, tcID uuid.UUID, yearMonth string) (total, unapproved int, err error) {
+	return monthWorklogReadinessQ(ctx, s.pool, taID, tcID, yearMonth)
+}
+
+// monthWorklogReadinessQ is monthWorklogReadiness on a caller's connection —
+// the staff sign-off counts inside its own locked transaction, so the count
+// and the write cannot be separated by a TA's commit.
+func monthWorklogReadinessQ(ctx context.Context, q ledgerQuerier, taID, tcID uuid.UUID, yearMonth string) (total, unapproved int, err error) {
 	// Rows the TA can no longer send — draft/rejected in a closed period — are
 	// forfeited ("ไม่ประสงค์ลงเวลา", staff decision 03/08/2026). They are
 	// neither work to approve nor work that exists, so they count in neither
 	// figure: counting them as "not yet approved" meant a month holding one
 	// forgotten draft could never be signed off or exported, however complete
 	// the rest was (found in the UAT follow-up review).
-	err = s.pool.QueryRow(ctx, `
+	err = q.QueryRow(ctx, `
 		SELECT COUNT(*) FILTER (WHERE wl.status = 'approved'),
 		       COUNT(*) FILTER (WHERE wl.status = 'submitted'
 		                           OR (wl.status IN ('draft','rejected') AND NOT `+unsubmittableMonthSQL("wl")+`))
@@ -676,6 +664,15 @@ func (s *SubmissionPeriodService) CourseWorklogFingerprint(ctx context.Context, 
 // that the row trigger (migration 0124) refuses writes into locked months.
 // An empty builtFP skips the check.
 func (s *SubmissionPeriodService) MarkCourseExportedAsBuilt(ctx context.Context, actor, tcID uuid.UUID, months []string, builtFP string) (int, error) {
+	return s.MarkCourseExportedWithFigures(ctx, actor, tcID, months, builtFP, nil)
+}
+
+// MarkCourseExportedWithFigures is MarkCourseExportedAsBuilt that also records,
+// in the same transaction, what the pack paid for every cell it locks
+// (export_month_ledger, migration 0140). From then on every reader prices those
+// months from the record rather than live, so the document and the system
+// cannot drift apart. nil figs locks without a record (the demo seeder).
+func (s *SubmissionPeriodService) MarkCourseExportedWithFigures(ctx context.Context, actor, tcID uuid.UUID, months []string, builtFP string, figs MonthFigures) (int, error) {
 	name := s.userDisplayName(ctx, actor)
 	// This is the freeze point for a course's payout numbers, so the lock rows
 	// and the record of the lock go in together.
@@ -761,7 +758,7 @@ func (s *SubmissionPeriodService) MarkCourseExportedAsBuilt(ctx context.Context,
 	if err != nil {
 		return 0, err
 	}
-	type cell struct{ taID, periodID uuid.UUID }
+	type cell = lockedCell
 	var cells []cell
 	for rows.Next() {
 		var c cell
@@ -773,6 +770,19 @@ func (s *SubmissionPeriodService) MarkCourseExportedAsBuilt(ctx context.Context,
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for i := range cells {
+		var periodYM string
+		if err := tx.QueryRow(ctx, `SELECT year_month FROM submission_periods WHERE id = $1`,
+			cells[i].periodID).Scan(&periodYM); err != nil {
+			return 0, err
+		}
+		if cells[i].gregYM, err = gregorianYearMonth(periodYM); err != nil {
+			return 0, err
+		}
+	}
+	if err := writeMonthLedger(ctx, tx, actor, tcID, cells, figs); err != nil {
 		return 0, err
 	}
 	if len(cells) > 0 {
@@ -925,10 +935,26 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 // signal. Mirrors ExportService.validatePayoutReadiness in export.go, scoped
 // to a single TA.
 func (s *SubmissionPeriodService) assertPayoutReady(ctx context.Context, taID uuid.UUID) error {
+	issue, err := payoutIssue(ctx, s.pool, taID)
+	if err != nil {
+		return err
+	}
+	if issue != "" {
+		return Invalid("ส่งการเงินไม่ได้ " + issue)
+	}
+	return nil
+}
+
+// payoutIssue is why a TA's profile would produce a defective claim document,
+// or "" when it would not: no profile, a profile staff have not approved, or no
+// approved creditor form. One definition shared by the finance handoff and the
+// staff sign-off (MarkStaffReviewed), so a month is never signed off for a TA
+// whose documents the export will then refuse.
+func payoutIssue(ctx context.Context, q ledgerQuerier, taID uuid.UUID) (string, error) {
 	var hasProfile bool
 	var status string
 	var missingForm bool
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT p.user_id IS NOT NULL, COALESCE(p.status::text, ''),
 		       NOT EXISTS (
 		           SELECT 1 FROM ta_documents d
@@ -937,43 +963,53 @@ func (s *SubmissionPeriodService) assertPayoutReady(ctx context.Context, taID uu
 		FROM (SELECT 1) x
 		LEFT JOIN ta_profiles p ON p.user_id = $1`, taID).Scan(&hasProfile, &status, &missingForm)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if !hasProfile {
-		return Invalid("ส่งการเงินไม่ได้ TA ยังไม่ได้กรอกข้อมูลโปรไฟล์/บัญชีธนาคาร")
+	switch {
+	case !hasProfile:
+		return "TA ยังไม่ได้กรอกข้อมูลโปรไฟล์/บัญชีธนาคาร", nil
+	case status != "approved":
+		return "เอกสารโปรไฟล์ของ TA ยังไม่ผ่านการอนุมัติจากเจ้าหน้าที่", nil
+	case missingForm:
+		return "ยังไม่มีแบบฟอร์มเจ้าหนี้ที่อนุมัติแล้ว", nil
 	}
-	if status != "approved" {
-		return Invalid("ส่งการเงินไม่ได้ เอกสารโปรไฟล์ของ TA ยังไม่ผ่านการอนุมัติจากเจ้าหน้าที่")
-	}
-	if missingForm {
-		return Invalid("ส่งการเงินไม่ได้ ยังไม่มีแบบฟอร์มเจ้าหนี้ที่อนุมัติแล้ว")
-	}
-	return nil
+	return "", nil
 }
 
-// MarkSentBack is the "ตีกลับ" transition: staff/admin push an exported month
-// back to pending with a mandatory reason, which unlocks the daily worklog so
-// the TA/lecturer can correct it. The exported snapshot is cleared. Lecturers
-// have no monthly action in this flow (their review is the daily approve/
-// reject), so send-back is staff/admin only. finance_sent rows can only be
-// reopened via the admin-only RevertFinanceSent.
+// MarkSentBack is the "ตีกลับ" transition: staff/admin return one TA's month
+// to them for correction, with a mandatory reason.
 //
-// A month nobody has signed off yet (no status row, or 'pending') has no
-// status to move back, and the grid offered ตีกลับ on exactly those months —
-// every press was refused. There the send-back is the month's approved rows
-// going back to the TA as rejected; see sendBackUnsignedMonth.
+// It does ONE thing, whatever stage the month is at (pending, staff_reviewed
+// or exported — anything before finance_sent): the month is reopened so the
+// TA can actually edit it. Its approved and still-submitted rows become
+// rejected with the officer's reason, the month's status goes back to
+// pending (clearing the sign-off and the export lock), and the lecturer must
+// approve the corrected rows again before staff can review and export.
+//
+// It used to do two different things. On an unsigned month it rejected the
+// rows; on a reviewed or exported month it only moved the status back and left
+// the rows approved — so the TA and the lecturer were told "ส่งกลับให้แก้ไข"
+// while neither could edit anything (the TA edits only draft/rejected rows,
+// the lecturer approves only submitted ones), until a second press finally
+// rejected the rows.
+//
+// An exported month that is sent back and exported again produces a
+// corrected document ("ฉบับแก้ไข", export_batches.version); the old batch
+// stays in the history.
+//
+// Refused once the period has closed: a rejected row in a closed month is
+// forfeited (ไม่ประสงค์ลงเวลา) and can never be resent, so the send-back would
+// silently cancel the TA's pay. Moving the period's due date is the deliberate,
+// visible act that reopens a closed month (decision 03/08/2026).
+//
+// toStatus is kept for the API's shape; only "pending" (or empty) is valid.
 func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, periodID, taID, tcID uuid.UUID, toStatus, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		return Invalid("ต้องระบุเหตุผลการตีกลับ")
 	}
-	// The only backward target in the new flow is pending (unlock for edits).
-	if toStatus == "" {
-		toStatus = "pending"
-	}
-	toRank, known := statusRank[toStatus]
-	if !known || toStatus == "finance_sent" {
-		return Invalid("สถานะปลายทางไม่ถูกต้อง")
+	if toStatus != "" && toStatus != "pending" {
+		return Invalid("สถานะปลายทางไม่ถูกต้อง การตีกลับจะคืนเดือนนี้ให้ผู้ช่วยสอนแก้ไขเสมอ")
 	}
 	if err := s.assertPrivileged(ctx, actor); err != nil {
 		return err
@@ -981,100 +1017,111 @@ func (s *SubmissionPeriodService) MarkSentBack(ctx context.Context, actor, perio
 	if err := s.assertSignTarget(ctx, periodID, taID, tcID); err != nil {
 		return err
 	}
+	name := s.userDisplayName(ctx, actor)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-
-	// Lock the row so a concurrent export/finance-send can't race the revert.
-	var cur string
-	err = tx.QueryRow(ctx, `
-		SELECT status FROM submission_period_status
-		WHERE submission_period_id=$1 AND ta_id=$2 AND teaching_course_id=$3
-		FOR UPDATE`, periodID, taID, tcID).Scan(&cur)
-	if errors.Is(err, pgx.ErrNoRows) {
-		cur, err = "pending", nil
-	}
+	res, err := reopenCellForCorrection(ctx, tx, actor, name, periodID, taID, tcID, reason)
 	if err != nil {
 		return err
 	}
-	if cur == "pending" && toStatus == "pending" {
-		return s.sendBackUnsignedMonth(ctx, tx, actor, periodID, taID, tcID, reason)
-	}
-	curRank, known := statusRank[cur]
-	if !known {
-		return Invalid("สถานะปัจจุบันไม่รองรับการตีกลับ")
-	}
-	if cur == "finance_sent" {
-		return Conflict("รายการนี้ส่งการเงินแล้ว ต้องให้ผู้ดูแลระบบปลดล็อกก่อน")
-	}
-	if toRank >= curRank {
-		return Invalid("สถานะปลายทางต้องอยู่ก่อนสถานะปัจจุบัน")
-	}
-
-	name := s.userDisplayName(ctx, actor)
-	if _, err := tx.Exec(ctx, `
-		UPDATE submission_period_status SET
-		  status        = $4,
-		  exported_at   = NULL,
-		  exported_by   = NULL,
-		  exported_name = NULL,
-		  sent_back_at     = now(),
-		  sent_back_by     = $5,
-		  sent_back_name   = $6,
-		  sent_back_reason = $7
-		WHERE submission_period_id=$1 AND ta_id=$2 AND teaching_course_id=$3`,
-		periodID, taID, tcID, toStatus, actor, name, reason); err != nil {
-		return err
+	if res.prev == "pending" && len(res.moved) == 0 {
+		return Invalid("เดือนนี้ไม่มีรายการที่อนุมัติแล้วหรือรออนุมัติให้ตีกลับ")
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.sent_back",
 		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-		Note: reason, After: map[string]string{"from": cur, "to": toStatus}}); err != nil {
+		Note:   reason,
+		Before: map[string]any{"status": res.prev, "rows": res.moved},
+		After:  map[string]any{"status": "pending", "rows_rejected": len(res.moved), "hours": res.hours}}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if s.notify != nil {
-		label := courseLabelOf(ctx, s.pool, tcID)
-		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
-		body := "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน" + month + " รายวิชา " + label + " กลับมาให้ท่านแก้ไข เนื่องจาก " + reason
-		s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month, body, "/ta/reminders")
-		// The course lecturers may need to re-open a worklog for correction.
-		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
-			for _, lid := range lects {
-				if lid != actor {
-					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
-						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
-							" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เนื่องจาก "+reason,
-						"/lecturer/courses/"+tcID.String()+"/reports")
-				}
-			}
-		}
-	}
+	s.notifyReopened(ctx, actor, periodID, taID, tcID, res.prev,
+		"เจ้าหน้าที่", reason)
 	return nil
 }
 
-// sendBackUnsignedMonth returns a not-yet-signed-off month to the TA: its
-// approved rows become rejected with the officer's reason, so the TA corrects
-// and resends them and the lecturer approves them again. The TA can only edit
-// draft/rejected rows, so nothing short of this lets them fix anything.
+// reopenResult is what reopenCellForCorrection moved.
+type reopenResult struct {
+	prev  string           // status before: pending | staff_reviewed | exported
+	moved []map[string]any // the rows sent back to the TA
+	hours float64
+}
+
+// reopenCellForCorrection is the one definition of "give this TA's month back
+// to them": shared by the staff send-back and the admin course unlock, so the
+// two can never again leave a month in different half-open states.
 //
-// Refused once the period has closed: a rejected row in a closed month is
-// forfeited (ไม่ประสงค์ลงเวลา) and can never be resent, so the "send-back"
-// would silently cancel the TA's pay for the month. Corrections there are
-// made by staff directly in the review modal.
-func (s *SubmissionPeriodService) sendBackUnsignedMonth(ctx context.Context, tx pgx.Tx, actor, periodID, taID, tcID uuid.UUID, reason string) error {
+// Serialised against the lecturer's approval (the same per-course lock
+// ApproveMany takes) and against the staff sign-off and the worklog trigger
+// (the per-cell lock, lockPeriodCell / migration 0141). The rows are then
+// rejected in one statement that covers submitted rows too: an approval racing
+// this either commits first and its rows are rejected here, or finds nothing
+// left to approve — the TA never gets "ส่งกลับ" and "อนุมัติ" for the same rows.
+//
+// The status is reopened BEFORE the rows move: an exported month's rows are
+// write-protected by the lock trigger (0124) until it is no longer exported.
+func reopenCellForCorrection(ctx context.Context, tx pgx.Tx, actor uuid.UUID, actorName string,
+	periodID, taID, tcID uuid.UUID, reason string) (*reopenResult, error) {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 42))`, tcID); err != nil {
+		return nil, err
+	}
+	if err := lockPeriodCell(ctx, tx, periodID, taID, tcID); err != nil {
+		return nil, err
+	}
+	res := &reopenResult{prev: "pending", moved: []map[string]any{}}
+	err := tx.QueryRow(ctx, `
+		SELECT status FROM submission_period_status
+		WHERE submission_period_id=$1 AND ta_id=$2 AND teaching_course_id=$3
+		FOR UPDATE`, periodID, taID, tcID).Scan(&res.prev)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	switch res.prev {
+	case "pending", StatusStaffReviewed, "exported":
+	case "finance_sent":
+		return nil, Conflict("รายการนี้ส่งการเงินแล้ว ต้องให้ผู้ดูแลระบบยกเลิกสถานะส่งการเงินก่อน")
+	default:
+		return nil, Invalid("สถานะปัจจุบันไม่รองรับการตีกลับ")
+	}
 	var closed bool
+	var label string
 	if err := tx.QueryRow(ctx,
-		`SELECT `+periodClosedSQL("sp")+` FROM submission_periods sp WHERE sp.id = $1`,
-		periodID).Scan(&closed); err != nil {
-		return err
+		`SELECT `+periodClosedSQL("sp")+`, sp.label FROM submission_periods sp WHERE sp.id = $1`,
+		periodID).Scan(&closed, &label); err != nil {
+		return nil, err
 	}
 	if closed {
-		return Invalid("เดือนนี้ปิดรับบันทึกเวลาแล้ว ถ้าตีกลับ TA จะส่งใหม่ไม่ได้ กรุณาแก้ไขรายการผ่านปุ่ม \"ดู\" แทน")
+		return nil, Invalid(fmt.Sprintf(
+			"เดือน %s ปิดรับบันทึกเวลาแล้ว ถ้าตีกลับ ผู้ช่วยสอนจะส่งใหม่ไม่ได้และรายการจะถือว่าไม่ประสงค์ลงเวลา "+
+				"กรุณาขยายกำหนดส่งของรอบนี้ที่หน้าตั้งค่ารอบลงเวลาก่อน แล้วจึงตีกลับ", label))
+	}
+	// Every send-back writes its reason, so the timeline shows the CURRENT one
+	// rather than whichever earlier event happened to create the row.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO submission_period_status
+		    (id, submission_period_id, ta_id, teaching_course_id, status,
+		     sent_back_at, sent_back_by, sent_back_name, sent_back_reason)
+		VALUES (gen_random_uuid(), $1, $2, $3, 'pending', now(), $4, $5, $6)
+		ON CONFLICT (submission_period_id, ta_id, teaching_course_id) DO UPDATE
+		SET status              = 'pending',
+		    staff_reviewed_by   = NULL,
+		    staff_reviewed_name = NULL,
+		    exported_at         = NULL,
+		    exported_by         = NULL,
+		    exported_name       = NULL,
+		    sent_back_at        = now(),
+		    sent_back_by        = $4,
+		    sent_back_name      = $5,
+		    sent_back_reason    = $6
+		WHERE submission_period_status.status <> 'finance_sent'`,
+		periodID, taID, tcID, actor, actorName, reason); err != nil {
+		return nil, err
 	}
 	rows, err := tx.Query(ctx, `
 		UPDATE work_logs wl SET status = 'rejected', reject_reason = $4,
@@ -1087,73 +1134,138 @@ func (s *SubmissionPeriodService) sendBackUnsignedMonth(ctx context.Context, tx 
 		WHERE wl.assignment_id = a.id
 		  AND sp.id = $1 AND a.ta_id = $2 AND tc.id = $3
 		  AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
-		  AND wl.status = 'approved'
+		  AND wl.status IN ('approved','submitted')
 		  -- Same exclusion as the review queue: grad-special rows are dead.
 		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
 		RETURNING wl.id, TO_CHAR(wl.work_date, 'YYYY-MM-DD'), wl.hours`,
 		periodID, taID, tcID, reason)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	moved := []map[string]any{}
-	var hours float64
 	for rows.Next() {
 		var id uuid.UUID
 		var date string
 		var h float64
 		if err := rows.Scan(&id, &date, &h); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
-		moved = append(moved, map[string]any{"id": id, "work_date": date, "hours": h})
-		hours += h
+		res.moved = append(res.moved, map[string]any{"id": id, "work_date": date, "hours": h})
+		res.hours += h
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	if len(moved) == 0 {
-		return Invalid("เดือนนี้ไม่มีรายการที่อนุมัติแล้วให้ตีกลับ")
-	}
-	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.sent_back",
-		Entity: "submission_period_status", EntityID: periodID.String() + "/" + taID.String(),
-		Note:   reason,
-		Before: map[string]any{"status": "approved", "rows": moved},
-		After:  map[string]any{"status": "rejected", "count": len(moved), "hours": hours}}); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	if s.notify != nil {
-		label := courseLabelOf(ctx, s.pool, tcID)
-		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
-		s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month,
-			"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+
-				" กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก "+reason,
-			"/ta/courses/"+tcID.String()+"/worklog")
-		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
-			for _, lid := range lects {
-				if lid != actor {
-					s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
-						"เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
-							" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เมื่อผู้ช่วยสอนส่งใหม่แล้ว ขอให้ท่านอนุมัติอีกครั้ง เนื่องจาก "+reason,
-						"/lecturer/courses/"+tcID.String()+"/reports")
-				}
-			}
-		}
-	}
-	return nil
+	return res, nil
 }
 
-// RevertFinanceSent is the admin-only escape hatch that reopens a
-// finance_sent month (status → exported) so corrections can flow again after
-// an admin also sends it back to pending. Requires a reason; audited and
-// notified so the paper trail explains why the re-issued documents differ.
+// notifyReopened tells the TA and the course's lecturers that a month came
+// back for correction, and exactly what each of them now has to do. by names
+// the sender ("เจ้าหน้าที่" / "ผู้ดูแลระบบ").
+func (s *SubmissionPeriodService) notifyReopened(ctx context.Context, actor, periodID, taID, tcID uuid.UUID, prev, by, reason string) {
+	if s.notify == nil {
+		return
+	}
+	label := courseLabelOf(ctx, s.pool, tcID)
+	code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
+	reissue := ""
+	if prev == "exported" {
+		reissue = " เมื่อแก้ไขและผ่านการตรวจอีกครั้ง เจ้าหน้าที่จะออกเอกสารเบิกจ่ายฉบับแก้ไขแทนฉบับเดิม"
+	}
+	s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month,
+		by+"ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+
+			" กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก "+reason+reissue,
+		"/ta/courses/"+tcID.String()+"/worklog")
+	if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
+		for _, lid := range lects {
+			if lid == actor {
+				continue
+			}
+			s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
+				by+"ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
+					" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เมื่อผู้ช่วยสอนส่งใหม่แล้ว ขอให้ท่านอนุมัติอีกครั้ง เนื่องจาก "+reason,
+				"/lecturer/courses/"+tcID.String()+"/reports")
+		}
+	}
+}
+
+// ReopenCourseExports is the admin "ปลดล็อก" for a course: every exported
+// (TA, month) of the course — not finance_sent — is reopened for correction
+// exactly as a send-back would (reopenCellForCorrection), and the course's
+// own section-edit lock (teaching_courses.exported_at) is cleared in the same
+// transaction. Before, unlock cleared only that course flag: the months stayed
+// exported and locked, and the dashboards that read the flag disagreed with
+// every screen that read the months.
+//
+// All or nothing: if any exported month's period has closed the unlock is
+// refused, naming the months, because reopening there would forfeit the TA's
+// rows (see MarkSentBack).
+func ReopenCourseExports(ctx context.Context, tx pgx.Tx, actor uuid.UUID, actorName string, tcID uuid.UUID, reason string) ([]reopenedCell, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT st.submission_period_id, st.ta_id
+		FROM submission_period_status st
+		JOIN submission_periods sp ON sp.id = st.submission_period_id
+		WHERE st.teaching_course_id = $1 AND st.status = 'exported'
+		ORDER BY sp.starts_on, st.ta_id`, tcID)
+	if err != nil {
+		return nil, err
+	}
+	var cells []reopenedCell
+	for rows.Next() {
+		var c reopenedCell
+		if err := rows.Scan(&c.PeriodID, &c.TAID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		cells = append(cells, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i, c := range cells {
+		res, err := reopenCellForCorrection(ctx, tx, actor, actorName, c.PeriodID, c.TAID, tcID, reason)
+		if err != nil {
+			return nil, err
+		}
+		cells[i].RowsRejected = len(res.moved)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE teaching_courses SET exported_at = NULL WHERE id = $1`, tcID); err != nil {
+		return nil, err
+	}
+	return cells, nil
+}
+
+// reopenedCell is one (TA, month) an admin unlock reopened.
+type reopenedCell struct {
+	PeriodID     uuid.UUID `json:"period_id"`
+	TAID         uuid.UUID `json:"ta_id"`
+	RowsRejected int       `json:"rows_rejected"`
+}
+
+// NotifyCourseReopened sends the per-cell notices after an admin unlock has
+// committed.
+func (s *SubmissionPeriodService) NotifyCourseReopened(ctx context.Context, actor, tcID uuid.UUID, cells []reopenedCell, reason string) {
+	for _, c := range cells {
+		s.notifyReopened(ctx, actor, c.PeriodID, c.TAID, tcID, "exported", "ผู้ดูแลระบบ", reason)
+	}
+}
+
+// RevertFinanceSent is the admin-only undo of "ส่งการเงินแล้ว": a finance_sent
+// month goes back to exported. It does NOT unlock anything — the month is still
+// exported and its work_logs stay write-locked; to correct the hours, staff
+// then send the month back (MarkSentBack) or an admin unlocks the course.
+// Requires a reason; audited and notified.
+//
+// The notices used to say "ปลดล็อก…เพื่อให้แก้ไข" while leaving the month
+// locked, so the TA was told to edit a month nobody could edit. They now say
+// what this actually does.
 func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, periodID, taID, tcID uuid.UUID, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		return Invalid("ต้องระบุเหตุผลการปลดล็อก")
+		return Invalid("ต้องระบุเหตุผลการยกเลิกสถานะส่งการเงิน")
 	}
 	isAdmin, err := hasRole(ctx, s.pool, actor, "admin")
 	if err != nil {
@@ -1206,14 +1318,17 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 	if s.notify != nil {
 		label := courseLabelOf(ctx, s.pool, tcID)
 		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
-		s.notify.SendAction(ctx, taID, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข "+code+" "+month,
-			"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+" ของท่านเพื่อให้แก้ไข เนื่องจาก "+reason,
+		s.notify.Send(ctx, taID, "ยกเลิกสถานะส่งการเงิน "+code+" "+month,
+			"ผู้ดูแลระบบได้ยกเลิกสถานะส่งการเงินของบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+
+				" ของท่าน กลับเป็นสถานะเจ้าหน้าที่ส่งเอกสารเบิกจ่ายแล้ว เนื่องจาก "+reason+
+				" บันทึกเวลาของเดือนนี้ยังคงถูกล็อก หากต้องแก้ไข เจ้าหน้าที่จะส่งกลับให้ท่านอีกครั้ง",
 			"/ta/reminders")
 		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 			for _, lid := range lects {
-				s.notify.Send(ctx, lid, "ปลดล็อกบันทึกเวลาประจำเดือนเพื่อแก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
-					"ผู้ดูแลระบบได้ปลดล็อกบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
-						" ผู้ช่วยสอนรายวิชา "+label+" เพื่อให้แก้ไข เนื่องจาก "+reason,
+				s.notify.Send(ctx, lid, "ยกเลิกสถานะส่งการเงิน "+code+" "+month+" "+personName(ctx, s.pool, taID),
+					"ผู้ดูแลระบบได้ยกเลิกสถานะส่งการเงินของบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
+						" ผู้ช่วยสอนรายวิชา "+label+" กลับเป็นสถานะส่งเอกสารเบิกจ่ายแล้ว เนื่องจาก "+reason+
+						" บันทึกเวลาของเดือนนี้ยังคงถูกล็อก",
 					"/lecturer/courses/"+tcID.String()+"/reports")
 			}
 		}

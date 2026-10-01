@@ -58,8 +58,19 @@ type Announcement struct {
 	TargetTermID    *uuid.UUID               `json:"target_term_id,omitempty"`
 	Attachments     []AnnouncementAttachment `json:"attachments,omitempty"`
 	// AudienceCount is how many people the announcement actually reached.
-	// Filled by Get from the materialised ledger; 0 before publishing.
+	// Filled from the materialised ledger; 0 before publishing. The three
+	// counts beside it break that number down for the staff list, so a failed
+	// email is visible without opening every announcement.
 	AudienceCount int `json:"audience_count"`
+	FailedCount   int `json:"failed_count,omitempty"`
+	PendingCount  int `json:"pending_count,omitempty"`
+	ReadCount     int `json:"read_count,omitempty"`
+	// RemindedAt is when unread recipients were last nudged.
+	RemindedAt *time.Time `json:"reminded_at,omitempty"`
+	// TargetCourses / TargetUsers carry the names behind the target ids, so the
+	// composer can show "CP363205 …" instead of a UUID. Filled by Get only.
+	TargetCourses []TargetCourse   `json:"target_courses,omitempty"`
+	TargetUsers   []AudienceMember `json:"target_users,omitempty"`
 	// Excerpt is the body with its markup taken off, cut to a length that fits
 	// a link-preview card. Filled by PublicGet, because the page that needs it
 	// is rendered for crawlers that cannot run the React renderer. Derived from
@@ -81,7 +92,15 @@ type AnnouncementRecipient struct {
 	UserID *uuid.UUID `json:"user_id,omitempty"`
 	Status string     `json:"status"` // pending | sent | skipped | failed
 	SentAt *time.Time `json:"sent_at,omitempty"`
+	ReadAt *time.Time `json:"read_at,omitempty"`
 	Error  string     `json:"error,omitempty"`
+}
+
+// TargetCourse names one course a rule aims at.
+type TargetCourse struct {
+	ID   uuid.UUID `json:"id"`
+	Code string    `json:"code"`
+	Name string    `json:"name"`
 }
 
 type AnnounceService struct {
@@ -120,7 +139,8 @@ func (s *AnnounceService) List(ctx context.Context, f ListFilter) ([]Announcemen
 	q.WriteString(`SELECT id, title, body, category, audience, pinned,
 	                       cover_image_key, published_at, expires_at,
 	                       announced_at, created_at, updated_at, is_public,
-	                       target_course_ids, target_user_ids, target_filters, target_term_id
+	                       target_course_ids, target_user_ids, target_filters, target_term_id,
+	                       reminded_at
 	                FROM announcements`)
 	args := []any{}
 	where := []string{}
@@ -161,6 +181,7 @@ func (s *AnnounceService) List(ctx context.Context, f ListFilter) ([]Announcemen
 			&a.CoverImageKey, &a.PublishedAt, &a.ExpiresAt,
 			&a.AnnouncedAt, &a.CreatedAt, &a.UpdatedAt, &a.IsPublic,
 			&a.TargetCourseIDs, &a.TargetUserIDs, &a.TargetFilters, &a.TargetTermID,
+			&a.RemindedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -180,7 +201,51 @@ func (s *AnnounceService) List(ctx context.Context, f ListFilter) ([]Announcemen
 			out[i].Attachments = byID[out[i].ID]
 		}
 	}
+	if f.IncludeAll {
+		if err := s.fillDeliveryCounts(ctx, out, ids); err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
+}
+
+// fillDeliveryCounts adds the ledger totals to the staff list in one query.
+func (s *AnnounceService) fillDeliveryCounts(ctx context.Context, out []Announcement, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT announcement_id,
+		       COUNT(*),
+		       COUNT(*) FILTER (WHERE status = 'failed'),
+		       COUNT(*) FILTER (WHERE status = 'pending'),
+		       COUNT(*) FILTER (WHERE read_at IS NOT NULL)
+		  FROM announcement_recipients
+		 WHERE announcement_id = ANY($1) AND user_id IS NOT NULL
+		 GROUP BY announcement_id`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type counts struct{ all, failed, pending, read int }
+	byID := map[uuid.UUID]counts{}
+	for rows.Next() {
+		var id uuid.UUID
+		var c counts
+		if err := rows.Scan(&id, &c.all, &c.failed, &c.pending, &c.read); err != nil {
+			return err
+		}
+		byID[id] = c
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range out {
+		c := byID[out[i].ID]
+		out[i].AudienceCount, out[i].FailedCount = c.all, c.failed
+		out[i].PendingCount, out[i].ReadCount = c.pending, c.read
+	}
+	return nil
 }
 
 // Get returns a single announcement regardless of publish state. Visibility
@@ -192,13 +257,15 @@ func (s *AnnounceService) Get(ctx context.Context, id uuid.UUID) (*Announcement,
 		SELECT id, title, body, category, audience, pinned,
 		       cover_image_key, published_at, expires_at,
 		       announced_at, created_at, updated_at, is_public,
-		       target_course_ids, target_user_ids, target_filters, target_term_id
+		       target_course_ids, target_user_ids, target_filters, target_term_id,
+		       reminded_at
 		FROM announcements WHERE id = $1
 	`, id).Scan(
 		&a.ID, &a.Title, &a.Body, &a.Category, &a.Audience, &a.Pinned,
 		&a.CoverImageKey, &a.PublishedAt, &a.ExpiresAt,
 		&a.AnnouncedAt, &a.CreatedAt, &a.UpdatedAt, &a.IsPublic,
 		&a.TargetCourseIDs, &a.TargetUserIDs, &a.TargetFilters, &a.TargetTermID,
+		&a.RemindedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -211,11 +278,65 @@ func (s *AnnounceService) Get(ctx context.Context, id uuid.UUID) (*Announcement,
 	if rec, err := s.loadRecipients(ctx, id); err == nil {
 		a.Recipients = rec
 		a.AudienceCount = len(rec)
+		for _, r := range rec {
+			switch r.Status {
+			case "failed":
+				a.FailedCount++
+			case "pending":
+				a.PendingCount++
+			}
+			if r.ReadAt != nil {
+				a.ReadCount++
+			}
+		}
 	}
+	a.TargetCourses, a.TargetUsers = s.targetNames(ctx, a.TargetCourseIDs, a.TargetUserIDs)
 	if att, err := s.loadAttachments(ctx, id); err == nil {
 		a.Attachments = att
 	}
 	return &a, nil
+}
+
+// targetNames resolves the ids of a rule to what an officer calls them. A
+// course or account that has since been deleted is simply absent — the composer
+// then drops it from the rule rather than showing an id nobody can read.
+func (s *AnnounceService) targetNames(ctx context.Context, courseIDs, userIDs []uuid.UUID) ([]TargetCourse, []AudienceMember) {
+	courses := []TargetCourse{}
+	if len(courseIDs) > 0 {
+		rows, err := s.pool.Query(ctx, `
+			SELECT id, code, name_th FROM teaching_courses WHERE id = ANY($1) ORDER BY code`, courseIDs)
+		if err == nil {
+			for rows.Next() {
+				var c TargetCourse
+				if rows.Scan(&c.ID, &c.Code, &c.Name) == nil {
+					courses = append(courses, c)
+				}
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				log.Printf("announce.targetNames courses: %v", err)
+			}
+		}
+	}
+	users := []AudienceMember{}
+	if len(userIDs) > 0 {
+		rows, err := s.pool.Query(ctx, `
+			SELECT id, email, COALESCE(NULLIF(title,''), '') || first_name || ' ' || last_name
+			  FROM users WHERE id = ANY($1) ORDER BY first_name, last_name`, userIDs)
+		if err == nil {
+			for rows.Next() {
+				var u AudienceMember
+				if rows.Scan(&u.ID, &u.Email, &u.Name) == nil {
+					users = append(users, u)
+				}
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				log.Printf("announce.targetNames users: %v", err)
+			}
+		}
+	}
+	return courses, users
 }
 
 // ============================================================================
@@ -284,9 +405,9 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 	if !validCategories[category] {
 		return uuid.Nil, errors.New("หมวดหมู่ไม่ถูกต้อง")
 	}
-	// Audience: dedupe + validate. Empty audience = broadcast to all four roles.
-	// Roles may be empty now: a rule can select by course, by name, or by a
-	// condition alone, and an empty rule deliberately means "everyone".
+	// Audience: dedupe + validate. Roles may be empty: a rule can select by
+	// course, by name, or by a condition alone. A rule with nothing in it selects
+	// nobody, and is refused below the moment it would be published.
 	aud := normalizeAudience(in.Audience)
 	rule := AudienceRule{
 		Roles:     aud,
@@ -328,10 +449,18 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 	//   1. Row is (or has just become) published — published_at <= NOW().
 	//   2. We haven't already announced (announced_at IS NULL).
 	// The fanout itself happens after commit so a rollback can't leak notifs.
-	var oldAnnouncedAt *time.Time
+	var (
+		oldAnnouncedAt, oldPublishedAt *time.Time
+		oldRule                        AudienceRule
+	)
 	if !isNew {
-		_ = s.pool.QueryRow(ctx, `SELECT announced_at FROM announcements WHERE id=$1`, in.ID).Scan(&oldAnnouncedAt)
+		_ = s.pool.QueryRow(ctx, `SELECT announced_at, published_at FROM announcements WHERE id=$1`, in.ID).
+			Scan(&oldAnnouncedAt, &oldPublishedAt)
+		oldRule, _ = s.storedRule(ctx, s.pool, in.ID)
 	}
+	now := time.Now()
+	// "Already out": published, and the first delivery has run.
+	wasLive := oldAnnouncedAt != nil && oldPublishedAt != nil && !oldPublishedAt.After(now)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -381,6 +510,23 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 			return uuid.Nil, err
 		}
 		oldAnnouncedAt = nil
+		wasLive = false
+	}
+
+	// Read the rule back as stored: a payload that left the target fields out
+	// keeps the old ones, so the payload alone does not say who this is for.
+	newRule, err := s.storedRule(ctx, tx, in.ID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	ruleChanged := isNew || !sameAudience(oldRule, newRule)
+	// Publishing or scheduling to nobody is refused. Checked only when the
+	// target is being decided — first publish, or a changed rule — so fixing a
+	// typo in a notice whose condition has since emptied out is still allowed.
+	if in.PublishedAt != nil && (!wasLive || ruleChanged) {
+		if err := s.requireAudience(ctx, tx, in.ID, newRule); err != nil {
+			return uuid.Nil, err
+		}
 	}
 
 	if in.Attachments != nil {
@@ -400,20 +546,32 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 		return uuid.Nil, err
 	}
 
-	// Fanout only if the row is live *now* and hasn't been announced yet.
-	if in.PublishedAt != nil && !in.PublishedAt.After(time.Now()) {
-		if err := s.materializeAudience(ctx, in.ID); err != nil {
-			log.Printf("announce.upsert materialize %s: %v", in.ID, err)
-		}
-	}
-	if oldAnnouncedAt == nil && in.PublishedAt != nil && !in.PublishedAt.After(time.Now()) {
-		s.fanout(ctx, in.ID)
-	}
-	// People the edited rule newly selects are reached on save, so the officer
-	// does not have to remember a second button.
-	if in.PublishedAt != nil && !in.PublishedAt.After(time.Now()) {
-		if _, err := s.Deliver(ctx, in.ID); err != nil {
-			log.Printf("announce.upsert deliver %s: %v", in.ID, err)
+	// What happens to the audience depends on what this save was:
+	//
+	//   going live            resolve the rule, freeze it, tell everyone
+	//   live, rule changed    re-resolve: drop people no longer selected, tell
+	//                         only the people newly selected
+	//   live, rule untouched  nothing. Fixing a typo or pinning must not mail
+	//                         anybody — it used to re-run the conditions on every
+	//                         save and quietly email whoever newly matched.
+	//
+	// A row saved already past its expiry is not "going live": nobody could open
+	// it, so nobody is told about it.
+	expired := in.ExpiresAt != nil && !in.ExpiresAt.After(now)
+	if in.PublishedAt != nil && !in.PublishedAt.After(now) && !(expired && !wasLive) {
+		switch {
+		case !wasLive:
+			if err := s.syncAudience(ctx, in.ID); err != nil {
+				log.Printf("announce.upsert sync %s: %v", in.ID, err)
+			}
+			s.fanout(ctx, in.ID)
+		case ruleChanged:
+			if err := s.syncAudience(ctx, in.ID); err != nil {
+				log.Printf("announce.upsert sync %s: %v", in.ID, err)
+			}
+			if _, err := s.Deliver(ctx, in.ID); err != nil {
+				log.Printf("announce.upsert deliver %s: %v", in.ID, err)
+			}
 		}
 	}
 	return in.ID, nil
@@ -438,16 +596,41 @@ func (s *AnnounceService) Delete(ctx context.Context, actor, id uuid.UUID) error
 		})
 }
 
-// Publish flips a draft/scheduled row to "live now" and fires the fanout.
-// Safe to call repeatedly — a second call just refreshes published_at but
+// Publish makes a draft or scheduled row live NOW and fires the fanout.
+// Safe to call on a row that is already live — published_at is left alone and
 // the fanout guard (announced_at) prevents re-notifying.
+//
+// Two things are refused rather than quietly "succeeding":
+//   - an expired row: its expiry is still in the past, so it would stay hidden
+//     while the page reported "เผยแพร่ประกาศแล้ว";
+//   - a rule that reaches nobody.
 func (s *AnnounceService) Publish(ctx context.Context, actor, id uuid.UUID) error {
+	var expiresAt *time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT expires_at FROM announcements WHERE id=$1`, id).Scan(&expiresAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if expiresAt != nil && !expiresAt.After(time.Now()) {
+		return Invalid("ประกาศนี้หมดอายุแล้ว กรุณาแก้ไขวันหมดอายุก่อนเผยแพร่อีกครั้ง")
+	}
+	rule, err := s.storedRule(ctx, s.pool, id)
+	if err != nil {
+		return err
+	}
+	if err := s.requireAudience(ctx, s.pool, id, rule); err != nil {
+		return err
+	}
 	if err := writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "announce.publish", Entity: "announcement", EntityID: id.String()},
 		func(tx pgx.Tx) error {
+			// A scheduled row keeps a FUTURE published_at; COALESCE alone left it
+			// scheduled, so "publish now" on it did nothing.
 			tag, err := tx.Exec(ctx, `
 				UPDATE announcements
-				   SET published_at = COALESCE(published_at, NOW()),
+				   SET published_at = CASE WHEN published_at IS NULL OR published_at > NOW()
+				                           THEN NOW() ELSE published_at END,
 				       updated_by = $2, updated_at = NOW()
 				 WHERE id = $1
 			`, id, actor)
@@ -462,9 +645,14 @@ func (s *AnnounceService) Publish(ctx context.Context, actor, id uuid.UUID) erro
 		return err
 	}
 	// Resolve and freeze the audience first — the fanout and the email both
-	// read that ledger, so nothing can be delivered before it exists.
-	if err := s.materializeAudience(ctx, id); err != nil {
-		log.Printf("announce.publish materialize %s: %v", id, err)
+	// read that ledger, so nothing can be delivered before it exists. Skipped
+	// for a row that is already out: its audience is frozen.
+	var announcedAt *time.Time
+	_ = s.pool.QueryRow(ctx, `SELECT announced_at FROM announcements WHERE id=$1`, id).Scan(&announcedAt)
+	if announcedAt == nil {
+		if err := s.syncAudience(ctx, id); err != nil {
+			log.Printf("announce.publish sync %s: %v", id, err)
+		}
 	}
 	// After the commit on purpose: the fanout sends mail and notifications, and
 	// those cannot be rolled back if the transaction later fails.
@@ -551,8 +739,8 @@ func (s *AnnounceService) tryFanoutDue(ctx context.Context) {
 		log.Printf("announce.fanout rows: %v", err)
 	}
 	for _, id := range ids {
-		if err := s.materializeAudience(ctx, id); err != nil {
-			log.Printf("announce.sweep materialize %s: %v", id, err)
+		if err := s.syncAudience(ctx, id); err != nil {
+			log.Printf("announce.sweep sync %s: %v", id, err)
 		}
 		s.fanout(ctx, id)
 	}

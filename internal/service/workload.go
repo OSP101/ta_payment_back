@@ -8,6 +8,7 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -162,6 +163,71 @@ func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, term
 	return "", nil
 }
 
+// oldClassRow is one row of the timetable a save is about to replace, with the
+// metadata the save must carry forward (see migration 0132).
+type oldClassRow struct {
+	ID                 uuid.UUID
+	Day, Start, End    int
+	Name               string
+	IsWBA              bool
+	CreatedAt          time.Time
+	AddedAfterApproval bool
+	Protected          bool // existed when an approved request was decided
+}
+
+// termApproval reports whether the TA holds an approved (active/trimmed)
+// assignment this term, and the latest time such a request was decided. A
+// request decided with no timestamp counts as "always": the protective side.
+func termApproval(ctx context.Context, tx pgx.Tx, userID, termID uuid.UUID) (bool, time.Time, error) {
+	var approved bool
+	var latest *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) > 0,
+		       MAX(COALESCE(r.decided_at, 'infinity'::timestamptz))
+		  FROM ta_request_assignments a
+		  JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
+		  JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		 WHERE a.ta_id = $1 AND tc.term_id = $2 AND a.state IN ('active','trimmed')`,
+		userID, termID).Scan(&approved, &latest)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	if latest == nil {
+		return approved, time.Time{}, nil
+	}
+	return approved, *latest, nil
+}
+
+// loadOldClassRows reads the timetable about to be replaced. A row is
+// protected unless it was added after approval AND no approval has been
+// decided since — a class a later request was decided against is part of
+// that decision exactly like one that was there from the start.
+func loadOldClassRows(ctx context.Context, tx pgx.Tx, userID, termID uuid.UUID, approved bool, latest time.Time) ([]oldClassRow, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id, day_of_week, to_char(start_time,'HH24:MI'), to_char(end_time,'HH24:MI'),
+		       COALESCE(NULLIF(course_code,''), course_label, ''), is_wba,
+		       created_at, added_after_approval
+		  FROM ta_class_schedules
+		 WHERE user_id = $1 AND term_id = $2`, userID, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []oldClassRow
+	for rows.Next() {
+		var r oldClassRow
+		var st, en string
+		if err := rows.Scan(&r.ID, &r.Day, &st, &en, &r.Name, &r.IsWBA, &r.CreatedAt, &r.AddedAfterApproval); err != nil {
+			return nil, err
+		}
+		r.Start, _ = parseHM(st)
+		r.End, _ = parseHM(en)
+		r.Protected = approved && (!r.AddedAfterApproval || !r.CreatedAt.After(latest))
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // assertNoClassRemovedAfterApproval keeps a TA from winning back pay by editing
 // their own timetable after a request was decided. The decision trims every
 // period that clashes with a class the TA attends; deleting that class
@@ -169,59 +235,21 @@ func (s *WorkloadService) ScheduleLockedReason(ctx context.Context, userID, term
 // while the assignment still read "trimmed" and the printed timetable form
 // showed no clash for the lecturer to notice.
 //
-// The rule is one-way on purpose: once any assignment of this term is
-// approved (active/trimmed), every existing non-WBA class block must still be
-// covered by the new timetable. Adding classes — which can only cost the TA
-// hours — stays self-service; removing or shortening one needs staff.
-func assertNoClassRemovedAfterApproval(ctx context.Context, tx pgx.Tx, userID, termID uuid.UUID, blocks []ClassBlock) error {
-	var approved bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-		  SELECT 1 FROM ta_request_assignments a
-		    JOIN ta_requests r      ON r.id = a.request_id AND r.status = 'approved'
-		    JOIN teaching_courses tc ON tc.id = r.teaching_course_id
-		   WHERE a.ta_id = $1 AND tc.term_id = $2 AND a.state IN ('active','trimmed'))`,
-		userID, termID).Scan(&approved); err != nil {
-		return err
-	}
-	if !approved {
-		return nil
-	}
-	rows, err := tx.Query(ctx, `
-		SELECT day_of_week, to_char(start_time,'HH24:MI'), to_char(end_time,'HH24:MI'),
-		       COALESCE(NULLIF(course_code,''), course_label, '')
-		  FROM ta_class_schedules
-		 WHERE user_id = $1 AND term_id = $2 AND NOT is_wba`, userID, termID)
-	if err != nil {
-		return err
-	}
-	type span struct{ day, start, end int }
-	var old []span
-	var names []string
-	for rows.Next() {
-		var d int
-		var st, en, name string
-		if err := rows.Scan(&d, &st, &en, &name); err != nil {
-			rows.Close()
-			return err
-		}
-		sm, _ := parseHM(st)
-		em, _ := parseHM(en)
-		old = append(old, span{d, sm, em})
-		names = append(names, name)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for i, o := range old {
-		if o.end <= o.start {
-			continue // malformed legacy row; nothing to protect
+// The rule is one-way on purpose: every PROTECTED class block (one that
+// existed when an approved request was decided) must still be covered by the
+// new timetable. Adding classes — which can only cost the TA hours — stays
+// self-service, and since 01/10/2026 so does taking back a class that was
+// added AFTER every approval: it was never part of any decision, and refusing
+// it left a TA who mistyped a class stuck until staff stepped in.
+func assertNoClassRemovedAfterApproval(old []oldClassRow, blocks []ClassBlock) error {
+	for _, o := range old {
+		if !o.Protected || o.IsWBA || o.End <= o.Start {
+			continue // unprotected, WBA, or malformed legacy row: nothing to keep
 		}
 		// Minute-level coverage of [start, end) by the new blocks of that day.
-		covered := make([]bool, o.end-o.start)
+		covered := make([]bool, o.End-o.Start)
 		for _, b := range blocks {
-			if b.IsWBA || b.DayOfWeek != o.day {
+			if b.IsWBA || b.DayOfWeek != o.Day {
 				continue
 			}
 			bs, ok1 := parseHM(b.StartTime)
@@ -229,19 +257,196 @@ func assertNoClassRemovedAfterApproval(ctx context.Context, tx pgx.Tx, userID, t
 			if !ok1 || !ok2 {
 				continue
 			}
-			for m := max(bs, o.start); m < min(be, o.end); m++ {
-				covered[m-o.start] = true
+			for m := max(bs, o.Start); m < min(be, o.End); m++ {
+				covered[m-o.Start] = true
 			}
 		}
 		for _, c := range covered {
 			if !c {
 				return Invalid(fmt.Sprintf(
-					"มีคำขอ TA ที่อนุมัติแล้วในภาคเรียนนี้ จึงลบหรือลดเวลาคาบเรียนเดิม (%s %s–%s) เองไม่ได้ เพิ่มคาบใหม่ได้ตามปกติ หากตารางเรียนเปลี่ยนจริง กรุณาติดต่อเจ้าหน้าที่",
-					names[i], hmString(o.start), hmString(o.end)))
+					"มีคำขอ TA ที่อนุมัติแล้วในภาคเรียนนี้ จึงลบหรือลดเวลาคาบเรียนเดิม (%s %s–%s) เองไม่ได้ เพิ่มคาบใหม่ได้ตามปกติ และคาบที่เพิ่มหลังการอนุมัติลบเองได้ หากตารางเรียนเดิมเปลี่ยนจริง กรุณาติดต่อเจ้าหน้าที่",
+					o.Name, hmString(o.Start), hmString(o.End)))
 			}
 		}
 	}
 	return nil
+}
+
+// assertNoOverlappingOwnClasses refuses a timetable in which the TA attends two
+// different classes at once (Fri 15:00–16:00 and Fri 15:30–17:00). Every clash
+// rule downstream reads this table as the truth about where the TA is; an
+// impossible timetable silently trims teaching hours on both sides of a typo.
+//
+// Two blocks of the SAME course may overlap: sections of one course that meet
+// together are entered as separate blocks, and the timetable page has always
+// allowed that on purpose.
+func assertNoOverlappingOwnClasses(blocks []ClassBlock) error {
+	type span struct {
+		b          ClassBlock
+		start, end int
+	}
+	byDay := map[int][]span{}
+	for _, b := range blocks {
+		if b.IsWBA {
+			continue
+		}
+		sm, ok1 := parseHM(b.StartTime)
+		em, ok2 := parseHM(b.EndTime)
+		if !ok1 || !ok2 || sm >= em {
+			continue // the per-block validation reports these
+		}
+		byDay[b.DayOfWeek] = append(byDay[b.DayOfWeek], span{b, sm, em})
+	}
+	sameCourse := func(a, b ClassBlock) bool {
+		ca, cb := strings.TrimSpace(a.CourseCode), strings.TrimSpace(b.CourseCode)
+		if ca != "" || cb != "" {
+			return strings.EqualFold(ca, cb)
+		}
+		na, nb := strings.TrimSpace(a.CourseName+a.CourseLabel), strings.TrimSpace(b.CourseName+b.CourseLabel)
+		return na != "" && na == nb
+	}
+	for day, list := range byDay {
+		for i := 0; i < len(list); i++ {
+			for j := i + 1; j < len(list); j++ {
+				x, y := list[i], list[j]
+				if x.start < y.end && y.start < x.end && !sameCourse(x.b, y.b) {
+					name := func(b ClassBlock) string {
+						if l := strings.TrimSpace(classLabelOf(b)); l != "" {
+							return l
+						}
+						return "คาบเรียน"
+					}
+					return Invalid(fmt.Sprintf(
+						"คาบเรียน %s (%s %s–%s) และ %s (%s %s–%s) เวลาซ้อนกัน เรียนสองวิชาพร้อมกันไม่ได้ กรุณาแก้เวลาให้ตรงกับตารางเรียนจริง",
+						name(x.b), dayTH(day), hmString(x.start), hmString(x.end),
+						name(y.b), dayTH(day), hmString(y.start), hmString(y.end)))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// ClassSaveNeedsConfirm is the status a TA's own timetable save returns when it
+// would cost an APPROVED assignment teaching sessions. The client shows the
+// message and resends with confirm=1. 428 Precondition Required rather than
+// 409 so the page can tell "please confirm" from a genuine conflict.
+const ClassSaveNeedsConfirm = 428
+
+// approvedSessionImpact lists, in Thai, every teaching session of the TA's
+// approved assignments this term that clashes with the NEW timetable but did
+// not clash with the old one — the sessions this save would silently trim.
+// Empty when the save costs nothing.
+func approvedSessionImpact(ctx context.Context, tx pgx.Tx, userID, termID uuid.UUID, old []oldClassRow, blocks []ClassBlock) ([]string, error) {
+	var oldBlocks, newBlocks []ownClassBlock
+	for _, o := range old {
+		if !o.IsWBA && o.Start < o.End {
+			oldBlocks = append(oldBlocks, ownClassBlock{Label: o.Name, Day: o.Day, StartMin: o.Start, EndMin: o.End})
+		}
+	}
+	for _, b := range blocks {
+		if b.IsWBA {
+			continue
+		}
+		sm, ok1 := parseHM(b.StartTime)
+		em, ok2 := parseHM(b.EndTime)
+		if ok1 && ok2 && sm < em {
+			newBlocks = append(newBlocks, ownClassBlock{Label: strings.TrimSpace(classLabelOf(b)), Day: b.DayOfWeek, StartMin: sm, EndMin: em})
+		}
+	}
+	if len(newBlocks) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT tc.code, sec.sec_no, ss.kind, ss.day_of_week,
+		       to_char(ss.start_time,'HH24:MI'), to_char(ss.end_time,'HH24:MI')
+		  FROM ta_request_assignments a
+		  JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
+		  JOIN sections sec        ON sec.id = a.section_id
+		  JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+		  JOIN section_schedules ss ON ss.section_id = a.section_id
+		 WHERE a.ta_id = $1 AND tc.term_id = $2 AND a.state <> 'dropped'
+		 ORDER BY tc.code, sec.sec_no, ss.day_of_week, ss.start_time`, userID, termID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var lines []string
+	for rows.Next() {
+		var code, secNo, kind, st, en string
+		var day int
+		if err := rows.Scan(&code, &secNo, &kind, &day, &st, &en); err != nil {
+			return nil, err
+		}
+		sm, ok1 := parseHM(st)
+		em, ok2 := parseHM(en)
+		if !ok1 || !ok2 {
+			continue
+		}
+		hit := findOwnClassClash(newBlocks, day, sm, em)
+		if hit == nil || findOwnClassClash(oldBlocks, day, sm, em) != nil {
+			continue
+		}
+		lost := "คาบสอน"
+		if k := kindTH(kind); k != "" {
+			lost = "คาบ" + k
+		}
+		lines = append(lines, fmt.Sprintf("%s Sec %s %s %s %s–%s ตรงกับ %s",
+			code, secNo, lost, dayTH(day), st, en, hit.describe()))
+	}
+	return lines, rows.Err()
+}
+
+// inheritClassMeta decides created_at / added_after_approval for a block being
+// (re)inserted. The timetable is replaced wholesale on every save, so without
+// this every autosave would make every class look brand new — and a protected
+// class could be laundered into a removable one by one save that keeps it and
+// a second that deletes it.
+//
+// A block inherits from every old row it touches: the same row id (an edit
+// that moved it), or any old row on that day whose time it overlaps. If ANY
+// of those was protected the block is protected (flag false, earliest
+// created_at); otherwise it keeps the earliest created_at and stays
+// unprotected. A block touching nothing is new: added after approval exactly
+// when the TA already holds an approved assignment. nil created_at = NOW().
+func inheritClassMeta(old []oldClassRow, b ClassBlock, approved bool) (*time.Time, bool) {
+	sm, ok1 := parseHM(b.StartTime)
+	em, ok2 := parseHM(b.EndTime)
+	id, idErr := uuid.Parse(b.ID)
+	var earliest *time.Time
+	touched, anyProtected, anyOriginal := false, false, false
+	for i := range old {
+		o := &old[i]
+		match := idErr == nil && o.ID == id
+		if !match && o.IsWBA == b.IsWBA {
+			if b.IsWBA {
+				match = true
+			} else if ok1 && ok2 && o.Day == b.DayOfWeek && o.Start < em && sm < o.End {
+				match = true
+			}
+		}
+		if !match {
+			continue
+		}
+		touched = true
+		if o.Protected {
+			anyProtected = true
+		}
+		if !o.AddedAfterApproval {
+			anyOriginal = true
+		}
+		if earliest == nil || o.CreatedAt.Before(*earliest) {
+			t := o.CreatedAt
+			earliest = &t
+		}
+	}
+	if !touched {
+		return nil, approved
+	}
+	if anyProtected || anyOriginal {
+		return earliest, false
+	}
+	return earliest, true
 }
 
 func hmString(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
@@ -249,9 +454,22 @@ func hmString(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
 // maxClassBlocksPerTerm bounds the self-service timetable a TA may submit.
 const maxClassBlocksPerTerm = 200
 
-// ReplaceClasses swaps the whole schedule for a term — the TA's own save.
+// ReplaceClasses swaps the whole schedule for a term as the TA, with the
+// impact already accepted — for programmatic callers (demo seeding, tests).
+// A person saving from the timetable page goes through SaveOwnClasses, which
+// asks first when the save would cost an approved assignment sessions.
 func (s *WorkloadService) ReplaceClasses(ctx context.Context, userID, termID uuid.UUID, blocks []ClassBlock) error {
-	return s.replaceClasses(ctx, userID, userID, termID, blocks)
+	return s.replaceClasses(ctx, userID, userID, termID, blocks, true)
+}
+
+// SaveOwnClasses is the TA's own save from the timetable page. Unless
+// confirmed, a timetable that newly clashes with sessions of an APPROVED
+// assignment is refused with status ClassSaveNeedsConfirm and a Thai list of
+// what would be lost. It used to save silently: the re-check that follows a
+// save trims those sessions (and can zero a declared duty), so a TA who typed
+// a class on the wrong day lost approved teaching hours without being told.
+func (s *WorkloadService) SaveOwnClasses(ctx context.Context, userID, termID uuid.UUID, blocks []ClassBlock, confirmed bool) error {
+	return s.replaceClasses(ctx, userID, userID, termID, blocks, confirmed)
 }
 
 // ReplaceClassesForTA is staff correcting a TA's timetable — the path the
@@ -268,10 +486,10 @@ func (s *WorkloadService) ReplaceClassesForTA(ctx context.Context, actor, taID, 
 	if !isTA {
 		return Invalid("บัญชีนี้ไม่ใช่ผู้ช่วยสอน")
 	}
-	return s.replaceClasses(ctx, actor, taID, termID, blocks)
+	return s.replaceClasses(ctx, actor, taID, termID, blocks, true)
 }
 
-func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, termID uuid.UUID, blocks []ClassBlock) error {
+func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, termID uuid.UUID, blocks []ClassBlock, confirmed bool) error {
 	// A term's real timetable is a couple of dozen blocks. The cap is here
 	// because everything downstream scales with this count and none of it is
 	// bounded on its own: the insert below is one round trip per row inside a
@@ -289,6 +507,11 @@ func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, ter
 	} else if reason != "" {
 		return Invalid(reason)
 	}
+	// Applies to staff corrections too: an impossible timetable is wrong
+	// whoever types it.
+	if err := assertNoOverlappingOwnClasses(blocks); err != nil {
+		return err
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -305,9 +528,29 @@ func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, ter
 	if err != nil {
 		return err
 	}
+	approved, latestApproval, err := termApproval(ctx, tx, userID, termID)
+	if err != nil {
+		return err
+	}
+	old, err := loadOldClassRows(ctx, tx, userID, termID, approved, latestApproval)
+	if err != nil {
+		return err
+	}
 	if actor == userID {
-		if err := assertNoClassRemovedAfterApproval(ctx, tx, userID, termID, blocks); err != nil {
+		if err := assertNoClassRemovedAfterApproval(old, blocks); err != nil {
 			return err
+		}
+		if !confirmed && approved {
+			lines, err := approvedSessionImpact(ctx, tx, userID, termID, old, blocks)
+			if err != nil {
+				return err
+			}
+			if len(lines) > 0 {
+				return &UserError{Status: ClassSaveNeedsConfirm, Msg: "ตารางเรียนใหม่ตรงกับคาบสอนที่ได้รับอนุมัติแล้ว " +
+					"หากบันทึก คาบเหล่านี้จะลงเวลาไม่ได้ และชั่วโมงที่อาจารย์กำหนดอาจถูกตัดลง:\n- " +
+					strings.Join(lines, "\n- ") +
+					"\nหากเพิ่มคาบผิด ลบคาบที่เพิ่มหลังการอนุมัติออกเองได้ ระบบจะคืนสิทธิ์และชั่วโมงที่ถูกตัดให้อัตโนมัติ"}
+			}
 		}
 	}
 	if _, err := tx.Exec(ctx,
@@ -406,13 +649,17 @@ func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, ter
 		if utf8.RuneCountInString(b.Note) > classNoteMax {
 			return errors.New("หมายเหตุยาวเกินกำหนด")
 		}
+		createdAt, addedAfter := inheritClassMeta(old, b, approved)
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO ta_class_schedules
-			 (id, user_id, term_id, course_code, course_name, kind, sec_no, day_of_week, start_time, end_time, note, is_wba)
-			 VALUES ($1,$2,$3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), $8,$9::time,$10::time,$11,$12)`,
+			 (id, user_id, term_id, course_code, course_name, kind, sec_no, day_of_week, start_time, end_time, note, is_wba,
+			  created_at, added_after_approval)
+			 VALUES ($1,$2,$3, NULLIF($4,''), NULLIF($5,''), NULLIF($6,''), NULLIF($7,''), $8,$9::time,$10::time,$11,$12,
+			         COALESCE($13, NOW()), $14)`,
 			uuid.New(), userID, termID,
 			b.CourseCode, b.CourseName, b.Kind, b.SecNo,
-			b.DayOfWeek, b.StartTime, b.EndTime, b.Note, b.IsWBA); err != nil {
+			b.DayOfWeek, b.StartTime, b.EndTime, b.Note, b.IsWBA,
+			createdAt, addedAfter); err != nil {
 			return err
 		}
 	}

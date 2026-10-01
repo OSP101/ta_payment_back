@@ -348,19 +348,6 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 		}
 		return err
 	}
-	total, unapproved, err := s.monthWorklogReadiness(ctx, taID, tcID, yearMonth)
-	if err != nil {
-		return err
-	}
-	// Outstanding work first: it tells staff what is missing, where "nothing
-	// approved yet" would not.
-	if unapproved > 0 {
-		return Invalid(fmt.Sprintf(
-			"ยังมี %d รายการที่อาจารย์ยังไม่อนุมัติ ต้องให้ครบก่อน จึงจะตรวจสอบเบิกจ่ายได้", unapproved))
-	}
-	if total == 0 {
-		return Invalid("เดือนนี้ยังไม่มีรายการบันทึกเวลาที่อนุมัติแล้ว จึงยังตรวจสอบไม่ได้")
-	}
 
 	name := s.userDisplayName(ctx, actor)
 	// The state this sign-off replaced. Without it a re-sign of a month that
@@ -374,10 +361,39 @@ func (s *SubmissionPeriodService) MarkStaffReviewed(ctx context.Context, actor, 
 			After: map[string]any{"status": StatusStaffReviewed},
 		},
 		func(tx pgx.Tx, e *audit.Entry) error {
-			// Lock, then read the before-image, on the same transaction as the
-			// write — so it is the state this sign-off actually replaced.
+			// Lock, then count and read the before-image, all on the same
+			// transaction as the write. The count used to run on the pool
+			// before the transaction, so a TA's draft committed in between
+			// left a month "reviewed" with a draft inside. The work-log trigger
+			// takes this same cell lock (migration 0141): either this waits for
+			// the TA's write and counts it, or the write waits for this and
+			// then resets the sign-off it would have invalidated.
 			if err := lockPeriodCell(ctx, tx, periodID, taID, tcID); err != nil {
 				return err
+			}
+			total, unapproved, err := monthWorklogReadinessQ(ctx, tx, taID, tcID, yearMonth)
+			if err != nil {
+				return err
+			}
+			// Outstanding work first: it tells staff what is missing, where
+			// "nothing approved yet" would not.
+			if unapproved > 0 {
+				return Invalid(fmt.Sprintf(
+					"ยังมี %d รายการที่อาจารย์ยังไม่อนุมัติ ต้องให้ครบก่อน จึงจะตรวจสอบเบิกจ่ายได้", unapproved))
+			}
+			if total == 0 {
+				return Invalid("เดือนนี้ยังไม่มีรายการบันทึกเวลาที่อนุมัติแล้ว จึงยังตรวจสอบไม่ได้")
+			}
+			// The TA's documents are part of what staff certify: a month
+			// signed off for a TA whose profile or creditor form is not
+			// approved could only fail later, at the export, as "ข้อมูล TA
+			// ไม่ครบ" for the whole course.
+			issue, err := payoutIssue(ctx, tx, taID)
+			if err != nil {
+				return err
+			}
+			if issue != "" {
+				return Invalid("ตรวจสอบเบิกจ่ายไม่ได้ " + issue)
 			}
 			prevStatus, err := periodStatus(ctx, tx, periodID, taID, tcID)
 			if err != nil {

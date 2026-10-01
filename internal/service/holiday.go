@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
+	"ta-payment-back/internal/timeutil"
 )
 
 // HolidayService owns the public_holidays table + derived queries: "which
@@ -137,6 +138,50 @@ func normalizeHolidayWindow(start, end *string) (*string, *string, error) {
 	return &sOut, &eOut, nil
 }
 
+// holidayYearsAround bounds a holiday date to today ± this many years. Years
+// 1900 and 9999 used to be accepted: nothing ever reads them, and a typo in
+// the year (2096 for 2026) hides the real closure the faculty meant to add.
+const holidayYearsAround = 5
+
+// validateHolidayDate parses the date and refuses one outside the sane range.
+func validateHolidayDate(date string) error {
+	d, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return Invalid(fmt.Sprintf("วันที่ %q ไม่ถูกต้อง (ต้องเป็น YYYY-MM-DD)", date))
+	}
+	today := timeutil.Now()
+	lo := time.Date(today.Year()-holidayYearsAround, 1, 1, 0, 0, 0, 0, time.UTC)
+	hi := time.Date(today.Year()+holidayYearsAround, 12, 31, 0, 0, 0, 0, time.UTC)
+	if d.Before(lo) || d.After(hi) {
+		return Invalid(fmt.Sprintf("วันที่ %s อยู่นอกช่วงที่รับได้ (ปี ค.ศ. %d–%d) กรุณาตรวจปีอีกครั้ง",
+			date, lo.Year(), hi.Year()))
+	}
+	return nil
+}
+
+// sameHolidayExists reports whether another closure already covers exactly
+// this date and window, of ANY type. The unique index is per (date, source,
+// window), so the same day entered once as "คณะ" and once as "อื่น ๆ" was two
+// rows for one closure — every reader then counted it twice. exclude skips the
+// row being edited (uuid.Nil on create).
+func sameHolidayExists(ctx context.Context, q querier, date string, startT *string, exclude uuid.UUID) (string, bool, error) {
+	var name string
+	err := q.QueryRow(ctx, `
+		SELECT name_th FROM public_holidays
+		 WHERE holiday_date = $1::date
+		   AND COALESCE(start_time, TIME '00:00') = COALESCE($2::time, TIME '00:00')
+		   AND (start_time IS NULL) = ($2::time IS NULL)
+		   AND id <> $3
+		 LIMIT 1`, date, startT, exclude).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return name, true, nil
+}
+
 // holidayWindowLabelTH renders a window for user-facing messages: "ทั้งวัน" or
 // "09:00–12:00". Used by every refusal that names a holiday, because "วันหยุด"
 // alone is misleading once a holiday can cover only part of the day.
@@ -152,8 +197,8 @@ func holidayWindowLabelTH(start, end *string) string {
 // to 'custom' when the caller omits it — safer than defaulting to 'national'
 // which we treat as immutable in the admin UI.
 func (s *HolidayService) Create(ctx context.Context, actor uuid.UUID, in HolidayInput) (uuid.UUID, error) {
-	if _, err := time.Parse("2006-01-02", in.HolidayDate); err != nil {
-		return uuid.Nil, Invalid("รูปแบบวันที่ไม่ถูกต้อง (ต้องเป็น YYYY-MM-DD)")
+	if err := validateHolidayDate(in.HolidayDate); err != nil {
+		return uuid.Nil, err
 	}
 	if in.NameTH == "" {
 		return uuid.Nil, Invalid("กรุณาระบุชื่อวันหยุด")
@@ -173,6 +218,12 @@ func (s *HolidayService) Create(ctx context.Context, actor uuid.UUID, in Holiday
 	if err := writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "holiday.create", Entity: "holiday", EntityID: id.String()},
 		func(tx pgx.Tx) error {
+			if name, dup, err := sameHolidayExists(ctx, tx, in.HolidayDate, startT, uuid.Nil); err != nil {
+				return err
+			} else if dup {
+				return Invalid(fmt.Sprintf("วันที่ %s (%s) มีวันหยุด \"%s\" อยู่แล้ว",
+					thaiLongDateISO(in.HolidayDate), holidayWindowLabelTH(startT, endT), name))
+			}
 			_, err := tx.Exec(ctx,
 				`INSERT INTO public_holidays (id, holiday_date, name_th, name_en, source, note, start_time, end_time, created_by)
 				 VALUES ($1, $2::date, $3, $4, $5, $6, $7::time, $8::time, $9)`,
@@ -235,8 +286,8 @@ func (s *HolidayService) BulkCreate(ctx context.Context, actor uuid.UUID, ins []
 	defer tx.Rollback(ctx)
 	inserted := 0
 	for _, in := range ins {
-		if _, err := time.Parse("2006-01-02", in.HolidayDate); err != nil {
-			return 0, Invalid(fmt.Sprintf("วันที่ %q ไม่ถูกต้อง", in.HolidayDate))
+		if err := validateHolidayDate(in.HolidayDate); err != nil {
+			return 0, err
 		}
 		if in.NameTH == "" {
 			return 0, Invalid("กรุณาระบุชื่อวันหยุดทุกแถว")
@@ -251,6 +302,14 @@ func (s *HolidayService) BulkCreate(ctx context.Context, actor uuid.UUID, ins []
 		startT, endT, err := normalizeHolidayWindow(in.StartTime, in.EndTime)
 		if err != nil {
 			return 0, err
+		}
+		// The same closure under another type is a duplicate too — skipped,
+		// like the same-type duplicate ON CONFLICT already skips, so importing
+		// a list twice stays a no-op.
+		if _, dup, err := sameHolidayExists(ctx, tx, in.HolidayDate, startT, uuid.Nil); err != nil {
+			return 0, err
+		} else if dup {
+			continue
 		}
 		// Conflict target must name the index EXPRESSION, not the bare columns —
 		// the arbiter is the partial-window unique index from migration 0058.
@@ -305,6 +364,13 @@ func (s *HolidayService) Patch(ctx context.Context, actor, id uuid.UUID, nameTH 
 				nameTH, nameEN, note, startT, endT, id).Scan(&date)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrNotFound
+			}
+			if err == nil {
+				if name, dup, derr := sameHolidayExists(ctx, tx, date, startT, id); derr != nil {
+					return derr
+				} else if dup {
+					return Invalid(fmt.Sprintf("วันนี้มีวันหยุด \"%s\" ในช่วงเวลา %s อยู่แล้ว", name, holidayWindowLabelTH(startT, endT)))
+				}
 			}
 			if isUniqueViolation(err) {
 				// The edited window now collides with another row on the same date+source.
@@ -383,6 +449,26 @@ type HolidayImpact struct {
 type HolidayImpactsResponse struct {
 	Impacts         []HolidayImpact `json:"impacts"`
 	UnresolvedCount int             `json:"unresolved_count"`
+	// OtherMakeups are the course's makeups and waivers that are NOT attached
+	// to a holiday above — a class cancelled for another reason (the lecturer
+	// was away), or one whose holiday was since deleted. They used to be
+	// invisible: a waiver of an ordinary teaching day could be filed through
+	// the API but never seen or undone on the page.
+	OtherMakeups []CourseMakeupRow `json:"other_makeups"`
+}
+
+// CourseMakeupRow is one makeup_schedules row as the lecturer's list shows it.
+type CourseMakeupRow struct {
+	ID           uuid.UUID `json:"id"`
+	SectionID    uuid.UUID `json:"section_id"`
+	SecNo        string    `json:"sec_no"`
+	Kind         string    `json:"kind"`
+	OriginalDate string    `json:"original_date"`
+	MakeupDate   *string   `json:"makeup_date,omitempty"`
+	StartTime    *string   `json:"start_time,omitempty"`
+	EndTime      *string   `json:"end_time,omitempty"`
+	Note         *string   `json:"note,omitempty"`
+	Waived       bool      `json:"waived"`
 }
 
 // ImpactsForCourse computes every holiday in the course's term that lands on a
@@ -505,10 +591,52 @@ func (s *HolidayService) ImpactsForCourse(ctx context.Context, tcID uuid.UUID) (
 		return nil, err
 	}
 	impacts := make([]HolidayImpact, 0, len(order))
+	shown := map[uuid.UUID]struct{}{}
 	for _, k := range order {
 		impacts = append(impacts, *group[k])
+		for _, sec := range group[k].AffectedSections {
+			if sec.Makeup != nil {
+				shown[sec.Makeup.ID] = struct{}{}
+			}
+		}
 	}
-	return &HolidayImpactsResponse{Impacts: impacts, UnresolvedCount: unresolved}, nil
+	other, err := s.courseMakeupsExcept(ctx, tcID, shown)
+	if err != nil {
+		return nil, err
+	}
+	return &HolidayImpactsResponse{Impacts: impacts, UnresolvedCount: unresolved, OtherMakeups: other}, nil
+}
+
+// courseMakeupsExcept lists every makeup/waiver of the course not already in
+// shown, oldest cancelled day first.
+func (s *HolidayService) courseMakeupsExcept(ctx context.Context, tcID uuid.UUID, shown map[uuid.UUID]struct{}) ([]CourseMakeupRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.id, sec.id, sec.sec_no, m.kind,
+		       TO_CHAR(m.original_date,'YYYY-MM-DD'),
+		       CASE WHEN m.makeup_date IS NULL THEN NULL ELSE TO_CHAR(m.makeup_date,'YYYY-MM-DD') END,
+		       TO_CHAR(m.start_time,'HH24:MI'), TO_CHAR(m.end_time,'HH24:MI'),
+		       m.note, m.waived
+		  FROM makeup_schedules m
+		  JOIN sections sec ON sec.id = m.section_id
+		 WHERE sec.teaching_course_id = $1
+		 ORDER BY m.original_date, sec.sec_no, m.kind`, tcID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CourseMakeupRow{}
+	for rows.Next() {
+		var r CourseMakeupRow
+		if err := rows.Scan(&r.ID, &r.SectionID, &r.SecNo, &r.Kind, &r.OriginalDate,
+			&r.MakeupDate, &r.StartTime, &r.EndTime, &r.Note, &r.Waived); err != nil {
+			return nil, err
+		}
+		if _, ok := shown[r.ID]; ok {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

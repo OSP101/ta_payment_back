@@ -38,6 +38,8 @@ func TestUpdateCourseInfo_StaffCanCorrectTheIdentityFields(t *testing.T) {
 	if err := svc.UpdateCourseInfo(f.ctx, f.StaffID, f.CourseID, UpdateCourseInfoInput{
 		Code: strp("CP353201"), NameTH: strp("ชื่อวิชาที่แก้แล้ว"),
 		Credits: intp(4), LectureHrs: intp(2), LabHrs: intp(4), SelfHrs: intp(6),
+		// The fixture course has an approved TA, and new hours move its budget.
+		Confirm: true,
 	}); err != nil {
 		t.Fatalf("staff must be able to correct a course: %v", err)
 	}
@@ -55,16 +57,18 @@ func TestUpdateCourseInfo_OmittedFieldsAreUntouched(t *testing.T) {
 	svc := courseInfoSvc(f)
 	beforeCode, beforeName, beforeCredits, _, _, _ := courseFields(f)
 
+	// 4, not 2: the fixture's 3 lecture hours need at least 3 credits since
+	// the shared notation rule (validateCourseNumbers).
 	if err := svc.UpdateCourseInfo(f.ctx, f.StaffID, f.CourseID,
-		UpdateCourseInfoInput{Credits: intp(2)}); err != nil {
+		UpdateCourseInfoInput{Credits: intp(4)}); err != nil {
 		t.Fatal(err)
 	}
 	code, name, credits, _, _, _ := courseFields(f)
 	if code != beforeCode || name != beforeName {
 		t.Errorf("code/name changed to %s/%s when only credits were sent", code, name)
 	}
-	if credits != 2 || beforeCredits == 2 {
-		t.Errorf("credits = %d, want 2 (was %d)", credits, beforeCredits)
+	if credits != 4 || beforeCredits == 4 {
+		t.Errorf("credits = %d, want 4 (was %d)", credits, beforeCredits)
 	}
 }
 

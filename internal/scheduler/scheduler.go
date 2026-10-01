@@ -93,6 +93,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// hour, and without a sweep a long-lived process keeps every one of them
 	// for the life of the process. See handler/audit_read.go.
 	handler.SweepReadAudit(time.Now())
+	handler.SweepDeniedAudit(time.Now())
 
 	// AUTH-01: unknownAttempts is keyed by an open key space (any email
 	// string anyone submits), unlike loginAttempts which is bounded by real

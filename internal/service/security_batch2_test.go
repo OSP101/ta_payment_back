@@ -142,6 +142,11 @@ func TestExport_UnappointedColleagueBlocksUntilAppointed(t *testing.T) {
 	// The reason must say what to DO: issue the order. "unreviewed" would send
 	// staff to a review queue that does not list this TA.
 	for _, bl := range blockers {
+		// The colleague also has no approved documents — a separate,
+		// correctly reported blocker (WP3), not the one under test.
+		if bl.Kind == "profile" {
+			continue
+		}
 		if bl.Kind != "not_appointed" {
 			t.Errorf("blocker kind = %q, want not_appointed (the queue cannot review this TA)", bl.Kind)
 		}

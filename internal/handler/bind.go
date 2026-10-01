@@ -56,7 +56,7 @@ func init() {
 // surface either kind of rejection.
 func Bind(c *fiber.Ctx, dst any) error {
 	if err := c.BodyParser(dst); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+		return fiber.NewError(fiber.StatusBadRequest, "รูปแบบข้อมูลที่ส่งมาไม่ถูกต้อง")
 	}
 	if err := validate.Struct(dst); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, humanizeValidationError(err))
@@ -64,47 +64,109 @@ func Bind(c *fiber.Ctx, dst any) error {
 	return nil
 }
 
-// humanizeValidationError turns the first failing field into a short,
-// specific message ("email is required", "new_password must be at least 8
-// characters") instead of validator's default Go-oriented dump. Only the
-// first failure is reported — a form the user cannot see already told them
-// nothing about which field, so naming the single most useful one beats a
-// concatenated list they cannot map back to inputs.
+// humanizeValidationError turns the first failing field into a short Thai
+// sentence naming the field the way the form labels it ("จำนวนนักศึกษา
+// ต้องไม่น้อยกว่า 0"). It used to answer in validator's English ("num_students
+// must be 0 or greater"); the frontend only shows server text that contains
+// Thai, so every one of those surfaced as a bare "ทำรายการไม่สำเร็จ (รหัส
+// 400)" and the user never learned which field was wrong. Only the first
+// failure is reported — naming the single most useful one beats a list.
 func humanizeValidationError(err error) string {
 	var verrs validator.ValidationErrors
 	if !errors.As(err, &verrs) || len(verrs) == 0 {
-		return "invalid body"
+		return "ข้อมูลที่ส่งมาไม่ถูกต้อง"
 	}
 	e := verrs[0]
-	field := e.Field()
+	field := fieldLabel(e.Field())
+	isString := e.Kind() == reflect.String
+	// slice/map: min/max count items, not characters.
+	isList := e.Kind() == reflect.Slice || e.Kind() == reflect.Array || e.Kind() == reflect.Map
 	switch e.Tag() {
-	case "required":
-		return fmt.Sprintf("%s is required", field)
+	case "required", "required_if", "required_unless", "required_with", "required_without":
+		return fmt.Sprintf("กรุณาระบุ%s", field)
 	case "min":
-		if e.Kind().String() == "string" {
-			return fmt.Sprintf("%s must be at least %s characters", field, e.Param())
+		switch {
+		case isString:
+			return fmt.Sprintf("%s ต้องมีอย่างน้อย %s ตัวอักษร", field, e.Param())
+		case isList:
+			return fmt.Sprintf("%s ต้องเลือกอย่างน้อย %s รายการ", field, e.Param())
 		}
-		return fmt.Sprintf("%s must be at least %s", field, e.Param())
+		return fmt.Sprintf("%s ต้องไม่น้อยกว่า %s", field, e.Param())
 	case "max":
-		if e.Kind().String() == "string" {
-			return fmt.Sprintf("%s must be at most %s characters", field, e.Param())
+		switch {
+		case isString:
+			return fmt.Sprintf("%s ยาวได้ไม่เกิน %s ตัวอักษร", field, e.Param())
+		case isList:
+			return fmt.Sprintf("%s เลือกได้ไม่เกิน %s รายการ", field, e.Param())
 		}
-		return fmt.Sprintf("%s must be at most %s", field, e.Param())
+		return fmt.Sprintf("%s ต้องไม่เกิน %s", field, e.Param())
+	case "len":
+		if isString {
+			return fmt.Sprintf("%s ต้องมี %s ตัวอักษร", field, e.Param())
+		}
+		return fmt.Sprintf("%s ต้องมี %s รายการ", field, e.Param())
 	case "email":
-		return fmt.Sprintf("%s must be a valid email address", field)
+		return fmt.Sprintf("%s ไม่ใช่รูปแบบอีเมลที่ถูกต้อง", field)
 	case "oneof":
-		return fmt.Sprintf("%s must be one of: %s", field, e.Param())
+		return fmt.Sprintf("%s ต้องเป็นค่าใดค่าหนึ่งต่อไปนี้: %s", field, strings.ReplaceAll(e.Param(), " ", ", "))
 	case "gte":
-		return fmt.Sprintf("%s must be %s or greater", field, e.Param())
+		return fmt.Sprintf("%s ต้องไม่น้อยกว่า %s", field, e.Param())
 	case "lte":
-		return fmt.Sprintf("%s must be %s or less", field, e.Param())
+		return fmt.Sprintf("%s ต้องไม่เกิน %s", field, e.Param())
 	case "gt":
-		return fmt.Sprintf("%s must be greater than %s", field, e.Param())
+		return fmt.Sprintf("%s ต้องมากกว่า %s", field, e.Param())
+	case "lt":
+		return fmt.Sprintf("%s ต้องน้อยกว่า %s", field, e.Param())
 	case "uuid4", "uuid":
-		return fmt.Sprintf("%s must be a valid id", field)
+		return fmt.Sprintf("%s ไม่ใช่รหัสอ้างอิงที่ถูกต้อง", field)
+	case "datetime":
+		return fmt.Sprintf("%s ไม่ใช่รูปแบบวันที่/เวลาที่ถูกต้อง (%s)", field, e.Param())
+	case "numeric", "number":
+		return fmt.Sprintf("%s ต้องเป็นตัวเลข", field)
 	case "dive":
-		return fmt.Sprintf("%s contains an invalid item", field)
+		return fmt.Sprintf("%s มีรายการที่ไม่ถูกต้อง", field)
 	default:
-		return fmt.Sprintf("%s is invalid", field)
+		return fmt.Sprintf("%s ไม่ถูกต้อง", field)
 	}
+}
+
+// fieldLabels names request fields the way the screens label them. A field
+// missing here falls back to its JSON key — still specific, and still wrapped
+// in a Thai sentence so the frontend shows it instead of a bare status code.
+var fieldLabels = map[string]string{
+	"email": "อีเมล", "confirm_email": "อีเมลยืนยัน", "password": "รหัสผ่าน",
+	"first_name": "ชื่อ", "last_name": "นามสกุล", "prefix": "คำนำหน้า", "title": "หัวข้อ",
+	"name": "ชื่อ", "name_th": "ชื่อภาษาไทย", "full_name_th": "ชื่อ-นามสกุลภาษาไทย",
+	"phone": "เบอร์โทรศัพท์", "student_id": "รหัสนักศึกษา", "national_id": "เลขประจำตัวประชาชน",
+	"study_level": "ระดับการศึกษา", "level": "ระดับ", "role": "บทบาท", "roles": "บทบาท",
+	"note": "หมายเหตุ", "reason": "เหตุผล", "comment": "ความคิดเห็น", "body": "เนื้อหา",
+	"code": "รหัสวิชา", "credits": "หน่วยกิต", "sec_no": "หมายเลข section", "room": "ห้อง",
+	"num_students": "จำนวนนักศึกษา", "num_students_regular": "จำนวนนักศึกษาภาคปกติ",
+	"num_students_special": "จำนวนนักศึกษาภาคพิเศษ",
+	"lecturer_ids":         "อาจารย์ผู้สอน", "ta_id": "TA", "ta_ids": "TA", "user_id": "ผู้ใช้", "user_ids": "ผู้ใช้",
+	"section_id": "section", "section_ids": "section", "assignments": "รายชื่อ TA", "counts": "จำนวน TA ต่อ section",
+	"undergrad_count": "จำนวน TA ป.ตรี", "graduate_count": "จำนวน TA บัณฑิตศึกษา",
+	"teaching_course_id": "รายวิชา", "course_ids": "รายวิชา", "term_id": "ภาคเรียน",
+	"academic_year": "ปีการศึกษา", "semester": "ภาคเรียน",
+	"day_of_week": "วัน", "start_time": "เวลาเริ่ม", "end_time": "เวลาสิ้นสุด",
+	"work_date": "วันที่ปฏิบัติงาน", "hours": "จำนวนชั่วโมง", "year_month": "เดือน", "months": "เดือน",
+	"opens_at": "วันเปิด", "closes_at": "วันปิด", "due_date": "วันครบกำหนด", "starts_on": "วันเริ่ม",
+	"effective_date": "วันที่มีผล", "effective_from": "วันที่มีผล", "order_date": "วันที่ออกคำสั่ง",
+	"order_no": "เลขที่คำสั่ง", "holiday_date": "วันหยุด", "makeup_date": "วันสอนชดเชย",
+	"original_date": "วันเดิม", "review_date": "วันที่ตรวจ",
+	"bank_name": "ธนาคาร", "bank_branch": "สาขาธนาคาร", "account_no": "เลขที่บัญชี", "account_name": "ชื่อบัญชี",
+	"activity": "กิจกรรม", "category": "หมวดหมู่", "label": "ชื่อ", "kind": "ประเภท", "stage": "ขั้นตอน",
+	"to_status": "สถานะ", "attachments": "ไฟล์แนบ", "items": "รายการ", "audience": "กลุ่มผู้รับ",
+	"signer_id": "ผู้ลงนาม", "signer_officer_id": "ผู้ลงนาม", "officer_id": "เจ้าหน้าที่",
+}
+
+func fieldLabel(field string) string {
+	// Fields inside a slice arrive as "section_ids[0]"; label the list itself.
+	if i := strings.IndexByte(field, '['); i >= 0 {
+		field = field[:i]
+	}
+	if l, ok := fieldLabels[field]; ok {
+		return l
+	}
+	return field
 }

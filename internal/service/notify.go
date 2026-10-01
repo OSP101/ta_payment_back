@@ -64,8 +64,37 @@ func (s *NotifyService) SendLaidOut(ctx context.Context, userID uuid.UUID, title
 }
 
 func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, body, link, closing string, layout MailLayout) {
+	// Failures are logged where they happen; ordinary notices are best-effort.
+	_ = s.deliverChecked(ctx, userID, title, body, link, closing, layout, true)
+}
+
+// SendChecked is Send for a caller that keeps its own delivery record: the
+// error says the notice did not go out (the in-app row could not be written, or
+// the mailer refused the message). The announcement ledger is that caller — it
+// used to mark every recipient "sent" whatever the mailer answered.
+func (s *NotifyService) SendChecked(ctx context.Context, userID uuid.UUID, title, body, link string) error {
+	return s.deliverChecked(ctx, userID, title, body, link, closingInform, MailLayout{}, true)
+}
+
+// SendEmailOnly mails the user without touching the bell. Used to retry a
+// failed email: the in-app row already exists, and a second one would tell the
+// person twice about the same thing.
+func (s *NotifyService) SendEmailOnly(ctx context.Context, userID uuid.UUID, title, body, link string) error {
+	return s.deliverChecked(ctx, userID, title, body, link, closingInform, MailLayout{}, false)
+}
+
+func (s *NotifyService) deliverChecked(ctx context.Context, userID uuid.UUID, title, body, link, closing string, layout MailLayout, inApp bool) error {
 	title, body = plainPunct(title), plainPunct(body)
 	linkArg := nilStr(&link)
+	if inApp {
+		if err := s.writeInApp(ctx, userID, title, body, linkArg); err != nil {
+			return err
+		}
+	}
+	return s.sendEmail(ctx, userID, title, body, link, linkArg, closing, layout)
+}
+
+func (s *NotifyService) writeInApp(ctx context.Context, userID uuid.UUID, title, body string, linkArg any) error {
 
 	// in-app row — the source of truth for the bell/inbox.
 	//
@@ -85,7 +114,7 @@ func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, bo
 		userID, title, body, linkArg)
 	if err != nil {
 		log.Printf("notify in_app coalesce: %v", err)
-		return
+		return err
 	}
 	if tag.RowsAffected() == 0 {
 		if _, err := s.pool.Exec(ctx,
@@ -93,11 +122,14 @@ func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, bo
 			 VALUES (gen_random_uuid(), $1, 'in_app', $2, $3, $4)`,
 			userID, title, body, linkArg); err != nil {
 			log.Printf("notify in_app: %v", err)
-			return
+			return err
 		}
 	}
+	return nil
+}
 
-	// email — informational only, so keep failures out of the caller's path.
+// sendEmail mails one user. Informational for most callers, who drop the error.
+func (s *NotifyService) sendEmail(ctx context.Context, userID uuid.UUID, title, body, link string, linkArg any, closing string, layout MailLayout) error {
 	var email, prefix, first, last string
 	if err := s.pool.QueryRow(ctx, `
 		SELECT u.email,
@@ -106,7 +138,7 @@ func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, bo
 		  FROM users u
 		  LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		 WHERE u.id = $1`, userID).Scan(&email, &prefix, &first, &last); err != nil {
-		return
+		return err
 	}
 	// Manual links are in-app paths too; the mail client needs them absolute.
 	layout.Guides = absoluteGuides(s.baseURL, layout.Guides)
@@ -119,12 +151,13 @@ func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, bo
 		To: email, Subject: title, HTML: renderMailHTML(m), Text: renderMailText(m),
 	}); err != nil {
 		log.Printf("notify email: %v", err)
-		return
+		return err
 	}
 	_, _ = s.pool.Exec(ctx,
 		`INSERT INTO notifications (id, user_id, channel, title, body, link, sent_at)
 		 VALUES (gen_random_uuid(), $1, 'email', $2, $3, $4, NOW())`,
 		userID, title, body, linkArg)
+	return nil
 }
 
 // List returns the user's in-app notifications, newest first. When

@@ -50,6 +50,11 @@ func (s *WorkLogService) assertTAOwnsAssignment(ctx context.Context, actor, assi
 	if ac.TAID != actor {
 		return nil, ErrForbidden
 	}
+	if ac.RequestStatus == "cancelled" {
+		// A cancelled appointment is final, not "waiting" — saying "not yet
+		// approved" sent TAs to wait for an approval that will never come.
+		return nil, Conflict("บันทึกภาระงานไม่ได้ เนื่องจากอาจารย์ผู้สอนได้ยกเลิกการแต่งตั้ง TA ของรายวิชานี้แล้ว")
+	}
 	if ac.RequestStatus != "approved" {
 		return nil, Invalid("ยังไม่สามารถบันทึกภาระงานได้ เนื่องจากคำขอ TA ยังไม่ได้รับการอนุมัติ")
 	}
@@ -718,6 +723,10 @@ func autoNoteFor(activity string, shifted bool) string {
 type SkipGroup struct {
 	Reason string `json:"reason"`
 	Count  int    `json:"count"`
+	// Dates ("YYYY-MM-DD") are listed only where the TA has to act on a
+	// particular day — the cross-course overlap skip, where the fix is to look
+	// at that day in the other course. Empty for the weekly-pattern reasons.
+	Dates []string `json:"dates,omitempty"`
 }
 
 // GenerateResult carries what auto-generation produced AND what it deliberately
@@ -750,6 +759,39 @@ type GenerateResult struct {
 	// KeptMonths ("YYYY-MM") are months left exactly as they were because they
 	// are in review — submitted, approved, or bounced and not yet cleared.
 	KeptMonths []string `json:"kept_months,omitempty"`
+	// SkippedOverlap groups sessions left out because the TA already has a row
+	// at that hour in ANOTHER course (or another row of this run). Lecture
+	// overlap between two courses is allowed at request time on purpose, so the
+	// timetables of two approved courses can genuinely collide; generating both
+	// paid the same clock hours twice (15 h worked → 1,200 ฿ instead of 600).
+	// Whoever holds the hour first keeps it; the TA sees which days and why.
+	SkippedOverlap []SkipGroup `json:"skipped_overlap,omitempty"`
+	// ClosedMonths ("YYYY-MM") are months skipped because their submission
+	// period is closed or the month is locked for export — forfeited or paid,
+	// either way not writable.
+	ClosedMonths []string `json:"closed_months,omitempty"`
+	// EmptyReason is set only when the run created nothing: the real reason in
+	// Thai, so the TA is not left with a guess ("อาจไม่มีตารางสอน…") when the
+	// actual cause is that every month is already submitted or closed.
+	EmptyReason string `json:"empty_reason,omitempty"`
+}
+
+// genBusySlot is one clock range a TA is already committed to on some day,
+// used by Generate to refuse a second course claiming the same minutes.
+type genBusySlot struct {
+	startMin, endMin int
+	label            string // course code that owns the range
+}
+
+// findBusyOverlap returns the first slot overlapping [startMin, endMin), or
+// nil. Touching edges do not overlap — the same rule enforceNoOverlap applies.
+func findBusyOverlap(slots []genBusySlot, startMin, endMin int) *genBusySlot {
+	for i := range slots {
+		if slots[i].startMin < endMin && startMin < slots[i].endMin {
+			return &slots[i]
+		}
+	}
+	return nil
 }
 
 // DailyCapSkip is one day Generate trimmed to stay within the daily pay cap:
@@ -1114,6 +1156,93 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	if err != nil {
 		return nil, err
 	}
+	// Every clock range the TA already holds after the wipe, in ANY course —
+	// the same population enforceNoOverlap checks a hand-typed row against
+	// (non-rejected, co-taught siblings of this request exempt, since rule B2
+	// pays that shared sitting once). Generate inserts directly and used to skip
+	// this gate entirely, so two approved courses whose lectures run at the same
+	// hour (allowed at request time on purpose) each got a 09:00–12:00 row on the
+	// same days and both were paid. Rows this run inserts are added as it goes,
+	// so the run cannot collide with itself either.
+	busy := map[string][]genBusySlot{}
+	var ownCode string
+	if err := tx.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id=$1`,
+		ac.TeachingCourseID).Scan(&ownCode); err != nil {
+		return nil, err
+	}
+	{
+		brows, err := tx.Query(ctx, `
+			SELECT TO_CHAR(wl.work_date,'YYYY-MM-DD'),
+			       TO_CHAR(wl.start_time,'HH24:MI'), TO_CHAR(wl.end_time,'HH24:MI'), tc.code
+			FROM work_logs wl
+			JOIN ta_request_assignments a ON a.id = wl.assignment_id
+			JOIN sections sec ON sec.id = a.section_id
+			JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
+			JOIN ta_request_assignments self ON self.id = $2
+			WHERE a.ta_id = $1 AND wl.status <> 'rejected'
+			  AND wl.work_date BETWEEN $3::date AND $4::date
+			  AND NOT (a.id <> self.id
+			           AND a.request_id = self.request_id
+			           AND a.cotaught_group IS NOT NULL
+			           AND a.cotaught_group = self.cotaught_group)`,
+			ac.TAID, assignmentID, startsOn.Format("2006-01-02"), endsOn.AddDate(0, 0, 31).Format("2006-01-02"))
+		if err != nil {
+			return nil, err
+		}
+		for brows.Next() {
+			var ds, st, en, code string
+			if err := brows.Scan(&ds, &st, &en, &code); err != nil {
+				brows.Close()
+				return nil, err
+			}
+			sm, ok1 := parseHM(st)
+			em, ok2 := parseHM(en)
+			if ok1 && ok2 {
+				busy[ds] = append(busy[ds], genBusySlot{sm, em, code})
+			}
+		}
+		brows.Close()
+		if err := brows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	type overlapAgg struct {
+		count int
+		dates []string
+	}
+	skippedByOverlap := map[string]*overlapAgg{}
+	// overlapBlocked reports (and records) whether [start,end) on dkey collides
+	// with a range the TA already holds. Checked on the UNtrimmed window, before
+	// the pay-cap trim: refusing the whole session mirrors the own-class rule —
+	// a TA busy in another course for part of a lab is not supervising that lab.
+	overlapBlocked := func(dkey, start, end string) bool {
+		sm, ok1 := parseHM(start)
+		em, ok2 := parseHM(end)
+		if !ok1 || !ok2 {
+			return false
+		}
+		hit := findBusyOverlap(busy[dkey], sm, em)
+		if hit == nil {
+			return false
+		}
+		reason := fmt.Sprintf("%s %s–%s", hit.label, hhmm(hit.startMin), hhmm(hit.endMin))
+		agg := skippedByOverlap[reason]
+		if agg == nil {
+			agg = &overlapAgg{}
+			skippedByOverlap[reason] = agg
+		}
+		agg.count++
+		agg.dates = append(agg.dates, dkey)
+		return true
+	}
+	markBusy := func(dkey, start, end string) {
+		sm, ok1 := parseHM(start)
+		em, ok2 := parseHM(end)
+		if ok1 && ok2 {
+			busy[dkey] = append(busy[dkey], genBusySlot{sm, em, ownCode})
+		}
+	}
+
 	// Counted per clashing class rather than per occurrence, so the TA reads
 	// "ข้ามไป 14 คาบ เพราะตรงกับ X" instead of fourteen identical lines.
 	skippedByClass := map[string]int{}
@@ -1232,6 +1361,12 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			rowStart, rowEnd, rowHours := sc.start, sc.end, sc.hours
 			explicitTime := false
 			if mk, ok := makeup[makeupKey{key, sc.kind}]; ok {
+				// A makeup filed outside the course's own dates (only possible
+				// before AddMakeup checked the window) would produce a row the
+				// TA can never submit. Skip it rather than generate it.
+				if mk.date.Before(startsOn) || mk.date.After(endsOn) {
+					continue
+				}
 				useDate = mk.date
 				if mk.hasTime {
 					rowStart, rowEnd = mk.start, mk.end
@@ -1363,6 +1498,9 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if dailyHrs[useDate.Format("2006-01-02")]+rowHours > dailyHourCap {
 				continue
 			}
+			if overlapBlocked(useDate.Format("2006-01-02"), rowStart, rowEnd) {
+				continue
+			}
 			if fit, fitEnd := bahtFit(useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours); fit <= 0 {
 				continue
 			} else {
@@ -1393,6 +1531,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			dailyHrs[useDate.Format("2006-01-02")] += rowHours
 			dailyBaht[useDate.Format("2006-01-02")] += bahtCost(useDate.Format("2006-01-02"), rowStart, rowEnd, rowHours)
 			termHours += rowHours
+			markBusy(useDate.Format("2006-01-02"), rowStart, rowEnd)
 		}
 	}
 
@@ -1441,6 +1580,9 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			if dailyHrs[dstr]+hrs > dailyHourCap {
 				continue
 			}
+			if overlapBlocked(dstr, start, end) {
+				continue
+			}
 			if fit, fitEnd := bahtFit(dstr, start, end, hrs); fit <= 0 {
 				continue
 			} else {
@@ -1470,6 +1612,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 			dailyHrs[dstr] += hrs
 			dailyBaht[dstr] += bahtCost(dstr, start, end, hrs)
 			termHours += hrs
+			markBusy(dstr, start, end)
 		}
 		if err := reviewRows.Err(); err != nil {
 			reviewRows.Close()
@@ -1575,6 +1718,9 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				if dailyHrs[dkey]+r.hours > dailyHourCap {
 					continue
 				}
+				if overlapBlocked(dkey, r.start, r.end) {
+					continue
+				}
 				if fit, fitEnd := bahtFit(dkey, r.start, r.end, r.hours); fit <= 0 {
 					continue
 				} else {
@@ -1602,6 +1748,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				dailyHrs[dkey] += r.hours
 				dailyBaht[dkey] += bahtCost(dkey, r.start, r.end, r.hours)
 				termHours += r.hours
+				markBusy(dkey, r.start, r.end)
 			}
 		}
 	}
@@ -1639,7 +1786,26 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 		bahtSkips = append(bahtSkips, DailyCapSkip{Date: d, Hours: h, Existing: existingBaht[d]})
 	}
 	sort.Slice(bahtSkips, func(i, j int) bool { return bahtSkips[i].Date < bahtSkips[j].Date })
+	overlapSkips := make([]SkipGroup, 0, len(skippedByOverlap))
+	for reason, agg := range skippedByOverlap {
+		sort.Strings(agg.dates)
+		overlapSkips = append(overlapSkips, SkipGroup{Reason: reason, Count: agg.count, Dates: agg.dates})
+	}
+	sort.Slice(overlapSkips, func(i, j int) bool { return overlapSkips[i].Reason < overlapSkips[j].Reason })
+	// Months of the term this run could not write because the period is closed
+	// or the month is locked — walked over the term so each carries its year.
+	var closedMonths []string
+	termMonths := 0
+	for m := time.Date(startsOn.Year(), startsOn.Month(), 1, 0, 0, 0, 0, startsOn.Location()); !m.After(endsOn); m = m.AddDate(0, 1, 0) {
+		termMonths++
+		mm := m.Format("01")
+		if bm, ok := blockedMonths[mm]; ok && (bm.IsClosed || bm.Locked) && !reviewMonths[mm] {
+			closedMonths = append(closedMonths, m.Format("2006-01"))
+		}
+	}
 	res := &GenerateResult{
+		SkippedOverlap:       overlapSkips,
+		ClosedMonths:         closedMonths,
 		Entries:              out,
 		SkippedOwnClass:      skips,
 		SkippedWeeklyCap:     weeklyCapSkips,
@@ -1651,7 +1817,47 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	if len(bahtSkips) > 0 {
 		res.DailyBahtCap = dailyBahtCap
 	}
+	if len(out) == 0 {
+		res.EmptyReason = generateEmptyReason(keptMonths, closedMonths, termMonths,
+			len(schs) > 0 || len(trss) > 0 || ac.AllowReview, len(skips) > 0 || len(overlapSkips) > 0)
+	}
 	return res, nil
+}
+
+// generateEmptyReason says, in Thai, why a run produced nothing. Ordered from
+// the most certain cause to the least: a term whose every month is already in
+// review or closed has nothing left to generate whatever the timetable says,
+// and the old client-side guess ("อาจไม่มีตารางสอน…") sent TAs looking for a
+// missing timetable that was never the problem.
+func generateEmptyReason(kept, closed []string, termMonths int, hasSchedule, hadSkips bool) string {
+	monthsTH := func(yms []string) string {
+		parts := make([]string, 0, len(yms))
+		for _, ym := range yms {
+			parts = append(parts, thaiYearMonth(ym))
+		}
+		return strings.Join(parts, ", ")
+	}
+	if termMonths > 0 && len(kept)+len(closed) >= termMonths {
+		msg := "ไม่ได้สร้างรายการใหม่ เพราะทุกเดือนของภาคเรียนไม่เปิดให้สร้างแล้ว"
+		if len(kept) > 0 {
+			msg += " เดือนที่ส่งอนุมัติแล้ว/อยู่ระหว่างพิจารณา: " + monthsTH(kept)
+		}
+		if len(closed) > 0 {
+			msg += " เดือนที่ปิดรับแล้ว (ถือว่าไม่ประสงค์ลงเวลา): " + monthsTH(closed)
+		}
+		return msg
+	}
+	if !hasSchedule {
+		return "ไม่ได้สร้างรายการใด เพราะกลุ่มเรียนนี้ยังไม่มีตารางสอนในระบบ ให้อาจารย์เพิ่มตารางสอนของกลุ่มเรียนก่อน"
+	}
+	if hadSkips {
+		return "ไม่ได้สร้างรายการใด เพราะทุกคาบถูกข้ามด้วยเหตุผลที่แจ้งไว้"
+	}
+	msg := "ไม่ได้สร้างรายการใด ทุกคาบที่เหลือตกวันหยุด วันสอบ หรือเกินเพดานชั่วโมง"
+	if len(kept)+len(closed) > 0 {
+		msg += " (เดือนที่ไม่เปิดให้สร้าง: " + monthsTH(append(append([]string{}, kept...), closed...)) + ")"
+	}
+	return msg
 }
 
 // -----------------------------------------------------------------------------
@@ -2603,6 +2809,62 @@ func (s *WorkLogService) enforceNoOverlap(ctx context.Context, taID uuid.UUID, w
 	return Invalid(fmt.Sprintf("ช่วงเวลาซ้อนกับรายการเดิม (%s %s–%s) แก้ไขเวลาให้ไม่ทับกัน", code, st, en))
 }
 
+// setOverlap is the first collision findSetOverlap found: one of the rows
+// being moved (Date, Start–End) against another row the TA holds.
+type setOverlap struct {
+	Date, Start, End                string
+	OtherCode, OtherStart, OtherEnd string
+}
+
+// findSetOverlap is enforceNoOverlap for a whole batch of rows at once — the
+// rows of `assignmentID` matching candWhere (alias c) against every other row
+// of the same TA matching otherWhere (alias o). Same co-taught exemption.
+// extra binds as $2, $3, … for the two predicates.
+//
+// Upsert and StaffUpsert check one row as it is written, but rows reach
+// Submit and Approve without passing through either: auto-generated rows
+// (Generate inserts directly), rows written before this gate existed, and a
+// rejected row being resubmitted whose other-course twin was written while it
+// sat rejected (rejected rows do not count as busy). Those were the double-pay
+// path, so the transitions that lead to money re-ask the question.
+func findSetOverlap(ctx context.Context, q querier, assignmentID uuid.UUID, candWhere, otherWhere string, extra ...any) (*setOverlap, error) {
+	var o setOverlap
+	err := q.QueryRow(ctx, `
+		SELECT TO_CHAR(c.work_date,'YYYY-MM-DD'),
+		       TO_CHAR(c.start_time,'HH24:MI'), TO_CHAR(c.end_time,'HH24:MI'),
+		       otc.code, TO_CHAR(o.start_time,'HH24:MI'), TO_CHAR(o.end_time,'HH24:MI')
+		FROM work_logs c
+		JOIN ta_request_assignments ca ON ca.id = c.assignment_id
+		JOIN work_logs o ON o.work_date = c.work_date AND o.id <> c.id
+		                AND o.start_time < c.end_time AND o.end_time > c.start_time
+		JOIN ta_request_assignments oa ON oa.id = o.assignment_id AND oa.ta_id = ca.ta_id
+		JOIN sections osec ON osec.id = oa.section_id
+		JOIN teaching_courses otc ON otc.id = osec.teaching_course_id
+		WHERE c.assignment_id = $1
+		  AND (`+candWhere+`)
+		  AND (`+otherWhere+`)
+		  AND NOT (oa.id <> ca.id
+		           AND oa.request_id = ca.request_id
+		           AND oa.cotaught_group IS NOT NULL
+		           AND oa.cotaught_group = ca.cotaught_group)
+		ORDER BY c.work_date, c.start_time
+		LIMIT 1`, append([]any{assignmentID}, extra...)...).Scan(&o.Date, &o.Start, &o.End, &o.OtherCode, &o.OtherStart, &o.OtherEnd)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
+}
+
+// describe renders the collision for a Thai error message: which day, which of
+// the TA's rows, and which course already holds that time.
+func (o *setOverlap) describe() string {
+	return fmt.Sprintf("วันที่ %s เวลา %s–%s ซ้อนกับรายการของรายวิชา %s เวลา %s–%s",
+		thaiLongDateISO(o.Date), o.Start, o.End, o.OtherCode, o.OtherStart, o.OtherEnd)
+}
+
 // weeklyCapBucket is one weekly hour-cap grouping: grad's shared
 // lecture+lab pool (or undergrad's two separate ones), plus review and
 // other. weeklyCapBuckets is the single place that decides this grouping —
@@ -2715,6 +2977,20 @@ func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx
 // scoped by it: the hour caps stay assignment-wide, because a week can straddle
 // two months and filtering by month would let an over-cap week through.
 func (s *WorkLogService) recheckCapsForApproval(ctx context.Context, tx pgx.Tx, ac *assignmentContext, assignmentID uuid.UUID, yearMonth string) error {
+	// Defence in depth against double pay: the rows about to be approved must
+	// not share a minute with hours already APPROVED in another course (or
+	// another row of this one). Compared against approved rows only — a
+	// lecturer cannot fix the TA's draft elsewhere, so the first approval wins
+	// and the second is told exactly which course already holds the time. On
+	// the transaction, so a batch sees the rows it approved a moment earlier.
+	if hit, err := findSetOverlap(ctx, tx, assignmentID,
+		`c.status = 'submitted' AND ($2 = '' OR to_char(c.work_date, 'YYYY-MM') = $2)`,
+		`o.status = 'approved'`, yearMonth); err != nil {
+		return err
+	} else if hit != nil {
+		return Invalid("อนุมัติไม่ได้: " + hit.describe() +
+			" ซึ่งอนุมัติไปแล้ว ผู้ช่วยสอนรับค่าตอบแทนช่วงเวลาเดียวกันซ้ำไม่ได้ ให้ตีกลับเพื่อให้ผู้ช่วยสอนแก้ไขรายการนี้")
+	}
 	dailyCap := s.dailyHourCapFor(ctx, assignmentID)
 	rows, err := tx.Query(ctx, `
 		SELECT TO_CHAR(work_date,'YYYY-MM-DD')
@@ -3583,14 +3859,46 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	// Rows whose month is closed or already finance_sent are excluded (not
 	// errored) so a stale draft in a locked month can never wedge the TA's
 	// submission for the months that are still open.
-	tag, err := s.pool.Exec(ctx, `
+	//
+	// Overlap re-check first: a rejected row skipped the busy test while it sat
+	// rejected, and generated rows never passed it. "Other" is every row the TA
+	// still holds — including this batch's own rejected rows, which are about
+	// to count again — but not a draft stranded in a closed month, which will
+	// never be paid and must not block a month that will.
+	if hit, err := findSetOverlap(ctx, s.pool, assignmentID,
+		`c.status IN ('draft','rejected') AND `+submittableRowSQL("c"),
+		`(o.status <> 'rejected' OR (o.assignment_id = c.assignment_id AND `+submittableRowSQL("o")+`))
+		 AND NOT (o.status = 'draft' AND `+unsubmittableMonthSQL("o")+`)`); err != nil {
+		return err
+	} else if hit != nil {
+		return Invalid("ส่งอนุมัติไม่ได้: " + hit.describe() +
+			" ผู้ช่วยสอนรับค่าตอบแทนช่วงเวลาเดียวกันจากสองรายการไม่ได้ ให้แก้ไขหรือลบรายการที่ซ้อนก่อน")
+	}
+	// RETURNING the months so the lecturer's notice can name them (below).
+	monthRows, err := s.pool.Query(ctx, `
 		UPDATE work_logs wl SET status='submitted', submitted_at=NOW(), reject_reason=NULL
 		WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')
-		  AND `+submittableRowSQL("wl"), assignmentID)
+		  AND `+submittableRowSQL("wl")+`
+		RETURNING to_char(wl.work_date, 'YYYY-MM')`, assignmentID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	submittedMonths := map[string]bool{}
+	submittedRows := 0
+	for monthRows.Next() {
+		var ym string
+		if err := monthRows.Scan(&ym); err != nil {
+			monthRows.Close()
+			return err
+		}
+		submittedMonths[ym] = true
+		submittedRows++
+	}
+	monthRows.Close()
+	if err := monthRows.Err(); err != nil {
+		return err
+	}
+	if submittedRows == 0 {
 		// Distinguish "nothing to submit" from "everything is in a locked month"
 		// so the TA isn't left guessing why the button did nothing.
 		var locked int
@@ -3615,12 +3923,26 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	if s.notify != nil {
 		if lects, err := courseLecturerIDs(ctx, s.pool, ac.TeachingCourseID); err == nil {
 			t := s.notifyTarget(ctx, ac.TeachingCourseID)
-			body := fmt.Sprintf("%s ผู้ช่วยสอนรายวิชา %s ได้ส่งบันทึกเวลาปฏิบัติงานเพื่อขอรับการอนุมัติจากท่าน",
-				personName(ctx, s.pool, ac.TAID), t.Label())
+			taName := personName(ctx, s.pool, ac.TAID)
+			months := make([]string, 0, len(submittedMonths))
+			for ym := range submittedMonths {
+				months = append(months, ym)
+			}
+			sort.Strings(months)
+			monthsTH := make([]string, 0, len(months))
+			for _, ym := range months {
+				monthsTH = append(monthsTH, thaiYearMonth(ym))
+			}
+			body := fmt.Sprintf("%s ผู้ช่วยสอนรายวิชา %s ได้ส่งบันทึกเวลาปฏิบัติงานเดือน %s เพื่อขอรับการอนุมัติจากท่าน",
+				taName, t.Label(), strings.Join(monthsTH, ", "))
+			// Course, TA and months in the TITLE: unread in-app notices with the
+			// same (title, link) are folded into one, and every TA of a course
+			// shares this link — with a bare title the second TA's submission
+			// overwrote the first's and the lecturer saw only one.
+			title := fmt.Sprintf("%s รอการอนุมัติบันทึกเวลา %s เดือน %s",
+				t.Code, taName, strings.Join(monthsTH, ", "))
 			for _, lid := range lects {
-				s.notify.SendAction(ctx, lid,
-					"มีบันทึกเวลาปฏิบัติงานรอการอนุมัติ",
-					body,
+				s.notify.SendAction(ctx, lid, title, body,
 					"/lecturer/courses/"+ac.TeachingCourseID.String()+"/reports")
 			}
 		}
@@ -4410,10 +4732,11 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	}
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
+		who := actorRoleTH(ctx, s.pool, actor, privileged)
 		s.notify.Send(ctx, ac.TAID,
-			"เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน "+t.Code,
-			fmt.Sprintf("เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s",
-				t.Label(), thaiLongDateISO(w.WorkDate), thaiTimeRange(w.StartTime, w.EndTime)),
+			who+"แก้ไขบันทึกเวลาปฏิบัติงาน "+t.Code+" วันที่ "+thaiLongDateISO(w.WorkDate),
+			fmt.Sprintf("%sได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s",
+				who, t.Label(), thaiLongDateISO(w.WorkDate), thaiTimeRange(w.StartTime, w.EndTime)),
 			t.Link)
 		// A signed-off row changed: every lecturer on the course hears about it,
 		// with the reason. The batch path sends its own combined notice, so only
@@ -4733,9 +5056,10 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, actor uuid.UUID, privi
 	}
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, tcID)
+		who := actorRoleTH(ctx, s.pool, actor, privileged)
 		s.notify.Send(ctx, taID,
-			"เจ้าหน้าที่ลบบันทึกเวลาปฏิบัติงาน "+t.Code,
-			fmt.Sprintf("เจ้าหน้าที่ได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s", t.Label(), thaiLongDateISO(workDate), timeSpan),
+			who+"ลบบันทึกเวลาปฏิบัติงาน "+t.Code+" วันที่ "+thaiLongDateISO(workDate),
+			fmt.Sprintf("%sได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s", who, t.Label(), thaiLongDateISO(workDate), timeSpan),
 			t.Link)
 	}
 	return nil

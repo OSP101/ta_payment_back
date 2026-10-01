@@ -94,6 +94,9 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		  -- A section every one of whose sessions clashes with the TA's own
 		  -- timetable is not an appointment to print.
 		  AND a.state <> 'dropped'
+		  -- A deactivated account is not appointed (Preview lists it under
+		  -- skipped_tas with the reason); same rule as appointmentEligibleSQL.
+		  AND u.is_active
 		  -- Rounds: never reprint a name already on an issued order for this
 		  -- term. A late round must carry only the stragglers.
 		  AND NOT EXISTS (

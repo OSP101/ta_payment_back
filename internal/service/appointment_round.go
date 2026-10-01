@@ -65,6 +65,20 @@ type AppointmentPreview struct {
 	// AlreadyIssued counts pairs printed on an earlier round. Shown so the
 	// number of names on this round reads as deliberate rather than truncated.
 	AlreadyIssued int `json:"already_issued"`
+	// SkippedTAs are (TA × course) pairs that would otherwise be on this round
+	// but are left off, each with the reason ("ข้าม: ..."), so a missing name
+	// reads as a decision rather than a bug.
+	SkippedTAs []SkippedAppointee `json:"skipped_tas"`
+}
+
+// SkippedAppointee is one TA held off the order for a reason about the person
+// rather than the course (SkippedCourse covers the course-level holds).
+type SkippedAppointee struct {
+	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
+	CourseCode       string    `json:"course_code"`
+	TAID             uuid.UUID `json:"ta_id"`
+	TAName           string    `json:"ta_name"`
+	Reason           string    `json:"reason"`
 }
 
 // nextRoundNo returns the round number a new order for this term would take.
@@ -83,9 +97,15 @@ func (s *AppointmentOrderService) nextRoundNo(ctx context.Context, termID uuid.U
 
 // appointmentEligibleSQL is the one definition of "this (TA × course) pair
 // still needs an appointment order": approved request, assignment not dropped,
-// never printed on an earlier round of this term. Preview's name list and the
-// dashboard badge both read it, so the two can never show different numbers.
-const appointmentEligibleSQL = `
+// active account, never printed on an earlier round of this term. Preview's
+// name list and the dashboard badge both read it, so the two can never show
+// different numbers. Build's own roster query repeats the same predicates.
+const appointmentEligibleSQL = appointmentPendingFromSQL + `
+	  AND u.is_active`
+
+// appointmentPendingFromSQL is appointmentEligibleSQL without the per-person
+// readiness checks — what Preview diffs against to name who was skipped.
+const appointmentPendingFromSQL = `
 	FROM ta_request_assignments a
 	JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
 	JOIN sections sec        ON sec.id = a.section_id
@@ -124,6 +144,30 @@ func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID)
 		IsLate:    round > 1,
 		Include:   []AppointmentCandidate{},
 		Skipped:   []SkippedCourse{},
+		// A deactivated account (left the programme, disabled by staff) must
+		// not be appointed on paper. Listed rather than silently dropped.
+		SkippedTAs: []SkippedAppointee{},
+	}
+	srows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tc.id, tc.code, u.id, u.first_name || ' ' || u.last_name
+		`+appointmentPendingFromSQL+`
+		  AND NOT u.is_active
+		ORDER BY tc.code, u.first_name || ' ' || u.last_name`, termID)
+	if err != nil {
+		return nil, err
+	}
+	for srows.Next() {
+		var sk SkippedAppointee
+		if err := srows.Scan(&sk.TeachingCourseID, &sk.CourseCode, &sk.TAID, &sk.TAName); err != nil {
+			srows.Close()
+			return nil, err
+		}
+		sk.Reason = "ข้าม: บัญชีผู้ใช้ของ TA ถูกปิดใช้งาน"
+		out.SkippedTAs = append(out.SkippedTAs, sk)
+	}
+	srows.Close()
+	if err := srows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Eligible = approved request, assignment not dropped, and never printed

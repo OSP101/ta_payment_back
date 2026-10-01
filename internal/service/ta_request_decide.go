@@ -370,13 +370,16 @@ func (s *TARequestService) applyClashOutcomeFor(ctx context.Context, tx pgx.Tx, 
 	rows, err := tx.Query(ctx, `
 		SELECT a.id, a.ta_id, a.section_id, sec.sec_no,
 		       u.first_name || ' ' || u.last_name, a.level::text,
-		       a.state::text, COALESCE(a.state_reason, '')
+		       a.state::text, COALESCE(a.state_reason, ''), a.pre_clash IS NOT NULL
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN users u ON u.id = a.ta_id
-		WHERE a.request_id = $1 AND a.state <> 'dropped'
+		WHERE a.request_id = $1
+		  -- A recheck also looks at dropped rows: a drop caused by the TA's own
+		  -- timetable is undone when that class goes away (see restoreFromClash).
+		  AND (a.state <> 'dropped' OR ($3 AND a.pre_clash IS NOT NULL))
 		  AND ($2::uuid = '00000000-0000-0000-0000-000000000000' OR a.ta_id = $2)
-		ORDER BY a.ta_id, sec.sec_no`, reqID, onlyTA)
+		ORDER BY a.ta_id, sec.sec_no`, reqID, onlyTA, recheck)
 	if err != nil {
 		return nil, err
 	}
@@ -384,11 +387,12 @@ func (s *TARequestService) applyClashOutcomeFor(ctx context.Context, tx pgx.Tx, 
 		id, taID, secID      uuid.UUID
 		secNo, taName, level string
 		oldState, oldReason  string
+		hasSnapshot          bool
 	}
 	var all []asg
 	for rows.Next() {
 		var a asg
-		if err := rows.Scan(&a.id, &a.taID, &a.secID, &a.secNo, &a.taName, &a.level, &a.oldState, &a.oldReason); err != nil {
+		if err := rows.Scan(&a.id, &a.taID, &a.secID, &a.secNo, &a.taName, &a.level, &a.oldState, &a.oldReason, &a.hasSnapshot); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -406,7 +410,31 @@ func (s *TARequestService) applyClashOutcomeFor(ctx context.Context, tx pgx.Tx, 
 			return nil, err
 		}
 		if clashing == 0 {
+			if recheck && a.hasSnapshot && a.oldState != "active" {
+				line, err := s.restoreFromClash(ctx, tx, a.id, a.taID, a.secNo)
+				if err != nil {
+					return nil, err
+				}
+				if line != "" {
+					notices[a.taID] = append(notices[a.taID], line)
+				}
+			}
 			continue
+		}
+		// Remember the pre-clash shape once, before the first cut, so a later
+		// timetable fix can put it back.
+		if !a.hasSnapshot {
+			if _, err := tx.Exec(ctx, `
+				UPDATE ta_request_assignments a
+				SET pre_clash = jsonb_build_object(
+				      'state', a.state::text,
+				      'attendance_hrs', COALESCE(w.attendance_hrs, 0),
+				      'lab_hrs', COALESCE(w.lab_hrs, 0))
+				FROM (SELECT $1::uuid AS id) x
+				LEFT JOIN ta_workload_forms w ON w.assignment_id = x.id
+				WHERE a.id = x.id AND a.pre_clash IS NULL`, a.id); err != nil {
+				return nil, err
+			}
 		}
 		details, err := sectionClashDetails(ctx, tx, a.taID, a.secID)
 		if err != nil {
@@ -489,6 +517,62 @@ func (s *TARequestService) applyClashOutcomeFor(ctx context.Context, tx pgx.Tx, 
 		notices[a.taID] = append(notices[a.taID], stripped...)
 	}
 	return notices, nil
+}
+
+// restoreFromClash undoes a clash cut once the TA's timetable no longer
+// collides with the section: state back to what it was before the first cut,
+// and the in-class duty hours stripBlockedInClassHours zeroed back to what the
+// lecturer declared. A dropped assignment had released its quota, so it only
+// comes back while the TA is still under the per-term course cap; otherwise it
+// stays dropped and the notice says why. Returns the notice line ("" = none).
+func (s *TARequestService) restoreFromClash(ctx context.Context, tx pgx.Tx, assignmentID, taID uuid.UUID, secNo string) (string, error) {
+	var prevState string
+	var attendance, lab float64
+	var termID, courseID uuid.UUID
+	var curState string
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(a.pre_clash->>'state', 'active'),
+		       COALESCE((a.pre_clash->>'attendance_hrs')::numeric, 0),
+		       COALESCE((a.pre_clash->>'lab_hrs')::numeric, 0),
+		       tc.term_id, tc.id, a.state::text
+		FROM ta_request_assignments a
+		JOIN ta_requests r ON r.id = a.request_id
+		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
+		WHERE a.id = $1`, assignmentID).Scan(&prevState, &attendance, &lab, &termID, &courseID, &curState); err != nil {
+		return "", err
+	}
+	if prevState == "dropped" || prevState == "trimmed" {
+		// The snapshot is of the first cut; anything before it was active.
+		prevState = "active"
+	}
+	if curState == "dropped" {
+		count, err := s.reservedCourseCount(ctx, tx, taID, termID, courseID)
+		if err != nil {
+			return "", err
+		}
+		courseCap, err := maxCoursesPerTerm(ctx, tx)
+		if err != nil {
+			return "", err
+		}
+		if count >= courseCap {
+			return fmt.Sprintf("Section %s: ตารางเรียนไม่ทับซ้อนแล้ว แต่คืนสิทธิ์ช่วยสอนไม่ได้ เพราะคุณเป็นผู้ช่วยสอนครบ %d วิชาในภาคการศึกษานี้แล้ว", secNo, courseCap), nil
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ta_workload_forms
+		SET attendance_hrs = GREATEST(attendance_hrs, $2),
+		    lab_hrs        = GREATEST(lab_hrs, $3)
+		WHERE assignment_id = $1`, assignmentID, attendance, lab); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE ta_request_assignments
+		SET state = $2::ta_assignment_state, state_reason = NULL,
+		    state_decided_at = NOW(), pre_clash = NULL
+		WHERE id = $1`, assignmentID, prevState); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Section %s: ตารางเรียนไม่ชนกับคาบสอนแล้ว ระบบคืนสิทธิ์ช่วยสอนและชั่วโมงตามที่อาจารย์ระบุไว้", secNo), nil
 }
 
 // stripBlockedInClassHours zeroes the in-class duty of every session kind whose
@@ -587,8 +671,12 @@ func (s *TARequestService) ReevaluateForTA(ctx context.Context, taID, termID uui
 		FROM ta_requests r
 		JOIN ta_request_assignments a ON a.request_id = r.id
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
-		WHERE a.ta_id = $1 AND tc.term_id = $2 AND r.status = 'approved'
-		  AND a.state <> 'dropped'`, taID, termID)
+		WHERE a.ta_id = $1 AND tc.term_id = $2
+		  AND (r.status = 'approved'
+		       -- auto-rejected because every TA's timetable clashed: a fixed
+		       -- timetable may bring it back (recheckApproved)
+		       OR (r.status = 'rejected' AND r.decided_by IS NULL AND r.reject_reason = $3))
+		  AND (a.state <> 'dropped' OR a.pre_clash IS NOT NULL)`, taID, termID, clashRejectReason)
 	if err != nil {
 		return err
 	}
@@ -624,12 +712,15 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 	}
 	defer tx.Rollback(ctx)
 
-	var status string
+	var status, rejectReason string
+	var decidedByNull bool
 	if err := tx.QueryRow(ctx,
-		`SELECT status::text FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&status); err != nil {
+		`SELECT status::text, COALESCE(reject_reason, ''), decided_by IS NULL
+		   FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&status, &rejectReason, &decidedByNull); err != nil {
 		return err
 	}
-	if status != "approved" {
+	clashRejected := status == "rejected" && decidedByNull && rejectReason == clashRejectReason
+	if status != "approved" && !clashRejected {
 		return nil
 	}
 	notices, err := s.applyClashOutcomeFor(ctx, tx, reqID, taID, true)
@@ -646,8 +737,18 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 		reqID).Scan(&surviving); err != nil {
 		return err
 	}
-	const reason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
-	rejected := surviving == 0
+	reason := clashRejectReason
+	rejected := surviving == 0 && status == "approved"
+	reinstated := surviving > 0 && clashRejected
+	if reinstated {
+		if _, err := tx.Exec(ctx, `
+			UPDATE ta_requests SET
+			  status = 'approved', decided_at = NOW(), decided_by = NULL,
+			  reject_reason = NULL, updated_at = NOW()
+			WHERE id = $1`, reqID); err != nil {
+			return err
+		}
+	}
 	if rejected {
 		if _, err := tx.Exec(ctx, `
 			UPDATE ta_requests SET
@@ -665,8 +766,17 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 	if rejected {
 		s.notifyDecision(ctx, reqID, "rejected", reason)
 	}
+	if reinstated {
+		s.notifyDecision(ctx, reqID, "approved", "")
+	}
 	return nil
 }
+
+// clashRejectReason is the reject_reason recheckApproved writes when the TAs'
+// own timetables leave nobody able to teach. It doubles as the marker that a
+// rejection was the system's, not a decision anyone made, so a fixed
+// timetable may reinstate it.
+const clashRejectReason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
 
 // tryFinalize decides one pending request if every TA on it now has a
 // timetable. No-op otherwise.
@@ -749,6 +859,21 @@ func (s *TARequestService) tryFinalize(ctx context.Context, reqID, termID uuid.U
 // and why, and gives the lecturer one combined summary. Without this the TA
 // would discover the loss only when the work-log screen silently refused a
 // session.
+// restoreLineMarker is in every line restoreFromClash writes.
+const restoreLineMarker = "ตารางเรียนไม่ชน"
+
+func allRestoreLines(lines []string) bool {
+	if len(lines) == 0 {
+		return false
+	}
+	for _, l := range lines {
+		if !strings.Contains(l, restoreLineMarker) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UUID, notices map[uuid.UUID][]string) {
 	if len(notices) == 0 {
 		return
@@ -764,18 +889,32 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 
 	var summary []string
 	for taID, lines := range notices {
+		// A notice made only of restorations (restoreFromClash) is good news
+		// and must not arrive under a "ทับซ้อน" headline.
+		title := "ตารางเรียนของท่านทับซ้อนกับคาบสอน " + code
+		body := fmt.Sprintf("ระบบพบว่าตารางเรียนของท่านทับซ้อนกับคาบสอนของรายวิชา %s ดังนี้\n%s", label, strings.Join(lines, "\n"))
+		if allRestoreLines(lines) {
+			title = "คืนสิทธิ์ผู้ช่วยสอน " + code
+			body = fmt.Sprintf("ตารางเรียนของท่านไม่ทับซ้อนกับคาบสอนของรายวิชา %s แล้ว\n%s", label, strings.Join(lines, "\n"))
+		}
 		s.notify.Send(ctx, taID,
 			// Code in the title: unread notices fold by (title, link), and a
 			// clash on a second course would otherwise overwrite this one.
-			"ตารางเรียนของท่านทับซ้อนกับคาบสอน "+code,
-			fmt.Sprintf("ระบบพบว่าตารางเรียนของท่านทับซ้อนกับคาบสอนของรายวิชา %s ดังนี้\n%s", label, strings.Join(lines, "\n")),
+			title,
+			body,
 			// /ta/courses is not a route — the TA's course list is the home page.
 			"/ta")
 		summary = append(summary, fmt.Sprintf("%s %s", s.taName(ctx, taID), strings.Join(lines, " ")))
 	}
+	lecTitle := "ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน " + code
+	lecBody := fmt.Sprintf("ระบบพบว่าผู้ช่วยสอนในคำขอรายวิชา %s มีตารางเรียนทับซ้อนกับคาบสอน ดังนี้\n%s", label, numberedLines(summary))
+	if allRestoreLines(summary) {
+		lecTitle = "คืนสิทธิ์ผู้ช่วยสอน " + code
+		lecBody = fmt.Sprintf("ผู้ช่วยสอนในคำขอรายวิชา %s แก้ตารางเรียนแล้ว ระบบคืนสิทธิ์ให้ ดังนี้\n%s", label, numberedLines(summary))
+	}
 	s.notify.Send(ctx, lecturerID,
-		"ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน "+code,
-		fmt.Sprintf("ระบบพบว่าผู้ช่วยสอนในคำขอรายวิชา %s มีตารางเรียนทับซ้อนกับคาบสอน ดังนี้\n%s", label, numberedLines(summary)),
+		lecTitle,
+		lecBody,
 		// Likewise: the lecturer's course list is their home page.
 		"/lecturer")
 }

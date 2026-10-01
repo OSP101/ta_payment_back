@@ -28,5 +28,9 @@ func Invalid(msg string) *UserError { return &UserError{Status: 400, Msg: msg} }
 // Conflict builds a 409 user-facing error (state clash / duplicate).
 func Conflict(msg string) *UserError { return &UserError{Status: 409, Msg: msg} }
 
+// NotFound builds a 404 user-facing error, for a record the user pointed at
+// (often from a stale tab) that no longer exists.
+func NotFound(msg string) *UserError { return &UserError{Status: 404, Msg: msg} }
+
 // Forbidden builds a 403 user-facing error.
 func Forbidden(msg string) *UserError { return &UserError{Status: 403, Msg: msg} }

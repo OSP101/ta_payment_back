@@ -53,8 +53,10 @@ func TestBulkCreateForTerm_SecondSemesterWrapsDecember(t *testing.T) {
 	}
 }
 
-// First semester keeps the ประกาศ's shared 31 ก.ค. due date for สิงหาคม in the
-// same year — the December wrap fix must not push it a year forward.
+// First semester keeps the ประกาศ's shared 31 ก.ค. due date where it can (มิ.ย.,
+// ก.ค.), in the same year. สิงหาคม now opens on 1 ส.ค. (WP3, bug 9): the shared
+// date would close it before it opens, so it falls back to the 5th of the next
+// month instead of opening on 1 ก.ค.
 func TestBulkCreateForTerm_FirstSemesterSharedDueDateStays(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	termID := uuid.New()
@@ -65,8 +67,11 @@ func TestBulkCreateForTerm_FirstSemesterSharedDueDateStays(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range got {
-		if p.YearMonth == "2570-08" && (p.DueDate != "2027-07-31" || p.StartsOn != "2027-07-01") {
-			t.Errorf("สิงหาคม = %s → %s, want 2027-07-01 → 2027-07-31", p.StartsOn, p.DueDate)
+		if p.YearMonth == "2570-08" && (p.DueDate != "2027-09-05" || p.StartsOn != "2027-08-01") {
+			t.Errorf("สิงหาคม = %s → %s, want 2027-08-01 → 2027-09-05", p.StartsOn, p.DueDate)
+		}
+		if p.YearMonth == "2570-07" && (p.DueDate != "2027-07-31" || p.StartsOn != "2027-07-01") {
+			t.Errorf("กรกฎาคม = %s → %s, want 2027-07-01 → 2027-07-31", p.StartsOn, p.DueDate)
 		}
 	}
 }

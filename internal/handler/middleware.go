@@ -403,7 +403,7 @@ func errorResponse(err error) (int, string) {
 		case "23505": // unique_violation
 			return fiber.StatusConflict, "ข้อมูลนี้มีอยู่แล้วในระบบ"
 		case "23503": // foreign_key_violation
-			return fiber.StatusConflict, "ไม่สามารถดำเนินการได้เพราะมีข้อมูลอ้างอิงอยู่"
+			return fiber.StatusConflict, fkViolationMessage(pgErr)
 		case "23514", "22001", "22003", "22007", "22P02": // check/length/numeric/datetime/text-repr
 			return fiber.StatusBadRequest, "ข้อมูลที่กรอกไม่ถูกต้องตามรูปแบบที่กำหนด"
 		case "P0001": // RAISE EXCEPTION from our own triggers
@@ -435,6 +435,44 @@ func errorResponse(err error) (int, string) {
 		return fiber.StatusInternalServerError, "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
 	}
 	return fiber.StatusBadRequest, err.Error()
+}
+
+// fkReferrerLabels names, in the words of the screens, the tables whose rows
+// block a delete. pgErr.TableName on a foreign-key violation is the
+// REFERENCING table, i.e. the thing still pointing at the row being removed.
+var fkReferrerLabels = map[string]string{
+	"ta_request_assignments":  "TA ที่ได้รับมอบหมายใน section นี้",
+	"ta_request_counts":       "คำขอ TA ที่ระบุ section นี้",
+	"ta_requests":             "คำขอ TA",
+	"tdbm_extra_teachings":    "ข้อมูลภาระงานสอนที่นำเข้าจาก TDBM",
+	"work_logs":               "บันทึกเวลาปฏิบัติงานของ TA",
+	"sections":                "section ของรายวิชา",
+	"teaching_courses":        "รายวิชาที่เปิดสอน",
+	"teaching_lecturers":      "อาจารย์ผู้สอนของรายวิชา",
+	"section_schedules":       "ตารางสอนของ section",
+	"submission_periods":      "รอบการส่งเวลาปฏิบัติงาน",
+	"appointment_order_items": "คำสั่งแต่งตั้งที่ออกไปแล้ว",
+	"ta_documents":            "เอกสารของ TA",
+	"ta_profiles":             "ข้อมูลส่วนตัวของ TA",
+}
+
+// fkViolationMessage turns a 23503 into a sentence that says WHAT is in the
+// way. It used to be one fixed "มีข้อมูลอ้างอิงอยู่" for every case — deleting
+// a section that still has TAs on it gave staff no clue what to clear first.
+// Only table names (never key values or SQL) reach the user.
+func fkViolationMessage(pgErr *pgconn.PgError) string {
+	label, ok := fkReferrerLabels[pgErr.TableName]
+	// "update or delete on table X violates ..." is the delete/rename side;
+	// otherwise the write pointed at a row that does not exist (any more).
+	deleting := strings.HasPrefix(pgErr.Message, "update or delete")
+	switch {
+	case deleting && ok:
+		return "ลบหรือแก้ไขไม่ได้ เพราะยังมี" + label + "อ้างอิงอยู่ กรุณานำออกก่อนแล้วลองใหม่"
+	case deleting:
+		return "ลบหรือแก้ไขไม่ได้ เพราะยังมีข้อมูลอื่นอ้างอิงรายการนี้อยู่"
+	default:
+		return "ข้อมูลที่อ้างถึงไม่มีอยู่ในระบบแล้ว อาจถูกลบไปก่อนหน้า กรุณารีเฟรชหน้าแล้วลองใหม่"
+	}
 }
 
 // containsThai reports whether s holds at least one Thai character. Used by

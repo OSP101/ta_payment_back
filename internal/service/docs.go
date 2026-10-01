@@ -787,8 +787,12 @@ func (s *DocsService) OpenStored(ctx context.Context, id uuid.UUID) (rc io.ReadC
 
 func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approve bool, reason string) error {
 	reason = strings.TrimSpace(reason)
+	// Every refusal below is something an officer can trigger from the UI (a
+	// whitespace-only reason, an old tab after the TA re-uploaded), so each is
+	// a Thai UserError — the English errors.New these used to be reached the
+	// officer as a bare "ระบบขัดข้อง" 500.
 	if !approve && reason == "" {
-		return errors.New("reject reason required")
+		return Invalid("กรุณาระบุเหตุผลที่ตีกลับเอกสาร")
 	}
 	status := "approved"
 	if !approve {
@@ -797,13 +801,24 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	// Guard: cannot review a superseded doc — that would silently rewrite
 	// history and break the audit trail.
 	var superseded bool
-	if err := s.pool.QueryRow(ctx,
-		`SELECT superseded_at IS NOT NULL FROM ta_documents WHERE id = $1`, docID,
-	).Scan(&superseded); err != nil {
+	var curStatus string
+	err := s.pool.QueryRow(ctx,
+		`SELECT superseded_at IS NOT NULL, status::text FROM ta_documents WHERE id = $1`, docID,
+	).Scan(&superseded, &curStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return NotFound("ไม่พบเอกสารนี้ อาจถูกลบไปแล้ว กรุณารีเฟรชหน้า")
+	}
+	if err != nil {
 		return err
 	}
 	if superseded {
-		return errors.New("cannot review a superseded document")
+		return Conflict("เอกสารฉบับนี้ถูกแทนที่ด้วยฉบับใหม่แล้ว กรุณารีเฟรชหน้าแล้วตรวจฉบับล่าสุด")
+	}
+	// A rejected document stays rejected until the TA uploads a replacement
+	// (which supersedes this row). Approving it in place would pass the very
+	// file the officer already judged wrong, without the TA fixing anything.
+	if approve && (curStatus == "rejected" || curStatus == "needs_fix") {
+		return Conflict("เอกสารนี้ถูกตีกลับแล้ว ต้องรอให้ TA อัปโหลดฉบับใหม่ก่อนจึงจะอนุมัติได้")
 	}
 
 	if !approve {
@@ -972,7 +987,7 @@ func (s *DocsService) finalizeProfileIfComplete(
 func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID, approve bool, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if !approve && reason == "" {
-		return errors.New("reject reason required")
+		return Invalid("กรุณาระบุเหตุผลที่ตีกลับ")
 	}
 	status := "approved"
 	if !approve {
@@ -990,7 +1005,7 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 		`SELECT COALESCE(current_round, 1) FROM ta_profiles WHERE user_id = $1`, userID,
 	).Scan(&round)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return errors.New("profile not found")
+		return NotFound("ไม่พบโปรไฟล์ของ TA คนนี้")
 	}
 	if err != nil {
 		return err

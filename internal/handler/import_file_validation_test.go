@@ -143,9 +143,10 @@ func TestImportExcel_ValidXlsxPassesFileTypeGate(t *testing.T) {
 	}
 }
 
-// buildMinimalNormalizedXlsx makes the smallest file parseNormalizedSheet
-// accepts — a "Normalized" sheet with just the header row. No data rows is
-// fine: the parser returns an empty course list, not an error.
+// buildMinimalNormalizedXlsx makes the smallest file the import accepts — a
+// "Normalized" sheet with a header and ONE course row. A header-only file is
+// refused since 01/10/2026 ("ไม่พบรายวิชาในไฟล์") instead of previewing an
+// empty list with no explanation.
 func buildMinimalNormalizedXlsx(t *testing.T) []byte {
 	t.Helper()
 	f := excelize.NewFile()
@@ -154,6 +155,11 @@ func buildMinimalNormalizedXlsx(t *testing.T) []byte {
 	}
 	if err := f.SetSheetRow("Normalized", "A1", &[]string{
 		"CourseCode", "CourseName", "Unit", "Section",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.SetSheetRow("Normalized", "A2", &[]string{
+		"CP000001", "วิชาทดสอบ", "3 (3-0-6)", "1",
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -42,6 +42,7 @@ func TestMarkStaffReviewed_NotBlockedByDeadGradSpecialSiblingAssignment(t *testi
 	        VALUES (gen_random_uuid(), $1, $2::date, '09:00', '11:00', 2, 'review', 'submitted')`,
 		deadAssign, day(10))
 
+	payoutReady(f) // the sign-off requires approved TA documents (WP3)
 	if err := f.Periods.MarkStaffReviewed(f.ctx, f.StaffID, pid, f.TAID, f.CourseID, ""); err != nil {
 		t.Fatalf("MarkStaffReviewed must not be blocked by a dead grad-special "+
 			"sibling assignment's leftover 'submitted' row: %v", err)

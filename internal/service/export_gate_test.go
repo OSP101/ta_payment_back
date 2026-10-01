@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"ta-payment-back/internal/timeutil"
 )
 
@@ -14,12 +16,19 @@ import (
 
 // payoutReady clears the OTHER export gate — approved profile + creditor form —
 // so these tests fail on the pipeline stage under test rather than on paperwork.
-func payoutReady(f *fixture) {
+func payoutReady(f *fixture) { payoutReadyFor(f, f.TAID) }
+
+// payoutReadyFor approves one TA's profile and creditor form.
+func payoutReadyFor(f *fixture, ta uuid.UUID) {
 	f.exec(`INSERT INTO ta_profiles (user_id, prefix, status, completed_at, current_round)
 	        VALUES ($1, 'นาย', 'approved', now(), 1)
-	        ON CONFLICT (user_id) DO UPDATE SET status = 'approved'`, f.TAID)
+	        ON CONFLICT (user_id) DO UPDATE SET status = 'approved'`, ta)
+	// Idempotent: reviewFixture already calls this, and some tests call it
+	// again (one current document per kind — ta_documents_current_uidx).
 	f.exec(`INSERT INTO ta_documents (id, user_id, kind, filename, mime, size_bytes, storage_key, status)
-	        VALUES (gen_random_uuid(), $1, 'creditor_form', 'x.pdf', 'application/pdf', 1, 'k', 'approved')`, f.TAID)
+	        SELECT gen_random_uuid(), $1, 'creditor_form', 'x.pdf', 'application/pdf', 1, 'k', 'approved'
+	        WHERE NOT EXISTS (SELECT 1 FROM ta_documents
+	                           WHERE user_id = $1 AND kind = 'creditor_form' AND superseded_at IS NULL)`, ta)
 }
 
 // blockerKinds is the set of stages a course is currently stuck at.
@@ -136,6 +145,7 @@ func TestExportGate_ClearsOnceStaffSignOff(t *testing.T) {
 	if err := f.Svc.Approve(f.ctx, f.LecturerID, f.AssignmentID, "", false); err != nil {
 		t.Fatal(err)
 	}
+	payoutReady(f) // the sign-off requires approved TA documents (WP3)
 	staff := f.StaffID
 	if err := f.Periods.MarkStaffReviewed(f.ctx, staff, pid, f.TAID, f.CourseID, ""); err != nil {
 		t.Fatal(err)

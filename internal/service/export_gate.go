@@ -14,8 +14,11 @@ import (
 // ExportBlocker is one reason a course may not be exported yet, phrased for the
 // staff screen rather than for a log.
 type ExportBlocker struct {
-	// Kind is "waiting_ta" | "waiting_lecturer" | "class_clash" | "not_appointed" | "unreviewed" | "not_exported".
-	Kind   string `json:"kind"`
+	// Kind is "waiting_ta" | "waiting_lecturer" | "class_clash" | "not_appointed" | "profile" | "unreviewed" | "not_exported".
+	Kind string `json:"kind"`
+	// Issue says what is wrong for a "profile" blocker (no profile, profile
+	// not approved, no approved creditor form).
+	Issue  string `json:"issue,omitempty"`
 	TAName string `json:"ta_name"`
 	// Months affected, as Thai labels ("สิงหาคม 2569").
 	Months []string `json:"months"`
@@ -159,8 +162,25 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		add("class_clash", c.name, c.yearMonth, c.rows)
 	}
 
+	// TA documents. validatePayoutReadiness refuses the download while any
+	// TA's profile or creditor form is not approved, but nothing said so
+	// until the button was pressed — the course read as ready on every screen
+	// and then failed whole as "ข้อมูล TA ไม่ครบ". Named here, per TA, for the
+	// people this slice actually pays (approved work in it).
+	notReady, err := s.profileBlockers(ctx, courseID, months)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range notReady {
+		k := key{"profile", p.name}
+		if _, ok := agg[k]; !ok {
+			agg[k] = &ExportBlocker{Kind: "profile", TAName: p.name, Issue: p.issue}
+			order = append(order, k)
+		}
+	}
+
 	// Stage order, then name — staff read this list top-down as a work queue.
-	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "class_clash": 2, "not_appointed": 3, "unreviewed": 4}
+	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "class_clash": 2, "not_appointed": 3, "profile": 4, "unreviewed": 5}
 	sort.SliceStable(order, func(i, j int) bool {
 		if rank[order[i].kind] != rank[order[j].kind] {
 			return rank[order[i].kind] < rank[order[j].kind]
@@ -197,6 +217,8 @@ func exportBlockedError(blockers []ExportBlocker) error {
 			lines = append(lines, fmt.Sprintf("%s มีรายการที่อนุมัติแล้วตรงกับตารางเรียนปัจจุบันของ TA %d รายการ — ตีกลับหรือแก้ไขก่อน (%s)", name, b.Rows, months))
 		case "not_appointed":
 			lines = append(lines, fmt.Sprintf("%s ยังไม่อยู่ในคำสั่งแต่งตั้ง — ออกคำสั่งรอบถัดไปก่อน (%s)", name, months))
+		case "profile":
+			lines = append(lines, fmt.Sprintf("%s เอกสาร TA ยังไม่พร้อม: %s", name, b.Issue))
 		default:
 			lines = append(lines, fmt.Sprintf("%s ยังไม่ได้ตรวจสอบเบิกจ่าย (%s)", name, months))
 		}
@@ -418,6 +440,61 @@ func (s *ExportService) TermExportBlockers(ctx context.Context, termID uuid.UUID
 	return out, nil
 }
 
+type profileBlocker struct{ name, issue string }
+
+// profileBlockers names the TAs paid by this slice (approved work in it) whose
+// documents would make the claim defective — the same rule as
+// validatePayoutReadiness and the staff sign-off (payoutIssue).
+func (s *ExportService) profileBlockers(ctx context.Context, courseID uuid.UUID, months []string) ([]profileBlocker, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT a.ta_id,
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
+		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
+		       COALESCE(u.first_name,'')
+		FROM sections sec
+		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		JOIN users u ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
+		JOIN work_logs wl ON wl.assignment_id = a.id AND wl.status = 'approved'
+		WHERE sec.teaching_course_id = $1
+		  AND `+monthFilterSQL("wl.work_date", "$2")+`
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		ORDER BY 3`, courseID, months)
+	if err != nil {
+		return nil, err
+	}
+	type ta struct {
+		id   uuid.UUID
+		name string
+	}
+	var tas []ta
+	for rows.Next() {
+		var t ta
+		var sortName string
+		if err := rows.Scan(&t.id, &t.name, &sortName); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		tas = append(tas, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []profileBlocker
+	for _, t := range tas {
+		issue, err := payoutIssue(ctx, s.pool, t.id)
+		if err != nil {
+			return nil, err
+		}
+		if issue != "" {
+			out = append(out, profileBlocker{name: t.name, issue: issue})
+		}
+	}
+	return out, nil
+}
+
 type classClashMonth struct {
 	name, yearMonth string
 	rows            int
@@ -437,7 +514,10 @@ func (s *ExportService) approvedClassClashes(ctx context.Context, courseID uuid.
 		SELECT a.ta_id, tc.term_id,
 		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '')||
 		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
-		       TO_CHAR(wl.work_date,'YYYY-MM'), TO_CHAR(wl.work_date,'YYYY-MM-DD'),
+		       -- The period's academic key ("2569-10"), the same key every other
+		       -- blocker carries: thaiMonthLabelsBE reads it as an ACADEMIC year,
+		       -- and the Gregorian "2026-10" printed as "ตุลาคม 2026".
+		       sp.year_month, TO_CHAR(wl.work_date,'YYYY-MM-DD'),
 		       TO_CHAR(wl.start_time,'HH24:MI'), TO_CHAR(wl.end_time,'HH24:MI')
 		FROM teaching_courses tc
 		JOIN academic_terms trm ON trm.id = tc.term_id

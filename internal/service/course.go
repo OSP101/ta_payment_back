@@ -38,7 +38,7 @@ type PayRate struct {
 	UndergradSpecial float64   `json:"undergrad_special" validate:"gte=0"` // hourly, ประกาศ 1080/2565 = 50 ฿/hr
 	// Deprecated: kept for rollback safety. Payment/budget now read GraduateRegularHourly.
 	GraduateRegular        float64 `json:"graduate_regular" validate:"gte=0"`
-	GraduateSpecialLumpsum float64 `json:"graduate_special_lumpsum" validate:"gte=0"` // monthly lump-sum, ประกาศ = 4,000 ฿/เดือน
+	GraduateSpecialLumpsum float64 `json:"graduate_special_lumpsum" validate:"gte=0"` // whole-term lump per TA × course, ประกาศ = 4,000 ฿/ภาค
 	// Undergrad budget formula constants (from historical Excel workbook):
 	UGLectureHoursPerCredit float64 `json:"ug_lecture_hours_per_credit" validate:"gte=0"`
 	UGLabHoursPerCredit     float64 `json:"ug_lab_hours_per_credit" validate:"gte=0"`
@@ -51,7 +51,7 @@ type PayRate struct {
 	TermMonths            int     `json:"term_months" validate:"gte=0"`
 	// Policy limits (advisory) — from the official regulation notes.
 	UGMaxHoursPerDay     int `json:"ug_max_hours_per_day" validate:"gte=0"`    // undergrad regular: max hrs/day (7)
-	MaxCoursesPerStudent int `json:"max_courses_per_student" validate:"gte=0"` // any student: max concurrent TA courses (3)
+	MaxCoursesPerStudent int `json:"max_courses_per_student" validate:"gte=0"` // per-term TA course cap (1–10 checked in UpsertPayRate), read by maxCoursesPerTerm (default 3)
 	// New (migration 0018) — per-track daily caps + graduate hourly rate + term/day money caps.
 	GraduateRegularHourly   float64 `json:"graduate_regular_hourly" validate:"gte=0"`     // hourly rate for บัณฑิต regular (50 ฿/hr per ประกาศ)
 	GradSpecialTermCap      float64 `json:"grad_special_term_cap" validate:"gte=0"`       // per TA × course × term cap for บัณฑิต special (12,000 ฿)
@@ -226,6 +226,11 @@ func (s *CourseService) UpsertPayRate(ctx context.Context, actor uuid.UUID, in P
 	// Term length must be within a sane academic range (0 = use default).
 	if in.TermMonths > 12 {
 		return nil, Invalid("จำนวนเดือนต่อภาคเรียนต้องอยู่ระหว่าง 1 ถึง 12")
+	}
+	// The per-term course cap is enforced by maxCoursesPerTerm (ta_request.go);
+	// keep it within a range a real timetable could hold (0 = use default).
+	if in.MaxCoursesPerStudent > 10 {
+		return nil, Invalid("จำนวนวิชา TA สูงสุดต่อคนต้องอยู่ระหว่าง 1 ถึง 10")
 	}
 	// Fill defaults if the client didn't send the new fields
 	if in.UGLectureHoursPerCredit == 0 {

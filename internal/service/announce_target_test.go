@@ -169,8 +169,8 @@ func TestAudience_NamedPersonSelectsOnlyThem(t *testing.T) {
 	}
 }
 
-// Bases combine as a union: role OR named person.
-func TestAudience_BasesUnion(t *testing.T) {
+// A named person is reached on top of the group, whatever the group is.
+func TestAudience_NamedPersonIsAddedToTheGroup(t *testing.T) {
 	w := newTargetWorld(t)
 	got := w.resolve(t, AudienceRule{
 		Roles: []string{"lecturer"}, UserIDs: []uuid.UUID{w.taBehind},
@@ -183,19 +183,29 @@ func TestAudience_BasesUnion(t *testing.T) {
 	}
 }
 
-// An empty rule means everyone — but the preview has to SAY so, because an
-// officer reaching that by leaving fields blank is usually an accident.
-func TestAudience_EmptyRuleIsEveryoneAndSaysSo(t *testing.T) {
+// An empty rule used to mean everyone. Clearing the role chips to send to one
+// named person, then forgetting the name, mailed the whole faculty.
+func TestAudience_EmptyRuleSelectsNobodyAndSaysSo(t *testing.T) {
 	w := newTargetWorld(t)
 	p, err := w.svc.PreviewAudience(w.ctx, AudienceRule{TermID: &w.term})
 	if err != nil {
 		t.Fatalf("PreviewAudience: %v", err)
 	}
-	if !p.Everyone {
-		t.Error("an empty rule must be flagged as 'everyone', not shown as a plain number")
+	if p.Total != 0 || !p.Empty {
+		t.Errorf("an empty rule selected %d people (empty=%v), want nobody", p.Total, p.Empty)
 	}
-	if p.Total < 4 {
-		t.Errorf("everyone = %d, want at least the 4 people in the fixture", p.Total)
+	if p.Everyone {
+		t.Error("an empty rule must not be reported as 'everyone'")
+	}
+
+	all, err := w.svc.PreviewAudience(w.ctx, AudienceRule{
+		Roles: []string{"admin", "staff", "lecturer", "ta"}, TermID: &w.term,
+	})
+	if err != nil {
+		t.Fatalf("PreviewAudience: %v", err)
+	}
+	if !all.Everyone || all.Total < 4 {
+		t.Errorf("all four roles = %d people, everyone=%v; want the whole fixture, flagged", all.Total, all.Everyone)
 	}
 }
 

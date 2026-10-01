@@ -51,7 +51,7 @@ func TestCourseAndSectionEdits_DoNotDeadlock(t *testing.T) {
 			defer wg.Done()
 			<-start
 			errs[1] = svc.UpdateSection(ctx, f.StaffID, f.CourseID, f.SectionID,
-				UpdateSectionInput{NumStudents: &students})
+				UpdateSectionInput{NumStudents: &students, Confirm: true})
 		}()
 		close(start)
 		wg.Wait()

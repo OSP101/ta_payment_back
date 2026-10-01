@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -109,4 +110,18 @@ func WeeksInTerm(ctx context.Context, pool *pgxpool.Pool, teachingCourseID uuid.
 		months = 4
 	}
 	return float64(months) * 4.0
+}
+
+// validateRequestWindowRange is the TA-request window's own date rule: it must
+// close after it opens. A window saved with closes_at before opens_at was
+// never open for a single second, yet listed as a round, sent its "requests
+// are open" notice and counted as the term's window.
+func validateRequestWindowRange(opensAt, closesAt time.Time) error {
+	if opensAt.IsZero() || closesAt.IsZero() {
+		return Invalid("กรุณาระบุวันเวลาเปิดและปิดรับคำขอ")
+	}
+	if !closesAt.After(opensAt) {
+		return Invalid("วันเวลาปิดรับคำขอต้องอยู่หลังวันเวลาเปิดรับ")
+	}
+	return nil
 }

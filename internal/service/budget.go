@@ -7,6 +7,75 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// loadBudgetRates reads the formula constants in force plus the course's own
+// term months (the source of truth; pay_rates.term_months is only the
+// fallback). A missing pay_rates row leaves the zero value, which Compute has
+// always treated as "no budget" rather than an error.
+//
+// Takes a querier so an edit can price the course INSIDE its own transaction —
+// see guardBudgetChange, which compares the ceiling before and after a write.
+func loadBudgetRates(ctx context.Context, q querier, tcID uuid.UUID) BudgetRates {
+	rates := BudgetRates{}
+	_ = q.QueryRow(ctx, `
+		SELECT ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
+		       baseline_students_lecture, baseline_students_lab,
+		       ug_workload_rate_regular,
+		       graduate_regular, graduate_special_lumpsum, term_months
+		FROM `+payRatesInForce+``).Scan(
+		&rates.UGLectureHoursPerCredit, &rates.UGLabHoursPerCredit,
+		&rates.BaselineStudentsLecture, &rates.BaselineStudentsLab,
+		&rates.UGWorkloadRateRegular,
+		&rates.GraduateRegularLumpsum, &rates.GraduateSpecialLumpsum, &rates.TermMonths,
+	)
+	var termMonths int
+	_ = q.QueryRow(ctx, `
+		SELECT t.months FROM academic_terms t
+		JOIN teaching_courses tc ON tc.term_id = t.id WHERE tc.id = $1`, tcID).Scan(&termMonths)
+	if termMonths > 0 {
+		rates.TermMonths = termMonths
+	}
+	return rates
+}
+
+// ugWeeklyWorkload is the workbook's weekly-hours formula for one track —
+// shared by Compute and courseFormulaBudget so the figure an edit is checked
+// against is the figure every screen shows.
+func ugWeeklyWorkload(lectureCredits, labCredits, students int, rates BudgetRates) float64 {
+	var lec, lab float64
+	if lectureCredits > 0 && rates.BaselineStudentsLecture > 0 {
+		lec = float64(lectureCredits) * rates.UGLectureHoursPerCredit *
+			(float64(students) / float64(rates.BaselineStudentsLecture))
+	}
+	if labCredits > 0 && rates.BaselineStudentsLab > 0 {
+		lab = float64(labCredits) * rates.UGLabHoursPerCredit *
+			(float64(students) / float64(rates.BaselineStudentsLab))
+	}
+	return lec + lab
+}
+
+// courseFormulaBudget is Compute's PerCourseMaxBaht alone — the term ceiling
+// the workload formula gives — read through q, so a caller holding a
+// transaction sees its own uncommitted edit.
+func courseFormulaBudget(ctx context.Context, q querier, tcID uuid.UUID) (float64, error) {
+	var total, regular, special, lecHrs, labHrs int
+	if err := q.QueryRow(ctx, `
+		SELECT num_students, num_students_regular, num_students_special, lecture_hrs, lab_hrs
+		FROM teaching_courses WHERE id = $1`, tcID).Scan(&total, &regular, &special, &lecHrs, &labHrs); err != nil {
+		return 0, err
+	}
+	// Same fallbacks as Compute: lab credits are lab hours ÷ 2, and an
+	// aggregate with no per-track split counts as regular.
+	if regular == 0 && special == 0 && total > 0 {
+		regular = total
+	}
+	rates := loadBudgetRates(ctx, q, tcID)
+	if rates.TermMonths <= 0 {
+		return 0, nil
+	}
+	weekly := ugWeeklyWorkload(lecHrs, labHrs/2, regular, rates) + ugWeeklyWorkload(lecHrs, labHrs/2, special, rates)
+	return weekly * rates.UGWorkloadRateRegular * float64(rates.TermMonths), nil
+}
+
 // BudgetService encapsulates budget & hour cap calculations for a teaching course.
 type BudgetService struct {
 	pool *pgxpool.Pool
@@ -114,43 +183,13 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	// — set below after workload is computed. There is no manual per-course cap
 	// table any more (budget_caps, removed 15/09/2026 — TOR §3.4 ข.4).
 
-	rates := BudgetRates{}
-	if err := s.pool.QueryRow(ctx, `
-		SELECT ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
-		       baseline_students_lecture, baseline_students_lab,
-		       ug_workload_rate_regular,
-		       graduate_regular, graduate_special_lumpsum, term_months
-		FROM `+payRatesInForce+``).Scan(
-		&rates.UGLectureHoursPerCredit, &rates.UGLabHoursPerCredit,
-		&rates.BaselineStudentsLecture, &rates.BaselineStudentsLab,
-		&rates.UGWorkloadRateRegular,
-		&rates.GraduateRegularLumpsum, &rates.GraduateSpecialLumpsum, &rates.TermMonths,
-	); err == nil {
-		snap.Rates = rates
-	}
-	// Prefer per-term months (source of truth); fall back to pay_rates.term_months.
-	var termMonths int
-	_ = s.pool.QueryRow(ctx, `
-		SELECT t.months FROM academic_terms t
-		JOIN teaching_courses tc ON tc.term_id = t.id WHERE tc.id = $1`, tcID).Scan(&termMonths)
-	if termMonths > 0 {
-		rates.TermMonths = termMonths
-		snap.Rates.TermMonths = termMonths
-	}
+	rates := loadBudgetRates(ctx, s.pool, tcID)
+	snap.Rates = rates
 
 	// Weekly workload per Excel — identical formula for regular vs special,
 	// only the student count differs.
 	workload := func(students int) float64 {
-		var lec, lab float64
-		if snap.LectureCredits > 0 && rates.BaselineStudentsLecture > 0 {
-			lec = float64(snap.LectureCredits) * rates.UGLectureHoursPerCredit *
-				(float64(students) / float64(rates.BaselineStudentsLecture))
-		}
-		if snap.LabCredits > 0 && rates.BaselineStudentsLab > 0 {
-			lab = float64(snap.LabCredits) * rates.UGLabHoursPerCredit *
-				(float64(students) / float64(rates.BaselineStudentsLab))
-		}
-		return lec + lab
+		return ugWeeklyWorkload(snap.LectureCredits, snap.LabCredits, students, rates)
 	}
 	snap.WeeklyWorkloadRegular = workload(snap.NumStudentsRegular)
 	snap.WeeklyWorkloadSpecial = workload(snap.NumStudentsSpecial)

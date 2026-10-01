@@ -33,31 +33,112 @@ type ExportBatch struct {
 	// Months is the fiscal slice this ZIP covered, Gregorian "YYYY-MM". Empty
 	// for batches recorded before the split existed — those were whole-term.
 	Months []string `json:"months,omitempty"`
+	// Version is 1 for the first document of these months and n+1 for each
+	// corrected document issued after a deliberate send-back or unlock
+	// ("ฉบับแก้ไข ครั้งที่ n" = version-1). PreviousBatchID is the document it
+	// replaced; that batch stays in the history, marked SupersededBy.
+	Version         int        `json:"version"`
+	PreviousBatchID *uuid.UUID `json:"previous_batch_id,omitempty"`
+	SupersededBy    *uuid.UUID `json:"superseded_by,omitempty"`
 }
 
 // Record persists a batch that has already been written to storage.
 func (s *ExportBatchService) Record(ctx context.Context, actor uuid.UUID, in ExportBatch) (*ExportBatch, error) {
 	in.ID = uuid.New()
-	in.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
 	in.GeneratedBy = actor
 	if err := writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "export_batch.record",
 			Entity: "teaching_course", EntityID: in.TeachingCourseID.String(), After: in},
 		func(tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `
+			if err := batchVersion(ctx, tx, &in); err != nil {
+				return err
+			}
+			// generated_at is the DATABASE clock, like the exported_at of the
+			// lock this batch follows: the version and archive checks compare
+			// the two, and an app-side timestamp (second-truncated, possibly
+			// skewed) could read as older than the lock it came after.
+			err := tx.QueryRow(ctx, `
 				INSERT INTO export_batches
 				    (id, teaching_course_id, submission_period_id,
 				     file_path, file_name, ta_count, total_baht,
-				     generated_at, generated_by, months)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz,$9,$10)`,
+				     generated_at, generated_by, months, version, previous_batch_id)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11)
+				RETURNING to_char(generated_at, 'YYYY-MM-DD"T"HH24:MI:SS.USTZH:TZM')`,
 				in.ID, in.TeachingCourseID, in.SubmissionPeriodID,
 				in.FilePath, in.FileName, in.TACount, in.TotalBaht,
-				in.GeneratedAt, in.GeneratedBy, in.Months)
+				in.GeneratedBy, in.Months, in.Version, in.PreviousBatchID).Scan(&in.GeneratedAt)
 			return err
 		}); err != nil {
 		return nil, err
 	}
 	return &in, nil
+}
+
+// batchVersion decides whether a batch is a new document or a corrected one.
+//
+// The latest earlier batch covering any of the same months is the one this
+// may replace. It IS replaced — a new version — when one of those shared
+// months was locked again after that batch was issued: the month was sent
+// back (or unlocked) and exported anew, so its figures may differ and finance
+// must be told this document supersedes the old one. Otherwise the batch is the
+// same version as the one it overlaps (a reprint, or a further slice).
+func batchVersion(ctx context.Context, tx pgx.Tx, in *ExportBatch) error {
+	in.Version = 1
+	in.PreviousBatchID = nil
+	var prevID uuid.UUID
+	var prevVersion int
+	var prevAt time.Time
+	var prevMonths []string
+	err := tx.QueryRow(ctx, `
+		SELECT id, version, generated_at, COALESCE(months, '{}')
+		FROM export_batches
+		WHERE teaching_course_id = $1
+		  AND (months IS NULL OR COALESCE(cardinality($2::text[]), 0) = 0 OR months && $2::text[])
+		ORDER BY generated_at DESC
+		LIMIT 1`, in.TeachingCourseID, in.Months).Scan(&prevID, &prevVersion, &prevAt, &prevMonths)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	shared := in.Months
+	if len(prevMonths) > 0 && len(in.Months) > 0 {
+		inPrev := map[string]bool{}
+		for _, m := range prevMonths {
+			inPrev[m] = true
+		}
+		shared = nil
+		for _, m := range in.Months {
+			if inPrev[m] {
+				shared = append(shared, m)
+			}
+		}
+	}
+	var relocked bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+		    SELECT 1
+		    FROM submission_period_status st
+		    JOIN submission_periods sp ON sp.id = st.submission_period_id
+		    JOIN teaching_courses tc   ON tc.id = st.teaching_course_id
+		    JOIN academic_terms trm    ON trm.id = tc.term_id
+		    WHERE st.teaching_course_id = $1
+		      AND st.status IN ('exported','finance_sent')
+		      AND st.exported_at > $2
+		      AND (COALESCE(cardinality($3::text[]), 0) = 0 OR EXISTS (
+		            SELECT 1 FROM unnest($3::text[]) m
+		            WHERE sp.year_month = trm.academic_year::text || '-' || substr(m, 6, 2))))`,
+		in.TeachingCourseID, prevAt, shared).Scan(&relocked); err != nil {
+		return err
+	}
+	if relocked {
+		in.Version = prevVersion + 1
+		in.PreviousBatchID = &prevID
+	} else {
+		in.Version = prevVersion
+	}
+	return nil
 }
 
 // Get returns one batch by id, for BatchDownload to resolve which file to
@@ -85,7 +166,9 @@ func (s *ExportBatchService) ListByCourse(ctx context.Context, tcID uuid.UUID) (
 		       b.file_path, b.file_name, b.ta_count, b.total_baht,
 		       TO_CHAR(b.generated_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM'),
 		       b.generated_by, u.first_name||' '||u.last_name,
-		       COALESCE(b.months, '{}')
+		       COALESCE(b.months, '{}'), b.version, b.previous_batch_id,
+		       (SELECT n.id FROM export_batches n
+		         WHERE n.previous_batch_id = b.id ORDER BY n.generated_at LIMIT 1)
 		FROM export_batches b
 		JOIN users u ON u.id = b.generated_by
 		WHERE b.teaching_course_id = $1
@@ -99,7 +182,8 @@ func (s *ExportBatchService) ListByCourse(ctx context.Context, tcID uuid.UUID) (
 		var b ExportBatch
 		if err := rows.Scan(&b.ID, &b.TeachingCourseID, &b.SubmissionPeriodID,
 			&b.FilePath, &b.FileName, &b.TACount, &b.TotalBaht,
-			&b.GeneratedAt, &b.GeneratedBy, &b.GeneratedByName, &b.Months); err != nil {
+			&b.GeneratedAt, &b.GeneratedBy, &b.GeneratedByName, &b.Months,
+			&b.Version, &b.PreviousBatchID, &b.SupersededBy); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -133,6 +217,12 @@ type CourseSummary struct {
 	// and the screen has to say so. Kept apart from UnreviewedMonths for exactly
 	// that reason: the two call for different actions from different screens.
 	AwaitingAppointment []string `json:"awaiting_appointment,omitempty"`
+	// ProfileNotReady names TAs with approved work on this course whose
+	// profile or creditor form is not approved ("ชื่อ (เหตุผล)"). The export
+	// refuses the whole course for them (validatePayoutReadiness), and the
+	// staff sign-off now refuses their months, so neither ReviewComplete nor
+	// ExportEligible may read true while any is listed.
+	ProfileNotReady []string `json:"profile_not_ready,omitempty"`
 
 	// HasAppointmentOrder is whether a printed appointment order covers this
 	// course (see AppointedSQL). Until it does, the TA's work is not official and
@@ -422,13 +512,60 @@ func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *Budge
 		out[i].AwaitingAppointment = awaiting[out[i].TeachingCourseID]
 	}
 
-	// Decide eligibility last, once both inputs exist. Both conditions, not
-	// either: the order makes the work official, the review makes the amounts
-	// final, and an export missing either produces a package the finance office
-	// sends back.
+	// TA documents not approved — same rule as payoutIssue, in one query for
+	// the whole term rather than one per TA.
+	profileRows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tc.id,
+		       COALESCE(NULLIF(p.prefix,''), NULLIF(u.title,''), '')||
+		       COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,'') || ' (' ||
+		       CASE WHEN p.user_id IS NULL THEN 'ยังไม่กรอกโปรไฟล์'
+		            WHEN p.status::text <> 'approved' THEN 'โปรไฟล์ยังไม่ผ่านการอนุมัติ'
+		            ELSE 'ยังไม่มีแบบฟอร์มเจ้าหนี้ที่อนุมัติแล้ว' END || ')'
+		FROM teaching_courses tc
+		JOIN sections sec          ON sec.teaching_course_id = tc.id
+		JOIN ta_request_assignments a ON a.section_id = sec.id AND a.state <> 'dropped'
+		JOIN ta_requests r         ON r.id = a.request_id AND r.status = 'approved'
+		JOIN users u               ON u.id = a.ta_id
+		LEFT JOIN ta_profiles p    ON p.user_id = u.id
+		WHERE ($1::uuid IS NULL OR tc.term_id = $1)
+		  AND (a.level::text NOT IN ('master','phd') OR sec.track <> 'special')
+		  AND EXISTS (SELECT 1 FROM work_logs wl
+		               WHERE wl.assignment_id = a.id AND wl.status = 'approved')
+		  AND (p.user_id IS NULL OR p.status::text <> 'approved'
+		       OR NOT EXISTS (SELECT 1 FROM ta_documents d
+		                       WHERE d.user_id = a.ta_id AND d.kind = 'creditor_form'
+		                         AND d.superseded_at IS NULL AND d.status = 'approved'))
+		ORDER BY 2`,
+		uuid.NullUUID{UUID: termID, Valid: termID != uuid.Nil})
+	if err != nil {
+		return nil, err
+	}
+	notReady := map[uuid.UUID][]string{}
+	for profileRows.Next() {
+		var tc uuid.UUID
+		var label string
+		if err := profileRows.Scan(&tc, &label); err != nil {
+			profileRows.Close()
+			return nil, err
+		}
+		notReady[tc] = append(notReady[tc], label)
+	}
+	if err := profileRows.Err(); err != nil {
+		profileRows.Close()
+		return nil, err
+	}
+	profileRows.Close()
+	for i := range out {
+		out[i].ProfileNotReady = notReady[out[i].TeachingCourseID]
+	}
+
+	// Decide eligibility last, once every input exists. All conditions, not
+	// any: the order makes the work official, the review makes the amounts
+	// final, the TA's documents make the claim payable, and an export missing
+	// any of them produces a package the finance office sends back.
 	for i := range out {
 		out[i].ReviewComplete = anySignedOff[out[i].TeachingCourseID] &&
-			len(out[i].UnreviewedMonths) == 0
+			len(out[i].UnreviewedMonths) == 0 && len(out[i].ProfileNotReady) == 0
 		out[i].ExportEligible = out[i].HasAppointmentOrder && out[i].ReviewComplete &&
 			len(out[i].AwaitingAppointment) == 0
 	}

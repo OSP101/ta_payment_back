@@ -36,6 +36,9 @@ func reviewFixture(t *testing.T) (*fixture, string) {
 	t.Helper()
 	f, month := reviewFixtureWithoutOrder(t)
 	f.addAppointmentOrder()
+	// The sign-off requires the TA's documents to be approved (WP3, bug 7);
+	// tests about what review does with a month start from a payable TA.
+	payoutReady(f)
 	return f, month
 }
 

@@ -31,7 +31,21 @@ func TestCommitImport_RealFileSeparatesWarningsFromErrors(t *testing.T) {
 	svc := &TeachingService{pool: f.Pool, aud: audit.New(f.Pool)}
 	admin := f.insertUser("admin", "admin")
 
-	res, err := svc.CommitImport(f.ctx, admin, f.TermID, "รายวิชาที่เปิดสอน-1-2569.xlsx", body, nil, nil)
+	// No lecturers exist in the test database, so every course is
+	// "unmatched_officer". Since the commit follows the preview's decision,
+	// those import only when staff choose "สร้างโดยยังไม่ผูก" — simulate that
+	// choice for all of them, as the modal's default does.
+	preview, err := svc.PreviewImport(f.ctx, admin, f.TermID, "รายวิชาที่เปิดสอน-1-2569.xlsx", body)
+	if err != nil {
+		t.Fatalf("PreviewImport: %v", err)
+	}
+	var proceed []string
+	for _, c := range preview.Courses {
+		if c.Status == "unmatched_officer" {
+			proceed = append(proceed, c.Code)
+		}
+	}
+	res, err := svc.CommitImport(f.ctx, admin, f.TermID, "รายวิชาที่เปิดสอน-1-2569.xlsx", body, nil, nil, proceed...)
 	if err != nil {
 		t.Fatalf("CommitImport: %v", err)
 	}

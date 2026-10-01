@@ -86,7 +86,7 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 	// Lock the three current docs. Ordering by kind keeps the lock order
 	// deterministic across concurrent officers.
 	rows, err := tx.Query(ctx, `
-		SELECT id, kind FROM ta_documents
+		SELECT id, kind, status::text FROM ta_documents
 		WHERE user_id = $1
 		  AND kind = ANY($2)
 		  AND superseded_at IS NULL
@@ -96,13 +96,14 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		return nil, err
 	}
 	type docRow struct {
-		id   uuid.UUID
-		kind string
+		id     uuid.UUID
+		kind   string
+		status string
 	}
 	var docs []docRow
 	for rows.Next() {
 		var d docRow
-		if err := rows.Scan(&d.id, &d.kind); err != nil {
+		if err := rows.Scan(&d.id, &d.kind, &d.status); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -115,6 +116,15 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 	rows.Close()
 	if len(docs) < len(requiredDocKinds) {
 		return nil, Invalid("เอกสารบังคับยังไม่ครบ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)")
+	}
+
+	// Same rule as Review: a document the officer rejected stays rejected
+	// until the TA uploads a replacement. Approve-all must not sweep it back
+	// to approved together with the other two.
+	for _, d := range docs {
+		if d.status == "rejected" || d.status == "needs_fix" {
+			return nil, Conflict(kindLabel(d.kind) + " ถูกตีกลับแล้ว ต้องรอให้ TA อัปโหลดฉบับใหม่ก่อนจึงจะอนุมัติได้")
+		}
 	}
 
 	ids := make([]uuid.UUID, 0, len(docs))

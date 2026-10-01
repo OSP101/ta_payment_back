@@ -117,12 +117,19 @@ func newTestSlot(t *testing.T) (*Slot, *pgxpool.Pool) {
 // The dataset has to show every case the dashboard answers, and its money
 // has to add up the same way everywhere, or it is a poor thing to present.
 func TestPresentationDatasetCoversEveryCase(t *testing.T) {
-	// The term is anchored on "today", and how many classes each TA has
-	// taught shifts with the weekday — the money cases must hold on any day.
-	for _, back := range []int{0, 3, 5} {
-		now := timeutil.Now().AddDate(0, 0, -back)
-		t.Run(now.Weekday().String(), func(t *testing.T) { presentationCoversEveryCase(t, now) })
-	}
+	// Seeded at the REAL now, only. The seed takes `now` as a parameter, but
+	// the services it drives do not: whether a submission period is closed is
+	// decided by Postgres's CURRENT_DATE (periodClosedSQL), which no Go hook
+	// can move. Seeding at any other date puts the dataset and the database
+	// on different days — that was the flake: the old "3 and 5 days ago"
+	// variants and the pinned 2026-10-01 case pass or fail depending on which
+	// real day the suite runs (seeding at 2026-09-30 on 2026-10-01 already
+	// fails with "ปิดรับบันทึกเวลาแล้ว"; 2027-01-04 empties a bucket).
+	// Running at the real date is the only seed/DB pairing the product
+	// itself ever uses, so it is the one that must hold — on whatever day,
+	// weekday or month boundary the suite happens to run.
+	now := timeutil.Now()
+	t.Run(now.Format("2006-01-02"), func(t *testing.T) { presentationCoversEveryCase(t, now) })
 }
 
 func presentationCoversEveryCase(t *testing.T, now time.Time) {

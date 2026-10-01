@@ -187,17 +187,20 @@ type CreateTeachingCourseInput struct {
 	// rejects an empty Code outright but fills a blank NameTH in from NameEN or
 	// Code itself — a struct tag can't express "required unless X", so that
 	// fallback stays exactly where it is.
-	Code        string               `json:"code" validate:"required"`
-	NameTH      string               `json:"name_th"`
-	NameEN      *string              `json:"name_en,omitempty"`
-	Level       string               `json:"level" validate:"omitempty,oneof=undergrad graduate"`
-	Credits     int                  `json:"credits" validate:"gte=0"`
-	LectureHrs  int                  `json:"lecture_hrs" validate:"gte=0"`
-	LabHrs      int                  `json:"lab_hrs" validate:"gte=0"`
-	SelfHrs     int                  `json:"self_hrs" validate:"gte=0"`
+	Code   string  `json:"code" validate:"required"`
+	NameTH string  `json:"name_th"`
+	NameEN *string `json:"name_en,omitempty"`
+	Level  string  `json:"level" validate:"omitempty,oneof=undergrad graduate"`
+	// The numeric fields carry no validator tags on purpose: the tag fires
+	// first and answers in English ("credits must be ..."). Create checks them
+	// with the shared rules in teaching_rules.go, in Thai.
+	Credits     int                  `json:"credits"`
+	LectureHrs  int                  `json:"lecture_hrs"`
+	LabHrs      int                  `json:"lab_hrs"`
+	SelfHrs     int                  `json:"self_hrs"`
 	StartsOn    *string              `json:"starts_on,omitempty"`
 	EndsOn      *string              `json:"ends_on,omitempty"`
-	NumStudents int                  `json:"num_students" validate:"gte=0"`
+	NumStudents int                  `json:"num_students"`
 	LecturerIDs []uuid.UUID          `json:"lecturer_ids"`
 	Sections    []CourseSectionInput `json:"sections"`
 }
@@ -261,16 +264,35 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 	if in.Level != "undergrad" && in.Level != "graduate" {
 		return uuid.Nil, Invalid("ระดับวิชาต้องเป็นปริญญาตรีหรือบัณฑิตศึกษา")
 	}
+	// The same number rules /info, /num-students, the section editor and the
+	// import apply (teaching_rules.go) — Create used to apply none of them.
+	if err := validateCourseNumbers(courseNumbers{in.Credits, in.LectureHrs, in.LabHrs, in.SelfHrs}); err != nil {
+		return uuid.Nil, err
+	}
+	if err := validateCourseStudents(in.NumStudents); err != nil {
+		return uuid.Nil, err
+	}
+	if err := validateCourseDates(ctx, s.pool, in.TermID, in.StartsOn, in.EndsOn); err != nil {
+		return uuid.Nil, err
+	}
 	// Credit hours come straight from the input now (no catalog lookup); they
 	// gate which schedule kinds a section may carry.
 	lecHrs, labHrs := in.LectureHrs, in.LabHrs
+	sectionTotal := 0
 	for _, sec := range in.Sections {
+		if err := validateSectionStudents(sec.NumStudents, "Sec "+sec.SecNo); err != nil {
+			return uuid.Nil, err
+		}
+		sectionTotal += sec.NumStudents
 		if err := validateSectionSchedules(sec.Schedules, lecHrs, labHrs); err != nil {
 			return uuid.Nil, err
 		}
 		if sec.Curriculum != nil && *sec.Curriculum != "" && !validCurriculum(*sec.Curriculum) {
 			return uuid.Nil, Invalid("หลักสูตรไม่ถูกต้อง")
 		}
+	}
+	if err := validateCourseStudents(sectionTotal); err != nil {
+		return uuid.Nil, err
 	}
 	// Unique within the term across BOTH code columns: a code that was merged
 	// into another course as an alternate must not be opened again on its own.
@@ -971,8 +993,10 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 }
 
 // SetNumStudents updates aggregate + per-track counts. Callers may pass -1 for
-// a field they don't want to change (current value is kept).
-func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUID, total, regular, special int) error {
+// a field they don't want to change (current value is kept). confirm
+// acknowledges a budget change on a course with approved TAs or hours — see
+// guardBudgetChange; without it such a change is refused with a preview.
+func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUID, total, regular, special int, confirm bool) error {
 	// Staff-only, like the per-section headcount it aggregates: these numbers
 	// come off the registrar file and drive the budget and the TA hour ceiling.
 	priv, err := courseAccess(ctx, s.pool, actor, id)
@@ -989,12 +1013,11 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 	if err := s.assertNotExported(ctx, nil, id); err != nil {
 		return err
 	}
-	// A plausibility ceiling, not a policy: the largest real section in the
-	// registrar file is a few hundred. It catches the extra-zero typo that
-	// silently multiplies the budget tenfold.
-	const maxStudentsPerTrack = 3000
-	if regular > maxStudentsPerTrack || special > maxStudentsPerTrack || total > 2*maxStudentsPerTrack {
-		return Invalid(fmt.Sprintf("จำนวนนักศึกษาต่อภาคต้องไม่เกิน %d คน กรุณาตรวจตัวเลขอีกครั้ง", maxStudentsPerTrack))
+	// -1 is the "leave unchanged" sentinel; anything below it is a bad value,
+	// not a sentinel. Ceilings are the shared per-course rule
+	// (teaching_rules.go), applied below to the merged figures.
+	if total < -1 || regular < -1 || special < -1 {
+		return Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
 	}
 	// Fetch current values so we can preserve untouched fields.
 	var curTotal, curRegular, curSpecial int
@@ -1019,6 +1042,11 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 	} else if total < 0 {
 		total = curTotal
 	}
+	for _, n := range []int{regular, special, total} {
+		if err := validateCourseStudents(n); err != nil {
+			return err
+		}
+	}
 	// Student counts drive the workload formula, so a change here moves money.
 	// The hand-built After is dropped in favour of the column diff, which also
 	// carries what the counts WERE.
@@ -1027,7 +1055,11 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 			Entity: "teaching_course", EntityID: id.String()},
 		"teaching_courses", id,
 		func(tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `
+			before, err := courseFormulaBudget(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
 				UPDATE teaching_courses
 				SET num_students = $1,
 				    num_students_regular = $2,
@@ -1035,8 +1067,10 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 				    num_students_regular_entered = num_students_regular_entered OR $5,
 				    num_students_special_entered = num_students_special_entered OR $6,
 				    updated_at = NOW()
-				WHERE id = $4`, total, regular, special, id, regularSent, specialSent)
-			return err
+				WHERE id = $4`, total, regular, special, id, regularSent, specialSent); err != nil {
+				return err
+			}
+			return guardBudgetChange(ctx, tx, id, before, confirm)
 		})
 }
 
@@ -1228,6 +1262,31 @@ func (s *TeachingService) UpdateSettings(ctx context.Context, actor, id uuid.UUI
 	if !priv {
 		return Forbidden("ช่วงวันที่ของรายวิชาต้องให้เจ้าหน้าที่กำหนด อ้างอิงตามภาคการศึกษา")
 	}
+	// Validate the range the course will END UP with (sent fields over stored
+	// ones): a reversed range (start 2030, end 2020) or one outside the term
+	// used to save, leaving a course nobody could log work into.
+	if in.StartsOn != nil || in.EndsOn != nil {
+		var termID uuid.UUID
+		var curStart, curEnd *string
+		if err := s.pool.QueryRow(ctx,
+			`SELECT term_id, TO_CHAR(starts_on,'YYYY-MM-DD'), TO_CHAR(ends_on,'YYYY-MM-DD')
+			   FROM teaching_courses WHERE id = $1`, id).Scan(&termID, &curStart, &curEnd); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		st, en := curStart, curEnd
+		if in.StartsOn != nil {
+			st = in.StartsOn
+		}
+		if in.EndsOn != nil {
+			en = in.EndsOn
+		}
+		if err := validateCourseDates(ctx, s.pool, termID, st, en); err != nil {
+			return err
+		}
+	}
 	sets := []string{}
 	args := []any{}
 	i := 1
@@ -1283,6 +1342,15 @@ type UpdateCourseInfoInput struct {
 	// every section, which is what the open dialog promises ("แก้ทีหลังได้ที่
 	// หน้าตั้งค่ารายวิชา"); per-section overrides stay available on each section.
 	Curriculum *string `json:"curriculum,omitempty"`
+	// Level is accepted only to be REFUSED with a reason. Without the field a
+	// body {"level":"graduate"} decoded to nothing and answered ok while
+	// changing nothing — staff believed the level had moved. See the doc
+	// comment on UpdateCourseInfo for why it is not editable.
+	Level *string `json:"level,omitempty"`
+	// Confirm acknowledges a budget change on a course that already has
+	// approved TAs or hours (guardBudgetChange). Ignored when the edit does not
+	// move the budget.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
 // UpdateCourseInfo corrects a course's identity — code, name, credits, hours,
@@ -1306,6 +1374,9 @@ func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.U
 	}
 	if !priv {
 		return Forbidden("ข้อมูลรายวิชาต้องให้เจ้าหน้าที่แก้ไข")
+	}
+	if in.Level != nil {
+		return Invalid("แก้ระดับรายวิชา (ปริญญาตรี/บัณฑิตศึกษา) ที่หน้านี้ไม่ได้ ระดับกำหนดอัตราค่าตอบแทนและเพดานที่ใช้กับงานที่ลงไว้แล้ว หากระดับผิดจริง ให้ลบรายวิชาแล้วเปิดใหม่ (ทำได้เมื่อยังไม่มี TA หรือบันทึกเวลา)")
 	}
 	if err := s.assertNotExported(ctx, nil, id); err != nil {
 		return err
@@ -1358,28 +1429,39 @@ func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.U
 		}
 		i++
 	}
-	addInt := func(col string, v *int, label string) error {
-		if v == nil {
-			return nil
+	// Numbers are checked as the course will END UP — the sent fields merged
+	// over the stored ones — with the same rules every other path uses
+	// (teaching_rules.go). Checking only the sent field would let a credits-
+	// only edit leave "2 (3-0-6)" behind.
+	if in.Credits != nil || in.LectureHrs != nil || in.LabHrs != nil || in.SelfHrs != nil {
+		var cur courseNumbers
+		if err := s.pool.QueryRow(ctx,
+			`SELECT credits, lecture_hrs, lab_hrs, self_hrs FROM teaching_courses WHERE id = $1`, id).
+			Scan(&cur.Credits, &cur.LectureHrs, &cur.LabHrs, &cur.SelfHrs); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
 		}
-		if *v < 0 || *v > 30 {
-			return Invalid(label + "ต้องอยู่ระหว่าง 0 ถึง 30")
+		for _, f := range []struct {
+			col string
+			v   *int
+			dst *int
+		}{
+			{"credits", in.Credits, &cur.Credits},
+			{"lecture_hrs", in.LectureHrs, &cur.LectureHrs},
+			{"lab_hrs", in.LabHrs, &cur.LabHrs},
+			{"self_hrs", in.SelfHrs, &cur.SelfHrs},
+		} {
+			if f.v == nil {
+				continue
+			}
+			*f.dst = *f.v
+			sets = append(sets, fmt.Sprintf("%s = $%d", f.col, i))
+			args = append(args, *f.v)
+			i++
 		}
-		sets = append(sets, fmt.Sprintf("%s = $%d", col, i))
-		args = append(args, *v)
-		i++
-		return nil
-	}
-	for _, f := range []struct {
-		col, label string
-		v          *int
-	}{
-		{"credits", "หน่วยกิต", in.Credits},
-		{"lecture_hrs", "ชั่วโมงบรรยาย", in.LectureHrs},
-		{"lab_hrs", "ชั่วโมงปฏิบัติการ", in.LabHrs},
-		{"self_hrs", "ชั่วโมงศึกษาด้วยตนเอง", in.SelfHrs},
-	} {
-		if err := addInt(f.col, f.v, f.label); err != nil {
+		if err := validateCourseNumbers(cur); err != nil {
 			return err
 		}
 	}
@@ -1397,11 +1479,18 @@ func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.U
 		},
 		"teaching_courses", id,
 		func(tx pgx.Tx) error {
+			before, err := courseFormulaBudget(ctx, tx, id)
+			if err != nil {
+				return err
+			}
 			if len(sets) > 0 {
 				sets = append(sets, "updated_at = NOW()")
 				q := fmt.Sprintf("UPDATE teaching_courses SET %s WHERE id = $%d",
 					strings.Join(sets, ", "), i)
 				if _, err := tx.Exec(ctx, q, append(args, id)...); err != nil {
+					return err
+				}
+				if err := guardBudgetChange(ctx, tx, id, before, in.Confirm); err != nil {
 					return err
 				}
 			}
@@ -1474,10 +1563,11 @@ func (s *TeachingService) recomputeAggregate(ctx context.Context, tx pgx.Tx, tcI
 }
 
 type AddSectionInput struct {
-	SecNo       string  `json:"sec_no" validate:"required"`
-	Track       string  `json:"track" validate:"oneof=regular special"`
-	Room        *string `json:"room,omitempty" validate:"omitempty,max=200"`
-	NumStudents int     `json:"num_students" validate:"gte=0"`
+	SecNo string  `json:"sec_no" validate:"required"`
+	Track string  `json:"track" validate:"oneof=regular special"`
+	Room  *string `json:"room,omitempty" validate:"omitempty,max=200"`
+	// Untagged: validateSectionStudents answers in Thai; a tag would answer first, in English.
+	NumStudents int `json:"num_students"`
 	// Schedules is checked by validateSectionSchedules (kind/day/time-range/
 	// overlap/credit-hour gating) — a dive tag can't express those, so this
 	// stays untagged and the dedicated function remains the real check.
@@ -1507,8 +1597,8 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 	if in.SecNo == "" || (in.Track != "regular" && in.Track != "special") {
 		return uuid.Nil, ErrInvalidInput
 	}
-	if in.NumStudents < 0 {
-		return uuid.Nil, Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
+	if err := validateSectionStudents(in.NumStudents, ""); err != nil {
+		return uuid.Nil, err
 	}
 	lecHrs, labHrs, err := s.creditHrsForCourse(ctx, tcID)
 	if err != nil {
@@ -1541,6 +1631,9 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 		}
 	}
 	if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
+		return uuid.Nil, err
+	}
+	if err := assertCourseTotalStudents(ctx, tx, tcID); err != nil {
 		return uuid.Nil, err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "section.add",
@@ -1792,9 +1885,13 @@ func isHHMM(v string) bool {
 }
 
 type UpdateSectionInput struct {
-	SecNo       *string `json:"sec_no,omitempty" validate:"omitempty,max=200"`
-	Room        *string `json:"room,omitempty" validate:"omitempty,max=200"`
-	NumStudents *int    `json:"num_students,omitempty" validate:"omitempty,gte=0"`
+	SecNo *string `json:"sec_no,omitempty" validate:"omitempty,max=200"`
+	Room  *string `json:"room,omitempty" validate:"omitempty,max=200"`
+	// Untagged: validateSectionStudents answers in Thai; a tag would answer first, in English.
+	NumStudents *int `json:"num_students,omitempty"`
+	// Confirm acknowledges a budget change on a course with approved TAs or
+	// hours — see guardBudgetChange.
+	Confirm bool `json:"confirm,omitempty"`
 	// "" clears back to unknown; otherwise one of the CHECK-listed groups.
 	// This is the staff override the import respects (re-import fills only
 	// NULLs), so a wrong registrar value can be corrected once and stay put.
@@ -1826,8 +1923,10 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 	if !priv {
 		return errSectionsAreStaffOnly("การแก้ไข")
 	}
-	if in.NumStudents != nil && *in.NumStudents < 0 {
-		return Invalid("จำนวนนักศึกษาต้องไม่ติดลบ")
+	if in.NumStudents != nil {
+		if err := validateSectionStudents(*in.NumStudents, ""); err != nil {
+			return err
+		}
 	}
 	if in.Curriculum != nil && *in.Curriculum != "" && !validCurriculum(*in.Curriculum) {
 		return Invalid("หลักสูตรไม่ถูกต้อง")
@@ -1885,11 +1984,21 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 	if err != nil {
 		return err
 	}
+	budgetBefore, err := courseFormulaBudget(ctx, tx, tcID)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, q, args...); err != nil {
 		return err
 	}
 	if in.NumStudents != nil {
 		if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
+			return err
+		}
+		if err := assertCourseTotalStudents(ctx, tx, tcID); err != nil {
+			return err
+		}
+		if err := guardBudgetChange(ctx, tx, tcID, budgetBefore, in.Confirm); err != nil {
 			return err
 		}
 	}
@@ -1961,26 +2070,55 @@ func (s *TeachingService) MarkExported(ctx context.Context, tcID uuid.UUID) erro
 	return err
 }
 
-// Unexport clears the export lock so an accidentally-exported course can be
-// edited again. Admin-only (enforced at the route).
-func (s *TeachingService) Unexport(ctx context.Context, actor, tcID uuid.UUID) error {
+// Unexport is the admin "ปลดล็อก" (POST /exports/course/:id/unlock). It
+// used to clear only teaching_courses.exported_at: every exported month stayed
+// exported and write-locked, so nothing became editable, and the dashboards
+// that read the course flag said "not exported" while every screen reading the
+// months said "exported".
+//
+// It now reopens the course's exported months (not finance_sent) the same way
+// a staff send-back reopens one month (ReopenCourseExports →
+// reopenCellForCorrection): rows back to the TA as rejected with the reason,
+// months back to pending, the lecturer approves again, and the next export is
+// a corrected version. Admin-only (enforced at the route).
+func (s *TeachingService) Unexport(ctx context.Context, actor, tcID uuid.UUID, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "ผู้ดูแลระบบปลดล็อกเอกสารเบิกจ่ายของรายวิชาเพื่อให้แก้ไข"
+	}
+	periods := &SubmissionPeriodService{pool: s.pool, aud: s.aud, notify: s.notify}
+	name := periods.userDisplayName(ctx, actor)
+	var cells []reopenedCell
 	// The before-image carries the exported_at that is being cleared — which
 	// is the whole fact being reversed, and the only record that the course was
 	// ever locked.
-	return writeAuditedRow(ctx, s.pool, s.aud,
-		audit.Entry{ActorID: &actor, Action: "course.unexport", Entity: "teaching_course", EntityID: tcID.String()},
+	if err := writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "course.unexport", Entity: "teaching_course",
+			EntityID: tcID.String(), Note: reason},
 		"teaching_courses", tcID,
 		func(tx pgx.Tx) error {
-			tag, err := tx.Exec(ctx,
-				`UPDATE teaching_courses SET exported_at = NULL WHERE id = $1 AND exported_at IS NOT NULL`, tcID)
-			if err != nil {
+			var flagged bool
+			if err := tx.QueryRow(ctx,
+				`SELECT exported_at IS NOT NULL FROM teaching_courses WHERE id = $1`, tcID).Scan(&flagged); err != nil {
 				return err
 			}
-			if tag.RowsAffected() == 0 {
-				return Invalid("รายวิชานี้ยังไม่ได้ส่งออก จึงไม่มีอะไรให้ปลดล็อก")
+			var err error
+			if cells, err = ReopenCourseExports(ctx, tx, actor, name, tcID, reason); err != nil {
+				return err
 			}
-			return nil
-		})
+			if !flagged && len(cells) == 0 {
+				return Invalid("รายวิชานี้ไม่มีเดือนที่ส่งออกแล้ว จึงไม่มีอะไรให้ปลดล็อก (เดือนที่ส่งการเงินแล้วปลดล็อกด้วยวิธีนี้ไม่ได้)")
+			}
+			// Which months moved is the part of this act the course row cannot
+			// show, and the record anyone reconciling a re-issued document needs.
+			return s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.unlocked",
+				Entity: "teaching_course", EntityID: tcID.String(), Note: reason,
+				After: map[string]any{"reopened": cells}})
+		}); err != nil {
+		return err
+	}
+	periods.NotifyCourseReopened(ctx, actor, tcID, cells, reason)
+	return nil
 }
 
 // kindLabelTH names a class period the way the UI does, so a refusal the
@@ -2016,6 +2154,16 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	}
 	if _, err := timeutil.ParseDate(m.MakeupDate); err != nil {
 		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	// Both days inside the course window. assertMonthOpenForCourse below
+	// treats "no submission period for that month" as open, so a makeup on
+	// 2045-12-31 used to pass — and the TA could then never log it, because the
+	// worklog refuses any date outside the term.
+	if err := assertDateInCourseWindow(ctx, s.pool, tcID, m.OriginalDate, "วันที่งดสอน"); err != nil {
+		return err
+	}
+	if err := assertDateInCourseWindow(ctx, s.pool, tcID, m.MakeupDate, "วันสอนชดเชย"); err != nil {
+		return err
 	}
 	// The export lock is per MONTH, not per course. The old course-wide
 	// assertNotExported meant that exporting ธันวาคม froze makeups for
@@ -2290,8 +2438,9 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 // needed" — same identity (section/date/period) but no makeup date/time,
 // since none will ever be filed.
 type WaiveMakeupRequest struct {
-	OriginalDate string  `json:"original_date" validate:"required"`
-	Kind         string  `json:"kind" validate:"oneof=lecture lab"`
+	// Untagged: WaiveMakeup checks both and answers in Thai.
+	OriginalDate string  `json:"original_date"`
+	Kind         string  `json:"kind"`
 	Note         *string `json:"note,omitempty" validate:"omitempty,max=200"`
 }
 
@@ -2313,6 +2462,16 @@ func (s *TeachingService) WaiveMakeup(ctx context.Context, actor, sectionID uuid
 	origDay, err := time.Parse("2006-01-02", r.OriginalDate)
 	if err != nil {
 		return Invalid("รูปแบบวันที่ไม่ถูกต้อง")
+	}
+	if r.Kind != "lecture" && r.Kind != "lab" {
+		return Invalid("ชนิดคาบต้องเป็น lecture หรือ lab")
+	}
+	// The same gates AddMakeup applies to the cancelled day. A waiver used to
+	// skip them: it accepted 2040-01-02 (outside the course, so no TA could
+	// ever be affected by it) and a day whose class already had approved
+	// hours — "no makeup needed" for a class that evidently ran.
+	if err := assertDateInCourseWindow(ctx, s.pool, tcID, r.OriginalDate, "วันที่งดสอน"); err != nil {
+		return err
 	}
 	// Month-level lock, same as AddMakeup: only the cancelled day's month.
 	if err := assertMonthNotExportedForCourse(ctx, s.pool, tcID, r.OriginalDate); err != nil {
@@ -2342,6 +2501,23 @@ func (s *TeachingService) WaiveMakeup(ctx context.Context, actor, sectionID uuid
 	if !periodExists {
 		return Invalid("กลุ่มนี้ไม่มีคาบชนิดดังกล่าวในวันที่เลือก")
 	}
+	// Sent/approved hours for this very sitting mean the class ran — same
+	// refusal (and same way out) as AddMakeup's.
+	var taughtRows int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		  FROM work_logs wl
+		  JOIN ta_request_assignments a ON a.id = wl.assignment_id
+		 WHERE a.section_id = $1 AND wl.work_date = $2::date AND wl.activity = $3
+		   AND wl.status IN ('submitted','approved')`,
+		sectionID, r.OriginalDate, r.Kind).Scan(&taughtRows); err != nil {
+		return err
+	}
+	if taughtRows > 0 {
+		return Invalid(fmt.Sprintf(
+			"คาบ%sของวันที่ %s มีการลงเวลาปฏิบัติงานที่ส่งหรืออนุมัติแล้ว %d รายการ แสดงว่ามีการสอนตามปกติ จึงยกเว้นการชดเชยไม่ได้ หากคาบนี้ถูกยกเลิกจริง ให้อาจารย์ตีกลับรายการของวันนั้นก่อน",
+			kindLabelTH(r.Kind), thaiLongDateISO(r.OriginalDate), taughtRows))
+	}
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "makeup.waive", Entity: "section", EntityID: sectionID.String(), After: r},
 		func(tx pgx.Tx) error {
@@ -2352,6 +2528,19 @@ func (s *TeachingService) WaiveMakeup(ctx context.Context, actor, sectionID uuid
 				   SET waived = true, waived_by = EXCLUDED.waived_by, waived_at = NOW(),
 				       makeup_date = NULL, start_time = NULL, end_time = NULL, note = EXCLUDED.note`,
 				uuid.New(), sectionID, r.OriginalDate, r.Kind, actor, r.Note)
+			if err != nil {
+				return err
+			}
+			// The sitting is cancelled with no replacement, so unsent drafts the
+			// generator made for it must not ride along into the next submit —
+			// the same cleanup AddMakeup does for the day it replaces.
+			_, err = tx.Exec(ctx, `
+				DELETE FROM work_logs wl
+				 USING ta_request_assignments a
+				 WHERE a.id = wl.assignment_id
+				   AND a.section_id = $1 AND wl.work_date = $2::date
+				   AND wl.activity = $3 AND wl.status = 'draft'`,
+				sectionID, r.OriginalDate, r.Kind)
 			return err
 		})
 }
@@ -2460,6 +2649,10 @@ type ImportPreviewCourse struct {
 	MatchedLecturerNames []string `json:"matched_lecturer_names"`
 	UnmatchedNames       []string `json:"unmatched_names,omitempty"`
 	Note                 string   `json:"note,omitempty"`
+	// Problems explains an "invalid" row — why it will NOT be imported
+	// (unreadable credits, out-of-range hours or headcount). Shown in the
+	// preview, before the commit, which is where staff can still fix the file.
+	Problems []string `json:"problems,omitempty"`
 }
 
 type ImportPreview struct {
@@ -2468,6 +2661,12 @@ type ImportPreview struct {
 	NewCount      int                   `json:"new_count"`
 	ExistingCount int                   `json:"existing_count"`
 	BlockedCount  int                   `json:"blocked_count"`
+	// InvalidCount counts "invalid" rows (see ImportPreviewCourse.Problems).
+	InvalidCount int `json:"invalid_count"`
+	// Warnings/Errors are the per-row parse messages CommitImport would
+	// report — shown here so staff see them BEFORE committing, not after.
+	Warnings []string `json:"warnings"`
+	Errors   []string `json:"errors"`
 	// MergeGroups are the same-name / different-code groups staff are asked
 	// about before the commit (see teaching_merge.go). Empty when none.
 	MergeGroups []ImportMergeGroup `json:"merge_groups"`
@@ -2502,6 +2701,12 @@ type parsedCourse struct {
 	officerRaw      string
 	sectionsInOrder []string
 	sections        map[string]*parsedSection
+	// unitRaw/unitOK: the credit cell as written and whether parseUnit could
+	// read it. firstRow is the sheet row (1-based) the course starts on, for
+	// messages that point staff at the right place in the file.
+	unitRaw  string
+	unitOK   bool
+	firstRow int
 }
 
 // Officer tokens that are not real personal names — staff wrote them as
@@ -2613,6 +2818,15 @@ func isExamForLab(raw string) bool { return strings.HasPrefix(strings.TrimSpace(
 // Preference: the flattened sheet (exact name "Normalized", or a header row
 // containing "CourseCode"); then the raw sheet (name "sysTitle", or a header row
 // containing "COURSECODE1"); then the last sheet, guessed by its header.
+// errImportUnreadableMsg is the one answer for a file excelize cannot read,
+// whatever its reason (truncated zip, broken sheet XML, …).
+const errImportUnreadableMsg = "เปิดไฟล์ Excel ไม่ได้ ไฟล์อาจเสียหายหรือไม่ใช่ไฟล์ .xlsx ที่ถูกต้อง กรุณาดาวน์โหลดไฟล์จากระบบทะเบียนใหม่แล้วลองอีกครั้ง"
+
+// errImportNoCourses answers an .xlsx that opens but holds no course rows —
+// an empty workbook, or the wrong file. It used to return 200 with an empty
+// preview and no word about why nothing would be imported.
+var errImportNoCourses = Invalid("ไม่พบรายวิชาในไฟล์ กรุณาตรวจว่าเป็นไฟล์ 'รายวิชาที่เปิดสอน' จากระบบทะเบียน (ชีต Normalized ที่มีคอลัมน์ CourseCode หรือชีต sysTitle) และมีข้อมูลรายวิชาอย่างน้อย 1 แถว")
+
 func pickImportSheet(f *excelize.File) (name string, raw bool, err error) {
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
@@ -2653,19 +2867,22 @@ func pickImportSheet(f *excelize.File) (name string, raw bool, err error) {
 }
 
 // parseUnit reads the registrar's credit notation "N (a-b-c)" into
-// credits=N, lectureHrs=a, labHrs=b, selfHrs=c. Unparseable → all zeros.
+// credits=N, lectureHrs=a, labHrs=b, selfHrs=c. ok=false when the cell does
+// not have that shape — the caller marks the course invalid instead of
+// importing it at 0 credits, which used to happen silently ("abc" → a course
+// with no budget at all).
 var unitRe = regexp.MustCompile(`^\s*(\d+)\s*\(\s*(\d+)\s*-\s*(\d+)\s*-\s*(\d+)\s*\)\s*$`)
 
-func parseUnit(s string) (credits, lectureHrs, labHrs, selfHrs int) {
+func parseUnit(s string) (credits, lectureHrs, labHrs, selfHrs int, ok bool) {
 	m := unitRe.FindStringSubmatch(strings.TrimSpace(s))
 	if m == nil {
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, false
 	}
 	credits, _ = strconv.Atoi(m[1])
 	lectureHrs, _ = strconv.Atoi(m[2])
 	labHrs, _ = strconv.Atoi(m[3])
 	selfHrs, _ = strconv.Atoi(m[4])
-	return
+	return credits, lectureHrs, labHrs, selfHrs, true
 }
 
 // courseLevelFromReserved maps the "ReservedFor" text to a course level. The
@@ -2778,7 +2995,11 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		// truncated, corrupted, or a same-magic-bytes format under a renamed
 		// extension. Wrapped so the client sees Thai + a reason instead of
 		// excelize's raw Go error text (was "zip: not a valid zip file").
-		return nil, nil, nil, Invalid("เปิดไฟล์ Excel ไม่ได้ ไฟล์อาจเสียหายหรือไม่ใช่ไฟล์ .xlsx ที่ถูกต้อง: " + err.Error())
+		//
+		// The underlying text is logged, not shown: "zip: not a valid zip
+		// file" / "EOF" tell an officer nothing and leak library internals.
+		log.Printf("schedule import: open xlsx: %v", err)
+		return nil, nil, nil, Invalid(errImportUnreadableMsg)
 	}
 	defer f.Close()
 	sheet, raw, err := pickImportSheet(f)
@@ -2787,7 +3008,8 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 	}
 	rows, err := f.GetRows(sheet)
 	if err != nil {
-		return nil, nil, nil, err
+		log.Printf("schedule import: read sheet %q: %v", sheet, err)
+		return nil, nil, nil, Invalid(errImportUnreadableMsg)
 	}
 	// Raw registrar export (multi-line cells, header + section rows) is flattened
 	// by parseRawRows into the same []*parsedCourse the Normalized branch builds.
@@ -2826,7 +3048,7 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 		course, seen := byCode[code]
 		if !seen {
 			name := get(row, "coursename")
-			credits, lec, lab, self := parseUnit(get(row, "unit"))
+			credits, lec, lab, self, unitOK := parseUnit(get(row, "unit"))
 			course = &parsedCourse{
 				code:            code,
 				name:            name,
@@ -2836,6 +3058,9 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 				lectureHrs:      lec,
 				labHrs:          lab,
 				selfHrs:         self,
+				unitRaw:         get(row, "unit"),
+				unitOK:          unitOK,
+				firstRow:        r + 1,
 				officerRaw:      get(row, "officer"),
 				sections:        map[string]*parsedSection{},
 				sectionsInOrder: []string{},
@@ -2876,7 +3101,14 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 			if strings.Contains(get(row, "reservedfor"), "โครงการพิเศษ") {
 				track = "special"
 			}
-			seats, _ := strconv.Atoi(get(row, "totalseats"))
+			seatsRaw := get(row, "totalseats")
+			seats, serr := strconv.Atoi(seatsRaw)
+			if serr != nil && seatsRaw != "" {
+				// Not silently 0: a headcount that cannot be read is a budget
+				// that cannot be computed. The section imports with 0 and staff
+				// is told which one to fill in.
+				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): จำนวนที่นั่ง '%s' อ่านไม่ได้ นำเข้าเป็น 0 คน กรุณากรอกจำนวนนักศึกษาภายหลัง", r+1, code, secNo, seatsRaw))
+			}
 			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats,
 				curriculum: curriculumFromReserved(get(row, "reservedfor"))}
 			course.sections[secNo] = sec
@@ -2981,10 +3213,11 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 			c, ok := byCode[code]
 			if !ok {
 				name := cell(row, 1)
-				credits, lec, lab, self := parseUnit(cell(row, 2))
+				credits, lec, lab, self, unitOK := parseUnit(cell(row, 2))
 				c = &parsedCourse{
 					code: code, name: name, nameEN: name, level: "undergrad",
 					credits: credits, lectureHrs: lec, labHrs: lab, selfHrs: self,
+					unitRaw: cell(row, 2), unitOK: unitOK, firstRow: r + 1,
 					sections:        map[string]*parsedSection{},
 					sectionsInOrder: []string{},
 				}
@@ -3019,7 +3252,11 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 			if strings.Contains(reserved, "โครงการพิเศษ") {
 				track = "special"
 			}
-			seats, _ := strconv.Atoi(cell(row, 6))
+			seatsRaw := cell(row, 6)
+			seats, serr := strconv.Atoi(seatsRaw)
+			if serr != nil && seatsRaw != "" {
+				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): จำนวนที่นั่ง '%s' อ่านไม่ได้ นำเข้าเป็น 0 คน กรุณากรอกจำนวนนักศึกษาภายหลัง", r+1, cur.code, secNo, seatsRaw))
+			}
 			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats,
 				curriculum: curriculumFromReserved(reserved)}
 			cur.sections[secNo] = sec
@@ -3175,6 +3412,96 @@ func (s *TeachingService) matchOfficers(ctx context.Context, names []string) (ma
 	return matched, unmatched, nil
 }
 
+// Import row outcomes. The SAME decision (decideImportCourse) drives the
+// preview and the commit, so what the preview promises is what the commit
+// does. They used to be computed separately: the preview called a course with
+// an unknown lecturer "blocked" while the commit created it anyway, with no
+// lecturer at all.
+const (
+	importNew       = "new"
+	importExisting  = "existing"
+	importUnmatched = "unmatched_officer" // needs staff's explicit "create unassigned"
+	importInvalid   = "invalid"           // never imported; see Problems
+)
+
+type importDecision struct {
+	Status     string
+	ExistingID uuid.UUID
+	Matched    []uuid.UUID
+	Unmatched  []string
+	Problems   []string
+}
+
+// decideImportCourse classifies one parsed course. Existing wins (a re-import
+// only backfills curriculum, see commitOneCourse); then the course's own data
+// must pass the shared number rules (teaching_rules.go) — an unreadable credit
+// cell or a 2,000,000-seat section is "invalid", not a course at 0 credits;
+// then its officers must all resolve to lecturers, or it needs staff's
+// explicit go-ahead.
+func (s *TeachingService) decideImportCourse(ctx context.Context, termID uuid.UUID, c *parsedCourse) (importDecision, error) {
+	d := importDecision{Matched: []uuid.UUID{}, Unmatched: []string{}}
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM teaching_courses WHERE term_id = $1 AND (code = $2 OR $2 = ANY(alt_codes))`,
+		termID, c.code).Scan(&d.ExistingID)
+	if err == nil {
+		d.Status = importExisting
+		return d, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return d, err
+	}
+	d.Problems = parsedCourseProblems(c)
+	if len(d.Problems) > 0 {
+		d.Status = importInvalid
+		return d, nil
+	}
+	matched, unmatched, err := s.matchOfficers(ctx, officerTokens(c.officerRaw))
+	if err != nil {
+		return d, err
+	}
+	if matched != nil {
+		d.Matched = matched
+	}
+	if unmatched != nil {
+		d.Unmatched = unmatched
+	}
+	if len(d.Unmatched) > 0 {
+		d.Status = importUnmatched
+	} else {
+		d.Status = importNew
+	}
+	return d, nil
+}
+
+// parsedCourseProblems lists every reason a parsed course cannot be imported
+// as-is, in Thai, row-referenced.
+func parsedCourseProblems(c *parsedCourse) []string {
+	var out []string
+	where := fmt.Sprintf("แถว %d", c.firstRow)
+	if !c.unitOK {
+		raw := strings.TrimSpace(c.unitRaw)
+		if raw == "" {
+			out = append(out, where+": ไม่มีหน่วยกิต (คอลัมน์ Unit ว่าง)")
+		} else {
+			out = append(out, fmt.Sprintf("%s: อ่านหน่วยกิต '%s' ไม่ได้ ต้องอยู่ในรูป 3 (2-2-5)", where, raw))
+		}
+	} else if err := validateCourseNumbers(courseNumbers{c.credits, c.lectureHrs, c.labHrs, c.selfHrs}); err != nil {
+		out = append(out, where+": "+err.Error())
+	}
+	total := 0
+	for _, secNo := range c.sectionsInOrder {
+		sec := c.sections[secNo]
+		total += sec.numStudents
+		if err := validateSectionStudents(sec.numStudents, "SEC "+sec.secNo); err != nil {
+			out = append(out, err.Error())
+		}
+	}
+	if err := validateCourseStudents(total); err != nil {
+		out = append(out, err.Error())
+	}
+	return out
+}
+
 // PreviewImport parses the file and reports per-course what CommitImport
 // would do. It performs no writes.
 func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte) (*ImportPreview, error) {
@@ -3185,64 +3512,63 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 	if !priv {
 		return nil, ErrForbidden
 	}
-	courses, _, _, err := parseNormalizedSheet(body)
+	courses, warnings, parseErrs, err := parseNormalizedSheet(body)
 	if err != nil {
 		return nil, err
 	}
-	out := &ImportPreview{Filename: filename, Courses: make([]ImportPreviewCourse, 0, len(courses))}
+	if len(courses) == 0 {
+		return nil, errImportNoCourses
+	}
+	out := &ImportPreview{Filename: filename, Courses: make([]ImportPreviewCourse, 0, len(courses)),
+		Warnings: notNilStrs(warnings), Errors: notNilStrs(parseErrs)}
+	mergeable := make([]*parsedCourse, 0, len(courses))
 	for _, c := range courses {
 		schedCount := 0
 		for _, sec := range c.sections {
 			schedCount += len(sec.schedules)
 		}
-		tokens := officerTokens(c.officerRaw)
 		row := ImportPreviewCourse{
 			Code:          c.code,
 			Name:          c.name,
 			SectionCount:  len(c.sections),
 			ScheduleCount: schedCount,
 			OfficerRaw:    c.officerRaw,
-			OfficerNames:  tokens,
-			// Default to empty slices: an "existing" course returns before
-			// matchOfficers runs, and a nil slice would reach the client as
-			// JSON null and crash the preview table.
+			OfficerNames:  officerTokens(c.officerRaw),
+			// Default to empty slices: a nil slice reaches the client as JSON
+			// null and crashes the preview table.
 			MatchedLecturerIDs:   []uuid.UUID{},
 			MatchedLecturerNames: []string{},
 			UnmatchedNames:       []string{},
 		}
-		// Course identity comes from the file — nothing to pre-populate. A course
-		// is "existing" only when it was already imported into THIS term.
-		var existingID uuid.UUID
-		err := s.pool.QueryRow(ctx,
-			`SELECT id FROM teaching_courses WHERE term_id = $1 AND (code = $2 OR $2 = ANY(alt_codes))`, termID, c.code).Scan(&existingID)
-		if err == nil {
-			row.Status = "existing"
-			out.ExistingCount++
-			out.Courses = append(out.Courses, row)
-			continue
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return nil, err
-		}
-		matched, unmatched, err := s.matchOfficers(ctx, tokens)
+		d, err := s.decideImportCourse(ctx, termID, c)
 		if err != nil {
 			return nil, err
 		}
-		row.MatchedLecturerIDs = matched
-		row.UnmatchedNames = unmatched
-		if len(matched) > 0 {
-			if err := s.pool.QueryRow(ctx, `
-				SELECT COALESCE(array_agg(first_name || ' ' || last_name ORDER BY array_position($1::uuid[], id)), '{}')
-				FROM users WHERE id = ANY($1)`, matched).Scan(&row.MatchedLecturerNames); err != nil {
-				return nil, err
+		row.Status = d.Status
+		switch d.Status {
+		case importExisting:
+			out.ExistingCount++
+		case importInvalid:
+			row.Problems = d.Problems
+			out.InvalidCount++
+		default:
+			row.MatchedLecturerIDs = d.Matched
+			row.UnmatchedNames = d.Unmatched
+			if len(d.Matched) > 0 {
+				if err := s.pool.QueryRow(ctx, `
+					SELECT COALESCE(array_agg(first_name || ' ' || last_name ORDER BY array_position($1::uuid[], id)), '{}')
+					FROM users WHERE id = ANY($1)`, d.Matched).Scan(&row.MatchedLecturerNames); err != nil {
+					return nil, err
+				}
+			}
+			if d.Status == importUnmatched {
+				out.BlockedCount++
+			} else {
+				out.NewCount++
 			}
 		}
-		if len(unmatched) > 0 {
-			row.Status = "unmatched_officer"
-			out.BlockedCount++
-		} else {
-			row.Status = "new"
-			out.NewCount++
+		if d.Status != importInvalid {
+			mergeable = append(mergeable, c)
 		}
 		out.Courses = append(out.Courses, row)
 	}
@@ -3250,7 +3576,8 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 	for _, row := range out.Courses {
 		statusOf[row.Code] = row.Status
 	}
-	groups, err := s.detectImportMergeGroups(ctx, termID, courses, statusOf)
+	// Invalid rows are never imported, so they are not offered for merging.
+	groups, err := s.detectImportMergeGroups(ctx, termID, mergeable, statusOf)
 	if err != nil {
 		return nil, err
 	}
@@ -3262,7 +3589,7 @@ func (s *TeachingService) PreviewImport(ctx context.Context, actor uuid.UUID, te
 // course is written in its own tx: one failed course never blocks the rest of
 // the file. Codes listed in skipCodes are ignored, letting staff resolve
 // unmatched-officer rows preview-side.
-func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte, skipCodes []string, merges []ImportMerge) (*ImportResult, error) {
+func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, termID uuid.UUID, filename string, body []byte, skipCodes []string, merges []ImportMerge, proceedCodes ...string) (*ImportResult, error) {
 	started := time.Now()
 	sum := sha256.Sum256(body)
 	fileSHA256 := hex.EncodeToString(sum[:])
@@ -3284,6 +3611,10 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		s.recordFailedImport(ctx, actor, termID, filename, fileSHA256, started, err)
 		return nil, err
 	}
+	if len(courses) == 0 {
+		s.recordFailedImport(ctx, actor, termID, filename, fileSHA256, started, errImportNoCourses)
+		return nil, errImportNoCourses
+	}
 	res := &ImportResult{
 		Warnings: warnings, WarningCount: len(warnings),
 		Errors: parseErrs, ErrorCount: len(parseErrs),
@@ -3293,6 +3624,26 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		if v := strings.ToUpper(strings.TrimSpace(c)); v != "" {
 			skipSet[v] = struct{}{}
 		}
+	}
+
+	// proceedCodes: unmatched-officer courses staff explicitly chose to create
+	// with no lecturer ("สร้างโดยยังไม่ผูก" in the preview). Any other
+	// unmatched course is skipped — the preview calls it "ต้องตัดสินใจ", and
+	// no decision is not a yes.
+	proceedSet := map[string]struct{}{}
+	for _, c := range proceedCodes {
+		if v := strings.ToUpper(strings.TrimSpace(c)); v != "" {
+			proceedSet[v] = struct{}{}
+		}
+	}
+	// One decision per course, shared with PreviewImport.
+	decisions := make(map[string]importDecision, len(courses))
+	for _, c := range courses {
+		d, err := s.decideImportCourse(ctx, termID, c)
+		if err != nil {
+			return nil, err
+		}
+		decisions[c.code] = d
 	}
 
 	// Staff's merge decisions: code → the primary it folds into. A code that
@@ -3315,6 +3666,22 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		if _, skip := skipSet[c.code]; skip {
 			res.SkippedCodes = append(res.SkippedCodes, c.code)
 			continue
+		}
+		d := decisions[c.code]
+		if d.Status == importInvalid {
+			res.ErrorCount++
+			res.Errors = append(res.Errors, fmt.Sprintf("%s: ไม่ได้นำเข้า %s", c.code, strings.Join(d.Problems, " / ")))
+			continue
+		}
+		if d.Status == importUnmatched {
+			if _, ok := proceedSet[c.code]; !ok {
+				res.SkippedCodes = append(res.SkippedCodes, c.code)
+				res.Warnings = append(res.Warnings, fmt.Sprintf(
+					"%s: ข้าม ไม่พบอาจารย์ผู้สอน %s ในระบบ และไม่ได้เลือก 'สร้างโดยยังไม่ผูก' ในหน้าตรวจสอบ",
+					c.code, strings.Join(d.Unmatched, ", ")))
+				res.WarningCount++
+				continue
+			}
 		}
 		if _, merged := mergeInto[c.code]; merged {
 			continue // folded into its primary below
@@ -3344,6 +3711,13 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 			continue
 		}
 		if _, skip := skipSet[c.code]; skip {
+			continue
+		}
+		// Invalid and undecided-unmatched rows were already reported (and not
+		// imported) in the first pass; merging them would import them anyway.
+		if d := decisions[c.code]; d.Status == importInvalid {
+			continue
+		} else if _, ok := proceedSet[c.code]; d.Status == importUnmatched && !ok {
 			continue
 		}
 		targetID, ok := createdByCode[primary]
@@ -3721,10 +4095,10 @@ type Term struct {
 	MidtermEndsOn   *string `json:"midterm_ends_on,omitempty"`
 	FinalStartsOn   *string `json:"final_starts_on,omitempty"`
 	FinalEndsOn     *string `json:"final_ends_on,omitempty"`
-	// Months: 0 is a valid input (UpsertTerm defaults it to 4) — omitempty
-	// skips the bound below for that case, same as UpsertTerm's own
-	// `if in.Months == 0 { in.Months = 4 }` before it checks 1..12.
-	Months   int  `json:"months" validate:"omitempty,gte=1,lte=12"`
+	// Months: 0 is a valid input (UpsertTerm defaults it to the months the
+	// term's dates span). Untagged: UpsertTerm bounds it by those dates, which a
+	// tag cannot express, and answers in Thai.
+	Months   int  `json:"months"`
 	IsActive bool `json:"is_active"`
 }
 
@@ -3819,17 +4193,41 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 	if in.Semester < 1 || in.Semester > 3 {
 		return nil, Invalid("ภาคเรียนต้องเป็น 1, 2 หรือ 3")
 	}
-	if in.Months == 0 {
-		in.Months = 4
-	}
-	if in.Months < 1 || in.Months > 12 {
-		return nil, Invalid("จำนวนเดือนต้องอยู่ระหว่าง 1–12")
-	}
 	if !nonEmpty(in.StartsOn) || !nonEmpty(in.EndsOn) {
 		return nil, Invalid("กรุณาระบุวันเปิดและวันปิดภาคเรียน")
 	}
+	// Every date below is compared as a string, which only works for real
+	// YYYY-MM-DD values — parse them all first.
+	for _, d := range []struct {
+		v     *string
+		label string
+	}{
+		{in.StartsOn, "วันเปิดภาคเรียน"}, {in.EndsOn, "วันปิดภาคเรียน"},
+		{in.MidtermStartsOn, "วันเริ่มสอบกลางภาค"}, {in.MidtermEndsOn, "วันสิ้นสุดสอบกลางภาค"},
+		{in.FinalStartsOn, "วันเริ่มสอบปลายภาค"}, {in.FinalEndsOn, "วันสิ้นสุดสอบปลายภาค"},
+	} {
+		if nonEmpty(d.v) {
+			if _, err := time.Parse("2006-01-02", *d.v); err != nil {
+				return nil, Invalid(d.label + "ไม่ถูกต้อง (ต้องเป็น YYYY-MM-DD)")
+			}
+		}
+	}
 	if *in.StartsOn >= *in.EndsOn {
 		return nil, Invalid("วันปิดภาคเรียนต้องอยู่หลังวันเปิดภาคเรียน")
+	}
+	// months multiplies EVERY course budget in the term, so it is bounded by
+	// the calendar months the dates actually touch: a Jun 1–Sep 30 term saved
+	// with months = 12 tripled every budget. 0 means "use the span".
+	tStart, _ := time.Parse("2006-01-02", *in.StartsOn)
+	tEnd, _ := time.Parse("2006-01-02", *in.EndsOn)
+	span := TermMonthSpan(tStart, tEnd)
+	if in.Months == 0 {
+		in.Months = span
+	}
+	if in.Months < 1 || in.Months > span {
+		return nil, Invalid(fmt.Sprintf(
+			"จำนวนเดือนต้องอยู่ระหว่าง 1–%d ตามช่วงวันเปิด–ปิดภาคเรียน (%s ถึง %s ครอบคลุม %d เดือน) จำนวนเดือนนี้ใช้คูณงบประมาณของทุกรายวิชาในภาคเรียน",
+			span, thaiLongDateISO(*in.StartsOn), thaiLongDateISO(*in.EndsOn), span))
 	}
 	// Exam windows are required and must be closed intervals (start <= end).
 	// Faculty publishes these once per term — no partial saves.
@@ -3867,15 +4265,19 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 		// (worklog range, submission months, holidays) ambiguous. Checked on
 		// create only, so a term that already overlaps in existing data can
 		// still be edited (e.g. switched active) rather than locked out.
-		var clash string
-		if err := s.pool.QueryRow(ctx, `
-			SELECT academic_year::text || '/' || semester::text FROM academic_terms
-			 WHERE starts_on IS NOT NULL AND ends_on IS NOT NULL
-			   AND starts_on <= $2::date AND ends_on >= $1::date
-			 LIMIT 1`, *in.StartsOn, *in.EndsOn).Scan(&clash); err == nil {
-			return nil, Invalid(fmt.Sprintf("ช่วงภาคเรียนทับซ้อนกับภาคเรียน %s", clash))
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return nil, err
+		// The demo sandbox opts out (AllowTermOverlap): its walkthrough and its
+		// presentation dataset are both anchored on today by design.
+		if !termOverlapAllowed(ctx) {
+			var clash string
+			if err := s.pool.QueryRow(ctx, `
+				SELECT academic_year::text || '/' || semester::text FROM academic_terms
+				 WHERE starts_on IS NOT NULL AND ends_on IS NOT NULL
+				   AND starts_on <= $2::date AND ends_on >= $1::date
+				 LIMIT 1`, *in.StartsOn, *in.EndsOn).Scan(&clash); err == nil {
+				return nil, Invalid(fmt.Sprintf("ช่วงภาคเรียนทับซ้อนกับภาคเรียน %s", clash))
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				return nil, err
+			}
 		}
 		if err := writeAudited(ctx, s.pool, s.aud,
 			audit.Entry{ActorID: &actor, Action: "term.create", Entity: "term", EntityID: in.ID.String(), After: in},
@@ -3902,9 +4304,12 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 	}
 
 	// Update by ID — reject if year/semester changed (they are the durable identity).
-	var existYear, existSem int
+	var existYear, existSem, existMonths int
+	var existStart, existEnd *string
 	if err := s.pool.QueryRow(ctx,
-		`SELECT academic_year, semester FROM academic_terms WHERE id=$1`, in.ID).Scan(&existYear, &existSem); err != nil {
+		`SELECT academic_year, semester, months,
+		        TO_CHAR(starts_on,'YYYY-MM-DD'), TO_CHAR(ends_on,'YYYY-MM-DD')
+		   FROM academic_terms WHERE id=$1`, in.ID).Scan(&existYear, &existSem, &existMonths, &existStart, &existEnd); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -3912,6 +4317,27 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 	}
 	if existYear != in.AcademicYear || existSem != in.Semester {
 		return nil, ErrConflict
+	}
+	// Once any month of the term is on an issued payout file, the months and
+	// the term dates are frozen: months scales every course budget the file
+	// was priced against, and the dates decide which days were payable. The
+	// exam windows and the active flag stay editable.
+	sameStr := func(a, b *string) bool { return a != nil && b != nil && *a == *b }
+	if in.Months != existMonths || !sameStr(in.StartsOn, existStart) || !sameStr(in.EndsOn, existEnd) {
+		var label string
+		err := s.pool.QueryRow(ctx, `
+			SELECT sp.label
+			  FROM submission_period_status st
+			  JOIN submission_periods sp ON sp.id = st.submission_period_id
+			 WHERE sp.term_id = $1 AND st.status IN ('exported','finance_sent')
+			 ORDER BY sp.year_month LIMIT 1`, in.ID).Scan(&label)
+		if err == nil {
+			return nil, Conflict(fmt.Sprintf(
+				"เปลี่ยนจำนวนเดือนหรือวันเปิด–ปิดภาคเรียนไม่ได้ เพราะเดือน %s ของภาคเรียนนี้ส่งออกเอกสารเบิกจ่ายแล้ว เอกสารที่ออกไปคำนวณงบจากจำนวนเดือนและช่วงวันที่เดิม (แก้ช่วงสอบหรือสถานะภาคเรียนปัจจุบันได้ตามปกติ)",
+				label))
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
 	}
 	// Covers THIS term's row. demoteOtherActiveTerms below may also clear
 	// is_active on a different term; that row is not in this diff, and the

@@ -246,7 +246,7 @@ func TestCourseHeadcountAndDatesAreStaffOnly(t *testing.T) {
 	staffID := f.insertUser("staff", "staff")
 
 	t.Run("lecturer cannot set headcount", func(t *testing.T) {
-		if err := svc.SetNumStudents(f.ctx, f.LecturerID, f.CourseID, 999, 999, 0); err == nil {
+		if err := svc.SetNumStudents(f.ctx, f.LecturerID, f.CourseID, 999, 999, 0, false); err == nil {
 			t.Fatal("lecturer must not set the headcount")
 		}
 		var n int
@@ -268,7 +268,7 @@ func TestCourseHeadcountAndDatesAreStaffOnly(t *testing.T) {
 	})
 
 	t.Run("staff can do both", func(t *testing.T) {
-		if err := svc.SetNumStudents(f.ctx, staffID, f.CourseID, -1, 25, 5); err != nil {
+		if err := svc.SetNumStudents(f.ctx, staffID, f.CourseID, -1, 25, 5, false); err != nil {
 			t.Fatalf("staff headcount edit must succeed, got %v", err)
 		}
 		var n int
@@ -282,7 +282,7 @@ func TestCourseHeadcountAndDatesAreStaffOnly(t *testing.T) {
 
 		// An explicit 0 is a real answer (nobody enrolled): the track must
 		// read as entered, while a track left out of the body stays as it was.
-		if err := svc.SetNumStudents(f.ctx, staffID, f.CourseID, -1, -1, 0); err != nil {
+		if err := svc.SetNumStudents(f.ctx, staffID, f.CourseID, -1, -1, 0, false); err != nil {
 			t.Fatalf("staff zero special count must succeed, got %v", err)
 		}
 		tc, err := svc.Get(f.ctx, f.CourseID)
@@ -296,7 +296,9 @@ func TestCourseHeadcountAndDatesAreStaffOnly(t *testing.T) {
 			t.Fatalf("regular = %d entered=%v, want 25 entered", tc.NumStudentsRegular, tc.NumStudentsRegularEntered)
 		}
 
-		d := "2099-01-01"
+		// Inside the term: a course range outside its term is refused since
+		// teaching_rules.go (validateCourseDates).
+		d := day(2)
 		if err := svc.UpdateSettings(f.ctx, staffID, f.CourseID,
 			UpdateSettingsInput{StartsOn: &d}); err != nil {
 			t.Fatalf("staff date edit must succeed, got %v", err)

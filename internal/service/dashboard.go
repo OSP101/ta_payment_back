@@ -81,7 +81,7 @@ type TACourseStatus struct {
 	CourseCode       string    `json:"course_code"`
 	CourseNameTH     string    `json:"course_name_th"`
 	TermLabel        string    `json:"term_label"`
-	Stage            string    `json:"stage"` // draft/submitted/approved/exported
+	Stage            string    `json:"stage"` // draft/submitted/approved/exported, or rejected (TA must fix)
 	// Hours are counted as SITTINGS: a คาบ logged against two co-taught
 	// sections is one คาบ of work, and one shared with a special section is
 	// regular work (rule B2 bills it once, on the regular side).
@@ -174,7 +174,32 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 		       COALESCE(SUM(p.baht) FILTER (WHERE p.status='approved' AND NOT p.regular),0),
 		       COALESCE(BOOL_OR(p.status='approved'),  FALSE) AS any_approved,
 		       COALESCE(BOOL_OR(p.status='submitted'), FALSE) AS any_submitted,
-		       c.exported_at IS NOT NULL AS exported
+		       -- WP3: "exported" is read off THIS TA's months, not the course-wide
+		       -- teaching_courses.exported_at flag — the flag fires on the first
+		       -- ZIP of any slice and the admin unlock used to clear it while the
+		       -- months stayed locked, so this card and the payout screens
+		       -- disagreed. Exported = some month locked, and no approved or
+		       -- submitted work left in a month that is not.
+		       (EXISTS (SELECT 1 FROM submission_period_status st
+		                 WHERE st.ta_id = $1 AND st.teaching_course_id = c.tc_id
+		                   AND st.status IN ('exported','finance_sent'))
+		        AND NOT EXISTS (
+		            SELECT 1 FROM assign s3
+		            JOIN work_logs w3 ON w3.assignment_id = s3.assignment_id
+		            JOIN teaching_courses tc3 ON tc3.id = s3.tc_id
+		            JOIN academic_terms t3 ON t3.id = tc3.term_id
+		            LEFT JOIN submission_periods sp3 ON sp3.term_id = tc3.term_id
+		             AND `+workLogInPeriodSQL("w3", "t3", "sp3")+`
+		            LEFT JOIN submission_period_status st3
+		              ON st3.submission_period_id = sp3.id AND st3.ta_id = $1
+		             AND st3.teaching_course_id = tc3.id
+		            WHERE s3.tc_id = c.tc_id AND w3.status IN ('approved','submitted')
+		              AND COALESCE(st3.status, 'pending') NOT IN ('exported','finance_sent'))) AS exported,
+		       -- WP1 01/10/2026: bounced rows the TA can still fix. A forfeited
+		       -- month holds nothing to fix, so it does not count.
+		       EXISTS (SELECT 1 FROM assign s2 JOIN work_logs wr ON wr.assignment_id = s2.assignment_id
+		                WHERE s2.tc_id = c.tc_id AND wr.status = 'rejected'
+		                  AND NOT `+unsubmittableMonthSQL("wr")+`) AS any_rejected
 		FROM (SELECT DISTINCT tc_id, code, name_th, exported_at, academic_year, semester,
 		             -- A TA holds one level per course; MIN only settles ties
 		             -- that cannot happen.
@@ -190,18 +215,23 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 	out := []TACourseStatus{}
 	for rows.Next() {
 		var r TACourseStatus
-		var anyApproved, anySubmitted, exported bool
+		var anyApproved, anySubmitted, exported, anyRejected bool
 		if err := rows.Scan(&r.TeachingCourseID, &r.CourseCode, &r.CourseNameTH,
 			&r.TermLabel, &r.Level,
 			&r.HoursApproved, &r.HoursApprovedRegular, &r.HoursApprovedSpecial,
 			&r.HoursPending, &r.HoursPendingRegular, &r.HoursPendingSpecial,
 			&r.EstimatedBaht, &r.EstimatedBahtRegular, &r.EstimatedBahtSpecial,
-			&anyApproved, &anySubmitted, &exported); err != nil {
+			&anyApproved, &anySubmitted, &exported, &anyRejected); err != nil {
 			return nil, err
 		}
+		// Worst ACTIONABLE state wins (WP1 01/10/2026): an all-rejected course
+		// used to read "แบบร่าง" and approved+rejected "อนุมัติแล้ว", hiding
+		// the one thing the TA had to fix.
 		switch {
 		case exported:
 			r.Stage = "exported"
+		case anyRejected:
+			r.Stage = "rejected"
 		case anyApproved && !anySubmitted:
 			r.Stage = "approved"
 		case anySubmitted:

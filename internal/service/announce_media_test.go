@@ -38,6 +38,7 @@ func img(key string) AttachmentInput {
 func TestMediaIsPublic_FollowsTheAnnouncementItBelongsTo(t *testing.T) {
 	f := newAnnFixture(t)
 	actor := f.user("staff", "officer")
+	f.user("ta", "reader") // publishing to nobody is refused
 
 	mk := func(name string, in UpsertInput) uuid.UUID {
 		in.Title, in.Body, in.Category = name, "เนื้อหา", "info"

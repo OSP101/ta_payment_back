@@ -61,7 +61,11 @@ func stepTerm(ctx context.Context, svc *service.Container) (string, error) {
 		Months:          4,
 		IsActive:        true,
 	}
-	if _, err := svc.Teaching.UpsertTerm(ctx, adminID, in); err != nil {
+	// Overlap allowed: if the presentation dataset was loaded first, its
+	// (inactive) term also covers today, and the overlap rule would refuse
+	// this one with "ช่วงภาคเรียนทับซ้อนกับภาคเรียน …/2". The two are designed
+	// to sit side by side in one slot — see service.AllowTermOverlap.
+	if _, err := svc.Teaching.UpsertTerm(service.AllowTermOverlap(ctx), adminID, in); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("สร้างภาคเรียนที่ 1 ปีการศึกษา %d เรียบร้อย (ช่วงสอบกลางภาค/ปลายภาคตั้งอยู่ล่วงหน้า ไม่ชนกับเดือนที่กำลังจำลอง)", beYear), nil

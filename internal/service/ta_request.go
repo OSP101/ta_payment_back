@@ -239,10 +239,14 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			return nil, err
 		}
 		if alreadyActive {
-			return nil, fmt.Errorf(
+			// Not "cancel the old one first": Cancel refuses most of these
+			// cases (hours logged, order issued). The working path is the
+			// request form itself — picking this TA again adds sections to
+			// the existing request (AddSections).
+			return nil, Conflict(fmt.Sprintf(
 				"%s มีคำขอ TA ของวิชานี้ที่ยังดำเนินการอยู่แล้ว (จากรอบก่อนหน้า) ไม่สามารถส่งคำขอซ้ำได้ "+
-					"หากต้องการแก้ไข กรุณายกเลิกคำขอเดิมก่อน แล้วจึงส่งคำขอใหม่",
-				s.taName(ctx, a.TAID))
+					"หากต้องการให้ช่วยสอนเพิ่ม ให้เลือกชื่อ TA คนนี้ในฟอร์มขอ TA อีกครั้ง แล้วเพิ่ม section เข้าไปในคำขอเดิม",
+				s.taName(ctx, a.TAID)))
 		}
 	}
 
@@ -624,12 +628,12 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 		`SELECT lecturer_id, status::text FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID,
 	).Scan(&owner, &status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return errors.New("ไม่พบคำขอนี้")
+			return NotFound("ไม่พบคำขอนี้")
 		}
 		return err
 	}
 	if owner != lecturerID {
-		return errors.New("คุณไม่ใช่เจ้าของคำขอนี้ จึงยกเลิกไม่ได้")
+		return Forbidden("คุณไม่ใช่เจ้าของคำขอนี้ จึงยกเลิกไม่ได้")
 	}
 	// ...and must still teach the course: a lecturer taken off it could
 	// otherwise drop the TAs of a course that is no longer theirs.
@@ -705,7 +709,55 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 	}); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	// An approved request already told its TAs they were appointed
+	// (notifyTAsAppointed). Cancelling it silently left them believing that
+	// until the worklog page refused them — tell them now, best-effort.
+	if status == "approved" {
+		s.notifyTAsCancelled(ctx, reqID)
+	}
+	return nil
+}
+
+// notifyTAsCancelled tells every TA still on a just-cancelled request that the
+// appointment is withdrawn. The course code is in the title so two cancelled
+// courses do not fold into one unread notice (see notify coalescing).
+func (s *TARequestService) notifyTAsCancelled(ctx context.Context, reqID uuid.UUID) {
+	if s.notify == nil {
+		return
+	}
+	var courseID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id FROM ta_requests WHERE id = $1`, reqID).Scan(&courseID); err != nil {
+		return
+	}
+	code, nameTH := s.courseLabel(ctx, courseID)
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ta_id FROM ta_request_assignments
+		 WHERE request_id = $1 AND state <> 'dropped'`, reqID)
+	if err != nil {
+		return
+	}
+	var tas []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if rows.Scan(&id) == nil {
+			tas = append(tas, id)
+		}
+	}
+	rows.Close()
+	// Best-effort notice: a read error after partial results just means some
+	// TAs miss the notice, never that the cancel itself fails.
+	if rows.Err() != nil {
+		return
+	}
+	for _, taID := range tas {
+		s.notify.Send(ctx, taID, "ยกเลิกการแต่งตั้งผู้ช่วยสอน "+code,
+			fmt.Sprintf("อาจารย์ผู้สอนรายวิชา %s %s ได้ยกเลิกคำขอผู้ช่วยสอนที่ระบุชื่อท่านแล้ว ท่านจึงไม่ต้องปฏิบัติงานและไม่สามารถบันทึกเวลาปฏิบัติงานของรายวิชานี้ได้", code, nameTH),
+			"/ta")
+	}
 }
 
 // workloadFormColumns is the exact SELECT-column-order both
@@ -1662,10 +1714,23 @@ func (s *TARequestService) checkCrossRequestConflict(ctx context.Context, q quer
 	return nil
 }
 
-// maxApprovedCoursesPerTerm is the per-term cap on how many courses one TA may
-// be approved for (Q&A rule). Enforced at auto-decide; the request UI also uses
-// it to keep already-full TAs out of the picker.
-const maxApprovedCoursesPerTerm = 3
+// defaultMaxCoursesPerTerm is the ประกาศ figure, used only when pay_rates has
+// no version in force or holds a non-positive value.
+const defaultMaxCoursesPerTerm = 3
+
+// maxCoursesPerTerm is the per-term cap on how many courses one TA may hold,
+// as staff set it in ตั้งค่า (pay_rates.max_courses_per_student, the version in
+// force today). Every place that enforces or displays the cap reads it here —
+// it used to be a hard-coded 3 in four places while the settings field was
+// stored and ignored.
+func maxCoursesPerTerm(ctx context.Context, q querier) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, `SELECT max_courses_per_student FROM `+payRatesInForce).Scan(&n)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && n <= 0) {
+		return defaultMaxCoursesPerTerm, nil
+	}
+	return n, err
+}
 
 // TACandidate is one selectable TA for the request form, carrying how many
 // courses they are already approved for this term so the UI can hide/flag those
@@ -1678,6 +1743,7 @@ type TACandidate struct {
 	StudyLevel          string    `json:"study_level"`
 	ApprovedCourseCount int       `json:"approved_course_count"` // other courses this term (excl. this one)
 	AtQuota             bool      `json:"at_quota"`              // adding THIS course would exceed the cap
+	CourseCap           int       `json:"course_cap"`            // the per-term cap AtQuota was judged against
 	AlreadyInCourse     bool      `json:"already_in_course"`     // already an approved TA of THIS course
 	// HasSchedule reports whether this TA has filed a class timetable for the
 	// term. False means the request can still be submitted, but the verdict
@@ -1697,6 +1763,10 @@ type TACandidate struct {
 func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TACandidate, error) {
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id=$1`, tcID).Scan(&termID); err != nil {
+		return nil, err
+	}
+	courseCap, err := maxCoursesPerTerm(ctx, s.pool)
+	if err != nil {
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `
@@ -1734,7 +1804,8 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 			&c.ApprovedCourseCount, &c.AlreadyInCourse, &c.HasSchedule); err != nil {
 			return nil, err
 		}
-		c.AtQuota = c.ApprovedCourseCount >= maxApprovedCoursesPerTerm
+		c.CourseCap = courseCap
+		c.AtQuota = c.ApprovedCourseCount >= courseCap
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -1974,10 +2045,14 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		if err != nil {
 			return nil, false, err
 		}
+		courseCap, err := maxCoursesPerTerm(ctx, tx)
+		if err != nil {
+			return nil, false, err
+		}
 		add("cap", t.name,
-			fmt.Sprintf("%s เป็นผู้ช่วยสอนอยู่ %d วิชา (ยังไม่เกินขีดจำกัด 3 วิชา)", t.name, count),
-			fmt.Sprintf("%s เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว", t.name),
-			count < 3)
+			fmt.Sprintf("%s เป็นผู้ช่วยสอนอยู่ %d วิชา (ยังไม่เกินขีดจำกัด %d วิชา)", t.name, count, courseCap),
+			fmt.Sprintf("%s เป็นผู้ช่วยสอนครบ %d วิชาในภาคการศึกษานี้แล้ว", t.name, courseCap),
+			count < courseCap)
 
 		// Workload total range.
 		var totOK bool
@@ -2223,6 +2298,7 @@ type TARequestAssignmentDetail struct {
 	ProfileStatus       string    `json:"profile_status"`
 	HasSchedule         bool      `json:"has_schedule"`
 	ApprovedCourseCount int       `json:"approved_course_count"`
+	CourseCap           int       `json:"course_cap"` // per-term cap from ตั้งค่า, see maxCoursesPerTerm
 	Warnings            []string  `json:"warnings"`
 	// State and StateReason expose the per-section outcome of the deferred
 	// decision: 'active', 'trimmed' (some sessions clash with the TA's own
@@ -2355,6 +2431,10 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		return nil, err
 	}
 
+	courseCap, err := maxCoursesPerTerm(ctx, s.pool)
+	if err != nil {
+		return nil, err
+	}
 	for _, c := range checks {
 		a := &d.Assignments[c.idx]
 		count, err := s.reservedCourseCount(ctx, s.pool, c.taID, termID, d.TeachingCourseID)
@@ -2362,14 +2442,15 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 			return nil, err
 		}
 		a.ApprovedCourseCount = count
+		a.CourseCap = courseCap
 		if a.ProfileStatus != "approved" {
 			a.Warnings = append(a.Warnings, "เอกสารยังไม่ผ่านการอนุมัติ")
 		}
 		if !a.HasSchedule {
 			a.Warnings = append(a.Warnings, "ยังไม่ได้บันทึกตารางเรียนของภาคการศึกษานี้")
 		}
-		if count >= 3 {
-			a.Warnings = append(a.Warnings, "เป็นผู้ช่วยสอนครบ 3 วิชาในภาคการศึกษานี้แล้ว อนุมัติเพิ่มไม่ได้")
+		if count >= courseCap {
+			a.Warnings = append(a.Warnings, fmt.Sprintf("เป็นผู้ช่วยสอนครบ %d วิชาในภาคการศึกษานี้แล้ว อนุมัติเพิ่มไม่ได้", courseCap))
 		}
 		if err := s.checkOwnClassConflict(ctx, s.pool, c.taID, c.secID, a.TAName); err != nil {
 			a.Warnings = append(a.Warnings, "เวลาสอนทับซ้อนกับตารางเรียนของ TA")
@@ -2404,6 +2485,9 @@ type Window struct {
 }
 
 func (s *TARequestService) UpsertWindow(ctx context.Context, actor uuid.UUID, in Window) (*Window, error) {
+	if err := validateRequestWindowRange(in.OpensAt, in.ClosesAt); err != nil {
+		return nil, err
+	}
 	isNew := in.ID == uuid.Nil
 	if isNew {
 		in.ID = uuid.New()
@@ -2491,4 +2575,40 @@ func (s *TARequestService) DeleteWindow(ctx context.Context, actor, id uuid.UUID
 			}
 			return nil
 		})
+}
+
+// EnsureAssignmentTAActive refuses a staff/lecturer work-log write on behalf
+// of a TA whose account has been deactivated. The row is resolved from logID
+// when editing (the stored assignment is authoritative, as in StaffUpsert),
+// else from assignmentID. A deactivated TA cannot log in to see or dispute
+// hours entered in their name, and is no longer on the appointment order, so
+// nothing new may be paid against them. Lives here rather than in
+// WorkLogService.StaffUpsert only because that file had a different owner
+// when this was added; the handler calls it before StaffUpsert.
+func (s *TARequestService) EnsureAssignmentTAActive(ctx context.Context, logID, assignmentID uuid.UUID) error {
+	var active bool
+	var err error
+	if logID != uuid.Nil {
+		err = s.pool.QueryRow(ctx, `
+			SELECT u.is_active FROM work_logs wl
+			JOIN ta_request_assignments a ON a.id = wl.assignment_id
+			JOIN users u ON u.id = a.ta_id
+			WHERE wl.id = $1`, logID).Scan(&active)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			SELECT u.is_active FROM ta_request_assignments a
+			JOIN users u ON u.id = a.ta_id
+			WHERE a.id = $1`, assignmentID).Scan(&active)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Let StaffUpsert give its own "not found" answer.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !active {
+		return Conflict("บันทึกเวลาแทน TA คนนี้ไม่ได้ เนื่องจากบัญชีผู้ใช้ของ TA ถูกปิดใช้งานแล้ว")
+	}
+	return nil
 }

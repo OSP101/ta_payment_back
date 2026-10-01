@@ -4,14 +4,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
@@ -110,6 +108,11 @@ type ExportPreview struct {
 	Blockers  []ExportBlocker    `json:"blockers"`
 	CanExport bool               `json:"can_export"`
 	Rows      []ExportPreviewRow `json:"rows"`
+	// Archived is the document already issued for exactly this slice, when
+	// every month in it is locked: a download hands that file back unchanged.
+	// For months exported before per-TA figures were recorded (Legacy), its
+	// total is the authoritative figure, not the recomputation above.
+	Archived *ArchivedExport `json:"archived,omitempty"`
 }
 
 // round2 rounds a baht amount to 2 decimals — every figure that lands on a
@@ -447,58 +450,14 @@ func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uu
 // BuildCourseZip builds the per-TA .xlsx (+ best-effort .pdf) ZIP for a course.
 // It gates on payout readiness, then reuses buildExportRows so the file numbers
 // match the preview exactly. Returns (zip bytes, filename, TA count, error).
-// assertNoLockedTotalDrift refuses to regenerate a claim ZIP whose money has
-// moved since the same slice was last exported.
 //
-// Exporting is the freeze point for a course's payout figures, but nothing is
-// actually frozen: every amount is recomputed live from pay_rates and work_logs
-// on each build. So a rate edit, or the grad-special lump being reapportioned
-// after a later month gains hours, silently changes what a re-exported month is
-// worth — and the new figure reaches finance as a document that looks like a
-// reprint of the one they already hold.
-//
-// The graduate-special lump is now persisted per exported month
-// (grad_lump_ledger), so reapportioning can no longer move it. Hourly pay is
-// still priced live from the rate in force, so this check stays: it catches a
-// rate version that came into force after the month was exported, at the
-// boundary where the new figure would leave the server.
-// Deliberately scoped to an EXACT month-set match: a later fiscal round covers
-// a different slice and legitimately totals something else, so comparing across
-// different month sets would block normal work instead of catching drift.
-func (s *ExportService) assertNoLockedTotalDrift(ctx context.Context, teachingCourseID uuid.UUID, months []string) error {
-	if len(months) == 0 {
-		return nil
-	}
-	var prevTotal float64
-	err := s.pool.QueryRow(ctx, `
-		SELECT total_baht
-		FROM export_batches
-		WHERE teaching_course_id = $1
-		  AND months IS NOT NULL
-		  AND months @> $2::text[] AND months <@ $2::text[]
-		ORDER BY generated_at DESC
-		LIMIT 1`, teachingCourseID, months).Scan(&prevTotal)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil // never exported this exact slice — nothing to diverge from
-	}
-	if err != nil {
-		return err
-	}
-	prev, err := s.CoursePreview(ctx, teachingCourseID, months)
-	if err != nil {
-		return err
-	}
-	// Half a satang: total_baht is NUMERIC(12,2) and TotalActual is round2'd, so
-	// anything above this is a real change, not representation noise.
-	if math.Abs(prev.TotalActual-prevTotal) > 0.005 {
-		return Conflict(fmt.Sprintf(
-			"ยอดเงินของเดือนที่ export ไปแล้วเปลี่ยนไป (เดิม %.2f บาท ปัจจุบัน %.2f บาท ต่างกัน %.2f บาท) "+
-				"เอกสารชุดนี้จะไม่ตรงกับที่ส่งการเงินไปแล้ว กรุณาตรวจสอบอัตราค่าจ้างและบันทึกเวลาของเดือนนี้ก่อนออกเอกสารซ้ำ",
-			prevTotal, prev.TotalActual, prev.TotalActual-prevTotal))
-	}
-	return nil
-}
-
+// The course-total drift check that used to sit here (assertNoLockedTotalDrift)
+// is gone: it compared a rebuilt slice with the last batch's total, so a plain
+// re-download 409'd whenever anything in the term had moved the live pricing,
+// and a corrected document after a deliberate send-back 409'd forever. Locked
+// months are now priced from export_month_ledger, re-downloads are served
+// from the archived file (ArchivedReissue), and the remaining check is per TA
+// (assertLockedFiguresHold).
 func (s *ExportService) BuildCourseZip(ctx context.Context, teachingCourseID uuid.UUID, months []string) ([]byte, string, int, error) {
 	z, err := s.BuildCourseZipPack(ctx, teachingCourseID, months)
 	if err != nil {
@@ -515,6 +474,10 @@ type CourseZip struct {
 	Name      string
 	TACount   int
 	GradLumps *GradLumpSnapshot
+	// Figures is what the pack paid per (TA, month, track) — the ledger rows
+	// the locking download writes for the cells it locks
+	// (MarkCourseExportedWithFigures).
+	Figures MonthFigures
 }
 
 // BuildCourseZipPack is BuildCourseZip returning the lump snapshot as well.
@@ -531,15 +494,14 @@ func (s *ExportService) BuildCourseZipPack(ctx context.Context, teachingCourseID
 	if err != nil {
 		return nil, err
 	}
-	return &CourseZip{Body: body, Name: name, TACount: taCount, GradLumps: snap}, nil
+	figs, err := s.computeMonthFigures(ctx, teachingCourseID, months)
+	if err != nil {
+		return nil, err
+	}
+	return &CourseZip{Body: body, Name: name, TACount: taCount, GradLumps: snap, Figures: figs}, nil
 }
 
 func (s *ExportService) buildCourseZip(ctx context.Context, teachingCourseID uuid.UUID, months []string) ([]byte, string, int, error) {
-	// Before anything is built: if this exact slice was exported before, the
-	// figures must still be what finance already received.
-	if err := s.assertNoLockedTotalDrift(ctx, teachingCourseID, months); err != nil {
-		return nil, "", 0, err
-	}
 	// Student-count gate: the per-course budget is derived from the enrolled
 	// student count (budget.go). With 0 students the budget cap is 0, and
 	// everyone would be pro-rata'd down to ฿0 silently. Refuse the export, with
@@ -584,6 +546,10 @@ func (s *ExportService) buildCourseZip(ctx context.Context, teachingCourseID uui
 
 	comp, err := s.buildExportRows(ctx, teachingCourseID, months)
 	if err != nil {
+		return nil, "", 0, err
+	}
+	// Locked months must still pay what their document said, TA by TA.
+	if err := s.assertLockedFiguresHold(ctx, teachingCourseID, months, comp); err != nil {
 		return nil, "", 0, err
 	}
 	courseCode := comp.courseCode
@@ -874,6 +840,9 @@ func (s *ExportService) CoursePreview(ctx context.Context, teachingCourseID uuid
 	}
 	out.TotalPay = round2(out.TotalPay)
 	out.TotalActual = round2(out.TotalActual)
+	if out.Archived, err = s.archivedForSlice(ctx, teachingCourseID, months); err != nil {
+		return nil, err
+	}
 	out.CanExport = out.AllReady && len(out.Blockers) == 0
 	out.OverBudget = comp.budgetMax > 0 && out.TotalPay > comp.budgetMax+0.01
 	return out, nil

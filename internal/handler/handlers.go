@@ -611,16 +611,20 @@ func (h *TeachingHandler) SetNumStudents(c *fiber.Ctx) error {
 	// Accept either legacy `num_students` (aggregate) or per-track split.
 	// -1 means "no change" so callers can update one track without touching the other,
 	// so the floor is -1 (the sentinel), not 0.
+	// Untagged: the service bounds these (and the -1 sentinel) in Thai; a
+	// validator tag would answer first, in English. confirm acknowledges a
+	// budget change on a course with approved TAs (409 preview otherwise).
 	body := struct {
-		NumStudents        int `json:"num_students" validate:"gte=-1"`
-		NumStudentsRegular int `json:"num_students_regular" validate:"gte=-1"`
-		NumStudentsSpecial int `json:"num_students_special" validate:"gte=-1"`
+		NumStudents        int  `json:"num_students"`
+		NumStudentsRegular int  `json:"num_students_regular"`
+		NumStudentsSpecial int  `json:"num_students_special"`
+		Confirm            bool `json:"confirm"`
 	}{NumStudents: -1, NumStudentsRegular: -1, NumStudentsSpecial: -1}
 	if err := Bind(c, &body); err != nil {
 		return err
 	}
 	if err := h.Svc.Teaching.SetNumStudents(c.Context(), UserID(c), id,
-		body.NumStudents, body.NumStudentsRegular, body.NumStudentsSpecial); err != nil {
+		body.NumStudents, body.NumStudentsRegular, body.NumStudentsSpecial, body.Confirm); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -930,10 +934,21 @@ func (h *TeachingHandler) ImportExcel(c *fiber.Ctx) error {
 	var merges []service.ImportMerge
 	if raw := c.FormValue("merges"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &merges); err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "merges must be JSON")
+			return fiber.NewError(fiber.StatusBadRequest, "ข้อมูลการรวมรายวิชาไม่ถูกต้อง")
 		}
 	}
-	res, err := h.Svc.Teaching.CommitImport(c.Context(), UserID(c), termID, fh.Filename, body, skipCodes, merges)
+	// proceed_codes: unmatched-officer courses staff chose to create with no
+	// lecturer. Unmatched courses NOT listed are skipped, matching what the
+	// preview told staff ("ต้องตัดสินใจ").
+	var proceedCodes []string
+	if raw := c.FormValue("proceed_codes"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				proceedCodes = append(proceedCodes, p)
+			}
+		}
+	}
+	res, err := h.Svc.Teaching.CommitImport(c.Context(), UserID(c), termID, fh.Filename, body, skipCodes, merges, proceedCodes...)
 	if err != nil {
 		return err
 	}
@@ -1089,7 +1104,9 @@ func (h *TARequestHandler) AddSections(c *fiber.Ctx) error {
 		if errors.As(err, &ue) {
 			return err // carries its own status (409 for a frozen grad lump)
 		}
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		// Plain errors go through ErrorHandler too: Thai business text → 400,
+		// internal/DB errors → generic 500 instead of echoing them.
+		return err
 	}
 	return c.JSON(res)
 }
@@ -1101,7 +1118,9 @@ func (h *TARequestHandler) Create(c *fiber.Ctx) error {
 	}
 	res, err := h.Svc.TARequest.Create(c.Context(), UserID(c), in)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		// ErrorHandler, not a blanket 400: business refusals keep their Thai
+		// text and status, while a DB/driver failure must not be echoed raw.
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(res)
 }
@@ -1116,7 +1135,9 @@ func (h *TARequestHandler) Cancel(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	if err := h.Svc.TARequest.Cancel(c.Context(), UserID(c), id); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		// See Create: ErrorHandler maps UserError/Thai text to 4xx and anything
+		// internal to a generic 500 without leaking it.
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -1155,7 +1176,7 @@ func (h *TARequestHandler) UpdateAssignmentWorkload(c *fiber.Ctx) error {
 		return err
 	}
 	if err := h.Svc.TARequest.UpdateAssignmentWorkload(c.Context(), UserID(c), id, in); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err // see Create
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -1186,7 +1207,7 @@ func (h *TARequestHandler) PreviewConflicts(c *fiber.Ctx) error {
 	}
 	out, err := h.Svc.TARequest.PreviewConflicts(c.Context(), taID, tcID)
 	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		return err // see Create — never echo a raw internal error as the 500 body
 	}
 	return c.JSON(fiber.Map{"conflicts": out})
 }
@@ -1863,7 +1884,9 @@ func (h *WorkloadHandler) ReplaceClasses(c *fiber.Ctx) error {
 	if err := c.BodyParser(&blocks); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	if err := h.Svc.Workload.ReplaceClasses(c.Context(), UserID(c), termID, blocks); err != nil {
+	// confirm=1 is the TA accepting the impact the previous attempt listed
+	// (status 428) — sessions of an approved assignment the new timetable clashes with.
+	if err := h.Svc.Workload.SaveOwnClasses(c.Context(), UserID(c), termID, blocks, c.QueryBool("confirm")); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true, "count": len(blocks)})
@@ -2142,6 +2165,10 @@ func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
+	// No hours in the name of a deactivated TA (see EnsureAssignmentTAActive).
+	if err := h.Svc.TARequest.EnsureAssignmentTAActive(c.Context(), in.WorkLog.ID, in.WorkLog.AssignmentID); err != nil {
+		return err
+	}
 	// Staff/admin may edit any course; a lecturer only their own, enforced in
 	// the service so the rule survives a future caller.
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
@@ -2374,8 +2401,12 @@ func stripAnnounceTargeting(a *service.Announcement) {
 	a.TargetUserIDs = nil
 	a.TargetCourseIDs = nil
 	a.TargetFilters = nil
+	a.TargetCourses = nil
+	a.TargetUsers = nil
 	a.Recipients = nil
 	a.AudienceCount = 0
+	a.FailedCount, a.PendingCount, a.ReadCount = 0, 0, 0
+	a.RemindedAt = nil
 }
 
 // Get returns one announcement. Non-staff callers can only see it if the row
@@ -2400,22 +2431,10 @@ func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
 		if a.Status != "live" {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
-		roles := Roles(c)
-		matched := false
-		for _, want := range a.Audience {
-			for _, have := range roles {
-				if want == have {
-					matched = true
-					break
-				}
-			}
-			if matched {
-				break
-			}
-		}
-		if !matched {
-			return fiber.NewError(fiber.StatusForbidden, "forbidden")
-		}
+		// The recipient ledger is the one gate. A role test used to run first,
+		// which turned away exactly the people an announcement was aimed at by
+		// name or by course with no role ticked — they were emailed a link that
+		// answered "forbidden".
 		// Targeting is per person (the feed reads announcement_recipients);
 		// the role test alone let anyone in the audience role read a notice
 		// aimed at a few people once they had its id. Same 404 as not-live so
@@ -2431,6 +2450,9 @@ func (h *AnnounceHandler) Get(c *fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
 	}
+	// Opening the announcement is what "อ่านแล้ว" counts. A no-op for anyone
+	// who is not on its recipient list.
+	h.Svc.Announce.MarkRead(c.Context(), id, UserID(c))
 	return c.JSON(a)
 }
 
@@ -2560,14 +2582,60 @@ func (h *AnnounceHandler) Resend(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	sent, err := h.Svc.Announce.Deliver(c.Context(), id)
+	res, err := h.Svc.Announce.Redeliver(c.Context(), id)
 	if err != nil {
 		if errors.Is(err, service.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
 		return err
 	}
-	return c.JSON(fiber.Map{"sent": sent})
+	return c.JSON(res)
+}
+
+// Remind — POST /announcements/:id/remind — nudges recipients who have not
+// opened the announcement. At most once a day per announcement.
+func (h *AnnounceHandler) Remind(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	n, err := h.Svc.Announce.RemindUnread(c.Context(), UserID(c), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
+		}
+		return err
+	}
+	return c.JSON(fiber.Map{"reminded": n})
+}
+
+// MarkRead — POST /announcements/:id/read — the reader's feed reports that it
+// showed the whole announcement inline, without the detail page being opened.
+// Only ever touches the caller's own ledger row, so it needs no role check.
+func (h *AnnounceHandler) MarkRead(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	h.Svc.Announce.MarkRead(c.Context(), id, UserID(c))
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// SendTest — POST /announcements/send-test — mails the caller a copy of the
+// draft on screen. Nothing is saved and nobody else is told.
+func (h *AnnounceHandler) SendTest(c *fiber.Ctx) error {
+	var in struct {
+		Title    string `json:"title" validate:"required,max=200"`
+		Body     string `json:"body" validate:"required,max=8000"`
+		Category string `json:"category" validate:"omitempty,oneof=info news warning urgent event"`
+	}
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := h.Svc.Announce.SendTest(c.Context(), UserID(c), in.Title, in.Body, in.Category); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 // announceMediaKinds maps an accepted MIME to (kind, extension). The kind is
@@ -2998,6 +3066,21 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// A download of months that are already exported (and not sent back) is a
+	// re-download: hand back the exact ZIP finance received rather than a
+	// rebuild, which used to be refused with 409 once anything in the term had
+	// moved the live pricing. Audited like BatchDownload — it carries PII.
+	if arch, err := h.Svc.Export.ArchivedReissue(c.Context(), id, months); err != nil {
+		return err
+	} else if arch != nil {
+		actor := UserID(c)
+		if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.batch_download", Entity: "export_batch", EntityID: arch.Batch.BatchID.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")}); err != nil {
+			return err
+		}
+		c.Set("Content-Type", "application/zip")
+		c.Set("Content-Disposition", contentDisposition("attachment", arch.Batch.FileName))
+		return c.Send(arch.Body)
+	}
 	builtFP, err := h.Svc.SubmissionPeriods.CourseWorklogFingerprint(c.Context(), id, months)
 	if err != nil {
 		return err
@@ -3015,7 +3098,9 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// underlying worklogs stayed editable (file silently diverges from the DB).
 	// Fail the request instead so staff retries; months still being worked on
 	// stay editable and lock on a later re-export.
-	if _, err := h.Svc.SubmissionPeriods.MarkCourseExportedAsBuilt(c.Context(), actor, id, months, builtFP); err != nil {
+	// The pack's per-(TA, month) figures are recorded with the lock, so the
+	// locked months are priced from what this file says from now on.
+	if _, err := h.Svc.SubmissionPeriods.MarkCourseExportedWithFigures(c.Context(), actor, id, months, builtFP, pack.Figures); err != nil {
 		return err
 	}
 	// The graduate-special lump each exported month carries is fixed from here
@@ -3403,7 +3488,17 @@ func (h *ExportHandler) UnlockCourse(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	if err := h.Svc.Teaching.Unexport(c.Context(), UserID(c), id); err != nil {
+	// The reason is optional (existing callers send no body); it reaches the TA
+	// and the lecturer with the reopened months, and the audit trail.
+	var body struct {
+		Reason string `json:"reason" validate:"max=500"`
+	}
+	if len(c.Body()) > 0 {
+		if err := Bind(c, &body); err != nil {
+			return err
+		}
+	}
+	if err := h.Svc.Teaching.Unexport(c.Context(), UserID(c), id, body.Reason); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -3420,32 +3515,10 @@ type AuditHandler struct{ Svc *service.Container }
 // however it was phrased. Everything is now decided in SQL against the indexes
 // migration 0107 added.
 func (h *AuditHandler) List(c *fiber.Ctx) error {
-	q := service.AuditQuery{
-		Role:     c.Query("role"),
-		Action:   c.Query("action"),
-		Entity:   c.Query("entity"),
-		EntityID: c.Query("entity_id"),
-		IP:       c.Query("ip"),
-		Q:        strings.TrimSpace(c.Query("q")),
+	q, err := auditQueryFrom(c)
+	if err != nil {
+		return err
 	}
-	var err error
-	if q.From, err = optTime(c.Query("from")); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "from ไม่ใช่วันที่ที่ถูกต้อง")
-	}
-	if q.To, err = optTime(c.Query("to")); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "to ไม่ใช่วันที่ที่ถูกต้อง")
-	}
-	if q.ActorID, err = optUUID(c.Query("actor_id")); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "actor_id ไม่ถูกต้อง")
-	}
-	if q.RequestID, err = optUUID(c.Query("request_id")); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "request_id ไม่ถูกต้อง")
-	}
-	if q.SessionID, err = optUUID(c.Query("session_id")); err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "session_id ไม่ถูกต้อง")
-	}
-	q.Limit, _ = strconv.Atoi(c.Query("limit", "50"))
-	q.Offset, _ = strconv.Atoi(c.Query("offset", "0"))
 
 	items, total, err := h.Svc.Audit.ListAudit(c.Context(), q)
 	if err != nil {

@@ -35,8 +35,10 @@ func TestSendBack_UnsignedOpenMonthRejectsApprovedRows(t *testing.T) {
 	if approvedAt != nil {
 		t.Errorf("approved_at kept on a rejected row: %s", *approvedAt)
 	}
-	if got := f.statusOf(t); got != "(no row)" {
-		t.Errorf("send-back minted a status row: %q", got)
+	// The send-back writes its reason on the month's status row (WP3), so the
+	// timeline shows the current reason; the month stays pending.
+	if got := f.statusOf(t); got != "pending" {
+		t.Errorf("status after send-back = %q, want pending", got)
 	}
 
 	// Nothing approved is left, so a second press says so rather than succeeding.
@@ -68,9 +70,10 @@ func TestSendBack_UnsignedClosedMonthRefused(t *testing.T) {
 	}
 }
 
-// The signed-off path is unchanged: a staff_reviewed month goes back to
-// pending and its rows stay as they are.
-func TestSendBack_ReviewedMonthStillMovesStatus(t *testing.T) {
+// A signed-off month now behaves like every other: it goes back to pending AND
+// its rows go back to the TA as rejected, in one press (WP3, bug 3). Moving
+// only the status left a month nobody could edit.
+func TestSendBack_ReviewedMonthAlsoReopensRows(t *testing.T) {
 	f, month := reviewFixture(t)
 	staff := f.insertUser("staff", "officer")
 	pid := mustUUID(t, f.periodID(t, month))
@@ -88,7 +91,7 @@ func TestSendBack_ReviewedMonthStillMovesStatus(t *testing.T) {
 		f.AssignmentID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != "approved" {
-		t.Fatalf("reviewed-month send-back moved rows to %s", status)
+	if status != "rejected" {
+		t.Fatalf("reviewed-month send-back left rows %s, want rejected", status)
 	}
 }

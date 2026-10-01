@@ -97,9 +97,9 @@ func main() {
 	                       7, 6, 6,
 	                       'seed defaults per ประกาศ 731/2565 + 1080/2565 + Q&A 2026'
 	                WHERE NOT EXISTS (SELECT 1 FROM pay_rates)`)
-	pool.Exec(ctx, `INSERT INTO budget_caps (id, effective_from, per_course_max, note)
-	                SELECT gen_random_uuid(), CURRENT_DATE, 20000, 'seed default'
-	                WHERE NOT EXISTS (SELECT 1 FROM budget_caps)`)
+	// No budget_caps row: that table was dropped in migration 0114 (the per-course
+	// ceiling is now computed from the formula), and the insert here only ever
+	// failed silently because its error was ignored.
 	fmt.Println("Seed complete.")
 }
 
