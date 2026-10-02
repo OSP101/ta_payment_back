@@ -5,14 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
+	_ "image/jpeg" // registered for image.DecodeConfig (background size check)
+	_ "image/png"
 	"io"
 	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	_ "golang.org/x/image/webp"
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/rbac"
@@ -2607,6 +2612,92 @@ func (h *AnnounceHandler) Remind(c *fiber.Ctx) error {
 		return err
 	}
 	return c.JSON(fiber.Map{"reminded": n})
+}
+
+// announceBackgroundMaxBytes caps a background upload. Higher than a cover's
+// 5 MB: a 1920×1080 PNG with a photograph in it is easily 4–6 MB.
+const announceBackgroundMaxBytes = 8 * 1024 * 1024
+
+// ListBackgrounds — GET /announcements/backgrounds.
+func (h *AnnounceHandler) ListBackgrounds(c *fiber.Ctx) error {
+	out, err := h.Svc.Announce.ListBackgrounds(c.Context())
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": out})
+}
+
+// UploadBackground — POST /announcements/backgrounds (multipart: file, name,
+// text_tone). The size rule is checked from the decoded image header, never
+// from anything the client says about it.
+func (h *AnnounceHandler) UploadBackground(c *fiber.Ctx) error {
+	fh, err := c.FormFile("file")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "กรุณาเลือกไฟล์รูป")
+	}
+	if fh.Size > announceBackgroundMaxBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 8MB")
+	}
+	ext, ok := announceImageMIME[strings.ToLower(fh.Header.Get("Content-Type"))]
+	if !ok {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType, "รองรับเฉพาะ JPEG / PNG / WebP")
+	}
+	src, err := fh.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	buf, err := io.ReadAll(io.LimitReader(src, announceBackgroundMaxBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(buf)) > announceBackgroundMaxBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 8MB")
+	}
+	if !imageMagicMatches(buf, ext) {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType, "ประเภทไฟล์ไม่ตรงกับเนื้อหา")
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(buf))
+	if err != nil {
+		return fiber.NewError(fiber.StatusUnsupportedMediaType, "อ่านขนาดรูปไม่ได้ ไฟล์อาจเสีย")
+	}
+	if err := service.CheckBackgroundSize(cfg.Width, cfg.Height); err != nil {
+		return err
+	}
+	if err := h.Svc.ScanUpload(c.Context(), UserID(c), "announcement_background", fh.Filename, buf); err != nil {
+		return err
+	}
+	key, _, err := h.Svc.Storage.Save("announcements", uuid.New().String()+ext, bytes.NewReader(buf))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+	b, err := h.Svc.Announce.AddBackground(c.Context(), UserID(c), c.FormValue("name"), key,
+		cfg.Width, cfg.Height, c.FormValue("text_tone"))
+	if err != nil {
+		_ = h.Svc.Storage.Delete(key) // nothing refers to it
+		return err
+	}
+	return c.Status(fiber.StatusCreated).JSON(b)
+}
+
+// DeleteBackground — DELETE /announcements/backgrounds/:id.
+func (h *AnnounceHandler) DeleteBackground(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	key, err := h.Svc.Announce.DeleteBackground(c.Context(), UserID(c), id)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "ไม่พบพื้นหลัง")
+		}
+		return err
+	}
+	// The file goes too; covers made from it are copies and stay.
+	if err := h.Svc.Storage.Delete(key); err != nil {
+		slog.Warn("announce background file not removed", "key", key, "err", err)
+	}
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 // MarkRead — POST /announcements/:id/read — the reader's feed reports that it

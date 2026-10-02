@@ -244,6 +244,8 @@ var catalog = map[string]ActionInfo{
 	"announce.unpublish":           ok("ยกเลิกการเผยแพร่ประกาศ", CatComms),
 	"announce.delete":              ok("ลบประกาศ", CatComms),
 	"announce.remind":              ok("ส่งเตือนให้อ่านประกาศ", CatComms),
+	"announce.background_add":      ok("เพิ่มพื้นหลังรูปประกาศ", CatComms),
+	"announce.background_delete":   ok("ลบพื้นหลังรูปประกาศ", CatComms),
 	"holiday.remind":               ok("เตือนอาจารย์ให้นัดคาบชดเชย", CatComms),
 	"payout.remind_lecturer":       ok("เตือนอาจารย์ให้ตรวจชั่วโมง", CatComms),
 	"signature_checklist.remind":   ok("เตือนให้ลงนามเอกสาร", CatComms),
