@@ -65,6 +65,9 @@ const (
 
 // gradEvidencePerson is one graduate TA's row on one of the two sheets.
 type gradEvidencePerson struct {
+	// TAID lets a single TA's own copy be cut out of the course data
+	// (BuildTAClaimWorkbook); the sheet itself never prints it.
+	TAID    uuid.UUID
 	Name    string
 	LevelTH string // "ป.โท" / "ป.เอก"
 	// ByMonth is keyed by Gregorian "YYYY-MM". On the ปกติ sheet it holds HOURS,
@@ -869,7 +872,7 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 			levelTH = "ป.เอก"
 		}
 		if byMonth := hoursByTA[p.id]; len(byMonth) > 0 {
-			gp := gradEvidencePerson{Name: p.name, LevelTH: levelTH, ByMonth: byMonth}
+			gp := gradEvidencePerson{TAID: p.id, Name: p.name, LevelTH: levelTH, ByMonth: byMonth}
 			if paid := round2(fundedByTA[p.id]); paid+0.005 < round2(fullByTA[p.id]) {
 				gp.PaidBaht = &paid
 			}
@@ -881,7 +884,7 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 			// partial export — which is the point: the missing months are
 			// claimed on the other fiscal year's document.
 			d.Special = append(d.Special, gradEvidencePerson{
-				Name: p.name, LevelTH: levelTH,
+				TAID: p.id, Name: p.name, LevelTH: levelTH,
 				ByMonth: lumpByTA[p.id],
 			})
 		}

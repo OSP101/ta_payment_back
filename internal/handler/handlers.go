@@ -3495,6 +3495,23 @@ func (h *ExportHandler) CoursePreview(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// TAClaimSheet — GET /me/ta-courses/:tcId/claim-sheet.xlsx — the caller's own
+// claim sheet for the course, cut from the same workbook staff export. Reads
+// only: it locks no month and records no batch.
+func (h *ExportHandler) TAClaimSheet(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	body, name, err := h.Svc.Export.BuildTAClaimWorkbook(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	c.Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
+	return c.Send(body)
+}
+
 // CourseExportCoverage — GET /exports/course/:id/coverage — the term's months
 // with Thai labels, which of them this course has already exported, and where
 // the budget year cuts. Drives the month picker on the payout screen.

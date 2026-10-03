@@ -678,7 +678,13 @@ func (p *presBuilder) requests(ctx context.Context, phases ...string) error {
 			return fmt.Errorf("%s: %w", c.code, err)
 		}
 		expect := map[string]string{"1": "approved", "2": "approved", "pending": "submitted", "rejected": "rejected"}[c.phase]
-		if res.Status != expect {
+		// Each TA is its own request now, judged alone: a pending or rejected
+		// course needs that verdict on at least one TA, an approved one on all.
+		got := map[string]bool{res.Status: true}
+		for _, r := range res.Requests {
+			got[r.Status] = true
+		}
+		if !got[expect] || (expect == "approved" && len(got) > 1) {
 			return fmt.Errorf("%s: ระบบตัดสินคำขอเป็น %s แต่ชุดข้อมูลตั้งใจให้เป็น %s (%s)", c.code, res.Status, expect, res.RejectReason)
 		}
 	}

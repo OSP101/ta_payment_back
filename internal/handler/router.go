@@ -557,6 +557,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/exports/course/:id/preview", RequireRole(rbac.RoleAdmin, rbac.RoleStaff),
 		AuditRead(aud, "export.course.preview", "teaching_course", "id"), eh.CoursePreview)
 	authed.Get("/exports/course/:id/coverage", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseExportCoverage)
+	// A TA's own ใบเบิกเวลา for one course, to check against their records.
+	// A plain read — none of the course export's locking or gates.
+	authed.Get("/me/ta-courses/:tcId/claim-sheet.xlsx", RequireRole(rbac.RoleTA), heavyLimiter, eh.TAClaimSheet)
 	// No role guard: the service checks that the caller teaches or assists the
 	// course. A budget that decides a TA's own pay is not a staff secret.
 	authed.Get("/teaching-courses/:tcId/budget-settlement", eh.BudgetSettlement)

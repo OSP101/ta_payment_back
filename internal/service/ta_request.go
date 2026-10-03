@@ -49,14 +49,21 @@ type DecisionCheck struct {
 	Message string `json:"message"`
 }
 
-// CreateResult is what Create returns to the handler. Every submission
-// resolves to either 'approved' or 'rejected' inside the tx; there is no
-// 'submitted' state at rest under the auto-decide model.
+// CreateResult is what Create returns to the handler: 'approved' or
+// 'rejected', or 'submitted' while the TA's timetable is still missing.
+//
+// A submission files one request per TA (0149), so Create fills Requests with
+// every TA's own result; the top-level fields are the first TA's, which keeps
+// a single-TA submission reading as it always did.
 type CreateResult struct {
 	ID           uuid.UUID       `json:"id"`
 	Status       string          `json:"status"`
 	Checks       []DecisionCheck `json:"decision_checks"`
 	RejectReason string          `json:"reject_reason,omitempty"`
+	BatchID      *uuid.UUID      `json:"batch_id,omitempty"`
+	TAID         *uuid.UUID      `json:"ta_id,omitempty"`
+	TAName       string          `json:"ta_name,omitempty"`
+	Requests     []CreateResult  `json:"requests,omitempty"`
 }
 
 // WorkloadInput's Hrs fields carry validate:"gte=0,lte=99" mirroring
@@ -404,36 +411,62 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 	//
 	// Create now runs the same applyClashOutcome the deferred path runs (below),
 	// so there is one clash rule in the system instead of two. See 3ก, 31/07/2026.
+	//
+	// One request PER TA (03/10/2026, migration 0149). A submission naming
+	// several TAs used to be one request judged as a unit, so one TA failing a
+	// rule rejected everyone, and one TA without a timetable kept everyone
+	// waiting. Filed apart, every existing per-request rule — the verdict, the
+	// wait for a timetable, the clash recheck, cancel — applies to that TA
+	// alone. batch_id remembers they were sent together.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	rid := uuid.New()
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id, is_late, submitted_by)
-		 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5,$6,$7)`,
-		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID, isLate, onBehalfOf(actor, lecturerID)); err != nil {
-		return nil, err
+	batchID := uuid.New()
+
+	// autoDecide takes a per-TA advisory lock, and every request here holds it
+	// to the end of this one tx. Take them in TA-id order, as autoDecide does
+	// within a request, so two submissions sharing TAs cannot deadlock.
+	order := make([]int, len(in.Assignments))
+	for i := range order {
+		order[i] = i
 	}
-	for _, c := range in.Counts {
+	sort.Slice(order, func(x, y int) bool {
+		return in.Assignments[order[x]].TAID.String() < in.Assignments[order[y]].TAID.String()
+	})
+
+	results := make([]CreateResult, len(in.Assignments))
+	notices := make([]map[uuid.UUID][]string, len(in.Assignments))
+	for _, i := range order {
+		a := in.Assignments[i]
+		rid := uuid.New()
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO ta_request_counts (request_id, section_id, undergrad_count, graduate_count)
-			 VALUES ($1,$2,$3,$4)`, rid, c.SectionID, c.UndergradCount, c.GraduateCount); err != nil {
+			`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id, is_late, submitted_by, batch_id)
+			 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5,$6,$7,$8)`,
+			rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID, isLate, onBehalfOf(actor, lecturerID), batchID); err != nil {
 			return nil, err
 		}
-	}
-	// One TA can cover multiple sections. Each section becomes its own
-	// ta_request_assignments row (so worklog can attribute time per section
-	// and the schedule-conflict checks continue to operate per section), but
-	// the workload declaration is shared: only the first assignment carries
-	// the ta_workload_forms row. Downstream reads LEFT JOIN the form and
-	// COALESCE numeric fields to 0, so the aggregate (which sums across all
-	// of a TA's assignments in the request) matches the declared total.
-	// Every section now carries its OWN workload row (0041). Before that only
-	// the first one did, which made the hours mean "all sections combined" and
-	// left worklog unable to tell how much time belonged to which group.
-	for i, a := range in.Assignments {
+		// The counts describe this request, so they are this TA's own: one
+		// person on each of their sections. The form's per-section totals
+		// spanned every TA on the form, which is no longer one request.
+		ug, grad := 1, 0
+		if levels[i] != "undergrad" {
+			ug, grad = 0, 1
+		}
+		for _, secID := range a.SectionIDs {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO ta_request_counts (request_id, section_id, undergrad_count, graduate_count)
+				 VALUES ($1,$2,$3,$4)`, rid, secID, ug, grad); err != nil {
+				return nil, err
+			}
+		}
+		// Each section becomes its own ta_request_assignments row (so worklog
+		// can attribute time per section and the schedule-conflict checks
+		// operate per section), and every section carries its OWN workload row
+		// (0041). Before that only the first one did, which made the hours mean
+		// "all sections combined" and left worklog unable to tell how much time
+		// belonged to which group.
 		for _, secID := range a.SectionIDs {
 			aid := uuid.New()
 			group := coGroup[i][secID]
@@ -461,16 +494,56 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 				return nil, err
 			}
 		}
+
+		one := in
+		one.Assignments = []AssignmentInput{a}
+		one.Counts = nil
+		res, n, err := s.decideNew(ctx, tx, actor, rid, termID, one)
+		if err != nil {
+			return nil, err
+		}
+		taID := a.TAID
+		res.BatchID = &batchID
+		res.TAID = &taID
+		res.TAName = s.taName(ctx, a.TAID)
+		results[i] = *res
+		notices[i] = n
 	}
 
-	// Case 1: someone on this request has not filed a timetable, so there is
-	// nothing to judge yet. The row RESTS in 'submitted' — which already means
-	// "handed in, not yet judged" — and ReevaluateForTA finishes it the moment
-	// the last timetable arrives. The quota these assignments reserve is held
-	// throughout, which is the point: submitting books the slot.
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	decided := make([]CreateResult, 0, len(results))
+	for i, r := range results {
+		s.notifyClashOutcome(ctx, r.ID, notices[i])
+		if r.Status == "submitted" {
+			continue // nothing to tell anyone until the TA's timetable arrives
+		}
+		s.notifyTAsDecision(ctx, r.ID, r.Status, r.RejectReason)
+		decided = append(decided, r)
+	}
+	s.notifyLecturerBatch(ctx, decided)
+
+	// The top level stays the first TA's own result, so a single-TA submission
+	// reads exactly as it always did; Requests carries everyone.
+	out := results[0]
+	out.Requests = results
+	return &out, nil
+}
+
+// decideNew judges one freshly inserted request inside the submission's tx.
+// It leaves the request resting in 'submitted' when its TA has no timetable
+// yet, and otherwise decides it exactly as tryFinalize does. Notices are
+// returned for the caller to send after commit.
+func (s *TARequestService) decideNew(ctx context.Context, tx pgx.Tx, actor, rid, termID uuid.UUID, auditIn CreateTARequestInput) (*CreateResult, map[uuid.UUID][]string, error) {
+	// Case 1: the TA has not filed a timetable, so there is nothing to judge
+	// yet. The row RESTS in 'submitted' — which already means "handed in, not
+	// yet judged" — and ReevaluateForTA finishes it the moment the timetable
+	// arrives. The quota these assignments reserve is held throughout, which is
+	// the point: submitting books the slot.
 	waiting, err := tasMissingSchedule(ctx, tx, rid, termID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(waiting) > 0 {
 		checks := []DecisionCheck{{
@@ -478,43 +551,40 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 			Passed:  false,
 			Warning: true,
 			Message: fmt.Sprintf(
-				"รอตารางเรียนของ %s ระบบจะตัดสินคำขอนี้ให้อัตโนมัติเมื่อครบทุกคน "+
-					"หากคาบใดตรงกับตารางเรียนของเขา คาบนั้นจะถูกตัดออก",
+				"รอตารางเรียนของ %s ระบบจะตัดสินให้อัตโนมัติเมื่อบันทึกตารางเรียนแล้ว "+
+					"หากคาบใดตรงกับตารางเรียน คาบนั้นจะถูกตัดออก",
 				strings.Join(waiting, ", ")),
 		}}
 		checksJSON, err := json.Marshal(checks)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if _, err := tx.Exec(ctx,
 			`UPDATE ta_requests SET decision_checks = $1::jsonb, updated_at = NOW() WHERE id = $2`,
 			checksJSON, rid); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := s.aud.LogTx(ctx, tx, audit.Entry{
 			ActorID: &actor, Action: "ta_request.pending_schedule",
 			Entity: "ta_request", EntityID: rid.String(),
-			Note: strings.Join(waiting, ", "), After: in,
+			Note: strings.Join(waiting, ", "), After: auditIn,
 		}); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return nil, err
-		}
-		return &CreateResult{ID: rid, Status: "submitted", Checks: checks}, nil
+		return &CreateResult{ID: rid, Status: "submitted", Checks: checks}, nil, nil
 	}
 
-	// Everyone has a timetable, so the clash verdict is knowable now. Decide it
+	// The TA has a timetable, so the clash verdict is knowable now. Decide it
 	// exactly as tryFinalize does: trim the sessions that collide, drop only the
 	// sections where nothing workable is left, and keep the rest.
 	notices, err := s.applyClashOutcome(ctx, tx, rid)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	checks, passed, err := s.autoDecide(ctx, tx, rid)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// What was trimmed has to reach the lecturer at the moment they submit —
@@ -531,19 +601,18 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		})
 	}
 
-	// A TA whose every section was dropped is off the request; if that empties it,
-	// there is nobody left to teach. Mirrors tryFinalize.
+	// Every section dropped leaves nobody to teach. Mirrors tryFinalize.
 	var surviving int
 	if err := tx.QueryRow(ctx,
 		`SELECT COUNT(*) FROM ta_request_assignments WHERE request_id = $1 AND state <> 'dropped'`,
 		rid).Scan(&surviving); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	verdict := "rejected"
 	var reason string
 	switch {
 	case surviving == 0:
-		reason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
+		reason = clashRejectReason
 	case passed:
 		verdict = "approved"
 	default:
@@ -551,7 +620,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 	}
 	checksJSON, err := json.Marshal(checks)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE ta_requests SET
@@ -562,7 +631,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		  decision_checks = $3::jsonb,
 		  updated_at      = NOW()
 		WHERE id = $4`, verdict, reason, checksJSON, rid); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
 		ActorID:  &actor,
@@ -570,17 +639,11 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		Entity:   "ta_request",
 		EntityID: rid.String(),
 		Note:     verdict,
-		After:    in,
+		After:    auditIn,
 	}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	s.notifyClashOutcome(ctx, rid, notices)
-	s.notifyDecision(ctx, rid, verdict, reason)
-	return &CreateResult{ID: rid, Status: verdict, Checks: checks, RejectReason: reason}, nil
+	return &CreateResult{ID: rid, Status: verdict, Checks: checks, RejectReason: reason}, notices, nil
 }
 
 // joinRejectMessages produces a single-line reject_reason from the failed
@@ -995,6 +1058,36 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 // notifyDecision fans out approval / rejection notifications. Best-effort:
 // failures here must not roll back the decision itself.
 func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, verdict, reason string) {
+	s.notifyLecturerDecision(ctx, reqID, verdict, reason)
+	s.notifyTAsDecision(ctx, reqID, verdict, reason)
+}
+
+// requestTANames names the TAs on a request — one person since 0149, several
+// on older rows — for notices that must say whose verdict this is.
+func (s *TARequestService) requestTANames(ctx context.Context, reqID uuid.UUID) string {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT u.first_name || ' ' || u.last_name AS name
+		FROM ta_request_assignments a JOIN users u ON u.id = a.ta_id
+		WHERE a.request_id = $1 ORDER BY name`, reqID)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			names = append(names, n)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// notifyLecturerDecision tells the lecturer one request's verdict. The TA is
+// in the title: a course now holds one request per TA, and unread notices
+// fold by (title, link), so without the name a second TA's verdict would
+// overwrite the first.
+func (s *TARequestService) notifyLecturerDecision(ctx context.Context, reqID uuid.UUID, verdict, reason string) {
 	if s.notify == nil {
 		return
 	}
@@ -1004,14 +1097,67 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 		return
 	}
 	code, nameTH := s.courseLabel(ctx, courseID)
+	ta := s.requestTANames(ctx, reqID)
 	if verdict == "approved" {
-		s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนได้รับการอนุมัติ "+code,
-			fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอดังกล่าวได้รับการอนุมัติเรียบร้อยแล้ว", code, nameTH), "/lecturer")
+		s.notify.Send(ctx, lecturerID, fmt.Sprintf("คำขอผู้ช่วยสอนได้รับการอนุมัติ %s (%s)", code, ta),
+			fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนได้รับการอนุมัติเรียบร้อยแล้ว", code, nameTH, ta), "/lecturer")
+		return
+	}
+	s.notify.Send(ctx, lecturerID, fmt.Sprintf("คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ %s (%s)", code, ta),
+		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, ta, reason), "/lecturer")
+}
+
+// notifyLecturerBatch tells the lecturer the verdicts of one submission in a
+// single notice: a form naming five TAs is now five requests, and five
+// e-mails for one press of ส่งคำขอ is noise. TAs still waiting on a timetable
+// are left out — each is told on its own when decided (tryFinalize).
+func (s *TARequestService) notifyLecturerBatch(ctx context.Context, decided []CreateResult) {
+	if s.notify == nil || len(decided) == 0 {
+		return
+	}
+	if len(decided) == 1 {
+		s.notifyLecturerDecision(ctx, decided[0].ID, decided[0].Status, decided[0].RejectReason)
+		return
+	}
+	var courseID, lecturerID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id, lecturer_id FROM ta_requests WHERE id = $1`, decided[0].ID).Scan(&courseID, &lecturerID); err != nil {
+		return
+	}
+	code, nameTH := s.courseLabel(ctx, courseID)
+	names := make([]string, 0, len(decided))
+	lines := make([]string, 0, len(decided))
+	for _, r := range decided {
+		names = append(names, r.TAName)
+		if r.Status == "approved" {
+			lines = append(lines, r.TAName+" ได้รับการอนุมัติ")
+		} else {
+			lines = append(lines, r.TAName+" ไม่ผ่านการอนุมัติ เนื่องจาก "+r.RejectReason)
+		}
+	}
+	s.notify.Send(ctx, lecturerID,
+		fmt.Sprintf("ผลการพิจารณาคำขอผู้ช่วยสอน %s (%s)", code, strings.Join(names, ", ")),
+		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขของผู้ช่วยสอนเป็นรายบุคคลแล้ว ผลการพิจารณามีดังนี้\n%s",
+			code, nameTH, numberedLines(lines)),
+		"/lecturer")
+}
+
+// notifyTAsDecision tells the TAs on a request its verdict: the appointment
+// notice when approved, the reason when not.
+func (s *TARequestService) notifyTAsDecision(ctx context.Context, reqID uuid.UUID, verdict, reason string) {
+	if s.notify == nil {
+		return
+	}
+	var courseID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT teaching_course_id FROM ta_requests WHERE id = $1`, reqID).Scan(&courseID); err != nil {
+		return
+	}
+	code, nameTH := s.courseLabel(ctx, courseID)
+	if verdict == "approved" {
 		s.notifyTAsAppointed(ctx, reqID, courseID, code, nameTH)
 		return
 	}
-	s.notify.Send(ctx, lecturerID, "คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ "+code,
-		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบแล้ว คำขอดังกล่าวไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/lecturer")
 	// The named TAs deserve to hear the outcome too — previously only the
 	// lecturer was told and a rejected TA never learned.
 	rows, err := s.pool.Query(ctx,
@@ -1029,7 +1175,7 @@ func (s *TARequestService) notifyDecision(ctx context.Context, reqID uuid.UUID, 
 			fmt.Sprintf("คำขอผู้ช่วยสอนรายวิชา %s %s ซึ่งระบุชื่อท่านเป็นผู้ช่วยสอน ไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/ta")
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("notifyDecision rows %s: %v", reqID, err)
+		log.Printf("notifyTAsDecision rows %s: %v", reqID, err)
 	}
 }
 
@@ -2271,6 +2417,11 @@ type TARequestSummary struct {
 	// SubmittedByName is the officer who filed the request for the lecturer;
 	// empty when the lecturer sent it themselves.
 	SubmittedByName string `json:"submitted_by_name,omitempty"`
+	// TANames names who the request is for — one TA since 0149, so the lists
+	// can say whose verdict each row is. BatchID ties the requests of one
+	// submission together; nil on rows filed before it existed.
+	TANames string     `json:"ta_names"`
+	BatchID *uuid.UUID `json:"batch_id,omitempty"`
 }
 
 const requestSummarySelect = `
@@ -2284,7 +2435,11 @@ const requestSummarySelect = `
 	           SELECT 1 FROM work_logs wl
 	           JOIN ta_request_assignments a ON a.id = wl.assignment_id
 	           WHERE a.request_id = r.id),
-	       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), '')
+	       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), ''),
+	       COALESCE((SELECT string_agg(DISTINCT tu.first_name || ' ' || tu.last_name, ', ')
+	                 FROM ta_request_assignments ta JOIN users tu ON tu.id = ta.ta_id
+	                 WHERE ta.request_id = r.id), ''),
+	       r.batch_id
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 	JOIN academic_terms at ON at.id = tc.term_id
@@ -2296,7 +2451,7 @@ func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
 	for rows.Next() {
 		var t TARequestSummary
 		var checksRaw []byte
-		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount, &t.CanCancel, &t.SubmittedByName); err != nil {
+		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount, &t.CanCancel, &t.SubmittedByName, &t.TANames, &t.BatchID); err != nil {
 			return nil, err
 		}
 		if len(checksRaw) > 0 {
@@ -2400,7 +2555,11 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		           SELECT 1 FROM work_logs wl
 		           JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		           WHERE a.request_id = r.id),
-		       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), '')
+		       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), ''),
+		       COALESCE((SELECT string_agg(DISTINCT tu.first_name || ' ' || tu.last_name, ', ')
+		                 FROM ta_request_assignments ta JOIN users tu ON tu.id = ta.ta_id
+		                 WHERE ta.request_id = r.id), ''),
+		       r.batch_id
 		FROM ta_requests r
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 		JOIN academic_terms at ON at.id = tc.term_id
@@ -2410,7 +2569,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		&d.TeachingCourseID, &d.LecturerName, &d.TACount,
 		&d.TermID, &d.AcademicYear, &d.Semester,
 		&checksRaw, &d.ReimburseScope,
-		&d.IsLate, &d.TrimmedCount, &d.DroppedCount, &d.CanCancel, &d.SubmittedByName)
+		&d.IsLate, &d.TrimmedCount, &d.DroppedCount, &d.CanCancel, &d.SubmittedByName, &d.TANames, &d.BatchID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("ไม่พบคำขอนี้")

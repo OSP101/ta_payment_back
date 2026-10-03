@@ -628,8 +628,8 @@ func stripBlockedInClassHours(ctx context.Context, tx pgx.Tx, assignmentID, taID
 // WorkloadService.ReplaceClasses) and from the periodic sweep, so a missed
 // call self-heals rather than stranding the request forever.
 //
-// Requests where some OTHER TA still has no timetable are left alone — the
-// meeting asked for the verdict to wait until everyone on the request is ready.
+// A request filed since 0149 holds one TA, so it waits on that TA alone. An
+// older request naming several still waits until every one of them is ready.
 func (s *TARequestService) ReevaluateForTA(ctx context.Context, taID, termID uuid.UUID) error {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT r.id
@@ -675,8 +675,8 @@ func (s *TARequestService) ReevaluateForTA(ctx context.Context, taID, termID uui
 		  AND (r.status = 'approved'
 		       -- auto-rejected because every TA's timetable clashed: a fixed
 		       -- timetable may bring it back (recheckApproved)
-		       OR (r.status = 'rejected' AND r.decided_by IS NULL AND r.reject_reason = $3))
-		  AND (a.state <> 'dropped' OR a.pre_clash IS NOT NULL)`, taID, termID, clashRejectReason)
+		       OR (r.status = 'rejected' AND r.decided_by IS NULL AND r.reject_reason IN ($3, $4)))
+		  AND (a.state <> 'dropped' OR a.pre_clash IS NOT NULL)`, taID, termID, clashRejectReason, legacyClashRejectReason)
 	if err != nil {
 		return err
 	}
@@ -719,7 +719,7 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 		   FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&status, &rejectReason, &decidedByNull); err != nil {
 		return err
 	}
-	clashRejected := status == "rejected" && decidedByNull && rejectReason == clashRejectReason
+	clashRejected := status == "rejected" && decidedByNull && isClashRejectReason(rejectReason)
 	if status != "approved" && !clashRejected {
 		return nil
 	}
@@ -772,11 +772,20 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 	return nil
 }
 
-// clashRejectReason is the reject_reason recheckApproved writes when the TAs'
-// own timetables leave nobody able to teach. It doubles as the marker that a
-// rejection was the system's, not a decision anyone made, so a fixed
-// timetable may reinstate it.
-const clashRejectReason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
+// clashRejectReason is the reject_reason written when the TA's own timetable
+// leaves no section they can work. It doubles as the marker that a rejection
+// was the system's, not a decision anyone made, so a fixed timetable may
+// reinstate it.
+const clashRejectReason = "ผู้ช่วยสอนติดตารางเรียนทุกคาบในทุกกลุ่มที่ขอ จึงช่วยสอนไม่ได้"
+
+// legacyClashRejectReason is the same marker from before requests were filed
+// one per TA (0149), when one request could hold several. Rows carrying it
+// must still be reinstatable.
+const legacyClashRejectReason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
+
+func isClashRejectReason(r string) bool {
+	return r == clashRejectReason || r == legacyClashRejectReason
+}
 
 // tryFinalize decides one pending request if every TA on it now has a
 // timetable. No-op otherwise.
@@ -828,7 +837,7 @@ func (s *TARequestService) tryFinalize(ctx context.Context, reqID, termID uuid.U
 	var reason string
 	switch {
 	case surviving == 0:
-		reason = "ผู้ช่วยสอนทุกคนในคำขอนี้ติดตารางเรียนทุกคาบ จึงไม่มีใครสอนได้"
+		reason = clashRejectReason
 	case passed:
 		verdict = "approved"
 	default:
@@ -887,7 +896,7 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 	code, nameTH := s.courseLabel(ctx, courseID)
 	label := strings.TrimSpace(code + " " + nameTH)
 
-	var summary []string
+	var summary, names []string
 	for taID, lines := range notices {
 		// A notice made only of restorations (restoreFromClash) is good news
 		// and must not arrive under a "ทับซ้อน" headline.
@@ -904,12 +913,16 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 			body,
 			// /ta/courses is not a route — the TA's course list is the home page.
 			"/ta")
-		summary = append(summary, fmt.Sprintf("%s %s", s.taName(ctx, taID), strings.Join(lines, " ")))
+		names = append(names, s.taName(ctx, taID))
+		summary = append(summary, fmt.Sprintf("%s %s", names[len(names)-1], strings.Join(lines, " ")))
 	}
-	lecTitle := "ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน " + code
+	// The TA is in the title too: a course holds one request per TA (0149),
+	// and the code alone would fold one TA's notice into another's.
+	who := " (" + strings.Join(names, ", ") + ")"
+	lecTitle := "ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน " + code + who
 	lecBody := fmt.Sprintf("ระบบพบว่าผู้ช่วยสอนในคำขอรายวิชา %s มีตารางเรียนทับซ้อนกับคาบสอน ดังนี้\n%s", label, numberedLines(summary))
 	if allRestoreLines(summary) {
-		lecTitle = "คืนสิทธิ์ผู้ช่วยสอน " + code
+		lecTitle = "คืนสิทธิ์ผู้ช่วยสอน " + code + who
 		lecBody = fmt.Sprintf("ผู้ช่วยสอนในคำขอรายวิชา %s แก้ตารางเรียนแล้ว ระบบคืนสิทธิ์ให้ ดังนี้\n%s", label, numberedLines(summary))
 	}
 	s.notify.Send(ctx, lecturerID,
