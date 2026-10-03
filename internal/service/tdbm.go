@@ -509,7 +509,27 @@ func (s *TDBMService) resolveCourseMatches(ctx context.Context, academicYear, se
 // match outright: TDBM might introduce a third semester_type we haven't seen,
 // and a name+group match with an unrecognized track label is still stronger
 // evidence than no match at all.
+//
+// Track is a TIE-BREAKER, not a gate (03/10/2026). CP423324 2569/1: TDBM sent
+// "กลุ่มที่ 2 / ภาคพิเศษ" while our only group 2 is stored as regular, so
+// every one of that group's makeups stayed unmatched and never reached the
+// course's holiday page. The group number already names the section when the
+// course has only one group with it; track decides only between two groups
+// sharing a number (a regular 01 and a special 01), and is still preferred.
 func (s *TDBMService) resolveSectionMatches(ctx context.Context, academicYear, semester int) (int, error) {
+	secNoMatches := func(alias string) string {
+		return `CASE
+		          WHEN ` + alias + `.sec_no ~ '^\d+$' AND regexp_replace(COALESCE(t2.section_label, ''), '\D', '', 'g') ~ '^\d+$'
+		            THEN ` + alias + `.sec_no::int = regexp_replace(t2.section_label, '\D', '', 'g')::int
+		          ELSE ` + alias + `.sec_no = regexp_replace(COALESCE(t2.section_label, ''), '\D', '', 'g')
+		        END`
+	}
+	trackOK := `(t2.semester_type IS NULL
+	             OR t2.semester_type NOT IN ('ภาคปกติ', 'ภาคพิเศษ')
+	             OR sec.track = (CASE t2.semester_type
+	                               WHEN 'ภาคปกติ' THEN 'regular'
+	                               WHEN 'ภาคพิเศษ' THEN 'special'
+	                             END)::section_track)`
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE tdbm_extra_teachings t
 		SET section_id = m.sec_id
@@ -517,21 +537,14 @@ func (s *TDBMService) resolveSectionMatches(ctx context.Context, academicYear, s
 			SELECT t2.extra_class_id,
 			       (SELECT sec.id FROM sections sec
 			        WHERE sec.teaching_course_id = t2.teaching_course_id
-			          AND (
-			                CASE
-			                  WHEN sec.sec_no ~ '^\d+$' AND regexp_replace(COALESCE(t2.section_label, ''), '\D', '', 'g') ~ '^\d+$'
-			                    THEN sec.sec_no::int = regexp_replace(t2.section_label, '\D', '', 'g')::int
-			                  ELSE sec.sec_no = regexp_replace(COALESCE(t2.section_label, ''), '\D', '', 'g')
-			                END
-			              )
-			          AND (
-			                t2.semester_type IS NULL
-			             OR t2.semester_type NOT IN ('ภาคปกติ', 'ภาคพิเศษ')
-			             OR sec.track = (CASE t2.semester_type
-			                               WHEN 'ภาคปกติ' THEN 'regular'
-			                               WHEN 'ภาคพิเศษ' THEN 'special'
-			                             END)::section_track
-			          )
+			          AND (`+secNoMatches("sec")+`)
+			          AND (`+trackOK+`
+			               OR NOT EXISTS (
+			                   SELECT 1 FROM sections s2
+			                   WHERE s2.teaching_course_id = sec.teaching_course_id
+			                     AND s2.id <> sec.id
+			                     AND (`+secNoMatches("s2")+`)))
+			        ORDER BY `+trackOK+` DESC
 			        LIMIT 1) AS sec_id
 			FROM tdbm_extra_teachings t2
 			WHERE t2.academic_year = $1 AND t2.semester = $2
