@@ -3748,9 +3748,39 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 	// Staff's merge decisions: code → the primary it folds into. A code that
 	// is also skipped stays skipped (an unmatched-officer member staff chose
 	// not to import is not imported anywhere).
+	inFile := make(map[string]bool, len(courses))
+	for _, c := range courses {
+		inFile[c.code] = true
+	}
 	mergeInto := map[string]string{}
 	for _, m := range merges {
 		primary := strings.ToUpper(strings.TrimSpace(m.Primary))
+		// The course written first keeps its sections and timetable; the others
+		// fold into them (mergeCodeTx). When every code comes from the file,
+		// that base must be the newest-curriculum code: SC362005's three
+		// timetabled groups were folded into 342233's two WBA placeholders
+		// because 342233 came first in the file (03/10/2026). A course already
+		// open in the term stays the base — its data is already there.
+		if inFile[primary] {
+			others := make([]string, 0, len(m.Codes))
+			for _, c := range m.Codes {
+				code := strings.ToUpper(strings.TrimSpace(c))
+				if _, skipped := skipSet[code]; code == "" || !inFile[code] || skipped {
+					continue
+				}
+				// Only a code that will actually be created can be the base.
+				if d := decisions[code]; d.Status == importInvalid {
+					continue
+				} else if _, ok := proceedSet[code]; d.Status == importUnmatched && !ok {
+					continue
+				}
+				others = append(others, code)
+			}
+			if best := primaryCode(primary, others); best != primary {
+				m.Codes = append(append([]string{}, m.Codes...), primary)
+				primary = best
+			}
+		}
 		for _, c := range m.Codes {
 			code := strings.ToUpper(strings.TrimSpace(c))
 			if code == "" || code == primary {
