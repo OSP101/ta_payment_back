@@ -76,7 +76,10 @@ type RegEnrolmentRow struct {
 	Regular  int    `json:"regular"`
 	Special  int    `json:"special"`
 	Sections string `json:"sections,omitempty"` // "01 ปกติ 73, 02 พิเศษ 7" — what the sums came from
-	Error    string `json:"error,omitempty"`
+	// SectionCounts is the same per section, sent back with the save so each
+	// section — not just the course — takes its real enrolment.
+	SectionCounts []SectionCount `json:"section_counts,omitempty"`
+	Error         string         `json:"error,omitempty"`
 }
 
 // RegEnrolmentJob is what the page polls.
@@ -443,6 +446,7 @@ func (s *RegEnrolmentService) fetchCode(ctx context.Context, termID uuid.UUID, c
 			row.Regular += l.Enrolled
 		}
 		parts = append(parts, fmt.Sprintf("%s %s %d", l.No, track, l.Enrolled))
+		row.SectionCounts = append(row.SectionCounts, SectionCount{SecNo: l.No, Special: special, Count: l.Enrolled})
 	}
 	row.Sections = strings.Join(parts, ", ")
 	return row

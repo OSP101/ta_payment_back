@@ -17,6 +17,10 @@ type BulkCountRow struct {
 	Code    string `json:"code"`
 	Regular *int   `json:"regular"`
 	Special *int   `json:"special"`
+	// Sections, when the numbers came from the registrar, is the per-section
+	// enrolment under this code. Optional: an Excel paste carries only the
+	// track totals, which syncSectionCounts then spreads over the sections.
+	Sections []SectionCount `json:"sections,omitempty"`
 }
 
 // BulkCountResult is one COURSE (not one line): lines whose codes belong to
@@ -80,6 +84,8 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 		regSet, spSet bool
 		hasSpecial    bool
 		lockedExport  bool
+		sections      []SectionCount
+		secsMatch     bool
 	}
 	byCourse := map[uuid.UUID]*agg{}
 	order := []uuid.UUID{}
@@ -103,9 +109,15 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 		var id uuid.UUID
 		var name string
 		var oldReg, oldSpc int
-		var regEntered, spcEntered, hasSpecial, exported bool
+		var regEntered, spcEntered, hasSpecial, exported, secsMatch bool
 		err := s.pool.QueryRow(ctx, `
 			SELECT tc.id, tc.name_th, tc.num_students_regular, tc.num_students_special,
+			       -- Sections already adding up to the course row. Saves before
+			       -- 03/10/2026 changed only the course, so an "unchanged" row
+			       -- must still go through to bring its sections in line.
+			       NOT EXISTS (SELECT 1 FROM sections sx WHERE sx.teaching_course_id = tc.id)
+			       OR (COALESCE((SELECT SUM(num_students) FROM sections sx WHERE sx.teaching_course_id = tc.id AND sx.track = 'regular'), 0) = tc.num_students_regular
+			       AND COALESCE((SELECT SUM(num_students) FROM sections sx WHERE sx.teaching_course_id = tc.id AND sx.track = 'special'), 0) = tc.num_students_special),
 			       (tc.num_students_regular > 0 OR tc.num_students_regular_entered),
 			       (tc.num_students_special > 0 OR tc.num_students_special_entered),
 			       EXISTS (SELECT 1 FROM sections sx WHERE sx.teaching_course_id = tc.id AND sx.track = 'special'),
@@ -113,7 +125,7 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 			  FROM teaching_courses tc
 			 WHERE tc.term_id = $1 AND (UPPER(tc.code) = $2 OR $2 = ANY(SELECT UPPER(x) FROM unnest(tc.alt_codes) x))
 			 LIMIT 1`, termID, code,
-		).Scan(&id, &name, &oldReg, &oldSpc, &regEntered, &spcEntered, &hasSpecial, &exported)
+		).Scan(&id, &name, &oldReg, &oldSpc, &secsMatch, &regEntered, &spcEntered, &hasSpecial, &exported)
 		if errors.Is(err, pgx.ErrNoRows) {
 			out = append(out, BulkCountResult{Codes: []string{code}, Status: "not_found",
 				Message: "ไม่พบรหัสวิชานี้ในภาคเรียนที่เลือก"})
@@ -124,7 +136,7 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 		}
 		a := byCourse[id]
 		if a == nil {
-			a = &agg{hasSpecial: hasSpecial, lockedExport: exported}
+			a = &agg{hasSpecial: hasSpecial, lockedExport: exported, secsMatch: secsMatch}
 			cid := id
 			a.res = BulkCountResult{CourseID: &cid, NameTH: name}
 			if regEntered {
@@ -139,6 +151,10 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 			order = append(order, id)
 		}
 		a.res.Codes = append(a.res.Codes, code)
+		for _, sc := range r.Sections {
+			sc.Code = code
+			a.sections = append(a.sections, sc)
+		}
 		if r.Regular != nil {
 			a.reg += *r.Regular
 			a.regSet = true
@@ -166,10 +182,13 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 			}
 		}
 		same := func(old, nw *int) bool { return nw == nil || (old != nil && *old == *nw) }
+		if same(res.OldRegular, res.NewRegular) && same(res.OldSpecial, res.NewSpecial) && !a.secsMatch && res.Warn == "" {
+			res.Warn = "ยอดรวมเท่าเดิม แต่จำนวนใน section รวมไม่เท่ายอดของวิชา บันทึกเพื่อปรับจำนวนใน section ให้ตรง"
+		}
 		switch {
 		case !a.regSet && !a.spSet:
 			res.Status, res.Message = "error", "ไม่มีจำนวนนักศึกษาในแถวนี้"
-		case same(res.OldRegular, res.NewRegular) && same(res.OldSpecial, res.NewSpecial):
+		case same(res.OldRegular, res.NewRegular) && same(res.OldSpecial, res.NewSpecial) && a.secsMatch:
 			res.Status = "unchanged"
 		case a.lockedExport:
 			res.Status, res.Message = "locked", "วิชานี้ส่งออกเอกสารแล้ว แก้จำนวนนักศึกษาไม่ได้จนกว่าผู้ดูแลระบบจะปลดล็อก"
@@ -180,7 +199,7 @@ func (s *TeachingService) BulkSetNumStudents(ctx context.Context, actor, termID 
 		case dryRun:
 			res.Status, res.Message = s.previewCounts(ctx, id, reg, spc)
 		default:
-			err := s.SetNumStudents(ctx, actor, id, -1, reg, spc, confirm)
+			err := s.setNumStudents(ctx, actor, id, -1, reg, spc, confirm, a.sections)
 			res.Status, res.Message = classifyCountErr(err)
 			if err != nil && res.Status == "error" && !isUserFacing(err) {
 				return nil, err

@@ -134,6 +134,14 @@ type MergeCodeInput struct {
 // the course would have. The course's student counts are recomputed from its
 // sections, so the budget picks the merge up on the next read.
 func (s *TeachingService) MergeCourseCode(ctx context.Context, actor, targetID uuid.UUID, in MergeCodeInput) error {
+	err := s.mergeCourseCode(ctx, actor, targetID, in)
+	if err == nil {
+		s.rematchTDBM(ctx, targetID)
+	}
+	return err
+}
+
+func (s *TeachingService) mergeCourseCode(ctx context.Context, actor, targetID uuid.UUID, in MergeCodeInput) error {
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
 		return err
@@ -638,6 +646,14 @@ func (s *TeachingService) detectImportMergeGroups(ctx context.Context, termID uu
 // exported course: hours are re-parented, and a payout file already stands on
 // the old sections.
 func (s *TeachingService) FoldSection(ctx context.Context, actor, tcID, sectionID, intoID uuid.UUID) error {
+	err := s.foldSection(ctx, actor, tcID, sectionID, intoID)
+	if err == nil {
+		s.rematchTDBM(ctx, tcID)
+	}
+	return err
+}
+
+func (s *TeachingService) foldSection(ctx context.Context, actor, tcID, sectionID, intoID uuid.UUID) error {
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
 		return err

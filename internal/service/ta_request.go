@@ -1055,7 +1055,7 @@ func validateWorkloadFields(w WorkloadInput, name string) error {
 // group's real teaching time. Attendance happens inside the session; grading and
 // other work happen outside it, so the total legitimately exceeds the class
 // hours — but not without limit.
-const sectionTotalMultiplier = 2
+const sectionTotalMultiplier = 3
 
 // sectionWeekly is one section's actual weekly contact time, split by kind.
 type sectionWeekly struct{ Lecture, Lab float64 }
@@ -1160,10 +1160,9 @@ func validateUndergradSectionCaps(w WorkloadInput, name, secLabel string, hrs se
 	// fields at the ceiling declared three times the group's real teaching time.
 	// The total is bounded at sectionTotalMultiplier × the class hours.
 	//
-	// The multiplier is 2, not 1, because the second hour is real work that
-	// happens outside the room: every approved assignment in service today
-	// declares 2h เช็คชื่อ during a 2h lecture plus 2h ตรวจงาน after it. A ×1
-	// ceiling would describe a practice nobody follows and refuse every request.
+	// The multiplier is 3 (raised from 2 on the user's request, 2026-10-03):
+	// the work outside the room — grading plus other duties — can add up to
+	// more than one extra class-length on top of the in-session attendance.
 	totals := []struct {
 		v     float64
 		hrs   float64

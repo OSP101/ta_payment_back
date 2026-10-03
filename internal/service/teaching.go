@@ -481,6 +481,17 @@ func (s *TeachingService) Delete(ctx context.Context, actor, id uuid.UUID) error
 		})
 }
 
+// rematchTDBM re-runs TDBM course/section matching and the makeup auto-fill
+// after a write that can change what a TDBM row matches — a code, a section,
+// or a timetable. A WBA section the lecturer only times later (03/10/2026)
+// left its TDBM makeups unfiled until staff pressed sync. Best-effort: the
+// write already succeeded, and the next sync still catches anything missed.
+func (s *TeachingService) rematchTDBM(ctx context.Context, tcID uuid.UUID) {
+	if s.tdbm != nil {
+		s.tdbm.ResolveMatchesForTeachingCourse(ctx, tcID)
+	}
+}
+
 func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCourse, error) {
 	tc := &TeachingCourse{}
 	err := s.pool.QueryRow(ctx,
@@ -1096,6 +1107,12 @@ func (s *TeachingService) SetTermBudgetCap(ctx context.Context, actor, termID uu
 // acknowledges a budget change on a course with approved TAs or hours — see
 // guardBudgetChange; without it such a change is refused with a preview.
 func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUID, total, regular, special int, confirm bool) error {
+	return s.setNumStudents(ctx, actor, id, total, regular, special, confirm, nil)
+}
+
+// setNumStudents is SetNumStudents with the registrar's per-section enrolment
+// when the caller has it (the REG fetch); see syncSectionCounts.
+func (s *TeachingService) setNumStudents(ctx context.Context, actor, id uuid.UUID, total, regular, special int, confirm bool, secCounts []SectionCount) error {
 	// Staff-only, like the per-section headcount it aggregates: these numbers
 	// come off the registrar file and drive the budget and the TA hour ceiling.
 	priv, err := courseAccess(ctx, s.pool, actor, id)
@@ -1167,6 +1184,9 @@ func (s *TeachingService) SetNumStudents(ctx context.Context, actor, id uuid.UUI
 				    num_students_special_entered = num_students_special_entered OR $6,
 				    updated_at = NOW()
 				WHERE id = $4`, total, regular, special, id, regularSent, specialSent); err != nil {
+				return err
+			}
+			if err := syncSectionCounts(ctx, tx, id, regular, special, secCounts); err != nil {
 				return err
 			}
 			return guardBudgetChange(ctx, tx, id, before, confirm)
@@ -1467,6 +1487,14 @@ type UpdateCourseInfoInput struct {
 // workload fields apply and which caps are enforced, so moving a course between
 // ปริญญาตรี and บัณฑิตศึกษา would silently re-price work already logged under it.
 func (s *TeachingService) UpdateCourseInfo(ctx context.Context, actor, id uuid.UUID, in UpdateCourseInfoInput) error {
+	err := s.updateCourseInfo(ctx, actor, id, in)
+	if err == nil {
+		s.rematchTDBM(ctx, id)
+	}
+	return err
+}
+
+func (s *TeachingService) updateCourseInfo(ctx context.Context, actor, id uuid.UUID, in UpdateCourseInfoInput) error {
 	priv, err := isPrivileged(ctx, s.pool, actor)
 	if err != nil {
 		return err
@@ -1764,6 +1792,14 @@ func (s *TeachingService) AddSection(ctx context.Context, actor, tcID uuid.UUID,
 // quietly moving a class after TAs were assigned would silently invalidate
 // decisions already made. See [[section-schedule-one-shot]].
 func (s *TeachingService) ReplaceSectionSchedules(ctx context.Context, actor, tcID, sectionID uuid.UUID, schedules []SectionSchedule) error {
+	err := s.replaceSectionSchedules(ctx, actor, tcID, sectionID, schedules)
+	if err == nil {
+		s.rematchTDBM(ctx, tcID)
+	}
+	return err
+}
+
+func (s *TeachingService) replaceSectionSchedules(ctx context.Context, actor, tcID, sectionID uuid.UUID, schedules []SectionSchedule) error {
 	priv, err := courseAccess(ctx, s.pool, actor, tcID)
 	if err != nil {
 		return err
@@ -2015,6 +2051,14 @@ func validCurriculum(v string) bool {
 // Track is intentionally not editable — switching regular↔special would
 // invalidate any budget/request math already based on the old track.
 func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectionID uuid.UUID, in UpdateSectionInput) error {
+	err := s.updateSection(ctx, actor, tcID, sectionID, in)
+	if err == nil {
+		s.rematchTDBM(ctx, tcID)
+	}
+	return err
+}
+
+func (s *TeachingService) updateSection(ctx context.Context, actor, tcID, sectionID uuid.UUID, in UpdateSectionInput) error {
 	priv, err := courseAccess(ctx, s.pool, actor, tcID)
 	if err != nil {
 		return err
@@ -2121,6 +2165,14 @@ func (s *TeachingService) UpdateSection(ctx context.Context, actor, tcID, sectio
 // recomputed. FK violations (e.g. sections still referenced by TA request
 // assignments) surface as-is to the caller.
 func (s *TeachingService) DeleteSection(ctx context.Context, actor, tcID, sectionID uuid.UUID) error {
+	err := s.deleteSection(ctx, actor, tcID, sectionID)
+	if err == nil {
+		s.rematchTDBM(ctx, tcID)
+	}
+	return err
+}
+
+func (s *TeachingService) deleteSection(ctx context.Context, actor, tcID, sectionID uuid.UUID) error {
 	priv, err := courseAccess(ctx, s.pool, actor, tcID)
 	if err != nil {
 		return err

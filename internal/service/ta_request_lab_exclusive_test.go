@@ -65,36 +65,24 @@ func TestLabOtherCountsInTheWeeklyTotal(t *testing.T) {
 	}
 }
 
-// Each field fitting the class hours on its own was not enough: three
-// lecture-side fields at the ceiling declared three times the group's real
-// teaching time for that group.
-//
-// The total is bounded at 2× rather than 1× because the second hour is real
-// work done outside the room. Every approved assignment in service when this
-// was written declares 2h เช็คชื่อ inside a 2h lecture plus 2h ตรวจงาน after it;
-// a 1× ceiling would have refused all 23 of them.
-func TestSectionTotalIsCappedAtTwiceTheClassHours(t *testing.T) {
+// The lecture-side total is bounded at 3× the class hours (raised from 2× on
+// 2026-10-03). The lecture side has exactly three fields, each already capped
+// at 1× by the per-field rule, so 3× is the largest total they can reach: the
+// total cap is now a backstop that only bites if a fourth field is added.
+func TestSectionTotalIsCappedAtThreeTimesTheClassHours(t *testing.T) {
 	hrs := sectionWeekly{Lecture: 2, Lab: 2}
 
 	// The shape everyone actually files: 2 + 2 on a 2-hour lecture.
 	if err := validateUndergradSectionCaps(ugWorkload(2, 2, 0, 0, 0), "ผู้ช่วย", "1", hrs); err != nil {
 		t.Fatalf("the arrangement in live use must stay legal: %v", err)
 	}
-	// Exactly 2× is inclusive.
-	if err := validateUndergradSectionCaps(ugWorkload(2, 1, 1, 0, 0), "ผู้ช่วย", "1", hrs); err != nil {
-		t.Fatalf("exactly 2× the class hours must be allowed: %v", err)
+	// All three fields at the per-field ceiling is exactly 3× and inclusive.
+	if err := validateUndergradSectionCaps(ugWorkload(2, 2, 2, 0, 0), "ผู้ช่วย", "1", hrs); err != nil {
+		t.Fatalf("exactly 3× the class hours must be allowed: %v", err)
 	}
-	// All three fields at the per-field ceiling — 6h for a 2h group — is what
-	// the total cap exists to stop.
-	err := validateUndergradSectionCaps(ugWorkload(2, 2, 2, 0, 0), "ผู้ช่วย", "1", hrs)
-	if err == nil {
-		t.Fatal("6h declared on a 2h lecture must be refused by the total cap")
-	}
-	if !strings.Contains(err.Error(), "เพดานรวม") {
-		t.Fatalf("the refusal should name the total cap, got %q", err)
-	}
-	if !strings.Contains(err.Error(), "4.00") {
-		t.Fatalf("the refusal should quote the 2× limit, got %q", err)
+	// The per-field ceiling still refuses a single field above the class hours.
+	if err := validateUndergradSectionCaps(ugWorkload(3, 0, 0, 0, 0), "ผู้ช่วย", "1", hrs); err == nil {
+		t.Fatal("one field above the class hours must still be refused")
 	}
 }
 
