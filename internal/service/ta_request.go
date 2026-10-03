@@ -1080,6 +1080,9 @@ func (s *TARequestService) requestTANames(ctx context.Context, reqID uuid.UUID) 
 			names = append(names, n)
 		}
 	}
+	if rows.Err() != nil {
+		return ""
+	}
 	return strings.Join(names, ", ")
 }
 

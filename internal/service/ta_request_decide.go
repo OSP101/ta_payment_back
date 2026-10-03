@@ -790,6 +790,13 @@ func isClashRejectReason(r string) bool {
 // tryFinalize decides one pending request if every TA on it now has a
 // timetable. No-op otherwise.
 func (s *TARequestService) tryFinalize(ctx context.Context, reqID, termID uuid.UUID) error {
+	return s.finalize(ctx, reqID, termID, false)
+}
+
+// finalize is tryFinalize with a switch for re-decided old requests
+// (SplitLegacyRequests): onlyApprovals keeps every notice back unless the
+// verdict is an approval, so a TA rejected once is not told again.
+func (s *TARequestService) finalize(ctx context.Context, reqID, termID uuid.UUID, onlyApprovals bool) error {
 	missing, err := tasMissingSchedule(ctx, s.pool, reqID, termID)
 	if err != nil {
 		return err
@@ -859,6 +866,9 @@ func (s *TARequestService) tryFinalize(ctx context.Context, reqID, termID uuid.U
 		return err
 	}
 
+	if onlyApprovals && verdict != "approved" {
+		return nil
+	}
 	s.notifyClashOutcome(ctx, reqID, notices)
 	s.notifyDecision(ctx, reqID, verdict, reason)
 	return nil
@@ -937,6 +947,14 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 // path; this is the safety net that keeps a dropped call from stranding a
 // request — and, with it, the course quota those assignments reserve.
 func (s *TARequestService) SweepPendingRequests(ctx context.Context) (int, error) {
+	// Old multi-TA requests first, so the TAs among them who pass are decided
+	// in this same pass (see SplitLegacyRequests).
+	if n, err := s.SplitLegacyRequests(ctx); err != nil {
+		log.Printf("ta_request: split legacy requests: %v", err)
+	} else if n > 0 {
+		log.Printf("ta_request: split %d legacy request(s) into per-TA requests", n)
+	}
+
 	rows, err := s.pool.Query(ctx, `
 		SELECT r.id, tc.term_id
 		FROM ta_requests r

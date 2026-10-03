@@ -10,6 +10,9 @@ import (
 // sender, written as the audit actor, and the lecturer is told.
 func TestCreateOnBehalf_RecordsTheOfficerAndTellsTheLecturer(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{})
+	// A timetable, so the request is decided (ta_request.auto_decide) rather
+	// than resting on a missing one.
+	rf.addClassFor(rf.TAID)
 
 	res, err := rf.Req.CreateOnBehalf(rf.ctx, rf.StaffID, rf.LecturerID, rf.createInput())
 	if err != nil {

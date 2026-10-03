@@ -241,6 +241,7 @@ var catalog = map[string]ActionInfo{
 	"ta_request.update_workload":        ok("แก้ภาระงานในคำขอผู้ช่วยสอน", CatCourse),
 	"ta_request.cancel":                 warn("ยกเลิกคำขอผู้ช่วยสอน", CatCourse),
 	"ta_request.auto_decide":            system(ok("ระบบพิจารณาคำขอผู้ช่วยสอนอัตโนมัติ", CatCourse)),
+	"ta_request.split_per_ta":           system(ok("ระบบแยกคำขอผู้ช่วยสอนเดิมเป็นรายบุคคลเพื่อพิจารณาใหม่", CatCourse)),
 
 	// ── Announcements and reminders ─────────────────────────────────────────
 	"announce.upsert":              ok("สร้างหรือแก้ไขประกาศ", CatComms),
