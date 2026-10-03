@@ -1281,7 +1281,13 @@ func (h *TARequestHandler) AddSections(c *fiber.Ctx) error {
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
-	res, err := h.Svc.TARequest.AddSections(c.Context(), UserID(c), id, in)
+	var res *service.CreateResult
+	if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		// Staff add sections for the request's own lecturer (on behalf).
+		res, err = h.Svc.TARequest.AddSectionsOnBehalf(c.Context(), UserID(c), id, in)
+	} else {
+		res, err = h.Svc.TARequest.AddSections(c.Context(), UserID(c), id, in)
+	}
 	if err != nil {
 		var ue *service.UserError
 		if errors.As(err, &ue) {
@@ -1294,12 +1300,35 @@ func (h *TARequestHandler) AddSections(c *fiber.Ctx) error {
 	return c.JSON(res)
 }
 
+// createTARequestBody is the request form's payload plus, for staff filing
+// on a lecturer's behalf, the lecturer the request is for.
+type createTARequestBody struct {
+	service.CreateTARequestInput
+	LecturerID *uuid.UUID `json:"lecturer_id,omitempty"`
+}
+
 func (h *TARequestHandler) Create(c *fiber.Ctx) error {
-	var in service.CreateTARequestInput
-	if err := Bind(c, &in); err != nil {
+	var body createTARequestBody
+	if err := Bind(c, &body); err != nil {
 		return err
 	}
-	res, err := h.Svc.TARequest.Create(c.Context(), UserID(c), in)
+	in := body.CreateTARequestInput
+	actor := UserID(c)
+	officer := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
+	var res *service.CreateResult
+	var err error
+	switch {
+	case body.LecturerID != nil && *body.LecturerID != actor:
+		// Staff filing for a lecturer who does not do it themselves.
+		if !officer {
+			return fiber.NewError(fiber.StatusForbidden, "forbidden")
+		}
+		res, err = h.Svc.TARequest.CreateOnBehalf(c.Context(), actor, *body.LecturerID, in)
+	case rbac.Has(Roles(c), rbac.RoleLecturer):
+		res, err = h.Svc.TARequest.Create(c.Context(), actor, in)
+	default:
+		return fiber.NewError(fiber.StatusBadRequest, "กรุณาเลือกอาจารย์ผู้สอนที่ต้องการส่งคำขอแทน")
+	}
 	if err != nil {
 		// ErrorHandler, not a blanket 400: business refusals keep their Thai
 		// text and status, while a DB/driver failure must not be echoed raw.
@@ -1317,7 +1346,11 @@ func (h *TARequestHandler) Cancel(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	if err := h.Svc.TARequest.Cancel(c.Context(), UserID(c), id); err != nil {
+	cancel := h.Svc.TARequest.Cancel
+	if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		cancel = h.Svc.TARequest.CancelOnBehalf // for the request's own lecturer
+	}
+	if err := cancel(c.Context(), UserID(c), id); err != nil {
 		// See Create: ErrorHandler maps UserError/Thai text to 4xx and anything
 		// internal to a generic 500 without leaking it.
 		return err

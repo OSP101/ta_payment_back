@@ -140,6 +140,24 @@ type SectionWorkload struct {
 // conflicts) persist as a 'rejected' row so the staff accordion can display
 // the checklist that produced the verdict.
 func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
+	return s.create(ctx, lecturerID, lecturerID, in)
+}
+
+// CreateOnBehalf files a request for lecturerID, sent by an officer (actor)
+// for a lecturer who does not do it themselves (03/10/2026). Every rule is the
+// lecturer's own — the request is THEIR request, judged against THEIR course —
+// only the audit actor and ta_requests.submitted_by say who pressed send, and
+// the lecturer is told it was filed for them.
+func (s *TARequestService) CreateOnBehalf(ctx context.Context, actor, lecturerID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
+	res, err := s.create(ctx, actor, lecturerID, in)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyFiledOnBehalf(ctx, actor, lecturerID, in.TeachingCourseID, "ส่งคำขอผู้ช่วยสอน")
+	return res, nil
+}
+
+func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
 	if in.TeachingCourseID == uuid.Nil {
 		return nil, ErrInvalidInput
 	}
@@ -158,6 +176,9 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return nil, err
 	}
 	if !teaches {
+		if actor != lecturerID {
+			return nil, Invalid("อาจารย์ที่เลือกไม่ได้เป็นผู้สอนของรายวิชานี้")
+		}
 		return nil, errors.New("คุณไม่ได้เป็นผู้สอนของรายวิชานี้")
 	}
 
@@ -390,9 +411,9 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	defer tx.Rollback(ctx)
 	rid := uuid.New()
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id, is_late)
-		 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5,$6)`,
-		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID, isLate); err != nil {
+		`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id, is_late, submitted_by)
+		 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5,$6,$7)`,
+		rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID, isLate, onBehalfOf(actor, lecturerID)); err != nil {
 		return nil, err
 	}
 	for _, c := range in.Counts {
@@ -471,7 +492,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 			return nil, err
 		}
 		if err := s.aud.LogTx(ctx, tx, audit.Entry{
-			ActorID: &lecturerID, Action: "ta_request.pending_schedule",
+			ActorID: &actor, Action: "ta_request.pending_schedule",
 			Entity: "ta_request", EntityID: rid.String(),
 			Note: strings.Join(waiting, ", "), After: in,
 		}); err != nil {
@@ -544,7 +565,7 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return nil, err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
-		ActorID:  &lecturerID,
+		ActorID:  &actor,
 		Action:   "ta_request.auto_decide",
 		Entity:   "ta_request",
 		EntityID: rid.String(),
@@ -626,6 +647,27 @@ var statusLabelTH = map[string]string{
 // rather than adding schema. decided_by is set to the lecturer themselves,
 // distinguishing a self-cancel from a NULL (system auto-decide).
 func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UUID) error {
+	return s.cancel(ctx, lecturerID, false, reqID)
+}
+
+// CancelOnBehalf withdraws a request for its lecturer, by an officer (see
+// CreateOnBehalf). The same refusals apply — hours logged, an order issued, a
+// month exported — only the ownership checks are skipped. The lecturer is
+// told, and the request says who cancelled it.
+func (s *TARequestService) CancelOnBehalf(ctx context.Context, actor, reqID uuid.UUID) error {
+	if err := s.cancel(ctx, actor, true, reqID); err != nil {
+		return err
+	}
+	var lecturerID, courseID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT lecturer_id, teaching_course_id FROM ta_requests WHERE id = $1`, reqID).Scan(&lecturerID, &courseID); err == nil {
+		s.notifyFiledOnBehalf(ctx, actor, lecturerID, courseID, "ยกเลิกคำขอผู้ช่วยสอน")
+	}
+	return nil
+}
+
+func (s *TARequestService) cancel(ctx context.Context, actor uuid.UUID, privileged bool, reqID uuid.UUID) error {
+	lecturerID := actor
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -642,7 +684,9 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 		}
 		return err
 	}
-	if owner != lecturerID {
+	if privileged {
+		lecturerID = owner
+	} else if owner != lecturerID {
 		return Forbidden("คุณไม่ใช่เจ้าของคำขอนี้ จึงยกเลิกไม่ได้")
 	}
 	// ...and must still teach the course: a lecturer taken off it could
@@ -654,7 +698,7 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 		  WHERE r.id = $1 AND tl.lecturer_id = $2)`, reqID, lecturerID).Scan(&teaches); err != nil {
 		return err
 	}
-	if !teaches {
+	if !teaches && !privileged {
 		return errors.New("คุณไม่ได้เป็นอาจารย์ผู้สอนรายวิชานี้แล้ว จึงยกเลิกคำขอไม่ได้ กรุณาติดต่อเจ้าหน้าที่")
 	}
 	if !cancellableStatuses[status] {
@@ -708,13 +752,13 @@ func (s *TARequestService) Cancel(ctx context.Context, lecturerID, reqID uuid.UU
 		  status        = 'cancelled',
 		  decided_at    = NOW(),
 		  decided_by    = $1,
-		  reject_reason = 'ยกเลิกโดยอาจารย์ผู้สอน',
+		  reject_reason = $3,
 		  updated_at    = NOW()
-		WHERE id = $2`, lecturerID, reqID); err != nil {
+		WHERE id = $2`, actor, reqID, cancelReason(ctx, s.pool, actor, lecturerID)); err != nil {
 		return err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
-		ActorID: &lecturerID, Action: "ta_request.cancel", Entity: "ta_request", EntityID: reqID.String(),
+		ActorID: &actor, Action: "ta_request.cancel", Entity: "ta_request", EntityID: reqID.String(),
 		Note: "สถานะเดิม: " + status,
 	}); err != nil {
 		return err
@@ -2225,6 +2269,9 @@ type TARequestSummary struct {
 	// the button's enabled state can never drift from what Cancel itself
 	// checks (the same reasoning ExportPreview.CanExport already follows).
 	CanCancel bool `json:"can_cancel"`
+	// SubmittedByName is the officer who filed the request for the lecturer;
+	// empty when the lecturer sent it themselves.
+	SubmittedByName string `json:"submitted_by_name,omitempty"`
 }
 
 const requestSummarySelect = `
@@ -2237,7 +2284,8 @@ const requestSummarySelect = `
 	       r.status::text IN ('submitted','approved') AND NOT EXISTS (
 	           SELECT 1 FROM work_logs wl
 	           JOIN ta_request_assignments a ON a.id = wl.assignment_id
-	           WHERE a.request_id = r.id)
+	           WHERE a.request_id = r.id),
+	       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), '')
 	FROM ta_requests r
 	JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 	JOIN academic_terms at ON at.id = tc.term_id
@@ -2249,7 +2297,7 @@ func scanRequestSummaries(rows pgx.Rows) ([]TARequestSummary, error) {
 	for rows.Next() {
 		var t TARequestSummary
 		var checksRaw []byte
-		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount, &t.CanCancel); err != nil {
+		if err := rows.Scan(&t.ID, &t.Code, &t.NameTH, &t.Status, &t.SubmittedAt, &t.DecidedAt, &t.DecidedBy, &t.RejectReason, &t.TeachingCourseID, &t.LecturerName, &t.TACount, &t.TermID, &t.AcademicYear, &t.Semester, &t.IsLate, &checksRaw, &t.TrimmedCount, &t.DroppedCount, &t.CanCancel, &t.SubmittedByName); err != nil {
 			return nil, err
 		}
 		if len(checksRaw) > 0 {
@@ -2352,7 +2400,8 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		       r.status::text IN ('submitted','approved') AND NOT EXISTS (
 		           SELECT 1 FROM work_logs wl
 		           JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		           WHERE a.request_id = r.id)
+		           WHERE a.request_id = r.id),
+		       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), '')
 		FROM ta_requests r
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id
 		JOIN academic_terms at ON at.id = tc.term_id
@@ -2362,7 +2411,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		&d.TeachingCourseID, &d.LecturerName, &d.TACount,
 		&d.TermID, &d.AcademicYear, &d.Semester,
 		&checksRaw, &d.ReimburseScope,
-		&d.IsLate, &d.TrimmedCount, &d.DroppedCount, &d.CanCancel)
+		&d.IsLate, &d.TrimmedCount, &d.DroppedCount, &d.CanCancel, &d.SubmittedByName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("ไม่พบคำขอนี้")
@@ -2470,6 +2519,40 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		}
 	}
 	return &d, nil
+}
+
+// onBehalfOf is the ta_requests.submitted_by value: the officer when someone
+// other than the lecturer sent it, NULL when the lecturer sent it themselves.
+func onBehalfOf(actor, lecturerID uuid.UUID) *uuid.UUID {
+	if actor == lecturerID {
+		return nil
+	}
+	return &actor
+}
+
+// cancelReason is the text the request keeps for why it was withdrawn — and,
+// when an officer did it, who.
+func cancelReason(ctx context.Context, q querier, actor, lecturerID uuid.UUID) string {
+	if actor == lecturerID {
+		return "ยกเลิกโดยอาจารย์ผู้สอน"
+	}
+	return "ยกเลิกโดยเจ้าหน้าที่ " + personName(ctx, q, actor) + " แทนอาจารย์ผู้สอน"
+}
+
+// notifyFiledOnBehalf tells the lecturer that an officer filed something on
+// their course for them — they own the request and must not discover it only
+// in the list. Course code and officer in the title, so two such notices do
+// not fold into one (notify coalescing).
+func (s *TARequestService) notifyFiledOnBehalf(ctx context.Context, actor, lecturerID, courseID uuid.UUID, what string) {
+	if s.notify == nil || actor == lecturerID {
+		return
+	}
+	code, name := s.courseLabel(ctx, courseID)
+	officer := personName(ctx, s.pool, actor)
+	s.notify.Send(ctx, lecturerID,
+		fmt.Sprintf("เจ้าหน้าที่%sแทนท่าน รายวิชา %s", what, code),
+		fmt.Sprintf("%s ได้%sรายวิชา %s %s แทนท่าน ท่านตรวจสอบรายละเอียดได้ที่หน้าคำขอผู้ช่วยสอนของรายวิชา", officer, what, code, name),
+		"/lecturer/courses/"+courseID.String()+"/request")
 }
 
 // assertRequestWindowOpened refuses a new TA request for a term staff have not

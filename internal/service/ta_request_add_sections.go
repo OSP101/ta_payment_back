@@ -34,6 +34,26 @@ type AddSectionsInput struct {
 // the same sitting). The new rows are judged with the same clash rule a fresh
 // request gets; a cross-course clash refuses the whole call with no rows written.
 func (s *TARequestService) AddSections(ctx context.Context, lecturerID, reqID uuid.UUID, in AddSectionsInput) (*CreateResult, error) {
+	return s.addSections(ctx, lecturerID, false, reqID, in)
+}
+
+// AddSectionsOnBehalf is AddSections run by an officer for the request's own
+// lecturer (see CreateOnBehalf). No teaching check — staff act on any course —
+// and the lecturer the request belongs to is told afterwards.
+func (s *TARequestService) AddSectionsOnBehalf(ctx context.Context, actor, reqID uuid.UUID, in AddSectionsInput) (*CreateResult, error) {
+	res, err := s.addSections(ctx, actor, true, reqID, in)
+	if err != nil {
+		return nil, err
+	}
+	var lecturerID, courseID uuid.UUID
+	if err := s.pool.QueryRow(ctx,
+		`SELECT lecturer_id, teaching_course_id FROM ta_requests WHERE id = $1`, reqID).Scan(&lecturerID, &courseID); err == nil {
+		s.notifyFiledOnBehalf(ctx, actor, lecturerID, courseID, "เพิ่ม section ในคำขอผู้ช่วยสอน")
+	}
+	return res, nil
+}
+
+func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, privileged bool, reqID uuid.UUID, in AddSectionsInput) (*CreateResult, error) {
 	if in.TAID == uuid.Nil || len(in.Sections) == 0 {
 		return nil, errors.New("ต้องเลือก section ที่จะเพิ่มอย่างน้อย 1 กลุ่ม")
 	}
@@ -54,11 +74,13 @@ func (s *TARequestService) AddSections(ctx context.Context, lecturerID, reqID uu
 		}
 		return nil, err
 	}
-	var teaches bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM teaching_lecturers
-		  WHERE teaching_course_id = $1 AND lecturer_id = $2)`, courseID, lecturerID).Scan(&teaches); err != nil {
-		return nil, err
+	teaches := privileged
+	if !teaches {
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM teaching_lecturers
+			  WHERE teaching_course_id = $1 AND lecturer_id = $2)`, courseID, actor).Scan(&teaches); err != nil {
+			return nil, err
+		}
 	}
 	if !teaches {
 		return nil, errors.New("คุณไม่ได้เป็นผู้สอนของรายวิชานี้")
@@ -272,7 +294,7 @@ func (s *TARequestService) AddSections(ctx context.Context, lecturerID, reqID uu
 		labels = append(labels, s.sectionLabel(ctx, sid))
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{
-		ActorID: &lecturerID, Action: "ta_request.add_sections",
+		ActorID: &actor, Action: "ta_request.add_sections",
 		Entity: "ta_request", EntityID: reqID.String(),
 		Note:  fmt.Sprintf("ta=%s sec=%s", in.TAID, strings.Join(labels, ",")),
 		After: in,

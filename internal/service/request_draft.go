@@ -26,7 +26,10 @@ func (s *ExportService) lecturerTeaches(ctx context.Context, actor, courseID uui
 	var ok bool
 	if err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM teaching_lecturers tl
-		                WHERE tl.teaching_course_id = $1 AND tl.lecturer_id = $2)`,
+		                WHERE tl.teaching_course_id = $1 AND tl.lecturer_id = $2)
+		    -- Staff filing a request on a lecturer's behalf keep their own draft.
+		    OR EXISTS (SELECT 1 FROM user_roles ur
+		                WHERE ur.user_id = $2 AND ur.role IN ('admin','staff'))`,
 		courseID, actor).Scan(&ok); err != nil {
 		return err
 	}
