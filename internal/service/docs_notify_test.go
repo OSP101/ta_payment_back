@@ -16,10 +16,8 @@ import (
 // Until 15/09/2026 (TOR §3.7 ข.7, found during the acceptance review)
 // DocsService had no NotifyService at all — a rejected document or profile
 // was silent, and the TA only found out by opening /ta/documents on their own
-// initiative. These tests exercise the fix: one notification per REVIEW
-// ACTION, not per document, so approving three files in a row (or rejecting
-// them in one batch) does not spam the bell — see NotifyService.Send's
-// unread-coalesce behaviour, which this relies on rather than re-implements.
+// initiative. These tests exercise the fix and its 03/10/2026 refinement:
+// one notification per REVIEW, sent when the last file gets its verdict.
 
 // docsNotifyFixture returns (svc, taID, officerID, docsByKind). officerID is a
 // real users row — ta_documents.reviewed_by and ta_profiles.verified_by are
@@ -94,76 +92,90 @@ func notificationTitles(t *testing.T, svc *DocsService, ta uuid.UUID) []string {
 	return out
 }
 
-func TestReview_RejectNotifiesWithReason(t *testing.T) {
-	svc, ta, actor, docs := docsNotifyFixture(t)
-	ctx := context.Background()
+// Since 03/10/2026 a review sends ONE notice, once every uploaded document
+// has a verdict, listing all three — the office found one e-mail per file
+// cluttered the TA's inbox and spent the mail relay for nothing.
 
-	if err := svc.Review(ctx, actor, docs["national_id"], false, "รูปเบลอ อ่านเลขไม่ได้"); err != nil {
-		t.Fatalf("Review reject: %v", err)
-	}
-
-	titles := notificationTitles(t, svc, ta)
-	if len(titles) != 1 {
-		t.Fatalf("got %d notifications, want 1: %v", len(titles), titles)
-	}
-	want := "เอกสารต้องแก้ไข สำเนาบัตรประจำตัวประชาชน"
-	if titles[0] != want {
-		t.Errorf("title = %q, want %q", titles[0], want)
-	}
-
+func notificationBody(t *testing.T, svc *DocsService, ta uuid.UUID) string {
+	t.Helper()
 	var body string
-	if err := svc.pool.QueryRow(ctx,
-		`SELECT body FROM notifications WHERE user_id = $1 AND channel = 'in_app'`, ta).Scan(&body); err != nil {
+	if err := svc.pool.QueryRow(context.Background(),
+		`SELECT body FROM notifications WHERE user_id = $1 AND channel = 'in_app'
+		  ORDER BY created_at DESC LIMIT 1`, ta).Scan(&body); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(body, "เนื่องจาก รูปเบลอ อ่านเลขไม่ได้") {
-		t.Errorf("body = %q, want it to give the rejection reason", body)
-	}
+	return body
 }
 
-func TestReview_ApproveNotifiesPerDocument(t *testing.T) {
+func TestReview_NoNoticeUntilEveryFileHasAVerdict(t *testing.T) {
 	svc, ta, actor, docs := docsNotifyFixture(t)
 	ctx := context.Background()
 
-	// Approve one of three — not the profile-completing one — so this checks
-	// the per-document notice, not the auto-approval notice.
 	if err := svc.Review(ctx, actor, docs["national_id"], true, ""); err != nil {
-		t.Fatalf("Review approve: %v", err)
+		t.Fatalf("approve: %v", err)
+	}
+	if err := svc.RejectBatch(ctx, actor, ta, []RejectItem{{DocID: docs["bank_book"], Reason: "ไม่เห็นเลขบัญชี"}}); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	if titles := notificationTitles(t, svc, ta); len(titles) != 0 {
+		t.Fatalf("notified before the review was finished: %v", titles)
 	}
 
+	if err := svc.Review(ctx, actor, docs["creditor_form"], true, ""); err != nil {
+		t.Fatalf("approve last: %v", err)
+	}
 	titles := notificationTitles(t, svc, ta)
 	if len(titles) != 1 {
-		t.Fatalf("got %d notifications, want 1: %v", len(titles), titles)
+		t.Fatalf("got %d notifications for one review, want 1: %v", len(titles), titles)
 	}
-	want := "เอกสารผ่านการตรวจสอบ สำเนาบัตรประจำตัวประชาชน"
-	if titles[0] != want {
+	if want := "ผลการตรวจเอกสาร ผ่าน 2 รายการ ต้องแก้ไข 1 รายการ"; titles[0] != want {
 		t.Errorf("title = %q, want %q", titles[0], want)
+	}
+	body := notificationBody(t, svc, ta)
+	for _, want := range []string{
+		"แบบฟอร์มเจ้าหนี้: ผ่าน",
+		"สำเนาบัตรประจำตัวประชาชน: ผ่าน",
+		"สำเนาหน้าสมุดบัญชีธนาคาร: ไม่ผ่าน เนื่องจาก ไม่เห็นเลขบัญชี",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q:\n%s", want, body)
+		}
 	}
 }
 
-func TestReview_LastApprovalAlsoNotifiesProfileComplete(t *testing.T) {
+func TestReview_AllApprovedSendsOneNotice(t *testing.T) {
 	svc, ta, actor, docs := docsNotifyFixture(t)
 	ctx := context.Background()
 
-	if err := svc.Review(ctx, actor, docs["national_id"], true, ""); err != nil {
-		t.Fatalf("approve 1: %v", err)
-	}
-	if err := svc.Review(ctx, actor, docs["bank_book"], true, ""); err != nil {
-		t.Fatalf("approve 2: %v", err)
-	}
-	if err := svc.Review(ctx, actor, docs["creditor_form"], true, ""); err != nil {
-		t.Fatalf("approve 3 (completes the set): %v", err)
-	}
-
-	titles := notificationTitles(t, svc, ta)
-	found := false
-	for _, ti := range titles {
-		if ti == "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว" {
-			found = true
+	for _, k := range []string{"national_id", "bank_book", "creditor_form"} {
+		if err := svc.Review(ctx, actor, docs[k], true, ""); err != nil {
+			t.Fatalf("approve %s: %v", k, err)
 		}
 	}
-	if !found {
-		t.Errorf("no profile-complete notification among %v", titles)
+	titles := notificationTitles(t, svc, ta)
+	if len(titles) != 1 || titles[0] != "เอกสารผ่านการตรวจสอบครบทั้ง 3 รายการ" {
+		t.Fatalf("titles = %v, want the one all-passed notice", titles)
+	}
+	if body := notificationBody(t, svc, ta); !strings.Contains(body, "ข้อมูลส่วนตัวของท่านได้รับการอนุมัติแล้ว") {
+		t.Errorf("body does not say the profile is approved:\n%s", body)
+	}
+}
+
+func TestReview_SingleRejectStillNotifiesWhenOthersDecided(t *testing.T) {
+	svc, ta, actor, docs := docsNotifyFixture(t)
+	ctx := context.Background()
+
+	for _, k := range []string{"national_id", "bank_book"} {
+		if err := svc.Review(ctx, actor, docs[k], true, ""); err != nil {
+			t.Fatalf("approve %s: %v", k, err)
+		}
+	}
+	if err := svc.Review(ctx, actor, docs["creditor_form"], false, "ลายเซ็นไม่ตรง"); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+	titles := notificationTitles(t, svc, ta)
+	if len(titles) != 1 || titles[0] != "ผลการตรวจเอกสาร ผ่าน 2 รายการ ต้องแก้ไข 1 รายการ" {
+		t.Fatalf("titles = %v", titles)
 	}
 }
 
@@ -180,7 +192,7 @@ func TestApproveAll_SendsExactlyOneNotification(t *testing.T) {
 		t.Fatalf("got %d notifications for approving 3 docs + profile in one call, want 1: %v",
 			len(titles), titles)
 	}
-	if titles[0] != "เอกสารผ่านการตรวจสอบแล้ว" {
+	if titles[0] != "เอกสารผ่านการตรวจสอบครบทั้ง 3 รายการ" {
 		t.Errorf("title = %q", titles[0])
 	}
 }
@@ -203,7 +215,7 @@ func TestRejectBatch_SendsOneNotificationNotOnePerFile(t *testing.T) {
 		t.Fatalf("got %d notifications for rejecting 3 files in one batch, want 1 (must not spam "+
 			"one per file): %v", len(titles), titles)
 	}
-	if titles[0] != "เอกสารต้องแก้ไข 3 รายการ" {
+	if titles[0] != "ผลการตรวจเอกสาร ผ่าน 0 รายการ ต้องแก้ไข 3 รายการ" {
 		t.Errorf("title = %q", titles[0])
 	}
 }

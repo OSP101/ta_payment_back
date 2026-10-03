@@ -23,6 +23,8 @@ func twoMonthClaim(t *testing.T, f *fixture) (first, second string) {
 	t.Helper()
 	m1 := monthStart()
 	m2 := m1.AddDate(0, 1, 0)
+	// Exactly these two months make up the claim — not the term's defaults.
+	f.clearPeriods()
 	f.addSubmissionPeriod(m1.Format("01"), "2026-12-31", "", false)
 	f.addSubmissionPeriod(m2.Format("01"), "2026-12-31", "", false)
 	f.mustUpsert(f.entry(m1.AddDate(0, 0, 9).Format("2006-01-02"), "09:00", "11:00", 2))

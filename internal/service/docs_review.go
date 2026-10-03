@@ -167,14 +167,14 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		return nil, err
 	}
 
+	verdicts, err := settledVerdicts(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-
-	if s.notify != nil {
-		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบแล้ว",
-			"ข้อมูลส่วนตัวและเอกสารประกอบทั้ง 3 รายการของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
-	}
+	s.notifyReviewResult(ctx, userID, verdicts, true)
 
 	token, err := s.mintZipToken(actor, userID, ids)
 	if err != nil {
@@ -226,7 +226,6 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 	// A single tx-lock per doc prevents the officer racing themselves.
 	batchID := uuid.New()
 	reasons := make([]string, 0, len(items))
-	fixRows := make([][]string, 0, len(items))
 	for _, it := range items {
 		var (
 			ownerID    uuid.UUID
@@ -267,7 +266,6 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 			return err
 		}
 		reasons = append(reasons, kindLabel(kind)+": "+it.Reason)
-		fixRows = append(fixRows, []string{kindLabel(kind), it.Reason})
 	}
 
 	// Compose a truncated summary on the profile so the TA lands on their
@@ -293,25 +291,16 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 		return err
 	}
 
+	// The batch is usually one file (the workspace rejects a file at a time);
+	// the TA hears about it once the other files have their verdicts too.
+	verdicts, err := settledVerdicts(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if s.notify != nil {
-		s.notify.SendLaidOut(ctx, userID,
-			fmt.Sprintf("เอกสารต้องแก้ไข %d รายการ", len(items)),
-			fmt.Sprintf("เอกสารของท่านยังไม่ผ่านการตรวจสอบ จำนวน %d รายการ ดังนี้\n%s\n\nกรุณาแก้ไขและส่งเอกสารใหม่อีกครั้ง",
-				len(items), numberedLines(reasons)),
-			"/ta/documents", true, MailLayout{
-				Intro: fmt.Sprintf("เจ้าหน้าที่ได้ตรวจสอบเอกสารประกอบการเบิกจ่ายของท่านแล้ว พบว่ายังไม่ผ่านการตรวจสอบ จำนวน %d รายการ ดังนี้", len(items)),
-				Table: &MailTable{
-					Title: "รายการเอกสารที่ต้องแก้ไข",
-					Head:  []string{"เอกสาร", "เหตุผลที่ต้องแก้ไข"},
-					Rows:  fixRows,
-				},
-				After:       "กรุณาแก้ไขและส่งเอกสารใหม่อีกครั้งในระบบ",
-				ButtonLabel: "แก้ไขเอกสาร",
-			})
-	}
+	s.notifyReviewResult(ctx, userID, verdicts, false)
 	return nil
 }
 

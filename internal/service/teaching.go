@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -74,6 +75,11 @@ type TeachingCourse struct {
 	NumSectionsRegular int    `json:"num_sections_regular"`
 	NumSectionsSpecial int    `json:"num_sections_special"`
 	LecturerNames      string `json:"lecturer_names,omitempty"`
+	// TARequestState is list-only: where the course stands on asking for a TA,
+	// for the staff table's filter. "approved" > "submitted" > "draft" (a
+	// lecturer saved a draft but never sent it) > "none". Same "alive request"
+	// rule the dashboard's งบรวม uses (submitted or approved).
+	TARequestState string `json:"ta_request_state,omitempty"`
 	// ExportedAt is set the first time staff builds the export zip for this
 	// course. Once set, section list and per-section student counts are
 	// frozen — the export file is considered the source of truth.
@@ -689,7 +695,14 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	             -- คาบที่ตรงวันหยุดและยังไม่มีวันชดเชย see UnresolvedMakeupsSQL.
 	             -- Previously inlined here with a CURRENT_DATE fallback, which made
 	             -- this list disagree with both Get() and the holidays page.
-	             ` + UnresolvedMakeupsSQL("tc") + ` AS unresolved_makeups
+	             ` + UnresolvedMakeupsSQL("tc") + ` AS unresolved_makeups,
+	             CASE
+	               WHEN EXISTS (SELECT 1 FROM ta_requests r WHERE r.teaching_course_id = tc.id AND r.status = 'approved') THEN 'approved'
+	               WHEN EXISTS (SELECT 1 FROM ta_requests r WHERE r.teaching_course_id = tc.id AND r.status = 'submitted') THEN 'submitted'
+	               WHEN EXISTS (SELECT 1 FROM ta_request_drafts d WHERE d.teaching_course_id = tc.id) THEN 'draft'
+	               ELSE 'none'
+	             END AS ta_request_state,
+	             TO_CHAR(tc.exported_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM') AS exported_at
 	      FROM teaching_courses tc`
 	where := []string{}
 	args := []any{}
@@ -725,7 +738,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 			&tc.NumStudentsRegularEntered, &tc.NumStudentsSpecialEntered,
 			&tc.HasSpecial, &tc.HasMissingSchedule,
 			&tc.NumSectionsRegular, &tc.NumSectionsSpecial, &tc.LecturerNames,
-			&tc.UnresolvedMakeups); err != nil {
+			&tc.UnresolvedMakeups, &tc.TARequestState, &tc.ExportedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, tc)
@@ -990,6 +1003,92 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 		a.TermHourCeiling = weeklyTotal * weeks
 	}
 	return out, nil
+}
+
+// SetTermBudgetCap sets or clears the เพดานงบรายวิชา every course of the term
+// shares (migration 0144). nil = ไม่กำหนด (formula only). It moves the budget
+// of many courses at once, so each course goes through the same
+// guardBudgetChange a headcount edit does: a course with a month already
+// exported refuses the whole change (that payout file was priced on the old
+// figure), and courses whose approved TAs or hours stand on the old figure
+// are listed in a preview that is saved only with confirm.
+func (s *TeachingService) SetTermBudgetCap(ctx context.Context, actor, termID uuid.UUID, budgetCap *float64, confirm bool) error {
+	if priv, err := isPrivileged(ctx, s.pool, actor); err != nil {
+		return err
+	} else if !priv {
+		return Forbidden("เพดานงบรายวิชาต้องให้เจ้าหน้าที่กำหนด")
+	}
+	if budgetCap != nil {
+		if *budgetCap < 0 || math.IsNaN(*budgetCap) || math.IsInf(*budgetCap, 0) {
+			return Invalid("เพดานงบต้องเป็นจำนวนเงินตั้งแต่ 0 บาทขึ้นไป")
+		}
+		if *budgetCap > 10_000_000 {
+			return Invalid("เพดานงบสูงเกินไป กรุณาตรวจสอบจำนวนเงินอีกครั้ง")
+		}
+		v := math.Round(*budgetCap*100) / 100
+		budgetCap = &v
+	}
+	return writeAuditedRow(ctx, s.pool, s.aud,
+		audit.Entry{ActorID: &actor, Action: "academic_term.budget_cap", Entity: "term", EntityID: termID.String()},
+		"academic_terms", termID,
+		func(tx pgx.Tx) error {
+			rows, err := tx.Query(ctx, `SELECT id, code FROM teaching_courses WHERE term_id = $1 ORDER BY code`, termID)
+			if err != nil {
+				return err
+			}
+			type course struct {
+				id     uuid.UUID
+				code   string
+				before float64
+			}
+			var courses []course
+			for rows.Next() {
+				var c course
+				if err := rows.Scan(&c.id, &c.code); err != nil {
+					rows.Close()
+					return err
+				}
+				courses = append(courses, c)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			for i := range courses {
+				if courses[i].before, err = courseFormulaBudget(ctx, tx, courses[i].id); err != nil {
+					return err
+				}
+			}
+			tag, err := tx.Exec(ctx, `UPDATE academic_terms SET course_budget_cap_baht = $2 WHERE id = $1`, termID, budgetCap)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrNotFound
+			}
+			var needConfirm []string
+			for _, c := range courses {
+				err := guardBudgetChange(ctx, tx, c.id, c.before, confirm)
+				if err == nil {
+					continue
+				}
+				var ue *UserError
+				if errors.As(err, &ue) && strings.HasPrefix(ue.Msg, BudgetConfirmPrefix) {
+					needConfirm = append(needConfirm, c.code)
+					continue
+				}
+				if errors.As(err, &ue) {
+					return Conflict(c.code + ": " + ue.Msg)
+				}
+				return err
+			}
+			if len(needConfirm) > 0 {
+				return Conflict(fmt.Sprintf(
+					"%s เพดานใหม่จะเปลี่ยนงบของ %d วิชาที่มี TA หรือชั่วโมงที่อนุมัติแล้ว (%s) ซึ่งอนุมัติไว้ตามงบเดิม การแก้ไขนี้จะบันทึกเมื่อยืนยันเท่านั้น",
+					BudgetConfirmPrefix, len(needConfirm), strings.Join(needConfirm, ", ")))
+			}
+			return nil
+		})
 }
 
 // SetNumStudents updates aggregate + per-track counts. Callers may pass -1 for
@@ -4100,6 +4199,10 @@ type Term struct {
 	// tag cannot express, and answers in Thai.
 	Months   int  `json:"months"`
 	IsActive bool `json:"is_active"`
+	// CourseBudgetCapBaht is the เพดานงบรายวิชา every course of the term shares
+	// (nil = ไม่กำหนด). Read-only here: set through SetTermBudgetCap, which
+	// runs the budget guards UpsertTerm does not.
+	CourseBudgetCapBaht *float64 `json:"course_budget_cap_baht"`
 }
 
 // TermFilter narrows a ListTerms query. All fields optional; nil means no
@@ -4117,7 +4220,7 @@ func (s *TeachingService) ListTerms(ctx context.Context, f TermFilter) ([]Term, 
 		        TO_CHAR(starts_on,'YYYY-MM-DD'), TO_CHAR(ends_on,'YYYY-MM-DD'),
 		        TO_CHAR(midterm_starts_on,'YYYY-MM-DD'), TO_CHAR(midterm_ends_on,'YYYY-MM-DD'),
 		        TO_CHAR(final_starts_on,'YYYY-MM-DD'),   TO_CHAR(final_ends_on,'YYYY-MM-DD'),
-		        months, is_active
+		        months, is_active, course_budget_cap_baht::float8
 		 FROM academic_terms
 		 WHERE ($1::int IS NULL OR academic_year = $1::int)
 		   AND ($2::int IS NULL OR academic_year >= $2::int)
@@ -4136,7 +4239,7 @@ func (s *TeachingService) ListTerms(ctx context.Context, f TermFilter) ([]Term, 
 			&t.StartsOn, &t.EndsOn,
 			&t.MidtermStartsOn, &t.MidtermEndsOn,
 			&t.FinalStartsOn, &t.FinalEndsOn,
-			&t.Months, &t.IsActive,
+			&t.Months, &t.IsActive, &t.CourseBudgetCapBaht,
 		); err != nil {
 			return nil, err
 		}
@@ -4289,8 +4392,13 @@ func (s *TeachingService) UpsertTerm(ctx context.Context, actor uuid.UUID, in Te
 					`INSERT INTO academic_terms
 					   (id, academic_year, semester, starts_on, ends_on,
 					    midterm_starts_on, midterm_ends_on, final_starts_on, final_ends_on,
-					    months, is_active)
-					 VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8::date,$9::date,$10,$11)`,
+					    months, is_active, course_budget_cap_baht)
+					 VALUES ($1,$2,$3,$4::date,$5::date,$6::date,$7::date,$8::date,$9::date,$10,$11,
+					         -- A new term starts from the latest term's เพดานงบ: the
+					         -- rule is the faculty's, not the term's, so staff set it
+					         -- once and change it only when the rule changes.
+					         (SELECT course_budget_cap_baht FROM academic_terms
+					           ORDER BY academic_year DESC, semester DESC LIMIT 1))`,
 					in.ID, in.AcademicYear, in.Semester,
 					nilStr(in.StartsOn), nilStr(in.EndsOn),
 					nilStr(in.MidtermStartsOn), nilStr(in.MidtermEndsOn),

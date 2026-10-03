@@ -12,6 +12,7 @@ func TestAppointNotice_ListsUpcomingMonthlyDeadlines(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	svc := &TARequestService{pool: f.Pool, notify: f.Svc.notify}
 
+	f.clearPeriods()
 	f.exec(`INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label, is_closed) VALUES
 	        (gen_random_uuid(), $1, '2569-07', CURRENT_DATE - 90, CURRENT_DATE - 60, 'เดือนที่ผ่านไปแล้ว', FALSE),
 	        (gen_random_uuid(), $1, '2569-08', CURRENT_DATE - 60, CURRENT_DATE + 1, 'เดือนที่ปิดรอบแล้ว', TRUE),

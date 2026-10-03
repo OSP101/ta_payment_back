@@ -168,7 +168,7 @@ func (s *ExportService) isReturningTA(ctx context.Context, taID, currentTermID u
 func (s *ExportService) buildExportRows(ctx context.Context, teachingCourseID uuid.UUID, months []string) (*exportComputation, error) {
 	var courseCode, courseName string
 	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.code, tc.name_th FROM teaching_courses tc
+		SELECT `+CourseCodesSQL("tc")+`, tc.name_th FROM teaching_courses tc
 		WHERE tc.id=$1`, teachingCourseID).Scan(&courseCode, &courseName); err != nil {
 		return nil, err
 	}
@@ -552,7 +552,9 @@ func (s *ExportService) buildCourseZip(ctx context.Context, teachingCourseID uui
 	if err := s.assertLockedFiguresHold(ctx, teachingCourseID, months, comp); err != nil {
 		return nil, "", 0, err
 	}
-	courseCode := comp.courseCode
+	// "CP245201_SC363001" for a merged course: every code, "/" swapped out
+	// because it is a path separator inside the ZIP.
+	courseCode := courseCodesFileSafe(comp.courseCode)
 	records := comp.records
 
 	buf := &bytes.Buffer{}

@@ -74,7 +74,7 @@ func (s *ExportService) BuildGradWorkloadForms(
 		academicYear, semester            int
 	)
 	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.term_id, tc.code, COALESCE(tc.name_th,''), COALESCE(tc.name_en,''),
+		SELECT tc.term_id, `+CourseCodesSQL("tc")+`, COALESCE(tc.name_th,''), COALESCE(tc.name_en,''),
 		       COALESCE(tc.credits,0), COALESCE(tc.lecture_hrs,0),
 		       COALESCE(tc.lab_hrs,0), COALESCE(tc.self_hrs,0),
 		       t.academic_year, t.semester

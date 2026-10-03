@@ -832,11 +832,10 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 		}
 		defer tx.Rollback(ctx)
 		var rejUserID uuid.UUID
-		var rejKind string
 		if err := tx.QueryRow(ctx,
 			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3
-			 WHERE id=$4 RETURNING user_id, kind`,
-			status, reason, actor, docID).Scan(&rejUserID, &rejKind); err != nil {
+			 WHERE id=$4 RETURNING user_id`,
+			status, reason, actor, docID).Scan(&rejUserID); err != nil {
 			return err
 		}
 		// An approved profile promises that every current required document is
@@ -856,14 +855,14 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			EntityID: docID.String(), After: map[string]any{"status": status, "reason": reason}}); err != nil {
 			return err
 		}
+		verdicts, err := settledVerdicts(ctx, tx, rejUserID)
+		if err != nil {
+			return err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
-		if s.notify != nil {
-			s.notify.SendAction(ctx, rejUserID, "เอกสารต้องแก้ไข "+kindLabel(rejKind),
-				kindLabel(rejKind)+" ของท่านยังไม่ผ่านการตรวจสอบ เนื่องจาก "+reason+" กรุณาแก้ไขและส่งเอกสารใหม่อีกครั้ง",
-				"/ta/documents")
-		}
+		s.notifyReviewResult(ctx, rejUserID, verdicts, false)
 		return nil
 	}
 	// Approve. Three things happen together, so they share a transaction: the
@@ -882,14 +881,13 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	defer tx.Rollback(ctx)
 
 	var userID uuid.UUID
-	var approvedKind string
 	if err := tx.QueryRow(ctx, `
 		UPDATE ta_documents
 		   SET status='approved', reject_reason=NULL, reviewed_at=NOW(), reviewed_by=$1,
 		       expires_at=NOW() + INTERVAL '7 days'
 		 WHERE id=$2
-		 RETURNING user_id, kind`,
-		actor, docID).Scan(&userID, &approvedKind); err != nil {
+		 RETURNING user_id`,
+		actor, docID).Scan(&userID); err != nil {
 		return err
 	}
 
@@ -911,17 +909,16 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 		}
 	}
 
+	verdicts, err := settledVerdicts(ctx, tx, userID)
+	if err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if s.notify != nil {
-		s.notify.Send(ctx, userID, "เอกสารผ่านการตรวจสอบ "+kindLabel(approvedKind),
-			kindLabel(approvedKind)+" ของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
-		if profileApproved {
-			s.notify.Send(ctx, userID, "ข้อมูลส่วนตัวผ่านการตรวจสอบแล้ว",
-				"ข้อมูลส่วนตัวและเอกสารประกอบทั้ง 3 รายการของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
-		}
-	}
+	// One notice for the whole review, sent by whichever verdict settles it
+	// (docs_review_mail.go) — never one per approved file.
+	s.notifyReviewResult(ctx, userID, verdicts, profileApproved)
 	return nil
 }
 

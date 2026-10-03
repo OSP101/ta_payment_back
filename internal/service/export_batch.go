@@ -288,7 +288,7 @@ type PayoutDashboard struct {
 // filtered by term. Heavy query — used by the staff dashboard page only.
 func (s *ExportBatchService) DashboardSummary(ctx context.Context, budget *BudgetService, export *ExportService, termID uuid.UUID) (*PayoutDashboard, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT tc.id, tc.code, tc.name_th,
+		SELECT tc.id, `+CourseCodesSQL("tc")+`, tc.name_th,
 		       -- Named with their ตำแหน่งทางวิชาการ (users.title, e.g. "รศ. ดร."),
 		       -- the way the claim documents name them: this card is what an
 		       -- officer reads before picking up the phone, and a bare given name

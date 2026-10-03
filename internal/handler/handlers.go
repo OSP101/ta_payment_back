@@ -264,6 +264,35 @@ func (h *EnrollmentHandler) RecordTransition(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(e)
 }
 
+func (h *EnrollmentHandler) GetTAIdentity(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Docs.GetTAIdentity(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// CorrectTAIdentity is staff/admin only — fixes a student id, citizen id or
+// prefix the TA typed wrong on their profile form. See DocsService.CorrectTAIdentity.
+func (h *EnrollmentHandler) CorrectTAIdentity(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in service.CorrectTAIdentityInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := h.Svc.Docs.CorrectTAIdentity(c.Context(), UserID(c), id, in); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // SetSessionScope is POST /me/enrollment-scope — self-only, no role gate
 // beyond being authenticated: EnrollmentService.SetSessionScope's own
 // ownership check is what actually protects this, the same way any other
@@ -630,6 +659,155 @@ func (h *TeachingHandler) SetNumStudents(c *fiber.Ctx) error {
 	}
 	if err := h.Svc.Teaching.SetNumStudents(c.Context(), UserID(c), id,
 		body.NumStudents, body.NumStudentsRegular, body.NumStudentsSpecial, body.Confirm); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// RegenerateCreditorForm is POST /users/:id/creditor-form/regenerate — staff
+// rebuild a TA's creditor form after correcting their details and download it
+// there and then. Password-gated like every other download of a document
+// carrying a full citizen ID and bank details.
+func (h *EnrollmentHandler) RegenerateCreditorForm(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in struct {
+		Password string `json:"password" validate:"required"`
+	}
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, UserID(c), in.Password); err != nil {
+		return err
+	}
+	body, name, err := h.Svc.Docs.RegenerateCreditorForm(c.Context(), UserID(c), id,
+		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir)
+	if err != nil {
+		return err
+	}
+	c.Set("Content-Type", "application/pdf")
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
+	c.Set("Cache-Control", "no-store")
+	return c.Send(body)
+}
+
+// BulkNumStudents is POST /terms/:id/num-students/bulk — staff paste the real
+// enrolment (code, regular, special) for many courses at once. dry_run
+// previews; confirm acknowledges budget changes on courses with approved TAs;
+// allow_zero lets rows take a course with students down to 0.
+func (h *TeachingHandler) BulkNumStudents(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Rows      []service.BulkCountRow `json:"rows"`
+		Confirm   bool                   `json:"confirm"`
+		AllowZero bool                   `json:"allow_zero"`
+		DryRun    bool                   `json:"dry_run"`
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	items, err := h.Svc.Teaching.BulkSetNumStudents(c.Context(), UserID(c), termID, body.Rows, body.Confirm, body.AllowZero, body.DryRun)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"items": items})
+}
+
+// RegEnrolment is GET /terms/:id/reg-enrolment — the term's fetch from the
+// registrar (running or finished), {job: null} when none was started.
+func (h *TeachingHandler) RegEnrolment(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	job, err := h.Svc.RegEnrolment.Status(c.Context(), UserID(c), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"job": job})
+}
+
+// StartRegEnrolment is POST /terms/:id/reg-enrolment {scope} — start fetching real
+// enrolment from reg.kku.ac.th, or get the fetch already running / a result
+// under ten minutes old. It only reads; staff apply the numbers through
+// BulkNumStudents.
+func (h *TeachingHandler) StartRegEnrolment(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Scope string `json:"scope"` // requested (default) | all
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	job, err := h.Svc.RegEnrolment.Start(c.Context(), UserID(c), termID, body.Scope)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"job": job})
+}
+
+// StopRegEnrolment is DELETE /terms/:id/reg-enrolment — stop the running
+// fetch; what was fetched so far is kept.
+func (h *TeachingHandler) StopRegEnrolment(c *fiber.Ctx) error {
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	job, err := h.Svc.RegEnrolment.Stop(c.Context(), UserID(c), termID)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"job": job})
+}
+
+// SetTermBudgetCap is PATCH /terms/:id/budget-cap — {budget_cap_baht:
+// number|null, confirm}: the เพดานงบรายวิชา every course of the term shares.
+// null clears it (ไม่กำหนด).
+func (h *TeachingHandler) SetTermBudgetCap(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		BudgetCapBaht *float64 `json:"budget_cap_baht"`
+		Confirm       bool     `json:"confirm"`
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.SetTermBudgetCap(c.Context(), UserID(c), id, body.BudgetCapBaht, body.Confirm); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// FoldSection is POST /teaching-courses/:id/sections/:sectionId/fold —
+// {into_section_id}: staff merge a section with no automatic partner into the
+// section it is taught with. See TeachingService.FoldSection.
+func (h *TeachingHandler) FoldSection(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	secID, err := uuid.Parse(c.Params("sectionId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
+	}
+	var body struct {
+		IntoSectionID uuid.UUID `json:"into_section_id" validate:"required"`
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.FoldSection(c.Context(), UserID(c), id, secID, body.IntoSectionID); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -1492,12 +1670,15 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	// Inline preview is fine for staff review; browsers will download
+	// Inline, for the TA's "ดูไฟล์ที่ส่ง" check; browsers will download
 	// anything they can't render. `Content-Disposition: inline` gives them
 	// the choice while still setting a filename for downloads.
 	c.Set("Content-Type", firstNonEmpty(mime, "application/octet-stream"))
 	c.Set("Content-Disposition", contentDisposition("inline", filename))
 	c.Set("X-Content-Type-Options", "nosniff")
+	// The TA re-opens their own ID card / bank book here to check it; a shared
+	// computer's browser cache must not keep a copy.
+	c.Set("Cache-Control", "no-store")
 	return c.Send(body)
 }
 

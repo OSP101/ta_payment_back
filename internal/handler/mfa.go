@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 
+	"ta-payment-back/internal/rbac"
 	"ta-payment-back/internal/service"
 )
 
@@ -152,6 +153,19 @@ func (h *MFAHandler) AdminReset(c *fiber.Ctx) error {
 		return err
 	}
 	actorID := UserID(c)
+	// Staff reach this route too, but only for accounts whose 2FA is optional
+	// (TA, lecturer). Same rule and wording as UserHandler.ResetPassword: a
+	// privileged target is admin-only, otherwise staff could reset an admin's
+	// password AND its 2FA and walk straight in.
+	if !rbac.Has(Roles(c), rbac.RoleAdmin) {
+		targetRoles, err := h.Svc.Users.RolesOf(c.Context(), targetID)
+		if err != nil {
+			return err
+		}
+		if rbac.Has(targetRoles, rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleExecutive) {
+			return fiber.NewError(fiber.StatusForbidden, "รีเซ็ต 2FA ของบัญชีผู้ดูแล/เจ้าหน้าที่/ผู้บริหาร ต้องให้ผู้ดูแลระบบดำเนินการ")
+		}
+	}
 	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, actorID, in.Password); err != nil {
 		return err
 	}

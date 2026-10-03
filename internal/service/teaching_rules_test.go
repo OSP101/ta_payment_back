@@ -162,6 +162,7 @@ func TestBudgetChange_RefusedOnceAMonthIsExported(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	svc := newTeachingSvc(t, f)
 	period := uuid.New()
+	f.clearPeriods()
 	f.exec(`INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label)
 	        VALUES ($1, $2, $3, $4::date, $5::date, 'เดือนทดสอบ')`,
 		period, f.TermID, "2569-"+currentMonthMM(), day(1), openDueDate())

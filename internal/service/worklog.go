@@ -3697,6 +3697,9 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	if err := assertWorklogWritable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate); err != nil {
 		return uuid.Nil, err
 	}
+	if err := assertPeriodDefined(ctx, s.pool, ac.TeachingCourseID, w.WorkDate); err != nil {
+		return uuid.Nil, err
+	}
 	if w.ID != uuid.Nil {
 		var oldDate string
 		if err := s.pool.QueryRow(ctx,
@@ -3879,6 +3882,9 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 		UPDATE work_logs wl SET status='submitted', submitted_at=NOW(), reject_reason=NULL
 		WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')
 		  AND `+submittableRowSQL("wl")+`
+		  -- A month with no submission period cannot be reviewed or exported;
+		  -- its rows wait as drafts until staff open the month.
+		  AND NOT `+periodMissingSQL("wl")+`
 		RETURNING to_char(wl.work_date, 'YYYY-MM')`, assignmentID)
 	if err != nil {
 		return err
@@ -3901,11 +3907,15 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	if submittedRows == 0 {
 		// Distinguish "nothing to submit" from "everything is in a locked month"
 		// so the TA isn't left guessing why the button did nothing.
-		var locked int
+		var locked, noPeriod int
 		if err := s.pool.QueryRow(ctx, `
-			SELECT COUNT(*) FILTER (WHERE `+unsubmittableMonthSQL("wl")+`)
+			SELECT COUNT(*) FILTER (WHERE `+unsubmittableMonthSQL("wl")+`),
+			       COUNT(*) FILTER (WHERE `+periodMissingSQL("wl")+`)
 			FROM work_logs wl WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')`,
-			assignmentID).Scan(&locked); err == nil {
+			assignmentID).Scan(&locked, &noPeriod); err == nil {
+			if noPeriod > 0 {
+				return Invalid("ยังส่งอนุมัติไม่ได้ เจ้าหน้าที่ยังไม่ได้เปิดรอบลงเวลาของเดือนที่บันทึกไว้")
+			}
 			if locked > 0 {
 				// No back-dated submission (staff decision, 03/08/2026): a month
 				// whose deadline passed unsent is a month the TA did not claim. The
@@ -4808,6 +4818,11 @@ func (s *WorkLogService) validateOnBehalfWrite(ctx context.Context, ac *assignme
 		// which disables the calendar rule outright regardless of what's
 		// passed for periodOpen.
 	}, termStart, termEnd, midterm, final, holidays, mk, time.Time{}, false); err != nil {
+		return err
+	}
+	// Same as the TA's own write: a row in a month with no period could never
+	// be exported, whoever keyed it in.
+	if err := assertPeriodDefined(ctx, s.pool, ac.TeachingCourseID, w.WorkDate); err != nil {
 		return err
 	}
 	if err := s.validateClassWindow(ctx, ac, w, mk); err != nil {

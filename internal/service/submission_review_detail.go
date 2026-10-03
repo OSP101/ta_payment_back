@@ -44,6 +44,10 @@ type ReviewDay struct {
 	// after the row was written — the answer is only true "as of now", which is
 	// exactly what a reviewer looking at it now wants to know.
 	OnTimetable bool `json:"on_timetable"`
+	// Status is the row's own work-log status. The review dialog needs it to
+	// offer ลบ only where StaffDelete can delete (draft/rejected) — it was
+	// offered on approved rows too and always came back refused.
+	Status string `json:"status"`
 }
 
 // ReviewSlot is one period of the section's weekly timetable — the backdrop the
@@ -87,7 +91,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 	rows, err := s.pool.Query(ctx, `
 		SELECT wl.id, TO_CHAR(wl.work_date,'YYYY-MM-DD'),
 		       wl.start_time::text, wl.end_time::text, wl.hours, wl.activity,
-		       wl.note, wl.room, sec.sec_no, sec.track::text, wl.source,
+		       wl.note, wl.room, sec.sec_no, sec.track::text, wl.source, wl.status::text,
 		       EXISTS (
 		         SELECT 1 FROM section_schedules sch
 		          WHERE sch.section_id = sec.id
@@ -117,7 +121,7 @@ func (s *SubmissionPeriodService) MonthDetailForReview(
 	for rows.Next() {
 		var d ReviewDay
 		if err := rows.Scan(&d.ID, &d.WorkDate, &d.StartTime, &d.EndTime, &d.Hours,
-			&d.Activity, &d.Note, &d.Room, &d.SecNo, &d.Track, &d.Source, &d.OnTimetable); err != nil {
+			&d.Activity, &d.Note, &d.Room, &d.SecNo, &d.Track, &d.Source, &d.Status, &d.OnTimetable); err != nil {
 			return nil, err
 		}
 		if d.Source == "auto" {

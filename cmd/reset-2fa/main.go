@@ -71,7 +71,10 @@ func main() {
 	err = pool.QueryRow(ctx, `
 		SELECT u.id, u.totp_enabled_at IS NOT NULL,
 		       (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = u.id AND r.used_at IS NULL)
-		FROM users u WHERE u.email = $1 AND u.deleted_at IS NULL`,
+		FROM users u WHERE u.email = $1 AND u.deleted_at IS NULL
+		-- Since migration 0143 a closed account may share the address with
+		-- the live one; the live one is the account that is locked out.
+		ORDER BY u.is_active DESC, u.created_at DESC LIMIT 1`,
 		*email).Scan(&id, &enabled, &codeCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		log.Fatalf("no account found for %s", *email)

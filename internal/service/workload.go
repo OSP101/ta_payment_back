@@ -575,16 +575,28 @@ func (s *WorkloadService) replaceClasses(ctx context.Context, actor, userID, ter
 	if wbaCount > 0 {
 		var studyLevel string
 		var studyYear *int
+		var studentID *string
+		var termYearBE int
 		if err := tx.QueryRow(ctx,
-			`SELECT study_level::text, study_year FROM users WHERE id=$1`, userID).Scan(&studyLevel, &studyYear); err != nil {
+			`SELECT COALESCE(u.study_level::text, ''), u.study_year, u.student_id,
+			        COALESCE((SELECT academic_year FROM academic_terms WHERE id = $2), 0)
+			   FROM users u WHERE u.id=$1`, userID, termID).Scan(&studyLevel, &studyYear, &studentID, &termYearBE); err != nil {
 			return err
+		}
+		// The year comes from the student id against THIS term's academic
+		// year, the same derivation the users screen shows — the stored
+		// column is only a fallback for ids that do not parse.
+		if studentID != nil {
+			if yr := deriveStudyYear(*studentID, termYearBE); yr > 0 {
+				studyYear = &yr
+			}
 		}
 		switch studyLevel {
 		case "master", "phd":
 			// No year requirement for graduate students.
 		case "undergrad":
 			if studyYear == nil {
-				return Invalid("ยังไม่ได้บันทึกชั้นปีของคุณในระบบ กรุณาติดต่อเจ้าหน้าที่เพื่อใช้โหมด WBA")
+				return Invalid("ระบบยังคำนวณชั้นปีของคุณไม่ได้ กรุณากรอกรหัสนักศึกษาในแบบฟอร์มข้อมูลส่วนตัวก่อนใช้โหมด WBA")
 			}
 			if *studyYear < 4 {
 				return Invalid("เฉพาะนักศึกษาชั้นปีที่ 4 ขึ้นไปเท่านั้นที่ใช้โหมด WBA ได้")

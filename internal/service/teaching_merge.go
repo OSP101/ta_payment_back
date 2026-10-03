@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"ta-payment-back/internal/audit"
 )
@@ -83,11 +84,29 @@ func primaryCode(current string, others []string) string {
 	return best
 }
 
+// CourseCodesSQL is the course code as the documents print it: every registrar
+// code the course is open under, primary first, joined with "/" — e.g.
+// "CP245201/SC363001". Printing the primary alone left the old-curriculum code
+// off every claim form, and the finance office matches forms to the registrar
+// by code (requested 02/10/2026). Display only: anything that KEYS on a course
+// (joins, DISTINCT, ORDER BY) keeps using tc.code.
+func CourseCodesSQL(tcAlias string) string {
+	return `array_to_string(ARRAY[` + tcAlias + `.code] || COALESCE(` + tcAlias + `.alt_codes, '{}'::text[]), '/')`
+}
+
+// courseCodesFileSafe is CourseCodesSQL's label for a file NAME: "/" is a path
+// separator inside a ZIP, so the codes are joined with "_" there instead.
+func courseCodesFileSafe(label string) string {
+	return strings.ReplaceAll(label, "/", "_")
+}
+
 // PrintSecNoSQL is the section number as the documents print it: the bare
 // number, without the "<code>-" prefix a section merged in under an alternate
-// code carries on screen. The documents name the course by its primary code
-// alone (see codeRank), so a prefixed section number there would name a code
-// the document never mentions.
+// code carries on screen. A merged course is one class taught under several
+// codes — CP sec 01 and SC sec 01 sit in the same room at the same time — so
+// the documents print the codes together ("CP245201/SC363001", CourseCodesSQL)
+// and the section once (confirmed by the office 02/10/2026); the sheets that
+// list sections dedupe the repeat (secRunLabel, dedupeTimetableBlocks).
 func PrintSecNoSQL(secAlias string) string {
 	return `CASE WHEN ` + secAlias + `.course_code IS NULL THEN ` + secAlias + `.sec_no
 	             ELSE substr(` + secAlias + `.sec_no, length(` + secAlias + `.course_code) + 2) END`
@@ -202,9 +221,19 @@ type mergeSection struct {
 }
 
 // mergeCodeTx does the writes: records the alternate code, adds any lecturers
-// the course does not have yet, opens the sections under the prefixed sec_no,
-// and recomputes the student counts. Callers own the transaction and the
+// the course does not have yet, folds the code's sections into the course's
+// own, and recomputes the student counts. Callers own the transaction and the
 // authorisation / export-lock checks.
+//
+// A merged course is ONE class (office, 02/10/2026): sec 1 of the alternate
+// code is sec 1 of the course — same room, same time, same TA — so it is not
+// opened as a section of its own. Its students join the course's section with
+// the same number and track, and its timetable and exams are dropped: the
+// class meets on the course's timetable. No same-number partner falls back to
+// the course's only section of that track. Only a section with neither is
+// opened separately, under the prefixed sec_no, so it stays visible for staff
+// to fold by hand (FoldSection) instead of being guessed into a wrong group.
+// See migration 0145 for the sections opened before this rule.
 func (s *TeachingService) mergeCodeTx(ctx context.Context, tx pgx.Tx, termID, targetID uuid.UUID,
 	code string, lecturerIDs []uuid.UUID, secs []mergeSection) error {
 	if taken, err := codeTakenInTerm(ctx, tx, termID, code, targetID); err != nil {
@@ -237,6 +266,26 @@ func (s *TeachingService) mergeCodeTx(ctx context.Context, tx pgx.Tx, termID, ta
 		}
 	}
 	for _, sec := range secs {
+		// Partner: same number and track, else the course's only section of
+		// that track — the registrar numbers each code's groups on its own
+		// (342233 sec 1 ภาคพิเศษ is SC362005 sec 3, its one special group).
+		tag, err := tx.Exec(ctx, `
+			UPDATE sections SET num_students = num_students + $4,
+			                    curriculum = COALESCE(curriculum, $5)
+			 WHERE id = COALESCE(
+			         (SELECT id FROM sections
+			           WHERE teaching_course_id = $1 AND course_code IS NULL
+			             AND ltrim(sec_no, '0') = ltrim($2, '0') AND track = $3::section_track),
+			         (SELECT min(id::text)::uuid FROM sections
+			           WHERE teaching_course_id = $1 AND course_code IS NULL AND track = $3::section_track
+			          HAVING COUNT(*) = 1))`,
+			targetID, sec.secNo, sec.track, sec.numStudents, sec.curriculum)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() > 0 {
+			continue
+		}
 		secID := uuid.New()
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students, curriculum, course_code)
@@ -262,8 +311,6 @@ func (s *TeachingService) mergeCodeTx(ctx context.Context, tx pgx.Tx, termID, ta
 			}
 		}
 	}
-	// After the sections are in, so a newly promoted primary's sections are
-	// there to lose their prefix.
 	if err := s.promotePrimaryCode(ctx, tx, targetID); err != nil {
 		return err
 	}
@@ -582,12 +629,90 @@ func (s *TeachingService) detectImportMergeGroups(ctx context.Context, termID uu
 	return out, nil
 }
 
+// FoldSection merges a section that is still on its own — a merged code's
+// section the automatic rule found no partner for (no section with the same
+// number and track) — into the section staff say it is taught with. The class
+// then meets on that section's timetable; TA requests, hours, makeups and the
+// students move with it (fold_section_into, migration 0145 — the same fold the
+// migration ran on existing data). Staff only, same track only, and not on an
+// exported course: hours are re-parented, and a payout file already stands on
+// the old sections.
+func (s *TeachingService) FoldSection(ctx context.Context, actor, tcID, sectionID, intoID uuid.UUID) error {
+	priv, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil {
+		return err
+	}
+	if !priv {
+		return Forbidden("การรวม section ต้องให้เจ้าหน้าที่ดำเนินการ")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := s.assertNotExported(ctx, tx, tcID); err != nil {
+		return err
+	}
+	var inCourse int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sections WHERE teaching_course_id = $1 AND id IN ($2, $3)`,
+		tcID, sectionID, intoID).Scan(&inCourse); err != nil {
+		return err
+	}
+	if inCourse != 2 || sectionID == intoID {
+		return Invalid("เลือก section ของวิชานี้ 2 กลุ่มที่ต่างกัน")
+	}
+	before, err := sectionListSnapshot(ctx, tx, tcID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT fold_section_into($1, $2)`, sectionID, intoID); err != nil {
+		var pg *pgconn.PgError
+		if errors.As(err, &pg) && pg.Code == "P0001" {
+			return Invalid(pg.Message)
+		}
+		return err
+	}
+	if err := s.recomputeAggregate(ctx, tx, tcID); err != nil {
+		return err
+	}
+	after, err := sectionListSnapshot(ctx, tx, tcID)
+	if err != nil {
+		return err
+	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "teaching_course.fold_section",
+		Entity: "teaching_course", EntityID: tcID.String(), Before: before, After: after}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// sectionListSnapshot is the course's section list for the fold's audit row.
+func sectionListSnapshot(ctx context.Context, tx pgx.Tx, tcID uuid.UUID) ([]map[string]any, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT sec_no, track::text, num_students FROM sections WHERE teaching_course_id = $1 ORDER BY sec_no`, tcID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var no, track string
+		var n int
+		if err := rows.Scan(&no, &track, &n); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{"sec_no": no, "track": track, "num_students": n})
+	}
+	return out, rows.Err()
+}
+
 // promotePrimaryCode re-picks the course's primary after a merge (see
-// codeRank). When the primary changes, the sections swap numbering with it:
-// the new primary's sections drop their "<code>-" prefix and the old
-// primary's gain one, so the bare "sec 1" always belongs to the code that
-// prints on the documents. Section ids never change — worklogs and TA
-// assignments point at ids, not numbers.
+// codeRank): only the course's code changes. Its sections are the course's,
+// not any one code's — a merged code's sections were folded into them
+// (mergeCodeTx) — so they keep their numbers. The only sections that still
+// carry a code are ones with no partner, and their "<code>-" prefix names the
+// code they really belong to whichever code prints first.
 func (s *TeachingService) promotePrimaryCode(ctx context.Context, tx pgx.Tx, tcID uuid.UUID) error {
 	var current string
 	var alts []string
@@ -607,20 +732,8 @@ func (s *TeachingService) promotePrimaryCode(ctx context.Context, tx pgx.Tx, tcI
 		}
 	}
 	sort.SliceStable(rest, func(i, j int) bool { return codeRank(rest[i]) < codeRank(rest[j]) })
-	if _, err := tx.Exec(ctx,
-		`UPDATE teaching_courses SET code = $2, alt_codes = $3, updated_at = NOW() WHERE id = $1`,
-		tcID, best, rest); err != nil {
-		return err
-	}
-	// Old primary's sections take its code as prefix…
-	if _, err := tx.Exec(ctx,
-		`UPDATE sections SET sec_no = $2 || '-' || sec_no, course_code = $2
-		  WHERE teaching_course_id = $1 AND course_code IS NULL`, tcID, current); err != nil {
-		return err
-	}
-	// …and the new primary's sections drop theirs.
 	_, err := tx.Exec(ctx,
-		`UPDATE sections SET sec_no = substr(sec_no, length($2) + 2), course_code = NULL
-		  WHERE teaching_course_id = $1 AND course_code = $2`, tcID, best)
+		`UPDATE teaching_courses SET code = $2, alt_codes = $3, updated_at = NOW() WHERE id = $1`,
+		tcID, best, rest)
 	return err
 }

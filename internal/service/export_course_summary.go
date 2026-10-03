@@ -101,7 +101,7 @@ func claimKindLabel(attendanceHrs, labHrs float64) string {
 
 func (s *ExportService) courseSummaryCourses(ctx context.Context, termID uuid.UUID) ([]courseSummaryCourse, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT tc.id, tc.code, tc.name_th, tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
+		SELECT tc.id, `+CourseCodesSQL("tc")+`, tc.name_th, tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		       tc.num_students_regular, tc.num_students_special, tc.level,
 		       COALESCE((
 		           SELECT COALESCE(NULLIF(u.title,''),'') || u.first_name || ' ' || u.last_name
@@ -138,10 +138,15 @@ func (s *ExportService) courseSummaryTAs(ctx context.Context, termID uuid.UUID) 
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT ON (sec.teaching_course_id, u.id)
 		       sec.teaching_course_id, u.id, COALESCE(a.student_id_snapshot, u.student_id, ''),
+		       -- With the คำนำหน้า, the way the college's own sheet lists them
+		       -- ("นางสาวธัญญลักษณ์ สาเสน", docs/Ngamnij.xlsx) and every other
+		       -- payout document names a TA: profile prefix, else account title.
+		       COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '') || u.first_name || ' ' || u.last_name,
 		       u.first_name || ' ' || u.last_name, a.level::text
 		FROM ta_request_assignments a
 		JOIN ta_requests r  ON r.id = a.request_id AND r.status = 'approved'
 		JOIN users u        ON u.id = a.ta_id
+		LEFT JOIN ta_profiles tp ON tp.user_id = u.id
 		JOIN sections sec   ON sec.id = a.section_id
 		JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
 		WHERE tc.term_id = $1 AND a.state <> 'dropped'
@@ -152,14 +157,15 @@ func (s *ExportService) courseSummaryTAs(ctx context.Context, termID uuid.UUID) 
 	defer rows.Close()
 	out := map[uuid.UUID][]courseSummaryTA{}
 	type row struct {
-		tcID  uuid.UUID
-		ta    courseSummaryTA
-		level string
+		tcID     uuid.UUID
+		ta       courseSummaryTA
+		sortName string // bare name: sorting the prefixed one files every นาย before every นางสาว
+		level    string
 	}
 	var collected []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.tcID, &r.ta.UserID, &r.ta.StudentID, &r.ta.Name, &r.level); err != nil {
+		if err := rows.Scan(&r.tcID, &r.ta.UserID, &r.ta.StudentID, &r.ta.Name, &r.sortName, &r.level); err != nil {
 			return nil, err
 		}
 		r.ta.LevelTH = studyLevelTH(r.level)
@@ -174,7 +180,7 @@ func (s *ExportService) courseSummaryTAs(ctx context.Context, termID uuid.UUID) 
 		if collected[i].tcID != collected[j].tcID {
 			return collected[i].tcID.String() < collected[j].tcID.String()
 		}
-		return collected[i].ta.Name < collected[j].ta.Name
+		return collected[i].sortName < collected[j].sortName
 	})
 	for _, r := range collected {
 		out[r.tcID] = append(out[r.tcID], r.ta)

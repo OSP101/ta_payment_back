@@ -63,9 +63,12 @@ type AdminOfficerService struct {
 var userTitleToPrefix = map[string]string{
 	"อาจารย์": "อาจารย์",
 	"อ. ดร.":  "ดร.",
+	"ดร.":     "ดร.",
 	"ผศ.":     "ผู้ช่วยศาสตราจารย์",
 	"ผศ. ดร.": "ผู้ช่วยศาสตราจารย์ ดร.",
+	"รศ.":     "รองศาสตราจารย์",
 	"รศ. ดร.": "รองศาสตราจารย์ ดร.",
+	"ศ.":      "ศาสตราจารย์",
 	"ศ. ดร.":  "ศาสตราจารย์ ดร.",
 }
 
@@ -158,7 +161,9 @@ func (s *AdminOfficerService) Upsert(ctx context.Context, actor uuid.UUID, in Ad
 	in.FullName = strings.TrimSpace(firstName + " " + lastName)
 	in.AcademicPrefix = ""
 	if userTitle != nil {
-		in.AcademicPrefix = userTitleToPrefix[strings.TrimSpace(*userTitle)]
+		// documentAcademicPrefix, not a bare map lookup: a title outside the
+		// vocabulary used to come back "" and the signer printed with no rank.
+		in.AcademicPrefix = documentAcademicPrefix(*userTitle)
 	}
 	// Derived, so a client that posts it back cannot contradict the title.
 	in.IsDean = IsDeanTitle(in.Title)

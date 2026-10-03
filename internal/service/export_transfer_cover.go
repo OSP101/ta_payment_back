@@ -261,7 +261,7 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 	for courseID, cur := range printCurricula {
 		var courseCode string
 		if err := s.pool.QueryRow(ctx, `
-			SELECT tc.code FROM teaching_courses tc WHERE tc.id = $1`, courseID).Scan(&courseCode); err != nil {
+			SELECT `+CourseCodesSQL("tc")+` FROM teaching_courses tc WHERE tc.id = $1`, courseID).Scan(&courseCode); err != nil {
 			return nil, nil, err
 		}
 

@@ -68,7 +68,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	// layout.
 	rows, err := s.pool.Query(ctx, `
 		SELECT CASE WHEN tc.level = 'undergrad' THEN 0 ELSE 1 END AS level_bucket,
-		       tc.code,
+		       `+CourseCodesSQL("tc")+`,
 		       COALESCE(NULLIF(tc.name_en, ''), tc.name_th) AS course_name,
 		       tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		       -- MAX(), not a plain column, so it stays an aggregate and does
@@ -106,7 +106,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		      WHERE o.term_id = $1
 		        AND it.teaching_course_id = tc.id
 		        AND it.ta_id = a.ta_id)
-		GROUP BY level_bucket, tc.id, tc.code, course_name,
+		GROUP BY level_bucket, tc.id, tc.code, tc.alt_codes, course_name,
 		         tc.credits, tc.lecture_hrs, tc.lab_hrs, tc.self_hrs,
 		         u.id, u.student_id, tp.prefix, u.title, u.first_name, u.last_name
 		ORDER BY level_bucket,

@@ -237,11 +237,11 @@ func (s *MFAService) Disable(ctx context.Context, actor uuid.UUID, code string) 
 
 // AdminReset clears actorID's target's 2FA entirely — the account-recovery
 // path for a lost device, used when the target cannot produce a code
-// themselves. Callers MUST restrict this to admins and re-verify the ADMIN's
-// own password first (VerifyUserPassword) — see internal/handler/mfa.go and
-// the plan's note on why this cannot be adminOrStaff: staff already hold
-// unrestricted password reset, and adding unrestricted 2FA reset on top would
-// turn any staff account into a one-click path to full admin takeover.
+// themselves. Callers MUST re-verify the ACTOR's own password first
+// (VerifyUserPassword) and keep privileged targets (admin/staff/executive)
+// admin-only — see internal/handler/mfa.go. Staff may reset TA and lecturer
+// accounts, the same reach they already have for password reset; unrestricted
+// staff 2FA reset would chain into a one-click path to admin takeover.
 func (s *MFAService) AdminReset(ctx context.Context, actorID, targetID uuid.UUID) error {
 	if actorID == targetID {
 		// Same reasoning as ClearPasswordGateLockout's own self-unlock

@@ -76,7 +76,10 @@ func (s *ExportService) ResolveCertifier(ctx context.Context, termID uuid.UUID) 
 		var a signerAuthority
 		var active bool
 		err := s.pool.QueryRow(ctx, `
-			SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title, ao.is_active
+			SELECT -- Claim forms sign with the ABBREVIATED rank as the account holds it
+		       -- ("ผศ. ดร.ณกร วัฒนกิจ"), like the college's own หลักฐาน sheet; only a
+		       -- seat with no linked account falls back to the stored prefix.
+		       COALESCE(NULLIF(u.title,''), ao.academic_prefix, '') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title, ao.is_active
 			FROM admin_officers ao
 			LEFT JOIN users u ON u.id = ao.user_id
 			WHERE ao.id = $1`, *chosen).Scan(&a.Name, &a.Title, &active)
@@ -100,7 +103,10 @@ func (s *ExportService) ResolveCertifier(ctx context.Context, termID uuid.UUID) 
 	// No explicit choice: whoever currently holds the seat.
 	var name, title string
 	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(ao.academic_prefix,'') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
+		SELECT -- Claim forms sign with the ABBREVIATED rank as the account holds it
+		       -- ("ผศ. ดร.ณกร วัฒนกิจ"), like the college's own หลักฐาน sheet; only a
+		       -- seat with no linked account falls back to the stored prefix.
+		       COALESCE(NULLIF(u.title,''), ao.academic_prefix, '') || COALESCE(u.first_name || ' ' || u.last_name, ao.full_name), ao.title
 		FROM admin_officers ao
 		LEFT JOIN users u ON u.id = ao.user_id
 		WHERE ao.is_active AND ao.title LIKE $1 || '%'

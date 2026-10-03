@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -179,6 +180,46 @@ func isMonthOpenForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUI
 		return false
 	}
 	return !closed
+}
+
+// assertPeriodDefined refuses a work log dated in a month the term has no
+// submission period for. Hours there could never be signed off or exported —
+// the review queue and every payout file are built from the periods — so a TA
+// who logged them did work nobody can pay (2569/2, 03/10/2026). Staff open the
+// months under ตั้งค่า → ปฏิทินเทอม.
+func assertPeriodDefined(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) error {
+	_, _, found, err := monthClosedForCourse(ctx, pool, tcID, workDate)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return Invalid(fmt.Sprintf(
+			"ยังลงเวลาเดือน%s ไม่ได้ เจ้าหน้าที่ยังไม่ได้เปิดรอบลงเวลาของเดือนนี้", thaiMonthOfDate(workDate)))
+	}
+	return nil
+}
+
+// periodMissingSQL is true for a work_logs row whose month has no submission
+// period in its term — the rows assertPeriodDefined would refuse today.
+func periodMissingSQL(wl string) string {
+	return `NOT EXISTS (
+		SELECT 1
+		FROM ta_request_assignments a3
+		JOIN sections sec3 ON sec3.id = a3.section_id
+		JOIN teaching_courses tc3 ON tc3.id = sec3.teaching_course_id
+		JOIN academic_terms trm3 ON trm3.id = tc3.term_id
+		JOIN submission_periods sp3 ON sp3.term_id = tc3.term_id
+		 AND sp3.year_month = trm3.academic_year::text || '-' || to_char(` + wl + `.work_date, 'MM')
+		WHERE a3.id = ` + wl + `.assignment_id
+	)`
+}
+
+func thaiMonthOfDate(workDate string) string {
+	t, err := time.Parse("2006-01-02", workDate)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s %d", thaiMonthNames[int(t.Month())], t.Year()+543)
 }
 
 // assertWorklogWritable rejects a write touching workDate when its month is

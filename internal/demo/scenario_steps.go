@@ -65,10 +65,30 @@ func stepTerm(ctx context.Context, svc *service.Container) (string, error) {
 	// (inactive) term also covers today, and the overlap rule would refuse
 	// this one with "ช่วงภาคเรียนทับซ้อนกับภาคเรียน …/2". The two are designed
 	// to sit side by side in one slot — see service.AllowTermOverlap.
-	if _, err := svc.Teaching.UpsertTerm(service.AllowTermOverlap(ctx), adminID, in); err != nil {
+	t, err := svc.Teaching.UpsertTerm(service.AllowTermOverlap(ctx), adminID, in)
+	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("สร้างภาคเรียนที่ 1 ปีการศึกษา %d เรียบร้อย (ช่วงสอบกลางภาค/ปลายภาคตั้งอยู่ล่วงหน้า ไม่ชนกับเดือนที่กำลังจำลอง)", beYear), nil
+	// Staff open the term for TA requests right after creating it — without a
+	// ช่วงรับคำขอ step 5 is refused (assertRequestWindowOpened).
+	if err := openRequestWindow(ctx, svc, adminID, t.ID, now.AddDate(0, 0, -1), now.AddDate(0, 0, 30)); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("สร้างภาคเรียนที่ 1 ปีการศึกษา %d พร้อมเปิดช่วงรับคำขอ TA 30 วัน เรียบร้อย (ช่วงสอบกลางภาค/ปลายภาคตั้งอยู่ล่วงหน้า ไม่ชนกับเดือนที่กำลังจำลอง)", beYear), nil
+}
+
+// openRequestWindow opens a ช่วงรับคำขอ with the lecturer e-mails off — demo
+// lecturers have no real inbox.
+func openRequestWindow(ctx context.Context, svc *service.Container, actor, termID uuid.UUID, opens, closes time.Time) error {
+	off := false
+	_, err := svc.TARequest.UpsertWindow(ctx, actor, service.Window{
+		TermID:          termID,
+		OpensAt:         opens,
+		ClosesAt:        closes,
+		IsOpen:          true,
+		NotifyLecturers: &off,
+	})
+	return err
 }
 
 // ---- 2. Courses --------------------------------------------------------

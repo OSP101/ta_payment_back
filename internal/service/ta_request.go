@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
+	"ta-payment-back/internal/timeutil"
 )
 
 type TARequestService struct {
@@ -167,6 +168,16 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 		return nil, errors.New("ไม่พบรายวิชาที่เลือก")
 	}
 
+	// Window gate: staff open the term for requests by setting a ช่วงรับคำขอ.
+	// A term with no window, or one whose window has not opened yet, takes no
+	// requests — a request sent before staff set the term up runs ahead of the
+	// submission periods and the appointment order, and its hours later had
+	// nowhere to be exported (2569/2, 03/10/2026). Past the closing date a
+	// request is still accepted, marked late, as before.
+	if err := assertRequestWindowOpened(ctx, s.pool, termID); err != nil {
+		return nil, err
+	}
+
 	// WBA gate: a course whose section(s) still have no class schedule (the
 	// registrar file said "will be arranged") cannot accept a TA request —
 	// downstream worklog validation, budget math, and time-clock checks all
@@ -187,12 +198,11 @@ func (s *TARequestService) Create(ctx context.Context, lecturerID uuid.UUID, in 
 	// Capture which window admitted this request so window deletion can honour
 	// the "in use" guard (M3).
 	//
-	// There is NO "closed" state: a TA request is never blocked by the window
-	// (per the lecturers' request — deadlines inform, they don't gate). The
-	// window only decides ONE thing: on-time vs late. Late requests carry
-	// `is_late` so staff (and the lecturer) know the payout will be delayed.
-	// When the term has no window configured at all, there is no deadline to
-	// miss, so the request is on time and window_id stays NULL.
+	// There is NO "closed" state: a request after the closing date is never
+	// blocked (per the lecturers' request — deadlines inform, they don't gate).
+	// Past the opening gate above, the window decides ONE thing: on-time vs
+	// late. Late requests carry `is_late` so staff (and the lecturer) know the
+	// payout will be delayed.
 	var windowID *uuid.UUID
 	var isLate bool
 	err := s.pool.QueryRow(ctx, `
@@ -2460,6 +2470,25 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		}
 	}
 	return &d, nil
+}
+
+// assertRequestWindowOpened refuses a new TA request for a term staff have not
+// opened: no ช่วงรับคำขอ at all, or every window still in the future.
+func assertRequestWindowOpened(ctx context.Context, pool *pgxpool.Pool, termID uuid.UUID) error {
+	var opensAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT MIN(opens_at) FROM ta_request_windows WHERE term_id = $1`, termID).Scan(&opensAt); err != nil {
+		return err
+	}
+	if opensAt == nil {
+		return Invalid("ยังส่งคำขอ TA ไม่ได้ เจ้าหน้าที่ยังไม่ได้กำหนดช่วงรับคำขอของภาคเรียนนี้")
+	}
+	if time.Now().Before(*opensAt) {
+		d := opensAt.In(timeutil.Bangkok)
+		return Invalid(fmt.Sprintf("ยังส่งคำขอ TA ไม่ได้ ช่วงรับคำขอของภาคเรียนนี้เริ่ม %s เวลา %02d:%02d น.",
+			thaiDate(*opensAt), d.Hour(), d.Minute()))
+	}
+	return nil
 }
 
 // Windows

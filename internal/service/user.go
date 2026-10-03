@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ta-payment-back/internal/audit"
@@ -138,6 +139,10 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 	}
 	defer tx.Rollback(ctx)
 
+	if err := activeEmailConflict(ctx, tx, in.Email, uuid.Nil, "สร้างบัญชีใหม่"); err != nil {
+		return nil, err
+	}
+
 	tempPw := ""
 	var pwHash *string
 	if in.Password != nil && *in.Password != "" {
@@ -159,6 +164,9 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 		`INSERT INTO users (id, email, title, first_name, last_name, phone, study_level, study_year, password_hash, must_change_password)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE)`,
 		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.Phone, in.StudyLevel, in.StudyYear, pwHash)
+	if isActiveEmailViolation(err) {
+		return nil, activeEmailConflict(ctx, s.pool, in.Email, id, "สร้างบัญชีใหม่")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -734,6 +742,21 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 		i++
 	}
 	if in.Email != nil {
+		// Only an ACTIVE account can collide (migration 0143); a closed one
+		// may keep an address someone else now uses — Activate checks then.
+		if err := activeEmailConflict(ctx, tx, *in.Email, id, "ใช้อีเมลนี้"); err != nil {
+			var ue *UserError
+			if !errors.As(err, &ue) {
+				return nil, err
+			}
+			var active bool
+			if qerr := tx.QueryRow(ctx, `SELECT is_active FROM users WHERE id=$1`, id).Scan(&active); qerr != nil {
+				return nil, qerr
+			}
+			if active {
+				return nil, err
+			}
+		}
 		add("email", strings.ToLower(*in.Email))
 	}
 	if in.Title != nil {
@@ -782,6 +805,21 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 		q := "UPDATE users SET " + strings.Join(sets, ", ") + " WHERE id=$" + itoa(i)
 		args = append(args, id)
 		if _, err := tx.Exec(ctx, q, args...); err != nil {
+			if isActiveEmailViolation(err) && in.Email != nil {
+				return nil, activeEmailConflict(ctx, s.pool, *in.Email, id, "ใช้อีเมลนี้")
+			}
+			return nil, err
+		}
+	}
+
+	// An officer seat keeps a spelled-out copy of the holder's rank for the
+	// signature lines (admin_officers.academic_prefix). It was only written
+	// when the seat was assigned, so a promotion — ผศ. to รศ. — kept signing
+	// every claim with the old rank while the name beside it read live.
+	if in.Title != nil {
+		if _, err := tx.Exec(ctx,
+			`UPDATE admin_officers SET academic_prefix = $2 WHERE user_id = $1`,
+			id, documentAcademicPrefix(*in.Title)); err != nil {
 			return nil, err
 		}
 	}
@@ -877,7 +915,17 @@ func (s *UserService) Activate(ctx context.Context, actor, id uuid.UUID) error {
 	if err := s.assertMayManage(ctx, actor, id); err != nil {
 		return err
 	}
-	return writeAuditedRow(ctx, s.pool, s.aud,
+	var email string
+	if err := s.pool.QueryRow(ctx, `SELECT email FROM users WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&email); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if err := activeEmailConflict(ctx, s.pool, email, id, "เปิดใช้งานบัญชีนี้"); err != nil {
+		return err
+	}
+	err := writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "user.activate", Entity: "user", EntityID: id.String()},
 		"users", id,
 		func(tx pgx.Tx) error {
@@ -891,6 +939,10 @@ func (s *UserService) Activate(ctx context.Context, actor, id uuid.UUID) error {
 			}
 			return nil
 		})
+	if isActiveEmailViolation(err) {
+		return activeEmailConflict(ctx, s.pool, email, id, "เปิดใช้งานบัญชีนี้")
+	}
+	return err
 }
 
 // GetEmail returns the current email for a user (used for deactivation confirmation).
@@ -1033,6 +1085,36 @@ func (s *UserService) ResetPassword(ctx context.Context, actor, id uuid.UUID) (s
 func (s *UserService) MarkProfileComplete(ctx context.Context, id uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `UPDATE users SET profile_completed=TRUE, updated_at=NOW() WHERE id=$1`, id)
 	return err
+}
+
+// activeEmailConflict refuses when ANOTHER active account already holds email.
+// Since migration 0143 an address is unique only among active accounts: a
+// closed account keeps its address, so staff can create a fresh account for
+// someone whose first one was made wrong, but two live accounts can never
+// share one — sign-in resolves an address to exactly one active account.
+// exclude is the account being changed (uuid.Nil on create).
+func activeEmailConflict(ctx context.Context, q querier, email string, exclude uuid.UUID, verb string) error {
+	var first, last string
+	err := q.QueryRow(ctx,
+		`SELECT first_name, last_name FROM users
+		  WHERE email = $1 AND is_active AND deleted_at IS NULL AND id <> $2 LIMIT 1`,
+		strings.ToLower(strings.TrimSpace(email)), exclude).Scan(&first, &last)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return Conflict(fmt.Sprintf(
+		"อีเมล %s ผูกกับบัญชีที่เปิดใช้งานอยู่แล้ว (%s %s) อีเมลหนึ่งเปิดใช้งานได้ครั้งละ 1 บัญชี กรุณาปิดบัญชีนั้นก่อนจึงจะ%sได้",
+		strings.ToLower(strings.TrimSpace(email)), first, last, verb))
+}
+
+// isActiveEmailViolation reports the race the pre-check above cannot close:
+// two requests passing it at once, the second losing on ux_users_email_active.
+func isActiveEmailViolation(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "23505" && pg.ConstraintName == "ux_users_email_active"
 }
 
 // validateStudyYear allows nil (not set) or 1..8; 0 is handled by callers as a

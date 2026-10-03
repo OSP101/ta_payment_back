@@ -177,7 +177,7 @@ const timetableOwnClassFill = "FFFF00"
 // block — filled by different functions — always agree on a course's colour.
 func (s *ExportService) timetableCourseColors(ctx context.Context, taID, termID uuid.UUID) (map[string]string, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tc.code
+		SELECT DISTINCT `+CourseCodesSQL("tc")+`
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id=a.section_id
 		JOIN teaching_courses tc ON tc.id=sec.teaching_course_id AND tc.term_id=$2
@@ -364,7 +364,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		tracks map[string]bool
 	}{}
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tc.code, ss.kind, ss.day_of_week,
+		SELECT DISTINCT `+CourseCodesSQL("tc")+`, ss.kind, ss.day_of_week,
 		       EXTRACT(HOUR FROM ss.start_time)*60+EXTRACT(MINUTE FROM ss.start_time),
 		       EXTRACT(HOUR FROM ss.end_time)*60+EXTRACT(MINUTE FROM ss.end_time),
 		       `+PrintSecNoSQL("sec")+`, sec.track::text
@@ -445,7 +445,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 		tracks map[string]bool
 	}{}
 	revRows, err := s.pool.Query(ctx, `
-		SELECT tc.code, rs.day_of_week,
+		SELECT `+CourseCodesSQL("tc")+`, rs.day_of_week,
 		       EXTRACT(HOUR FROM rs.start_time)*60+EXTRACT(MINUTE FROM rs.start_time),
 		       EXTRACT(HOUR FROM rs.end_time)*60+EXTRACT(MINUTE FROM rs.end_time),
 		       `+PrintSecNoSQL("sec")+`, sec.track::text, rs.kind
@@ -498,7 +498,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 	// nothing left in work_logs to reconstruct their duty pattern from. Their
 	// duty IS the class's own schedule, so that's what prints.
 	dutyRows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tc.code, wl.activity, EXTRACT(DOW FROM wl.work_date)::int,
+		SELECT DISTINCT `+CourseCodesSQL("tc")+`, wl.activity, EXTRACT(DOW FROM wl.work_date)::int,
 		       EXTRACT(HOUR FROM wl.start_time)*60+EXTRACT(MINUTE FROM wl.start_time),
 		       EXTRACT(HOUR FROM wl.end_time)*60+EXTRACT(MINUTE FROM wl.end_time),
 		       `+PrintSecNoSQL("sec")+`, sec.track::text
@@ -545,7 +545,7 @@ func (s *ExportService) fillTimetableGrid(ctx context.Context, f *excelize.File,
 	// grad-special's duty pattern, read straight from the section's own
 	// schedule rather than work_logs — see comment above.
 	gradSpecialDutyRows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tc.code, ss.kind, ss.day_of_week,
+		SELECT DISTINCT `+CourseCodesSQL("tc")+`, ss.kind, ss.day_of_week,
 		       EXTRACT(HOUR FROM ss.start_time)*60+EXTRACT(MINUTE FROM ss.start_time),
 		       EXTRACT(HOUR FROM ss.end_time)*60+EXTRACT(MINUTE FROM ss.end_time),
 		       `+PrintSecNoSQL("sec")+`, sec.track::text
@@ -663,13 +663,13 @@ func (s *ExportService) fillClaimSignatures(ctx context.Context, f *excelize.Fil
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT COALESCE(NULLIF(u.title,''),'')||COALESCE(u.first_name,'')||' '||COALESCE(u.last_name,''),
-		       tc.code, COALESCE(tc.name_th,'')
+		       `+CourseCodesSQL("tc")+`, COALESCE(tc.name_th,'')
 		FROM ta_requests r
 		JOIN users u ON u.id=r.lecturer_id
 		JOIN teaching_courses tc ON tc.id=r.teaching_course_id AND tc.term_id=$2
 		JOIN ta_request_assignments a ON a.request_id=r.id
 		WHERE a.ta_id=$1 AND r.status='approved' AND a.state <> 'dropped'
-		GROUP BY u.id, u.title, u.first_name, u.last_name, tc.code, tc.name_th, r.submitted_at
+		GROUP BY u.id, u.title, u.first_name, u.last_name, tc.code, tc.alt_codes, tc.name_th, r.submitted_at
 		ORDER BY MIN(r.submitted_at)`, taID, termID)
 	if err != nil {
 		return err

@@ -647,7 +647,7 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 	d := &gradEvidenceData{}
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.code, tc.term_id, t.academic_year, t.semester
+		SELECT `+CourseCodesSQL("tc")+`, tc.term_id, t.academic_year, t.semester
 		FROM teaching_courses tc JOIN academic_terms t ON t.id = tc.term_id
 		WHERE tc.id = $1`, courseID).Scan(&d.CourseCode, &termID, &d.AcademicYear, &d.Semester); err != nil {
 		return nil, err

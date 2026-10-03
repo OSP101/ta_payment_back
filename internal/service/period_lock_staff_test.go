@@ -17,7 +17,8 @@ func (f *fixture) closePeriodFor(t *testing.T, mm string) {
 	        SELECT gen_random_uuid(), $1, t.academic_year::text || '-' || $2,
 	               'เดือนทดสอบ', CURRENT_DATE - 60, CURRENT_DATE - 30, TRUE
 	        FROM academic_terms t WHERE t.id = $1
-	        ON CONFLICT DO NOTHING`, f.TermID, mm)
+	        ON CONFLICT (term_id, year_month) DO UPDATE
+	        SET is_closed = TRUE, starts_on = EXCLUDED.starts_on, due_date = EXCLUDED.due_date`, f.TermID, mm)
 }
 
 func TestStaffUpsert_RefusesAClosedMonth(t *testing.T) {

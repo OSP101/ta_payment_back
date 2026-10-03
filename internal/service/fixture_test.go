@@ -247,7 +247,46 @@ func (f *fixture) insertTerm(o fixtureOpts) uuid.UUID {
 	f.exec(`INSERT INTO academic_terms (id, academic_year, semester, starts_on, ends_on, is_active, months)
 	        VALUES ($1, $2, 1, $3::date, $4::date, TRUE, $5)`,
 		id, f.AcademicYear, o.TermStart, o.TermEnd, o.TermMonths)
+	f.openTermForWork(id, o)
 	return id
+}
+
+// clearPeriods drops the default periods openTermForWork laid down, for tests
+// that build their own month set from scratch.
+func (f *fixture) clearPeriods() {
+	f.exec(`DELETE FROM submission_periods WHERE term_id = $1`, f.TermID)
+}
+
+// openTermForWork does what staff do right after creating a term: open a
+// ช่วงรับคำขอ and lay down one submission period per month. Without them TA
+// requests and work logs are refused (assertRequestWindowOpened,
+// assertPeriodDefined) — tests ABOUT those gates delete the rows again.
+//
+// Periods mirror BulkCreateForTerm: each opens on the 1st and is due on the 5th
+// of the next month. The current month is always covered, since most tests log
+// work "this month" whatever the term's dates.
+func (f *fixture) openTermForWork(termID uuid.UUID, o fixtureOpts) {
+	f.exec(`INSERT INTO ta_request_windows (id, term_id, opens_at, closes_at, is_open)
+	        VALUES (gen_random_uuid(), $1, NOW() - INTERVAL '30 days', NOW() + INTERVAL '30 days', TRUE)`, termID)
+	start, err1 := time.Parse("2006-01-02", o.TermStart)
+	end, err2 := time.Parse("2006-01-02", o.TermEnd)
+	months := map[time.Month]time.Time{}
+	if err1 == nil && err2 == nil {
+		for m := time.Date(start.Year(), start.Month(), 1, 0, 0, 0, 0, time.UTC); !m.After(end); m = m.AddDate(0, 1, 0) {
+			months[m.Month()] = m
+		}
+	}
+	now := timeutil.Now()
+	cur := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if _, ok := months[cur.Month()]; !ok {
+		months[cur.Month()] = cur
+	}
+	for mm, first := range months {
+		ym := fmt.Sprintf("%d-%02d", f.AcademicYear, int(mm))
+		f.exec(`INSERT INTO submission_periods (id, term_id, year_month, starts_on, due_date, label)
+		        VALUES (gen_random_uuid(), $1, $2, $3::date, $4::date, $5)`,
+			termID, ym, first.Format("2006-01-02"), first.AddDate(0, 1, 4).Format("2006-01-02"), "รอบ "+ym)
+	}
 }
 
 func (f *fixture) insertUser(role, tag string) uuid.UUID {
@@ -446,9 +485,16 @@ func (f *fixture) mustUpsert(w WorkLog) uuid.UUID {
 func (f *fixture) addSubmissionPeriod(month, dueDate, status string, closed bool) uuid.UUID {
 	id := uuid.New()
 	ym := fmt.Sprintf("%d-%s", f.AcademicYear, month)
-	f.exec(`INSERT INTO submission_periods (id, term_id, year_month, due_date, label, starts_on, is_closed)
-	        VALUES ($1, $2, $3, $4::date, $5, $6::date, $7)`,
-		id, f.TermID, ym, dueDate, "รอบ "+ym, dueDate, closed)
+	// Upsert: openTermForWork already laid a default period for the month.
+	if err := f.Pool.QueryRow(f.ctx, `INSERT INTO submission_periods (id, term_id, year_month, due_date, label, starts_on, is_closed)
+	        VALUES ($1, $2, $3, $4::date, $5, $6::date, $7)
+	        ON CONFLICT (term_id, year_month) DO UPDATE
+	        SET due_date = EXCLUDED.due_date, label = EXCLUDED.label,
+	            starts_on = EXCLUDED.starts_on, is_closed = EXCLUDED.is_closed
+	        RETURNING id`,
+		id, f.TermID, ym, dueDate, "รอบ "+ym, dueDate, closed).Scan(&id); err != nil {
+		f.t.Fatalf("addSubmissionPeriod: %v", err)
+	}
 	if status != "" {
 		f.exec(`INSERT INTO submission_period_status
 		          (id, submission_period_id, ta_id, teaching_course_id, status)

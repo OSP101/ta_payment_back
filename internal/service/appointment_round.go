@@ -149,10 +149,10 @@ func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID)
 		SkippedTAs: []SkippedAppointee{},
 	}
 	srows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tc.id, tc.code, u.id, u.first_name || ' ' || u.last_name
+		SELECT DISTINCT tc.id, `+CourseCodesSQL("tc")+` AS codes, u.id, u.first_name || ' ' || u.last_name
 		`+appointmentPendingFromSQL+`
 		  AND NOT u.is_active
-		ORDER BY tc.code, u.first_name || ' ' || u.last_name`, termID)
+		ORDER BY codes, u.first_name || ' ' || u.last_name`, termID)
 	if err != nil {
 		return nil, err
 	}
@@ -173,11 +173,13 @@ func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID)
 	// Eligible = approved request, assignment not dropped, and never printed
 	// on an earlier round of this term.
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT tc.id, tc.code, tc.name_th, u.id, u.first_name || ' ' || u.last_name
+		SELECT DISTINCT tc.id, `+CourseCodesSQL("tc")+` AS codes, tc.name_th, u.id, u.first_name || ' ' || u.last_name
 		`+appointmentEligibleSQL+`
 		-- SELECT DISTINCT requires every ORDER BY expression to be selected;
 		-- the columns below are already in the list, so order by them by name.
-		ORDER BY tc.code, u.first_name || ' ' || u.last_name`, termID)
+		-- Every registrar code of a merged course ("CP245201/SC363001"), as
+		-- the printed order shows it.
+		ORDER BY codes, u.first_name || ' ' || u.last_name`, termID)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +222,7 @@ func (s *AppointmentOrderService) Preview(ctx context.Context, termID uuid.UUID)
 // part.
 func (s *AppointmentOrderService) skippedCourses(ctx context.Context, termID uuid.UUID) ([]SkippedCourse, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT tc.id, tc.code, tc.name_th, w.ta_id, w.name, w.reminded_at
+		SELECT tc.id, `+CourseCodesSQL("tc")+`, tc.name_th, w.ta_id, w.name, w.reminded_at
 		FROM teaching_courses tc
 		LEFT JOIN LATERAL (
 			SELECT DISTINCT a.ta_id, `+personNameSQL+` AS name,

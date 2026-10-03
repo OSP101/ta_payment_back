@@ -1280,10 +1280,12 @@ func writeEvidenceSheet(f *excelize.File, st *claimStyles, sheet, claimSheet, tr
 }
 
 // lecturerSignatory is the course's primary lecturer, named the way the
-// หลักฐาน sheet signs them: academic title in FULL. Accounts store the
-// abbreviation the UI uses, so the prefix is spelled out here rather than
-// printed as typed. A course with no lecturer on file yields "", which leaves
-// the signature line blank for a wet one instead of printing empty brackets.
+// หลักฐาน sheet signs them: the ABBREVIATED academic title as the account holds
+// it ("ผศ. ดร.วรัญญา วรรณศรี") — the office's choice 02/10/2026, matching the
+// certifier beside it and the timetable sheet in the same workbook (it used to
+// be spelled out here alone). A course with no lecturer on file yields "",
+// which leaves the signature line blank for a wet one instead of printing
+// empty brackets.
 func (s *ExportService) lecturerSignatory(ctx context.Context, courseID uuid.UUID) (string, error) {
 	var title, first, last string
 	err := s.pool.QueryRow(ctx, `
@@ -1301,7 +1303,7 @@ func (s *ExportService) lecturerSignatory(ctx context.Context, courseID uuid.UUI
 	if name == "" {
 		return "", nil
 	}
-	return documentAcademicPrefix(title) + name, nil
+	return strings.TrimSpace(title) + name, nil
 }
 
 // collectCombinedBook gathers every claimant on a course across the whole term.
@@ -1309,7 +1311,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	d := &combinedBookData{}
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `
-		SELECT tc.code, tc.term_id, t.academic_year, t.semester
+		SELECT `+CourseCodesSQL("tc")+`, tc.term_id, t.academic_year, t.semester
 		FROM teaching_courses tc JOIN academic_terms t ON t.id = tc.term_id
 		WHERE tc.id = $1`, courseID).Scan(&d.CourseCode, &termID, &d.AcademicYear, &d.Semester); err != nil {
 		return nil, err

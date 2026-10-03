@@ -435,6 +435,11 @@ func (p *presBuilder) term(ctx context.Context) error {
 		return err
 	}
 	p.termID = t.ID
+	// Wide enough that every request the dataset files, however far back it
+	// is dated, counts as on time.
+	if err := openRequestWindow(ctx, p.svc, p.adminID, t.ID, timeutil.Now().AddDate(-1, 0, 0), timeutil.Now().AddDate(0, 1, 0)); err != nil {
+		return err
+	}
 	if created != months {
 		if _, err := p.slot.Pool.Exec(ctx, `UPDATE academic_terms SET months = $2 WHERE id = $1`, t.ID, months); err != nil {
 			return err

@@ -193,6 +193,10 @@ type Config struct {
 	// POST /tdbm-webhook (TDBM → us) is deliberately unauthenticated too — see
 	// TDBMHandler.Webhook's doc comment.
 	TDBMAPIBaseURL string
+	// RegKKUBaseURL is the registrar's class-information site, read (never
+	// written) for real enrolment counts — see internal/regkku. Production
+	// resolves it through the campus DNS. Empty = reg.kku.ac.th/registrar.
+	RegKKUBaseURL string
 
 	// DemoMode gates the BETA "โหมดทดลอง" sandbox (internal/demo) entirely —
 	// false means main.go never provisions a slot, mounts a demo route, or
@@ -285,6 +289,7 @@ func Load() (Config, error) {
 		PIIEncKey:            env("PII_ENC_KEY", ""),
 		TOTPEncKey:           env("TOTP_ENC_KEY", ""),
 		TDBMAPIBaseURL:       env("TDBM_API_BASE_URL", "https://tdbm.computing.kku.ac.th/api"),
+		RegKKUBaseURL:        env("REG_KKU_BASE_URL", ""),
 		ClamAVAddr:           env("CLAMAV_ADDR", ""),
 		DemoJWTSecret:        env("DEMO_JWT_SECRET", ""),
 	}

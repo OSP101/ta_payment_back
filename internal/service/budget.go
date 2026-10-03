@@ -53,14 +53,32 @@ func ugWeeklyWorkload(lectureCredits, labCredits, students int, rates BudgetRate
 	return lec + lab
 }
 
+// courseBudgetCapSQL is the term's shared เพดานงบรายวิชา for course alias tc
+// (migration 0144) — NULL when the term sets none.
+const courseBudgetCapSQL = `(SELECT t.course_budget_cap_baht::float8 FROM academic_terms t WHERE t.id = tc.term_id)`
+
+// applyBudgetCap is the เพดานงบรายวิชา rule (migration 0144): nil = no cap,
+// otherwise the budget is min(formula, cap). Shared by Compute and
+// courseFormulaBudget so the figure an edit is checked against is the one
+// every screen shows.
+func applyBudgetCap(formula float64, budgetCap *float64) float64 {
+	if budgetCap != nil && *budgetCap < formula {
+		return *budgetCap
+	}
+	return formula
+}
+
 // courseFormulaBudget is Compute's PerCourseMaxBaht alone — the term ceiling
-// the workload formula gives — read through q, so a caller holding a
-// transaction sees its own uncommitted edit.
+// the workload formula gives, lowered to the course's เพดานงบ when one is set —
+// read through q, so a caller holding a transaction sees its own uncommitted
+// edit.
 func courseFormulaBudget(ctx context.Context, q querier, tcID uuid.UUID) (float64, error) {
 	var total, regular, special, lecHrs, labHrs int
+	var budgetCap *float64
 	if err := q.QueryRow(ctx, `
-		SELECT num_students, num_students_regular, num_students_special, lecture_hrs, lab_hrs
-		FROM teaching_courses WHERE id = $1`, tcID).Scan(&total, &regular, &special, &lecHrs, &labHrs); err != nil {
+		SELECT num_students, num_students_regular, num_students_special, lecture_hrs, lab_hrs,
+		       `+courseBudgetCapSQL+`
+		FROM teaching_courses tc WHERE id = $1`, tcID).Scan(&total, &regular, &special, &lecHrs, &labHrs, &budgetCap); err != nil {
 		return 0, err
 	}
 	// Same fallbacks as Compute: lab credits are lab hours ÷ 2, and an
@@ -73,7 +91,7 @@ func courseFormulaBudget(ctx context.Context, q querier, tcID uuid.UUID) (float6
 		return 0, nil
 	}
 	weekly := ugWeeklyWorkload(lecHrs, labHrs/2, regular, rates) + ugWeeklyWorkload(lecHrs, labHrs/2, special, rates)
-	return weekly * rates.UGWorkloadRateRegular * float64(rates.TermMonths), nil
+	return applyBudgetCap(weekly*rates.UGWorkloadRateRegular*float64(rates.TermMonths), budgetCap), nil
 }
 
 // BudgetService encapsulates budget & hour cap calculations for a teaching course.
@@ -107,7 +125,13 @@ type BudgetSnapshot struct {
 	LabHrs           int     `json:"lab_hrs"`
 	LectureCredits   int     `json:"lecture_credits"`
 	LabCredits       int     `json:"lab_credits"`
-	PerCourseMaxBaht float64 `json:"per_course_max"` // derived from the workload formula, not a stored cap — see Compute below
+	PerCourseMaxBaht float64 `json:"per_course_max"` // min(workload formula, BudgetCapBaht) — see Compute below
+	// BudgetCapBaht is the term's shared เพดานงบรายวิชา (nil = ไม่กำหนด);
+	// FormulaBaht is what the workload formula alone gives. CapApplied says the
+	// cap is the lower of the two, so every money figure below was scaled to it.
+	BudgetCapBaht *float64 `json:"budget_cap_baht"`
+	FormulaBaht   float64  `json:"formula_baht"`
+	CapApplied    bool     `json:"cap_applied"`
 	// Aggregate (regular + special)
 	WeeklyWorkload float64 `json:"weekly_workload_hours"`
 	MonthlyPay     float64 `json:"monthly_pay_baht"`
@@ -154,10 +178,10 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	snap := &BudgetSnapshot{TeachingCourseID: tcID}
 	err := s.pool.QueryRow(ctx, `
 		SELECT tc.num_students, tc.num_students_regular, tc.num_students_special,
-		       tc.credits, tc.lecture_hrs, tc.lab_hrs
+		       tc.credits, tc.lecture_hrs, tc.lab_hrs, `+courseBudgetCapSQL+`
 		FROM teaching_courses tc
 		WHERE tc.id = $1`, tcID).Scan(&snap.NumStudents, &snap.NumStudentsRegular, &snap.NumStudentsSpecial,
-		&snap.Credits, &snap.LectureHrs, &snap.LabHrs)
+		&snap.Credits, &snap.LectureHrs, &snap.LabHrs, &snap.BudgetCapBaht)
 	if err != nil {
 		return nil, err
 	}
@@ -180,8 +204,8 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 		snap.NumStudentsRegular = snap.NumStudents
 	}
 	// per_course_max is derived from the formula (weekly workload × rate × months)
-	// — set below after workload is computed. There is no manual per-course cap
-	// table any more (budget_caps, removed 15/09/2026 — TOR §3.4 ข.4).
+	// — set below after workload is computed — and then lowered to the term's
+	// เพดานงบรายวิชา when staff set one (migration 0144).
 
 	rates := loadBudgetRates(ctx, s.pool, tcID)
 	snap.Rates = rates
@@ -206,8 +230,21 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 		snap.TermPaySpecial = snap.MonthlyPaySpecial * m
 		snap.TermPay = snap.MonthlyPay * m
 	}
-	// Per-course budget cap is DERIVED from the formula (weekly workload × rate × months)
-	// — no manual override exists any more. Total term pay across both tracks = the cap.
+	// The ceiling is the formula (weekly workload × rate × months), lowered to
+	// the เพดานงบ when one is set and smaller. Every money figure is scaled by
+	// the same ratio so the regular/special pools still add up to the ceiling —
+	// the export's two-pool cap and the TA planner read the per-track figures.
+	snap.FormulaBaht = snap.TermPay
+	if capped := applyBudgetCap(snap.TermPay, snap.BudgetCapBaht); capped < snap.TermPay {
+		ratio := capped / snap.TermPay
+		snap.TermPayRegular *= ratio
+		snap.TermPaySpecial *= ratio
+		snap.MonthlyPayRegular *= ratio
+		snap.MonthlyPaySpecial *= ratio
+		snap.MonthlyPay *= ratio
+		snap.TermPay = capped
+		snap.CapApplied = true
+	}
 	snap.PerCourseMaxBaht = snap.TermPay
 
 	// Suggested TAs: informational only. Since 26/09/2026 this is the planner's

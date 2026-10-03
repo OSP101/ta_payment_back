@@ -231,13 +231,12 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// move work forward. Staff are also the people the gate protects against a
 	// stolen session, so they must not be able to clear each other's lockouts.
 	authed.Post("/users/:id/unlock-password-gate", RequireRole(rbac.RoleAdmin), uh.UnlockPasswordGate)
-	// Admin-only for the same reason, raised further: staff already hold
-	// unrestricted /users/:id/reset-password (no target restriction, temp
-	// password returned in the body). Letting staff ALSO reset 2FA would chain
-	// into a one-click path to full admin takeover — reset password, log in,
-	// reset 2FA, done — for the one control that's supposed to stop exactly
-	// that. See MFAService.AdminReset's own doc comment.
-	authed.Post("/users/:id/2fa/reset", RequireRole(rbac.RoleAdmin), mfaH.AdminReset)
+	// Staff may reset 2FA for TA and lecturer accounts — the help-desk case of
+	// a lost phone, which staff handle at the counter (requested 02/10/2026).
+	// The handler applies the SAME target rule as /users/:id/reset-password:
+	// an admin/staff/executive target needs an admin, so staff still cannot
+	// chain password reset + 2FA reset into taking over a privileged account.
+	authed.Post("/users/:id/2fa/reset", adminOrStaff, mfaH.AdminReset)
 
 	// Education-level history (migration 0094, ta_enrollments) — a TA may see
 	// their own history (self-service transparency), same self-or-staff gate
@@ -247,6 +246,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	enrollH := &EnrollmentHandler{Svc: svc}
 	authed.Get("/users/:id/enrollments", authed_forSelfOrStaff(), enrollH.List)
 	authed.Post("/users/:id/enrollments", adminOrStaff, enrollH.RecordTransition)
+	// Typo fix of the TA's CURRENT student id / citizen id / prefix (no new
+	// period) — the TA shows their card at the office and staff correct it.
+	authed.Get("/users/:id/ta-identity", adminOrStaff, enrollH.GetTAIdentity)
+	authed.Post("/users/:id/ta-identity", adminOrStaff, enrollH.CorrectTAIdentity)
+	authed.Post("/users/:id/creditor-form/regenerate", adminOrStaff, heavyLimiter, enrollH.RegenerateCreditorForm)
 	// Which enrollment period THIS session is viewing — a TA-only display
 	// filter (see migration 0096), set by the login-time picker
 	// (EnrollmentScopeModal on the frontend). Self-only by construction: the
@@ -273,6 +277,11 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/terms", adminOrStaff, th.UpsertTerm)
 	authed.Get("/terms/:id/usage", adminOrStaff, th.TermUsage)
 	authed.Delete("/terms/:id", adminOrStaff, th.DeleteTerm)
+	authed.Post("/terms/:id/num-students/bulk", adminOrStaff, heavyLimiter, th.BulkNumStudents)
+	authed.Get("/terms/:id/reg-enrolment", adminOrStaff, th.RegEnrolment)
+	authed.Post("/terms/:id/reg-enrolment", adminOrStaff, heavyLimiter, th.StartRegEnrolment)
+	authed.Delete("/terms/:id/reg-enrolment", adminOrStaff, th.StopRegEnrolment)
+	authed.Patch("/terms/:id/budget-cap", adminOrStaff, th.SetTermBudgetCap)
 
 	// Curricula — the sheet identity the two payout documents (สรุปรายวิชาที่
 	// ขอใช้ TA, ปะหน้าจ่ายตรง) print under, plus the course-group review flow
@@ -330,6 +339,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/teaching-courses/:id/sections", adminOrStaff, th.AddSection)
 	authed.Patch("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.UpdateSection)
 	authed.Delete("/teaching-courses/:id/sections/:sectionId", adminOrStaff, th.DeleteSection)
+	authed.Post("/teaching-courses/:id/sections/:sectionId/fold", adminOrStaff, th.FoldSection)
 	authed.Put("/teaching-courses/:id/sections/:sectionId/schedules", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.ReplaceSectionSchedules)
 	// Makeups (วันชดเชย) are lecturer/staff/admin only (faculty decision
 	// 27/09/2026: dates come from TDBM and the course, not from TAs). A TA

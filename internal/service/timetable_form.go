@@ -100,9 +100,11 @@ func (s *TeachingService) BuildTimetableForm(
 	}
 
 	if err := s.pool.QueryRow(ctx, `
-		SELECT u.first_name || ' ' || u.last_name, COALESCE(u.student_id,''),
-		       t.academic_year || '/' || t.semester
-		  FROM users u, academic_terms t
+		SELECT COALESCE(NULLIF(tp.prefix,''), NULLIF(u.title,''), '') || u.first_name || ' ' || u.last_name,
+		       COALESCE(u.student_id,''), t.academic_year || '/' || t.semester
+		  FROM users u
+		  LEFT JOIN ta_profiles tp ON tp.user_id = u.id
+		  CROSS JOIN academic_terms t
 		 WHERE u.id = $1 AND t.id = $2`, taID, termID,
 	).Scan(&out.TAName, &out.StudentID, &out.TermLabel); err != nil {
 		return nil, err
@@ -135,7 +137,7 @@ func (s *TeachingService) BuildTimetableForm(
 
 	// TA duties across every course they assist this term.
 	dutyRows, err := s.pool.Query(ctx, `
-		SELECT sch.kind, tc.code, tc.name_th, `+PrintSecNoSQL("sec")+`, sec.track::text,
+		SELECT sch.kind, `+CourseCodesSQL("tc")+`, tc.name_th, `+PrintSecNoSQL("sec")+`, sec.track::text,
 		       sch.day_of_week, sch.start_time::text, sch.end_time::text, sch.room
 		  FROM ta_request_assignments a
 		  JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
@@ -165,7 +167,7 @@ func (s *TeachingService) BuildTimetableForm(
 	// has to come along: drawing an "อื่น ๆ" slot as ตรวจงาน would put the wrong
 	// label on the signed form.
 	revRows, err := s.pool.Query(ctx, `
-		SELECT tc.code, tc.name_th, `+PrintSecNoSQL("sec")+`, sec.track::text, rs.kind,
+		SELECT `+CourseCodesSQL("tc")+`, tc.name_th, `+PrintSecNoSQL("sec")+`, sec.track::text, rs.kind,
 		       rs.day_of_week, rs.start_time::text, rs.end_time::text, rs.room
 		  FROM ta_review_schedules rs
 		  JOIN ta_request_assignments a ON a.id = rs.assignment_id
@@ -197,11 +199,20 @@ func (s *TeachingService) BuildTimetableForm(
 	if err := revRows.Err(); err != nil {
 		return nil, err
 	}
+	// A merged course (CP… with SC… folded in) opens the SAME class under each
+	// code: CP sec 01 and SC sec 01 are one room, one time, one group of
+	// students. The section number prints bare and the course prints every
+	// code, so the two rows are identical — draw the class once, not twice.
+	out.Blocks = dedupeTimetableBlocks(out.Blocks)
 
 	// Signature blocks: the lecturer who SUBMITTED each request, grouped so a
 	// lecturer covering two of the TA's courses signs once.
 	sigRows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT r.lecturer_id, u.first_name || ' ' || u.last_name, tc.code, tc.name_th
+		SELECT DISTINCT r.lecturer_id,
+		       -- With the ตำแหน่งทางวิชาการ, as the college's own form signs
+		       -- ("( อ.ดร.จักรกฤษณ์ แก้วโยธา )") — the PDF printed bare names.
+		       COALESCE(NULLIF(u.title,''),'') || u.first_name || ' ' || u.last_name,
+		       `+CourseCodesSQL("tc")+`, tc.name_th
 		  FROM ta_request_assignments a
 		  JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		  JOIN users u ON u.id = r.lecturer_id
@@ -267,7 +278,7 @@ func (s *TeachingService) fillMonthCounts(
 	rows, err := s.pool.Query(ctx, `
 		SELECT EXTRACT(DOW FROM wl.work_date)::int, wl.start_time::text, wl.end_time::text,
 		       wl.activity, TO_CHAR(wl.work_date,'YYYY-MM-DD'), wl.hours,
-		       tc.code, `+PrintSecNoSQL("sec")+`, wl.note, wl.source
+		       `+CourseCodesSQL("tc")+`, `+PrintSecNoSQL("sec")+`, wl.note, wl.source
 		  FROM work_logs wl
 		  JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		  JOIN sections sec ON sec.id = a.section_id
@@ -428,4 +439,24 @@ func activityTH(a string) string {
 		return "อื่นๆ"
 	}
 	return a
+}
+
+// dedupeTimetableBlocks drops blocks identical in everything the form prints —
+// the second copy a merged course's alternate-code section produces.
+func dedupeTimetableBlocks(blocks []TimetableBlock) []TimetableBlock {
+	type key struct {
+		kind, code, sec, track, start, end string
+		day                                int
+	}
+	seen := map[key]bool{}
+	out := blocks[:0]
+	for _, b := range blocks {
+		k := key{b.Kind, b.CourseCode, b.SecNo, b.Track, b.StartTime, b.EndTime, b.DayOfWeek}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, b)
+	}
+	return out
 }

@@ -53,15 +53,17 @@ func TestImportMerge_FoldsSecondCodeIntoOneCourseAndAddsStudents(t *testing.T) {
 	if tc.NumStudentsRegular != 55 || tc.NumStudentsSpecial != 20 || tc.NumStudents != 75 {
 		t.Fatalf("students = %d/%d/%d, want 55/20/75", tc.NumStudentsRegular, tc.NumStudentsSpecial, tc.NumStudents)
 	}
-	secNos := map[string]*string{}
+	// One class: the merged code's sec 01/02 fold into the course's own sec
+	// 01/02 (office, 02/10/2026) — no "SC313302-01" section of its own.
+	secs := map[string]int{}
 	for _, s := range tc.Sections {
-		secNos[s.SecNo] = s.CourseCode
+		if s.CourseCode != nil {
+			t.Fatalf("section %s still carries code %s: merged sections must fold", s.SecNo, *s.CourseCode)
+		}
+		secs[s.SecNo] = s.NumStudents
 	}
-	if len(secNos) != 4 {
-		t.Fatalf("sections = %v, want 4", secNos)
-	}
-	if secNos["01"] != nil || secNos["SC313302-01"] == nil || *secNos["SC313302-01"] != "SC313302" {
-		t.Fatalf("sections = %v: primary sections keep bare sec_no, merged ones carry the code", secNos)
+	if len(secs) != 2 || secs["01"] != 55 || secs["02"] != 20 {
+		t.Fatalf("sections = %v, want 01:55 02:20", secs)
 	}
 
 	// The merged code now counts as "existing" in a re-import…
@@ -179,7 +181,7 @@ func TestMerge_NewestCurriculumCodeBecomesPrimary(t *testing.T) {
 
 	// Opened first under the OLD code (bare six digits), then the SC code and
 	// finally the CP code arrive. The documents must print the CP code, and
-	// "sec 1" must be the CP section.
+	// every code's sec 01/02 is the same class — two sections in all.
 	old := mergeFixtureCourse("342233", 5, "")
 	id, err := svc.commitOneCourse(f.ctx, f.StaffID, f.TermID, old)
 	if err != nil {
@@ -205,36 +207,41 @@ func TestMerge_NewestCurriculumCodeBecomesPrimary(t *testing.T) {
 	for _, sec := range tc.Sections {
 		got[sec.SecNo] = derefStr(sec.CourseCode)
 	}
-	want := map[string]string{
-		"01": "", "02": "",
-		"SC362005-01": "SC362005", "SC362005-02": "SC362005",
-		"342233-01": "342233", "342233-02": "342233",
-	}
-	if len(got) != len(want) {
-		t.Fatalf("sections = %v, want %v", got, want)
-	}
-	for k, v := range want {
-		if cc, ok := got[k]; !ok || cc != v {
-			t.Fatalf("sections = %v, want %v", got, want)
-		}
+	if len(got) != 2 || got["01"] != "" || got["02"] != "" {
+		t.Fatalf("sections = %v, want just 01 and 02 with no code prefix", got)
 	}
 	if tc.NumStudentsRegular != 77 {
 		t.Fatalf("regular students = %d, want 5+42+30", tc.NumStudentsRegular)
 	}
 }
 
-func TestPrintSecNo_DocumentsDropTheAltCodePrefix(t *testing.T) {
+// A merged code's section with no partner — no same number and track, and
+// more than one section of its track to choose from — is not guessed into a
+// group: it stays its own section under the prefixed number, and documents
+// print the bare number. With ONE section of its track, it folds into that.
+func TestMerge_UnpartneredSectionStaysSeparate(t *testing.T) {
 	f := newFixture(t, fixtureOpts{NoRequest: true})
 	svc := &TeachingService{pool: f.Pool, aud: audit.New(f.Pool)}
-	id, err := svc.commitOneCourse(f.ctx, f.StaffID, f.TermID, mergeFixtureCourse("CP353301", 35, ""))
+	primary := mergeFixtureCourse("CP353301", 35, "")
+	primary.sections["03"] = &parsedSection{secNo: "03", track: "regular", numStudents: 9,
+		schedules: []parsedSchedule{{kind: "lecture", dow: 2, startTime: "09:00", endTime: "11:00"}}}
+	primary.sectionsInOrder = append(primary.sectionsInOrder, "03")
+	id, err := svc.commitOneCourse(f.ctx, f.StaffID, f.TermID, primary)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.mergeParsedCourse(f.ctx, f.StaffID, f.TermID, id, mergeFixtureCourse("SC313302", 20, "")); err != nil {
+	other := mergeFixtureCourse("SC313302", 20, "")
+	// Two regular sections (01, 03) to choose from: 04 stays on its own.
+	other.sections["04"] = &parsedSection{secNo: "04", track: "regular", numStudents: 7,
+		schedules: []parsedSchedule{{kind: "lecture", dow: 1, startTime: "09:00", endTime: "11:00"}}}
+	// One special section (02): 05 folds into it.
+	other.sections["05"] = &parsedSection{secNo: "05", track: "special", numStudents: 4}
+	other.sectionsInOrder = append(other.sectionsInOrder, "04", "05")
+	if err := svc.mergeParsedCourse(f.ctx, f.StaffID, f.TermID, id, other); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := f.Pool.Query(f.ctx,
-		`SELECT sec.sec_no, `+PrintSecNoSQL("sec")+` FROM sections sec WHERE sec.teaching_course_id = $1`, id)
+		`SELECT sec.sec_no, `+PrintSecNoSQL("sec")+`, sec.num_students FROM sections sec WHERE sec.teaching_course_id = $1`, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,15 +249,19 @@ func TestPrintSecNo_DocumentsDropTheAltCodePrefix(t *testing.T) {
 	got := map[string]string{}
 	for rows.Next() {
 		var raw, printed string
-		if err := rows.Scan(&raw, &printed); err != nil {
+		var n int
+		if err := rows.Scan(&raw, &printed, &n); err != nil {
 			t.Fatal(err)
 		}
 		got[raw] = printed
 	}
-	want := map[string]string{"01": "01", "02": "02", "SC313302-01": "01", "SC313302-02": "02"}
+	want := map[string]string{"01": "01", "02": "02", "03": "03", "SC313302-04": "04"}
+	if len(got) != len(want) {
+		t.Fatalf("sections = %v, want %v", got, want)
+	}
 	for k, v := range want {
 		if got[k] != v {
-			t.Fatalf("printed sec_no = %v, want %v", got, want)
+			t.Fatalf("sections = %v, want %v", got, want)
 		}
 	}
 }

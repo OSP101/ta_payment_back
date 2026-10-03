@@ -69,7 +69,7 @@ func combinedFixture(t *testing.T) (*excelize.File, *combinedBookData, []claiman
 	d := &combinedBookData{
 		CourseCode: "CP362104", AcademicYear: 2569, Semester: 1,
 		MonthRange:    "มิถุนายน 2569 - ตุลาคม 2569",
-		LecturerName:  "ผู้ช่วยศาสตราจารย์ ดร.วรัญญา วรรณศรี",
+		LecturerName:  "ผศ. ดร.วรัญญา วรรณศรี",
 		RateUGRegular: 40, RateUGSpecial: 50, RateGradRegular: 50,
 		Certifier: CertifierChoice{
 			Name: "ผศ. ดร.ณกร วัฒนกิจ", TitleLine: "รองคณบดีฝ่ายวิชาการ รักษาการแทน",
@@ -269,7 +269,7 @@ func TestCombinedSheet_OnlyTheTASigns(t *testing.T) {
 
 // Office instruction (ส.ค. 2569): the หลักฐาน sheet's left signature is the
 // LECTURER's, not a bare ผู้จ่ายเงิน rule — one signing place per person across
-// the whole bundle. The name carries the academic title spelled out in full.
+// the whole bundle. The name carries the abbreviated academic title (02/10/2026).
 func TestCombinedEvidence_LecturerSignsInPlaceOfThePayer(t *testing.T) {
 	f, d, _ := combinedFixture(t)
 	rows, _ := f.GetRows(sheetEvidenceRegular)
@@ -290,7 +290,7 @@ func TestCombinedEvidence_LecturerSignsInPlaceOfThePayer(t *testing.T) {
 		}
 	}
 	if !name {
-		t.Errorf("the lecturer's full-title name is missing from %s", sheetEvidenceRegular)
+		t.Errorf("the lecturer's titled name is missing from %s", sheetEvidenceRegular)
 	}
 	if !position {
 		t.Error("the lecturer's signature line has no ตำแหน่ง อาจารย์ผู้สอน beneath it")

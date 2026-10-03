@@ -71,7 +71,7 @@ type ScenarioEvent struct {
 // in order, so an out-of-sequence click fails with a clear Thai message
 // instead of a confusing crash.
 var scenarioEvents = []ScenarioEvent{
-	{Key: "term", Label: "1. สร้างปีการศึกษา / ภาคเรียน", Description: "เปิดภาคเรียนใหม่ พร้อมช่วงสอบกลางภาค/ปลายภาค", RelatedPath: "/staff/settings?tab=terms", ActorRole: "staff"},
+	{Key: "term", Label: "1. สร้างปีการศึกษา / ภาคเรียน", Description: "เปิดภาคเรียนใหม่ พร้อมช่วงสอบกลางภาค/ปลายภาค และช่วงรับคำขอ TA", RelatedPath: "/staff/settings?tab=terms", ActorRole: "staff"},
 	{Key: "courses", Label: "2. เปิดรายวิชา + ตารางสอน (อาจารย์ 3 คน)", Description: "สร้าง 3 รายวิชา คนละ 1 วิชา พร้อมตารางบรรยายของแต่ละวิชา", RelatedPath: "/staff/teaching", ActorRole: "staff"},
 	{Key: "submission_periods", Label: "3. เปิดรอบส่งค่าตอบแทนเดือนนี้", Description: "เปิดรอบเบิกจ่ายของเดือนปัจจุบัน กำหนดส่งยังไม่ถึง", RelatedPath: "/staff/settings?tab=calendar", ActorRole: "staff"},
 	{Key: "ta_schedules", Label: "4. TA บันทึกตารางเรียนของตัวเอง (4 คน)", Description: "TA ทั้ง 4 คนยืนยันว่าตัวเองมีตารางเรียนในภาคเรียนนี้แล้ว", RelatedPath: "/staff/teaching", ActorPath: "/ta/schedule", ActorRole: "ta"},
