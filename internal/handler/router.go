@@ -438,6 +438,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/timetable-form", th.TimetableForm)
 	authed.Get("/timetable-form.pdf", heavyLimiter, th.TimetableFormPDF)
 	authed.Get("/me/assignments", RequireRole(rbac.RoleTA), th.ListMyAssignments)
+	// Courses that asked for this TA and are still waiting on a verdict —
+	// shown on the TA home so they know before approval, and why it waits.
+	authed.Get("/me/ta-requests/pending", RequireRole(rbac.RoleTA), rh.MyPending)
 
 	// Workload / TA class schedule
 	wh := &WorkloadHandler{Svc: svc}
@@ -559,6 +562,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/exports/course/:id/coverage", RequireRole(rbac.RoleAdmin, rbac.RoleStaff), eh.CourseExportCoverage)
 	// A TA's own ใบเบิกเวลา for one course, to check against their records.
 	// A plain read — none of the course export's locking or gates.
+	authed.Get("/me/ta-courses/:tcId/claim-sheet/months", RequireRole(rbac.RoleTA), eh.TAClaimMonths)
 	authed.Get("/me/ta-courses/:tcId/claim-sheet.xlsx", RequireRole(rbac.RoleTA), heavyLimiter, eh.TAClaimSheet)
 	// No role guard: the service checks that the caller teaches or assists the
 	// course. A budget that decides a TA's own pay is not a staff secret.

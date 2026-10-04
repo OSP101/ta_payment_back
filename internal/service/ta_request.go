@@ -513,16 +513,18 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	decided := make([]CreateResult, 0, len(results))
 	for i, r := range results {
 		s.notifyClashOutcome(ctx, r.ID, notices[i])
 		if r.Status == "submitted" {
-			continue // nothing to tell anyone until the TA's timetable arrives
+			continue // nothing to tell the TA until their timetable arrives
 		}
 		s.notifyTAsDecision(ctx, r.ID, r.Status, r.RejectReason)
-		decided = append(decided, r)
 	}
-	s.notifyLecturerBatch(ctx, decided)
+	// The lecturer hears once per submission (ta_request_lecturer_digest.go):
+	// now if everyone was decided, otherwise when the rest are or in 24 hours.
+	if _, err := s.flushLecturerDigest(ctx, batchID, time.Now()); err != nil {
+		log.Printf("ta_request batch %s: lecturer digest: %v", batchID, err)
+	}
 
 	// The top level stays the first TA's own result, so a single-TA submission
 	// reads exactly as it always did; Requests carries everyone.
@@ -1090,8 +1092,15 @@ func (s *TARequestService) requestTANames(ctx context.Context, reqID uuid.UUID) 
 // in the title: a course now holds one request per TA, and unread notices
 // fold by (title, link), so without the name a second TA's verdict would
 // overwrite the first.
+//
+// A request filed with others (batch_id) is not told here: its verdict waits
+// for the submission's one notice, which this sends if it is now due.
 func (s *TARequestService) notifyLecturerDecision(ctx context.Context, reqID uuid.UUID, verdict, reason string) {
 	if s.notify == nil {
+		return
+	}
+	if s.lecturerAwaitsDigest(ctx, reqID) {
+		s.flushLecturerDigestFor(ctx, reqID)
 		return
 	}
 	var courseID, lecturerID uuid.UUID
@@ -1108,41 +1117,6 @@ func (s *TARequestService) notifyLecturerDecision(ctx context.Context, reqID uui
 	}
 	s.notify.Send(ctx, lecturerID, fmt.Sprintf("คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ %s (%s)", code, ta),
 		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, ta, reason), "/lecturer")
-}
-
-// notifyLecturerBatch tells the lecturer the verdicts of one submission in a
-// single notice: a form naming five TAs is now five requests, and five
-// e-mails for one press of ส่งคำขอ is noise. TAs still waiting on a timetable
-// are left out — each is told on its own when decided (tryFinalize).
-func (s *TARequestService) notifyLecturerBatch(ctx context.Context, decided []CreateResult) {
-	if s.notify == nil || len(decided) == 0 {
-		return
-	}
-	if len(decided) == 1 {
-		s.notifyLecturerDecision(ctx, decided[0].ID, decided[0].Status, decided[0].RejectReason)
-		return
-	}
-	var courseID, lecturerID uuid.UUID
-	if err := s.pool.QueryRow(ctx,
-		`SELECT teaching_course_id, lecturer_id FROM ta_requests WHERE id = $1`, decided[0].ID).Scan(&courseID, &lecturerID); err != nil {
-		return
-	}
-	code, nameTH := s.courseLabel(ctx, courseID)
-	names := make([]string, 0, len(decided))
-	lines := make([]string, 0, len(decided))
-	for _, r := range decided {
-		names = append(names, r.TAName)
-		if r.Status == "approved" {
-			lines = append(lines, r.TAName+" ได้รับการอนุมัติ")
-		} else {
-			lines = append(lines, r.TAName+" ไม่ผ่านการอนุมัติ เนื่องจาก "+r.RejectReason)
-		}
-	}
-	s.notify.Send(ctx, lecturerID,
-		fmt.Sprintf("ผลการพิจารณาคำขอผู้ช่วยสอน %s (%s)", code, strings.Join(names, ", ")),
-		fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขของผู้ช่วยสอนเป็นรายบุคคลแล้ว ผลการพิจารณามีดังนี้\n%s",
-			code, nameTH, numberedLines(lines)),
-		"/lecturer")
 }
 
 // notifyTAsDecision tells the TAs on a request its verdict: the appointment

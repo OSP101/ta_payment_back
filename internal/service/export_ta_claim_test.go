@@ -49,3 +49,26 @@ func TestTAClaimSheet_HoldsOnlyTheirOwnBlock(t *testing.T) {
 		t.Errorf("ลำดับ = %q, want 1", got)
 	}
 }
+
+// The check copy prints rows nobody has approved yet; each must say so, and the
+// label must not move a lab hour into the lecture column.
+func TestTAClaimSheet_MarksRowsNotYetApproved(t *testing.T) {
+	day := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	rows := buildClaimSheetRows([]claimLogRow{
+		{SecNo: "1", Track: "regular", Date: day, StartMin: 9 * 60, EndMin: 12 * 60, Activity: "lab", Status: "draft"},
+		{SecNo: "1", Track: "regular", Date: day, StartMin: 13 * 60, EndMin: 15 * 60, Activity: "lecture", Status: "submitted"},
+		{SecNo: "1", Track: "regular", Date: day, StartMin: 16 * 60, EndMin: 17 * 60, Activity: "lecture"},
+	}, "ปกติ")
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	want := []string{"ยังไม่ส่ง", "รออาจารย์อนุมัติ", ""}
+	for i, r := range rows {
+		if r.Pending != want[i] {
+			t.Errorf("row %d Pending = %q, want %q", i, r.Pending, want[i])
+		}
+	}
+	if !isLabNote(rows[0].Note) {
+		t.Errorf("an unsent lab row must still bill as ปฏิบัติการ, note = %q", rows[0].Note)
+	}
+}

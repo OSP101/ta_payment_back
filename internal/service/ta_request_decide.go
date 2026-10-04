@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -867,6 +868,12 @@ func (s *TARequestService) finalize(ctx context.Context, reqID, termID uuid.UUID
 	}
 
 	if onlyApprovals && verdict != "approved" {
+		// Already told under the old request; keep it out of the digest too.
+		if _, err := s.pool.Exec(ctx, `
+			UPDATE ta_requests SET lecturer_notified_at = NOW(), lecturer_note = NULL
+			WHERE id = $1`, reqID); err != nil {
+			log.Printf("ta_request %s: mark lecturer told: %v", reqID, err)
+		}
 		return nil
 	}
 	s.notifyClashOutcome(ctx, reqID, notices)
@@ -926,6 +933,16 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 		names = append(names, s.taName(ctx, taID))
 		summary = append(summary, fmt.Sprintf("%s %s", names[len(names)-1], strings.Join(lines, " ")))
 	}
+	// Until the lecturer has the submission's verdicts, the clash lines go
+	// into that one notice instead of one of their own.
+	if s.lecturerAwaitsDigest(ctx, reqID) {
+		var note []string
+		for _, lines := range notices {
+			note = append(note, strings.Join(lines, " "))
+		}
+		s.holdLecturerNote(ctx, reqID, strings.Join(note, " "))
+		return
+	}
 	// The TA is in the title too: a course holds one request per TA (0149),
 	// and the code alone would fold one TA's notice into another's.
 	who := " (" + strings.Join(names, ", ") + ")"
@@ -977,6 +994,16 @@ func (s *TARequestService) SweepPendingRequests(ctx context.Context) (int, error
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
+
+	defer func() {
+		// After the pass, so a submission whose last TA it just decided is
+		// sent too; this is also where the 24-hour summaries go out.
+		if n, err := s.SweepLecturerDigests(ctx, time.Now()); err != nil {
+			log.Printf("ta_request: lecturer digests: %v", err)
+		} else if n > 0 {
+			log.Printf("ta_request: sent %d lecturer digest(s)", n)
+		}
+	}()
 
 	decided := 0
 	for _, p := range list {

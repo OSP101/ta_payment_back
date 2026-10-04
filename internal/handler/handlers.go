@@ -1244,6 +1244,16 @@ func (h *TARequestHandler) List(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+// MyPending lists the requests that name the calling TA and are still waiting
+// on a verdict, with what is holding each one up.
+func (h *TARequestHandler) MyPending(c *fiber.Ctx) error {
+	out, err := h.Svc.TARequest.ListPendingForTA(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
 func (h *TARequestHandler) Detail(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -3495,7 +3505,22 @@ func (h *ExportHandler) CoursePreview(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-// TAClaimSheet — GET /me/ta-courses/:tcId/claim-sheet.xlsx — the caller's own
+// TAClaimMonths — GET /me/ta-courses/:tcId/claim-sheet/months — the months the
+// download picker offers, with the caller's approved hours in each.
+func (h *ExportHandler) TAClaimMonths(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("tcId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	out, err := h.Svc.Export.TAClaimMonths(c.Context(), UserID(c), id)
+	if err != nil {
+		return err
+	}
+	return c.JSON(out)
+}
+
+// TAClaimSheet — GET /me/ta-courses/:tcId/claim-sheet.xlsx?months=YYYY-MM,… —
+// the caller's own
 // claim sheet for the course, cut from the same workbook staff export. Reads
 // only: it locks no month and records no batch.
 func (h *ExportHandler) TAClaimSheet(c *fiber.Ctx) error {
@@ -3503,7 +3528,7 @@ func (h *ExportHandler) TAClaimSheet(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	body, name, err := h.Svc.Export.BuildTAClaimWorkbook(c.Context(), UserID(c), id)
+	body, name, err := h.Svc.Export.BuildTAClaimWorkbook(c.Context(), UserID(c), id, monthsParam(c))
 	if err != nil {
 		return err
 	}

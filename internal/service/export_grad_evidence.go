@@ -822,13 +822,13 @@ func (s *ExportService) collectGradEvidence(ctx context.Context, courseID uuid.U
 	for _, p := range people {
 		isGrad[p.id] = true
 	}
-	costs, err := s.claimCostByTASlot(ctx, courseID, pr, mergedSittingsCTE)
+	costs, err := s.claimCostByTASlot(ctx, courseID, pr, claimSittingsCTE(ctx))
 	if err != nil {
 		return nil, err
 	}
 	// The settlement decides what the budget actually funds; the sheet still
 	// prints every hour taught, but รับจริง must not claim more than the payout.
-	settlement, err := s.SettleCourse(ctx, courseID)
+	settlement, err := s.settleForClaim(ctx, courseID)
 	if err != nil {
 		return nil, err
 	}

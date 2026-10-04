@@ -46,6 +46,9 @@ type claimLogRow struct {
 	EndMin   int
 	Activity string
 	Makeup   bool
+	// Status is set only on a TA's own check copy (withTACheckCopy), where
+	// rows not yet approved are printed too; empty means approved.
+	Status string
 }
 
 // claimSheetRow is one printed row of a claim sheet.
@@ -54,6 +57,10 @@ type claimSheetRow struct {
 	Group string // "ปกติ Sec1-2"
 	Range string // "13.00 - 17.00"
 	Note  string // "สอนปฏิบัติ"
+	// Pending marks a row of a TA's check copy that is not approved yet —
+	// "ยังไม่ส่ง" / "รออาจารย์อนุมัติ" — printed after Note. Kept apart from
+	// Note because isLabNote reads Note to pick the hours column.
+	Pending string
 	// startMin/endMin carry the merged sitting so the book can total what the
 	// sheet prints (SUM × rate) without re-parsing Range.
 	startMin, endMin int
@@ -70,6 +77,18 @@ func claimNote(activity string, makeup bool) string {
 		return base + " (ชดเชย)"
 	}
 	return base
+}
+
+// pendingLabel is what a TA's check copy prints after หมายเหตุ for a row that
+// is not approved yet.
+func pendingLabel(status string) string {
+	switch status {
+	case "draft":
+		return "ยังไม่ส่ง"
+	case "submitted":
+		return "รออาจารย์อนุมัติ"
+	}
+	return ""
 }
 
 func fmtClaimRange(s, e int) string {
@@ -97,13 +116,14 @@ func secRunLabel(secs []string) string {
 // buildClaimSheetRows merges one track's logs for one month into printed rows.
 func buildClaimSheetRows(rows []claimLogRow, trackWord string) []claimSheetRow {
 	type key struct {
-		date time.Time
-		note string
+		date    time.Time
+		note    string
+		pending string
 	}
 	grouped := map[key][]claimLogRow{}
 	for _, r := range rows {
-		grouped[key{r.Date, claimNote(r.Activity, r.Makeup)}] = append(
-			grouped[key{r.Date, claimNote(r.Activity, r.Makeup)}], r)
+		k := key{r.Date, claimNote(r.Activity, r.Makeup), pendingLabel(r.Status)}
+		grouped[k] = append(grouped[k], r)
 	}
 	var out []claimSheetRow
 	for k, g := range grouped {
@@ -113,7 +133,7 @@ func buildClaimSheetRows(rows []claimLogRow, trackWord string) []claimSheetRow {
 		flush := func() {
 			out = append(out, claimSheetRow{
 				Date: k.date, Group: trackWord + " " + secRunLabel(secs),
-				Range: fmtClaimRange(curS, curE), Note: k.note,
+				Range: fmtClaimRange(curS, curE), Note: k.note, Pending: k.pending,
 				startMin: curS, endMin: curE,
 			})
 		}

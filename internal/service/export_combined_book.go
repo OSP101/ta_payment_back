@@ -598,7 +598,11 @@ func writeClaimBlock(f *excelize.File, st *claimStyles, sheet, trackTH string,
 		if err := set(at(col, rr), claimHours(row.Range)); err != nil {
 			return 0, err
 		}
-		if err := set(at("J", rr), row.Note); err != nil {
+		note := row.Note
+		if row.Pending != "" {
+			note += " (" + row.Pending + ")"
+		}
+		if err := set(at("J", rr), note); err != nil {
 			return 0, err
 		}
 	}
@@ -1318,7 +1322,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	}
 	// The same settlement the payout figures come from — the funded figure the
 	// document prints in ขอเบิกจ่ายเพียง must be the one the money follows.
-	settlement, err := s.SettleCourse(ctx, courseID)
+	settlement, err := s.settleForClaim(ctx, courseID)
 	if err != nil {
 		return nil, err
 	}
@@ -1351,7 +1355,7 @@ func (s *ExportService) collectCombinedBook(ctx context.Context, courseID uuid.U
 	// settled on and split at its cutoff. The sheet prints every hour taught
 	// (the office's instruction), so the budget no longer filters the rows —
 	// it only decides the figure ขอเบิกจ่ายเพียง carries.
-	costs, err := s.claimCostByTASlot(ctx, courseID, pr, mergedSittingsCTE)
+	costs, err := s.claimCostByTASlot(ctx, courseID, pr, claimSittingsCTE(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1569,12 +1573,13 @@ func (s *ExportService) claimLogsAllMonths(ctx context.Context, taID, courseID u
 		SELECT `+PrintSecNoSQL("sec")+`, sec.track::text, wl.work_date,
 		       EXTRACT(HOUR FROM wl.start_time)*60 + EXTRACT(MINUTE FROM wl.start_time),
 		       EXTRACT(HOUR FROM wl.end_time)*60 + EXTRACT(MINUTE FROM wl.end_time),
-		       wl.activity, COALESCE(wl.note,'') LIKE '%ชดเชย%'
+		       wl.activity, COALESCE(wl.note,'') LIKE '%ชดเชย%',
+		       CASE WHEN wl.status = 'approved' THEN '' ELSE wl.status::text END
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN sections sec ON sec.id = a.section_id
 		WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
-		  AND wl.status = 'approved'
+		  AND `+claimRowStatusSQL(ctx)+`
 		  AND `+monthFilterSQL("wl.work_date", "$3")+`
 		ORDER BY wl.work_date, wl.start_time`, taID, courseID, months)
 	if err != nil {
@@ -1585,7 +1590,7 @@ func (s *ExportService) claimLogsAllMonths(ctx context.Context, taID, courseID u
 	for rows.Next() {
 		var r claimLogRow
 		var sm, em float64
-		if err := rows.Scan(&r.SecNo, &r.Track, &r.Date, &sm, &em, &r.Activity, &r.Makeup); err != nil {
+		if err := rows.Scan(&r.SecNo, &r.Track, &r.Date, &sm, &em, &r.Activity, &r.Makeup, &r.Status); err != nil {
 			return nil, err
 		}
 		r.StartMin, r.EndMin = int(sm), int(em)

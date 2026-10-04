@@ -148,7 +148,8 @@ func (s *TARequestService) splitLegacy(ctx context.Context, reqID, termID uuid.U
 	if _, err := tx.Exec(ctx, `
 		UPDATE ta_requests SET
 		  batch_id = id, status = 'submitted', decided_at = NULL, decided_by = NULL,
-		  reject_reason = NULL, decision_checks = '[]'::jsonb, updated_at = NOW()
+		  reject_reason = NULL, decision_checks = '[]'::jsonb, updated_at = NOW(),
+		  lecturer_notified_at = NULL, lecturer_note = NULL
 		WHERE id = $1`, reqID); err != nil {
 		return nil, err
 	}

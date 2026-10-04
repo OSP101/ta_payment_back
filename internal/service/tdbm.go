@@ -729,6 +729,20 @@ func entryDurationMins(c tdbmCandidate) int {
 //     that term's payout is locked; a new makeup there could not change
 //     anything a TA can still log against.
 func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear, semester int) (int, error) {
+	// A twin of an already-filed sitting (the same makeup filed under the
+	// course's other code — see loadTDBMCandidates) points at that makeup
+	// too, so the TDBM page stops listing it as unmatched.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE tdbm_extra_teachings t SET applied_makeup_id = f.applied_makeup_id
+		FROM tdbm_extra_teachings f
+		WHERE t.academic_year = $1 AND t.semester = $2
+		  AND t.applied_makeup_id IS NULL AND t.opt_status <> 'C'
+		  AND f.applied_makeup_id IS NOT NULL
+		  AND f.section_id = t.section_id AND f.class_date = t.class_date
+		  AND f.start_time IS NOT DISTINCT FROM t.start_time
+		  AND f.end_time IS NOT DISTINCT FROM t.end_time`, academicYear, semester); err != nil {
+		return 0, err
+	}
 	unresolved, err := s.loadUnresolvedPeriods(ctx, academicYear, semester)
 	if err != nil {
 		return 0, err
@@ -922,8 +936,17 @@ func (s *TDBMService) applyOneMakeup(ctx context.Context, sectionID uuid.UUID, k
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE tdbm_extra_teachings SET applied_makeup_id = $1 WHERE extra_class_id = $2`,
+	// The row itself, and its twins filed under the course's other codes (see
+	// loadTDBMCandidates): one sitting, one makeup.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE tdbm_extra_teachings t SET applied_makeup_id = $1
+		FROM tdbm_extra_teachings e
+		WHERE e.extra_class_id = $2
+		  AND (t.extra_class_id = e.extra_class_id
+		       OR (t.section_id = e.section_id AND t.class_date = e.class_date
+		           AND t.start_time IS NOT DISTINCT FROM e.start_time
+		           AND t.end_time IS NOT DISTINCT FROM e.end_time
+		           AND t.applied_makeup_id IS NULL AND t.opt_status <> 'C'))`,
 		makeupID, entry.ExtraClassID); err != nil {
 		return 1, err
 	}
@@ -978,16 +1001,36 @@ func (s *TDBMService) loadUnresolvedPeriods(ctx context.Context, academicYear, s
 // previous auto-fill, ordered so entries sharing (section, class_date) come
 // out grouped and start_time-ascending within the group — see
 // AutoFillMakeupSchedules' pairing algorithm.
+//
+// One sitting, one candidate (04/10/2026). A merged course is filed in TDBM
+// under each of its codes — CP352201 and its alternate SC362201 both carry
+// the same group-1 makeup — and both rows resolve to the one section we keep
+// (0145). Counted twice, every holiday needing one period met a cluster of
+// two and was skipped as a count mismatch, so no makeup of a merged course
+// was ever filed. Twins collapse to the lowest extra_class_id here, a twin
+// whose sitting is already filed is not a candidate at all (it would pair
+// with the NEXT holiday), and applyOneMakeup marks every twin consumed.
 func (s *TDBMService) loadTDBMCandidates(ctx context.Context, academicYear, semester int) ([]tdbmCandidate, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT extra_class_id, section_id, TO_CHAR(class_date,'YYYY-MM-DD'),
-		       TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
-		FROM tdbm_extra_teachings
-		WHERE academic_year = $1 AND semester = $2
-		  AND section_id IS NOT NULL
-		  AND applied_makeup_id IS NULL
-		  AND opt_status <> 'C'
-		ORDER BY section_id, class_date, start_time`,
+		SELECT extra_class_id, section_id, class_date, start_time, end_time FROM (
+			SELECT DISTINCT ON (t.section_id, t.class_date, t.start_time, t.end_time)
+			       t.extra_class_id, t.section_id, TO_CHAR(t.class_date,'YYYY-MM-DD') AS class_date,
+			       TO_CHAR(t.start_time,'HH24:MI') AS start_time, TO_CHAR(t.end_time,'HH24:MI') AS end_time,
+			       t.class_date AS d, t.start_time AS st
+			FROM tdbm_extra_teachings t
+			WHERE t.academic_year = $1 AND t.semester = $2
+			  AND t.section_id IS NOT NULL
+			  AND t.applied_makeup_id IS NULL
+			  AND t.opt_status <> 'C'
+			  AND NOT EXISTS (
+			      SELECT 1 FROM tdbm_extra_teachings tw
+			      WHERE tw.section_id = t.section_id AND tw.class_date = t.class_date
+			        AND tw.start_time IS NOT DISTINCT FROM t.start_time
+			        AND tw.end_time IS NOT DISTINCT FROM t.end_time
+			        AND tw.applied_makeup_id IS NOT NULL)
+			ORDER BY t.section_id, t.class_date, t.start_time, t.end_time, t.extra_class_id
+		) c
+		ORDER BY section_id, d, st`,
 		academicYear, semester)
 	if err != nil {
 		return nil, err

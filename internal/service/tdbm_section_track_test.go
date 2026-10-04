@@ -67,3 +67,42 @@ func TestTDBMSectionMatch_TrackStillPicksBetweenTwoSameNumberedGroups(t *testing
 		t.Errorf("ภาคปกติ row: section = %v, want the regular group 3 (%s)", got, regular)
 	}
 }
+
+// A merged course is filed in TDBM under each of its codes, so one sitting
+// arrives as two rows on the one section we keep (04/10/2026: CP352201 +
+// SC362201, CP321002 + SC361002). Counted twice, every pairing was skipped as
+// a count mismatch and no makeup of a merged course was ever filed.
+func TestTDBMAutoFill_MergedCodeTwinsCountOnce(t *testing.T) {
+	f := newFixture(t, fixtureOpts{NoRequest: true})
+	s := &TDBMService{pool: f.Pool, aud: audit.New(f.Pool)}
+	mon := firstMonday() // the section meets Monday: lecture 09–12, lab 13–16
+	f.exec(`INSERT INTO public_holidays (id, holiday_date, name_th, source)
+	        VALUES (gen_random_uuid(), $1::date, 'วันหยุดทดสอบ', 'custom')`, mon)
+	makeup := day(27)
+	for i, code := range []string{"PRIMARY", "ALTCODE"} {
+		for j, slot := range [][2]string{{"09:00", "12:00"}, {"13:00", "16:00"}} {
+			f.exec(`INSERT INTO tdbm_extra_teachings
+			          (extra_class_id, academic_year, semester, course_code, class_date, start_time, end_time,
+			           opt_status, section_id, teaching_course_id)
+			        VALUES ($1, $2, 1, $3, $4::date, $5::time, $6::time, 'D', $7, $8)`,
+				920000+i*10+j, f.AcademicYear, code, makeup, slot[0], slot[1], f.SectionID, f.CourseID)
+		}
+	}
+
+	filled, err := s.AutoFillMakeupSchedules(f.ctx, f.AcademicYear, 1)
+	if err != nil {
+		t.Fatalf("auto-fill: %v", err)
+	}
+	if filled != 2 {
+		t.Fatalf("filled %d makeups, want 2 (lecture + lab) from the twin rows", filled)
+	}
+	var unapplied int
+	if err := f.Pool.QueryRow(f.ctx, `
+		SELECT COUNT(*) FROM tdbm_extra_teachings
+		WHERE extra_class_id BETWEEN 920000 AND 920099 AND applied_makeup_id IS NULL`).Scan(&unapplied); err != nil {
+		t.Fatal(err)
+	}
+	if unapplied != 0 {
+		t.Errorf("%d twin row(s) left unmatched; every copy of a filed sitting should point at its makeup", unapplied)
+	}
+}
