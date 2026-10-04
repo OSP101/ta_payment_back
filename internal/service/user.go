@@ -69,6 +69,9 @@ type User struct {
 type UserService struct {
 	pool *pgxpool.Pool
 	aud  *audit.Auditor
+	// notify mails sign-in details (SendCredentials). Set after construction
+	// in container.go: NotifyService is built after UserService.
+	notify *NotifyService
 }
 
 type CreateUserInput struct {

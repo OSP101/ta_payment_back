@@ -83,6 +83,18 @@ func (s *NotifyService) SendEmailOnly(ctx context.Context, userID uuid.UUID, tit
 	return s.deliverChecked(ctx, userID, title, body, link, closingInform, MailLayout{}, false)
 }
 
+// SendLaidOutEmailOnly is SendLaidOut that skips the bell and reports
+// failure. The sign-in letter is the caller: the person cannot open the bell
+// before they can sign in, and the officer who pressed the button needs to
+// know whether the mail went.
+func (s *NotifyService) SendLaidOutEmailOnly(ctx context.Context, userID uuid.UUID, title, body, link string, action bool, layout MailLayout) error {
+	closing := closingInform
+	if action {
+		closing = closingAction
+	}
+	return s.deliverChecked(ctx, userID, title, body, link, closing, layout, false)
+}
+
 func (s *NotifyService) deliverChecked(ctx context.Context, userID uuid.UUID, title, body, link, closing string, layout MailLayout, inApp bool) error {
 	title, body = plainPunct(title), plainPunct(body)
 	linkArg := nilStr(&link)
@@ -149,6 +161,7 @@ func (s *NotifyService) sendEmail(ctx context.Context, userID uuid.UUID, title, 
 	}
 	if err := s.mailer.SendMessage(mail.Message{
 		To: email, Subject: title, HTML: renderMailHTML(m), Text: renderMailText(m),
+		Attachments: layout.Attachments,
 	}); err != nil {
 		log.Printf("notify email: %v", err)
 		return err

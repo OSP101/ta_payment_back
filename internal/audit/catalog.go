@@ -119,6 +119,7 @@ var catalog = map[string]ActionInfo{
 	"user.activate":                 ok("เปิดใช้งานบัญชี", CatAccount),
 	"user.deactivate":               warn("ปิดใช้งานบัญชี", CatAccount),
 	"user.reset_password":           warn("รีเซ็ตรหัสผ่านให้ผู้ใช้", CatAccount),
+	"user.send_credentials":         ok("ส่งข้อมูลเข้าสู่ระบบทางอีเมล", CatAccount),
 	"user.temp_password_retired":    ok("ตั้งรหัสผ่านใหม่แทนรหัสชั่วคราว", CatAccount),
 	"user.password_gate_unlock":     ok("ยืนยันรหัสผ่านเพื่อปลดล็อกข้อมูลอ่อนไหว", CatAccount),
 	"user.2fa_enabled":              ok("เปิดการยืนยันตัวตน 2 ชั้น", CatAccount),

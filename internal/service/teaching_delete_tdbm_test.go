@@ -14,8 +14,8 @@ func TestDelete_CourseWithATDBMFilledMakeup(t *testing.T) {
 	f := newFixture(t, fixtureOpts{NoRequest: true})
 	svc := &TeachingService{pool: f.Pool, aud: audit.New(f.Pool)}
 	makeup := uuid.New()
-	f.exec(`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date)
-	        VALUES ($1, $2, '2026-07-01', '2026-07-04')`, makeup, f.SectionID)
+	f.exec(`INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, kind)
+	        VALUES ($1, $2, '2026-07-01', '2026-07-04', 'lecture')`, makeup, f.SectionID)
 	f.exec(`INSERT INTO tdbm_extra_teachings (extra_class_id, academic_year, semester,
 	            teaching_course_id, section_id, applied_makeup_id)
 	        VALUES (987654, 2569, 1, $1, $2, $3)`, f.CourseID, f.SectionID, makeup)

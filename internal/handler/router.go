@@ -224,6 +224,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 		AuditRead(aud, "user.record.view", "user", "id"), uh.Get)
 	authed.Patch("/users/:id", adminOrStaff, uh.Update)
 	authed.Post("/users/:id/reset-password", adminOrStaff, uh.ResetPassword)
+	authed.Post("/users/:id/send-credentials", heavyLimiter, RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), uh.SendCredentials)
 	authed.Post("/users/:id/deactivate", adminOrStaff, uh.Deactivate)
 	authed.Post("/users/:id/activate", adminOrStaff, uh.Activate)
 	// Admin-only, not adminOrStaff: clearing the re-auth lockout REVERSES a
@@ -347,6 +348,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/teaching-courses/:id/makeup/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddMakeup)
 	authed.Post("/teaching-courses/:id/makeup/:sectionId/waive", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.WaiveMakeup)
 	authed.Delete("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.DeleteMakeup)
+	authed.Put("/teaching-courses/:id/makeup/:sectionId/:makeupId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.ReplaceMakeup)
 	authed.Get("/teaching-courses/:id/holiday-impacts", th.HolidayImpacts)
 	authed.Post("/teaching-courses/:id/holiday-impacts/:originalDate/remind", RequireRole(rbac.RoleTA), taApproved, th.RemindLecturerAboutMakeup)
 	authed.Post("/teaching-courses/:id/review-date/:sectionId", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), th.AddReviewDate)

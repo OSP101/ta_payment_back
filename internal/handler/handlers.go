@@ -153,6 +153,36 @@ func (h *UserHandler) ResetPassword(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"temp_password": pw})
 }
 
+// SendCredentials mails the account its temporary password, from the
+// one-time panel shown after create / reset. The service only accepts the
+// account's own unused temporary password, so this cannot mail anything else.
+// Lecturers reach it for the TA accounts they create, and only for those.
+func (h *UserHandler) SendCredentials(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	if !rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		targetRoles, err := h.Svc.Users.RolesOf(c.Context(), id)
+		if err != nil {
+			return err
+		}
+		if len(targetRoles) != 1 || targetRoles[0] != rbac.RoleTA {
+			return fiber.NewError(fiber.StatusForbidden, "อาจารย์ส่งข้อมูลเข้าสู่ระบบได้เฉพาะบัญชีผู้ช่วยสอน")
+		}
+	}
+	if err := h.Svc.Users.SendCredentials(c.Context(), UserID(c), id, in.Password); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 func (h *UserHandler) Deactivate(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -983,6 +1013,27 @@ func (h *TeachingHandler) WaiveMakeup(c *fiber.Ctx) error {
 		return err
 	}
 	if err := h.Svc.Teaching.WaiveMakeup(c.Context(), UserID(c), sectionID, r); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// ReplaceMakeup moves a filed makeup to a new date/time in one call, checking
+// the new values before the old row is touched (see the service comment).
+func (h *TeachingHandler) ReplaceMakeup(c *fiber.Ctx) error {
+	sectionID, err := uuid.Parse(c.Params("sectionId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid section id")
+	}
+	makeupID, err := uuid.Parse(c.Params("makeupId"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid makeup id")
+	}
+	var m service.MakeupSchedule
+	if err := Bind(c, &m); err != nil {
+		return err
+	}
+	if err := h.Svc.Teaching.ReplaceMakeup(c.Context(), UserID(c), sectionID, makeupID, m); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
@@ -2186,7 +2237,14 @@ func (h *WorkLogHandler) Submit(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	if err := h.Svc.WorkLog.Submit(c.Context(), UserID(c), id); err != nil {
+	// months (["YYYY-MM", …]) is the TA's pick in the send dialog; no body or
+	// an empty list sends every open month. Same swallowed-parse reasoning as
+	// Approve below: an empty-body POST must keep meaning "all".
+	var body struct {
+		Months []string `json:"months"`
+	}
+	_ = c.BodyParser(&body)
+	if err := h.Svc.WorkLog.Submit(c.Context(), UserID(c), id, body.Months...); err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})

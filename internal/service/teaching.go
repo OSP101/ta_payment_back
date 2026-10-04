@@ -2286,6 +2286,44 @@ func kindLabelTH(kind string) string {
 
 // AddMakeup — makeup schedule
 func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.UUID, m MakeupSchedule) error {
+	if err := s.validateMakeup(ctx, actor, sectionID, m); err != nil {
+		return err
+	}
+	return s.insertMakeup(ctx, actor, sectionID, m)
+}
+
+// ReplaceMakeup moves an existing makeup to new values. The screen used to do
+// this as DELETE then POST from the browser: when the new date was refused (out
+// of the course window, a holiday, a closed month) the old makeup AND the TA's
+// draft hours on it were already gone, with nothing in their place. Now every
+// check on the new values runs first; only then is the old row removed
+// (DeleteMakeup's own guards and TA notices) and the new one written.
+func (s *TeachingService) ReplaceMakeup(ctx context.Context, actor, sectionID, makeupID uuid.UUID, m MakeupSchedule) error {
+	var origDate string
+	var kind string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT to_char(original_date, 'YYYY-MM-DD'), kind FROM makeup_schedules WHERE id = $1 AND section_id = $2`,
+		makeupID, sectionID).Scan(&origDate, &kind); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	// The identity of the cancelled period cannot change through an edit.
+	m.OriginalDate, m.Kind = origDate, kind
+	if err := s.validateMakeup(ctx, actor, sectionID, m); err != nil {
+		return err
+	}
+	if err := s.DeleteMakeup(ctx, actor, sectionID, makeupID); err != nil {
+		return err
+	}
+	return s.insertMakeup(ctx, actor, sectionID, m)
+}
+
+// validateMakeup is every check AddMakeup makes before writing — ownership,
+// dates in the course window, export and period locks, the period existing,
+// the class not already taught, times, and nested holidays.
+func (s *TeachingService) validateMakeup(ctx context.Context, actor, sectionID uuid.UUID, m MakeupSchedule) error {
 	// sectionID carries no course id — resolve the parent course so we can
 	// enforce ownership and the export lock the section-CRUD paths already use.
 	var tcID uuid.UUID
@@ -2366,7 +2404,7 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	if taughtRows > 0 {
 		return Invalid(fmt.Sprintf(
 			"คาบ%sของวันที่ %s มีการลงเวลาปฏิบัติงานที่ส่งหรืออนุมัติแล้ว %d รายการ แสดงว่ามีการสอนตามปกติ จึงกำหนดวันชดเชยไม่ได้ หากคาบนี้ถูกยกเลิกจริง ให้อาจารย์ตีกลับรายการของวันนั้นก่อน",
-			kindLabelTH(m.Kind), m.OriginalDate, taughtRows))
+			kindLabelTH(m.Kind), thaiLongDateISO(m.OriginalDate), taughtRows))
 	}
 	// A makeup whose month's submission period is already closed cannot
 	// produce payable work: the TA's work-log write for that month is frozen,
@@ -2419,6 +2457,11 @@ func (s *TeachingService) AddMakeup(ctx context.Context, actor, sectionID uuid.U
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
+	return nil
+}
+
+// insertMakeup writes a makeup that validateMakeup has already passed.
+func (s *TeachingService) insertMakeup(ctx context.Context, actor, sectionID uuid.UUID, m MakeupSchedule) error {
 	return writeAudited(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: "makeup.add", Entity: "section", EntityID: sectionID.String(), After: m},
 		func(tx pgx.Tx) error {

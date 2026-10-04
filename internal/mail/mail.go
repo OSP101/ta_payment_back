@@ -51,6 +51,16 @@ type Message struct {
 	Subject string
 	HTML    string
 	Text    string
+	// Attachments travel as downloadable files after the letter. Kept small:
+	// the KKU relay and the receiving mailboxes cap message size.
+	Attachments []Attachment
+}
+
+// Attachment is one file sent with a message.
+type Attachment struct {
+	Name        string // shown to the recipient; may be Thai
+	ContentType string
+	Data        []byte
 }
 
 // stripCRLF removes header-breaking characters from a value that is about to
@@ -113,11 +123,13 @@ const defaultFromName = "COCO TAS"
 
 // buildMessage renders the full RFC 5322 message:
 //
-//	multipart/alternative
-//	├── text/plain              (only when Text is set)
-//	└── multipart/related
-//	    ├── text/html
-//	    └── image/png           (the logo, only when the HTML references it)
+//	multipart/mixed             (only when there are attachments)
+//	├── multipart/alternative
+//	│   ├── text/plain          (only when Text is set)
+//	│   └── multipart/related
+//	│       ├── text/html
+//	│       └── image/png       (the logo, only when the HTML references it)
+//	└── attachment …
 //
 // Date and Message-ID are required or strongly expected by receivers; their
 // absence was one of the reasons these mails could land in spam.
@@ -134,8 +146,21 @@ func buildMessage(from string, msg Message, now time.Time) ([]byte, error) {
 	fmt.Fprintf(&buf, "Date: %s\r\nMessage-ID: %s\r\nMIME-Version: 1.0\r\n",
 		now.Format(time.RFC1123Z), messageID(from))
 
-	alt := multipart.NewWriter(&buf)
-	fmt.Fprintf(&buf, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", alt.Boundary())
+	// With attachments the letter becomes the first part of a multipart/mixed;
+	// without, it is the whole body as before.
+	var mixed *multipart.Writer
+	body := &buf
+	var altBuf bytes.Buffer
+	if len(msg.Attachments) > 0 {
+		mixed = multipart.NewWriter(&buf)
+		fmt.Fprintf(&buf, "Content-Type: multipart/mixed; boundary=%q\r\n\r\n", mixed.Boundary())
+		body = &altBuf
+	}
+
+	alt := multipart.NewWriter(body)
+	if mixed == nil {
+		fmt.Fprintf(&buf, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", alt.Boundary())
+	}
 
 	if msg.Text != "" {
 		if err := writeBase64Part(alt, textproto.MIMEHeader{
@@ -174,6 +199,37 @@ func buildMessage(from string, msg Message, now time.Time) ([]byte, error) {
 		return nil, err
 	}
 	if err := alt.Close(); err != nil {
+		return nil, err
+	}
+	if mixed == nil {
+		return buf.Bytes(), nil
+	}
+
+	altPart, err := mixed.CreatePart(textproto.MIMEHeader{
+		"Content-Type": {fmt.Sprintf("multipart/alternative; boundary=%q", alt.Boundary())},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := altPart.Write(altBuf.Bytes()); err != nil {
+		return nil, err
+	}
+	for _, a := range msg.Attachments {
+		ct := a.ContentType
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		// FormatMediaType writes a Thai file name in RFC 2231 form, which is
+		// also the CRLF guard: the encoded value cannot break the header line.
+		name := stripCRLF(a.Name)
+		if err := writeBase64Part(mixed, textproto.MIMEHeader{
+			"Content-Type":        {mime.FormatMediaType(ct, map[string]string{"name": name})},
+			"Content-Disposition": {mime.FormatMediaType("attachment", map[string]string{"filename": name})},
+		}, a.Data); err != nil {
+			return nil, err
+		}
+	}
+	if err := mixed.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

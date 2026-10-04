@@ -74,6 +74,9 @@ type MailLayout struct {
 	Facts     []MailFact
 	Highlight *MailFact
 	Table     *MailTable
+	// Tables follow Table, each under its own title: one block per course
+	// when a notice covers several.
+	Tables []MailTable
 	// After is text below the table, before the closing.
 	After       string
 	ButtonLabel string
@@ -82,6 +85,23 @@ type MailLayout struct {
 	// start"); delivery makes them absolute like the main link. /docs asks
 	// for login and returns the reader to the page afterwards (?next=).
 	Guides []MailGuide
+	// Attachments go out with the e-mail only; the bell has nowhere to put a
+	// file, so the in-app copy should say where else to find it.
+	Attachments []mail.Attachment
+}
+
+// tables is Table followed by Tables, skipping empty ones.
+func (L MailLayout) tables() []MailTable {
+	var out []MailTable
+	if L.Table != nil && len(L.Table.Rows) > 0 {
+		out = append(out, *L.Table)
+	}
+	for _, t := range L.Tables {
+		if len(t.Rows) > 0 {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // MailGuide is one manual page linked from an e-mail.
@@ -233,30 +253,8 @@ func renderMailHTML(m mailContent) string {
 		b.WriteString(`</td></tr></table>`)
 	}
 
-	if t := L.Table; t != nil && len(t.Rows) > 0 {
-		if t.Title != "" {
-			b.WriteString(`<div style="margin:0 0 12px;border-left:3px solid ` + mailBrand + `;padding-left:10px;font-size:16px;font-weight:bold;color:` + mailBrandDark + `;line-height:1.5">` + mailEsc(t.Title) + `</div>`)
-		}
-		align := func(i int) string {
-			if i < len(t.Align) && t.Align[i] != "" {
-				return t.Align[i]
-			}
-			return "left"
-		}
-		b.WriteString(`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ` + mailBorder + `;border-collapse:collapse;margin:0 0 24px;font-size:14px">`)
-		b.WriteString(`<tr>`)
-		for i, h := range t.Head {
-			b.WriteString(`<th align="` + align(i) + `" style="background:#f3f4f6;padding:10px 14px;border-bottom:1px solid ` + mailBorder + `;font-weight:bold;white-space:nowrap">` + mailEsc(h) + `</th>`)
-		}
-		b.WriteString(`</tr>`)
-		for _, row := range t.Rows {
-			b.WriteString(`<tr>`)
-			for i, cell := range row {
-				b.WriteString(`<td align="` + align(i) + `" style="padding:12px 14px;border-bottom:1px solid ` + mailBorder + `;vertical-align:top">` + mailEsc(cell) + `</td>`)
-			}
-			b.WriteString(`</tr>`)
-		}
-		b.WriteString(`</table>`)
+	for _, t := range L.tables() {
+		writeMailTableHTML(&b, t)
 	}
 
 	if L.After != "" {
@@ -314,6 +312,34 @@ func renderMailHTML(m mailContent) string {
 	return b.String()
 }
 
+// writeMailTableHTML writes one titled table of the letter.
+func writeMailTableHTML(b *strings.Builder, t MailTable) {
+	if t.Title != "" {
+		b.WriteString(`<div style="margin:0 0 12px;border-left:3px solid ` + mailBrand + `;padding-left:10px;font-size:16px;font-weight:bold;color:` + mailBrandDark + `;line-height:1.5">` + mailEsc(t.Title) + `</div>`)
+	}
+	align := func(i int) string {
+		if i < len(t.Align) && t.Align[i] != "" {
+			return t.Align[i]
+		}
+		return "left"
+	}
+	b.WriteString(`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ` + mailBorder + `;border-collapse:collapse;margin:0 0 24px;font-size:14px">`)
+	b.WriteString(`<tr>`)
+	for i, h := range t.Head {
+		b.WriteString(`<th align="` + align(i) + `" style="background:#f3f4f6;padding:10px 14px;border-bottom:1px solid ` + mailBorder + `;font-weight:bold;white-space:nowrap">` + mailEsc(h) + `</th>`)
+	}
+	b.WriteString(`</tr>`)
+	for _, row := range t.Rows {
+		b.WriteString(`<tr>`)
+		for i, cell := range row {
+			b.WriteString(`<td align="` + align(i) + `" style="padding:12px 14px;border-bottom:1px solid ` + mailBorder + `;vertical-align:top">` + mailEsc(cell) + `</td>`)
+		}
+		b.WriteString(`</tr>`)
+	}
+	b.WriteString(`</table>`)
+
+}
+
 // renderMailText is the plain-text alternative of the same letter.
 func renderMailText(m mailContent) string {
 	L := m.Layout
@@ -335,7 +361,7 @@ func renderMailText(m mailContent) string {
 	if L.Highlight != nil {
 		b.WriteString(L.Highlight.Label + " " + L.Highlight.Value + "\n\n")
 	}
-	if t := L.Table; t != nil && len(t.Rows) > 0 {
+	for _, t := range L.tables() {
 		if t.Title != "" {
 			b.WriteString(t.Title + "\n")
 		}

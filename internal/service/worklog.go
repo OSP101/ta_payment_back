@@ -3847,11 +3847,30 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	return w.ID, nil
 }
 
-func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UUID) error {
+// Submit sends the TA's draft + rejected rows to the lecturer. months
+// ("YYYY-MM") narrows it to the months the TA ticked in the send dialog; none
+// means every open month (the original behaviour, still used by the demo and
+// the tests). A month left out simply stays draft — nothing about one month's
+// review depends on another's.
+func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UUID, months ...string) error {
 	ac, err := s.assertTAOwnsAssignment(ctx, actor, assignmentID)
 	if err != nil {
 		return err
 	}
+	for _, ym := range months {
+		if ym == "" {
+			return Invalid("รูปแบบเดือนไม่ถูกต้อง (ต้องเป็น YYYY-MM)")
+		}
+		if err := validateYearMonth(ym); err != nil {
+			return err
+		}
+	}
+	if months == nil {
+		months = []string{} // ANY($n) needs a non-NULL array; empty = all months
+	}
+	// Applied to the candidate rows only: what they may collide with, and what
+	// counts as "already sent", is not narrowed by the TA's choice.
+	const inMonths = `(cardinality($2::text[]) = 0 OR to_char(%s.work_date, 'YYYY-MM') = ANY($2::text[]))`
 	// Include 'rejected' so pressing "ส่งอนุมัติ" resubmits the whole batch —
 	// TAs typically fix a handful of rows and expect the rest (which the
 	// lecturer bounced together) to go along with them. reject_reason is
@@ -3869,9 +3888,9 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 	// to count again — but not a draft stranded in a closed month, which will
 	// never be paid and must not block a month that will.
 	if hit, err := findSetOverlap(ctx, s.pool, assignmentID,
-		`c.status IN ('draft','rejected') AND `+submittableRowSQL("c"),
+		`c.status IN ('draft','rejected') AND `+submittableRowSQL("c")+` AND `+fmt.Sprintf(inMonths, "c"),
 		`(o.status <> 'rejected' OR (o.assignment_id = c.assignment_id AND `+submittableRowSQL("o")+`))
-		 AND NOT (o.status = 'draft' AND `+unsubmittableMonthSQL("o")+`)`); err != nil {
+		 AND NOT (o.status = 'draft' AND `+unsubmittableMonthSQL("o")+`)`, months); err != nil {
 		return err
 	} else if hit != nil {
 		return Invalid("ส่งอนุมัติไม่ได้: " + hit.describe() +
@@ -3885,7 +3904,8 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 		  -- A month with no submission period cannot be reviewed or exported;
 		  -- its rows wait as drafts until staff open the month.
 		  AND NOT `+periodMissingSQL("wl")+`
-		RETURNING to_char(wl.work_date, 'YYYY-MM')`, assignmentID)
+		  AND `+fmt.Sprintf(inMonths, "wl")+`
+		RETURNING to_char(wl.work_date, 'YYYY-MM')`, assignmentID, months)
 	if err != nil {
 		return err
 	}
@@ -3911,8 +3931,9 @@ func (s *WorkLogService) Submit(ctx context.Context, actor, assignmentID uuid.UU
 		if err := s.pool.QueryRow(ctx, `
 			SELECT COUNT(*) FILTER (WHERE `+unsubmittableMonthSQL("wl")+`),
 			       COUNT(*) FILTER (WHERE `+periodMissingSQL("wl")+`)
-			FROM work_logs wl WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')`,
-			assignmentID).Scan(&locked, &noPeriod); err == nil {
+			FROM work_logs wl WHERE wl.assignment_id=$1 AND wl.status IN ('draft','rejected')
+			  AND `+fmt.Sprintf(inMonths, "wl"),
+			assignmentID, months).Scan(&locked, &noPeriod); err == nil {
 			if noPeriod > 0 {
 				return Invalid("ยังส่งอนุมัติไม่ได้ เจ้าหน้าที่ยังไม่ได้เปิดรอบลงเวลาของเดือนที่บันทึกไว้")
 			}

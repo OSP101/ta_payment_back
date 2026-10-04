@@ -2,6 +2,7 @@ package mail
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -87,5 +88,49 @@ func partTypes(t *testing.T, contentType string, body io.Reader) []string {
 			t.Fatalf("next part: %v", err)
 		}
 		out = append(out, partTypes(t, p.Header.Get("Content-Type"), p)...)
+	}
+}
+
+// An attachment wraps the letter in multipart/mixed; the file arrives intact
+// under its Thai name, after the letter's own parts.
+func TestBuildMessage_Attachment(t *testing.T) {
+	data := []byte("PK\x03\x04 not really a docx")
+	raw, err := buildMessage("no-reply@coco.kku.ac.th", Message{
+		To: "a@example.test", Subject: "คำสั่ง", HTML: "<p>x</p>", Text: "x",
+		Attachments: []Attachment{{Name: "คำสั่ง 6-2569.docx", ContentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", Data: data}},
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := netmail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt, params, _ := mime.ParseMediaType(m.Header.Get("Content-Type"))
+	if mt != "multipart/mixed" {
+		t.Fatalf("top type = %q", mt)
+	}
+	r := multipart.NewReader(m.Body, params["boundary"])
+	first, err := r.NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := partTypes(t, first.Header.Get("Content-Type"), first); strings.Join(got, ",") != "text/plain,text/html" {
+		t.Errorf("letter parts = %v", got)
+	}
+	file, err := r.NextPart()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.FileName() != "คำสั่ง 6-2569.docx" {
+		t.Errorf("file name = %q", file.FileName())
+	}
+	b64, _ := io.ReadAll(file)
+	got, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(string(b64), "\r\n", ""))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Errorf("attachment bytes differ: %v", err)
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("unexpected extra part: %v", err)
 	}
 }

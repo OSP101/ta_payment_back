@@ -23,7 +23,8 @@ type AppointmentOrderService struct {
 	pool    *pgxpool.Pool
 	aud     *audit.Auditor
 	fontDir string
-	// notify sends the timetable reminders (appointment_remind.go).
+	// notify sends the timetable reminders (appointment_remind.go) and tells
+	// lecturers an order is out (appointment_lecturer_notice.go).
 	notify *NotifyService
 }
 
@@ -40,6 +41,9 @@ type AppointmentOrderInput struct {
 func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in AppointmentOrderInput) ([]byte, string, error) {
 	if in.OrderNo == "" || in.OrderDate == "" || in.EffectiveDate == "" {
 		return nil, "", Invalid("กรุณาระบุคำสั่งที่ / วันที่สั่ง / วันที่ทำการ")
+	}
+	if !orderDateOK(in.OrderDate) || !orderDateOK(in.EffectiveDate) {
+		return nil, "", Invalid("วันที่สั่งหรือวันที่ทำการไม่ถูกต้อง กรุณาเลือกวันที่ใหม่")
 	}
 
 	// Load term metadata.
@@ -242,6 +246,17 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	}); err != nil {
 		return nil, "", err
 	}
+
+	// Tell the lecturers, with the order attached. In the background: one
+	// SMTP exchange per lecturer would hold the download for minutes, and the
+	// round is already recorded, so nothing here can change what staff got.
+	if s.notify != nil {
+		go func() {
+			bg, cancel := context.WithTimeout(context.Background(), lecturerNoticeTimeout)
+			defer cancel()
+			s.notifyLecturersAppointed(bg, in.TermID, round, pairs, doc, docxBytes, name)
+		}()
+	}
 	return docxBytes, name, nil
 }
 
@@ -344,6 +359,23 @@ var thaiMonths = [...]string{
 // "14 มกราคม พ.ศ. 2569" (withEra) or "14 มกราคม 2569" (without). If the input
 // isn't ISO it's assumed to be a pre-formatted Thai string and passed through
 // (ensureBuddhistEra still fixes a missing พ.ศ. on the order date).
+// orderDateOK accepts what thaiGovDate can print: an ISO date with a real
+// year, or free Thai text ("24 มกราคม 2569"). It refuses a half-typed ISO
+// string — a keyboard-typed year once reached here as "2-10-05" and was
+// printed on a permanent order and mailed to lecturers.
+func orderDateOK(s string) bool {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t.Year() >= 1900 && t.Year() <= 2200
+	}
+	for _, r := range s {
+		if r >= 0x0E00 && r <= 0x0E7F {
+			return true
+		}
+	}
+	return false
+}
+
 func thaiGovDate(s string, withEra bool) string {
 	s = strings.TrimSpace(s)
 	t, err := time.Parse("2006-01-02", s)

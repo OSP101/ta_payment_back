@@ -138,3 +138,42 @@ func TestSubmit_SendsDaysThatHaveNotHappenedYet(t *testing.T) {
 		t.Errorf("%d rows left unsent, want 0 — the future day goes too", drafts)
 	}
 }
+
+// The send dialog lets the TA tick which months go (05/10/2026). Only the
+// ticked month moves; the other stays a draft the TA can still edit and send
+// later, and the lecturer's notice names only the month that went.
+func TestSubmit_OnlyTheChosenMonthsGo(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
+	next := monthStart().AddDate(0, 1, 9).Format("2006-01-02")
+	f.mustUpsert(f.entry(next, "09:00", "11:00", 2))
+
+	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID, next[:7]); err != nil {
+		t.Fatal(err)
+	}
+	var thisMonth, nextMonth string
+	if err := f.Pool.QueryRow(f.ctx,
+		`SELECT MAX(status) FILTER (WHERE work_date = $2::date), MAX(status) FILTER (WHERE work_date = $3::date)
+		 FROM work_logs WHERE assignment_id=$1`, f.AssignmentID, day(10), next).Scan(&thisMonth, &nextMonth); err != nil {
+		t.Fatal(err)
+	}
+	if nextMonth != "submitted" || thisMonth != "draft" {
+		t.Errorf("chosen month=%q, other month=%q; want submitted/draft", nextMonth, thisMonth)
+	}
+
+	// Picking only a month with nothing to send is refused, not silently "ok".
+	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID, next[:7]); err == nil {
+		t.Error("re-sending a month with no drafts left must be refused")
+	}
+	// A malformed month never reaches SQL.
+	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID, "2026-13"); err == nil {
+		t.Error("an invalid YYYY-MM must be refused")
+	}
+	// No months = every open month (the original behaviour).
+	if err := f.Svc.Submit(f.ctx, f.TAID, f.AssignmentID); err != nil {
+		t.Fatalf("submit-all must still send the remaining month: %v", err)
+	}
+	if got := f.worklogStatusOf(t, f.AssignmentID); got != "submitted" {
+		t.Errorf("after submit-all: %q, want submitted", got)
+	}
+}
