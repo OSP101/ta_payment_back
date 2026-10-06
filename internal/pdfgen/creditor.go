@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	pdfcpu "github.com/pdfcpu/pdfcpu/pkg/api"
 	pdfcpuModel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
@@ -74,7 +76,7 @@ func normalizedTemplate(src string) (string, error) {
 type CreditorData struct {
 	Prefix       string // exactly one of "นาย" / "นาง" / "นางสาว"
 	FullName     string
-	NationalID   string // 13 digits; non-digits are stripped before placement
+	NationalID   string // citizen ID (13 digits) or a foreign TA's passport number; see idChars
 	Phone        string
 	Email        string
 	AccountName  string
@@ -290,7 +292,7 @@ func FillCreditor(in CreditorInput) ([]byte, error) {
 
 	setTextInField(&pdf, c.name, d.FullName, alignLeft)
 
-	fillGrid(&pdf, c.nid, onlyDigits(d.NationalID))
+	fillGrid(&pdf, c.nid, idChars(d.NationalID))
 
 	setTextInField(&pdf, c.phone, d.Phone, alignLeft)
 	setTextInField(&pdf, c.email, d.Email, alignLeft)
@@ -322,7 +324,7 @@ func FillCreditor(in CreditorInput) ([]byte, error) {
 	// rather than on the joined string, so a profile with only a prefix filled
 	// in doesn't print a bare "นาย" on the signature line.
 	if d.FullName != "" {
-		setTextInField(&pdf, c.printedName, d.Prefix+d.FullName, alignCenter)
+		setTextInField(&pdf, c.printedName, printedName(d.Prefix, d.FullName), alignCenter)
 	}
 
 	setTextInField(&pdf, c.day, d.Day, alignCenter)
@@ -422,6 +424,20 @@ func setTextInField(pdf *gopdf.GoPdf, f field, s string, a align) {
 	}
 }
 
+// idChars is what goes into the ID boxes, one character per box: the digits of
+// a Thai citizen ID, or a foreign TA's passport number (letters kept,
+// upper-cased — "AB1234567"), which the office has them write in the same
+// boxes. Spaces and dashes are dropped either way.
+func idChars(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(s) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // fillGrid writes one digit per printed box, each centred in its box. Digits
 // past the last box are dropped: the grid is as long as the form allows, and
 // spilling past the printed row would look like a rendering fault rather than
@@ -509,4 +525,15 @@ func thaiMonth(m int) string {
 		return ""
 	}
 	return names[m]
+}
+
+// printedName is the name under the signature. Thai writes the prefix flush
+// against the name ("นายสมชาย ใจดี"); a foreign TA's name is in English as on
+// the passport, and "นายJohn Smith" reads as a typo, so a Latin name gets a
+// space.
+func printedName(prefix, fullName string) string {
+	if fullName != "" && fullName[0] < utf8.RuneSelf && unicode.IsLetter(rune(fullName[0])) {
+		return prefix + " " + fullName
+	}
+	return prefix + fullName
 }

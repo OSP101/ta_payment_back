@@ -98,3 +98,21 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func TestPrintedNameSpacesLatinNames(t *testing.T) {
+	if got := printedName("นาย", "สมชาย ใจดี"); got != "นายสมชาย ใจดี" {
+		t.Errorf("Thai name = %q", got)
+	}
+	if got := printedName("นาย", "John Smith"); got != "นาย John Smith" {
+		t.Errorf("Latin name = %q", got)
+	}
+}
+
+func TestIDCharsKeepsPassportLetters(t *testing.T) {
+	if got := idChars("1-1018-00123-45-6"); got != "1101800123456" {
+		t.Errorf("citizen ID = %q", got)
+	}
+	if got := idChars("ab 123-4567"); got != "AB1234567" {
+		t.Errorf("passport = %q", got)
+	}
+}

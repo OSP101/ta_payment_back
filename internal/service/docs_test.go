@@ -119,12 +119,13 @@ func TestDocKindsClosed(t *testing.T) {
 	// Regression guard: adding a new document kind requires updating the
 	// TA form and the staff review label map together, so the enum is
 	// intentionally small and closed.
-	for _, k := range []string{"national_id", "bank_book", "creditor_form"} {
+	// passport joined on 06/10/2026 for foreign TAs.
+	for _, k := range []string{"national_id", "passport", "bank_book", "creditor_form"} {
 		if !DocKinds[k] {
 			t.Errorf("expected DocKinds[%q] to be true", k)
 		}
 	}
-	for _, k := range []string{"", "passport", "other", "creditor"} {
+	for _, k := range []string{"", "tax_id_card", "other", "creditor"} {
 		if DocKinds[k] {
 			t.Errorf("did not expect DocKinds[%q] to be true", k)
 		}

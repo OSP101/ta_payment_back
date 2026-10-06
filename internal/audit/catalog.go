@@ -272,6 +272,8 @@ var catalog = map[string]ActionInfo{
 	"ta_docs.download_all":          sensitive("ดาวน์โหลดเอกสารของผู้ช่วยสอนทั้งชุด"),
 	"ta_docs.redownload_verify":     sensitive("ยืนยันตัวตนเพื่อดาวน์โหลดเอกสารซ้ำ"),
 	"ta_profile.citizen_id.reveal":  sensitive("เปิดดูเลขบัตรประชาชน"),
+	"ta_profile.payee.reveal":       sensitive("เปิดดูบัญชีธนาคารและที่อยู่"),
+	"export.suppliers":              sensitive("ส่งออกไฟล์ Suppliers ทีเอใหม่"),
 	"audit_log.search":              view("ค้นหาในบันทึกการใช้งาน"),
 	"audit_log.export":              sensitive("ส่งออกบันทึกการใช้งานเป็นไฟล์"),
 

@@ -1,5 +1,5 @@
-// Command rotate-pii-key re-encrypts every ta_profiles.citizen_id_enc value
-// under a new PII_ENC_KEY.
+// Command rotate-pii-key re-encrypts every ta_profiles.citizen_id_enc and
+// ta_profiles.payee_enc value under a new PII_ENC_KEY.
 //
 // This exists because internal/pii.Cipher only ever holds ONE key — Open()
 // simply fails against ciphertext sealed under a different one. Swapping
@@ -50,6 +50,24 @@ import (
 	"ta-payment-back/internal/storage"
 )
 
+// sealedColumn is one PII_ENC_KEY-encrypted column on ta_profiles. Both are
+// rotated in the same run and the same transaction, so the table is never left
+// with the two columns under different keys. Column names are literals, never
+// input, so interpolating them into SQL is safe.
+type sealedColumn struct {
+	name, version string
+	aad           func(uuid.UUID) []byte
+}
+
+var sealedColumns = []sealedColumn{
+	// AAD = user_id (internal/service/citizen_id.go storeCitizenID).
+	{"citizen_id_enc", "citizen_id_key_version", func(id uuid.UUID) []byte { return append([]byte{}, id[:]...) }},
+	// AAD = user_id || "payee" (internal/service/payee.go payeeAAD).
+	{"payee_enc", "payee_key_version", func(id uuid.UUID) []byte {
+		return append(append([]byte{}, id[:]...), "payee"...)
+	}},
+}
+
 type row struct {
 	userID  uuid.UUID
 	sealed  []byte
@@ -90,67 +108,77 @@ func main() {
 	defer pool.Close()
 
 	if *apply {
-		var maxVersion int
-		if err := pool.QueryRow(ctx,
-			`SELECT COALESCE(MAX(citizen_id_key_version), 0) FROM ta_profiles WHERE citizen_id_enc IS NOT NULL`,
-		).Scan(&maxVersion); err != nil {
-			log.Fatalf("read current max version: %v", err)
-		}
-		if *newVersion <= maxVersion {
-			log.Fatalf("-new-version=%d must be greater than the highest version already on the table (%d)",
-				*newVersion, maxVersion)
+		for _, col := range sealedColumns {
+			var maxVersion int
+			if err := pool.QueryRow(ctx, fmt.Sprintf(
+				`SELECT COALESCE(MAX(%s), 0) FROM ta_profiles WHERE %s IS NOT NULL`, col.version, col.name),
+			).Scan(&maxVersion); err != nil {
+				log.Fatalf("read current max %s: %v", col.version, err)
+			}
+			if *newVersion <= maxVersion {
+				log.Fatalf("-new-version=%d must be greater than the highest %s already on the table (%d)",
+					*newVersion, col.version, maxVersion)
+			}
 		}
 	}
 
-	rows, err := pool.Query(ctx,
-		`SELECT user_id, citizen_id_enc, COALESCE(citizen_id_key_version, 0)
-		 FROM ta_profiles WHERE citizen_id_enc IS NOT NULL`)
-	if err != nil {
-		log.Fatalf("query: %v", err)
+	type work struct {
+		col   sealedColumn
+		rows  []row
+		reenc [][]byte
 	}
-	var todo []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.userID, &r.sealed, &r.version); err != nil {
-			rows.Close()
-			log.Fatalf("scan: %v", err)
-		}
-		todo = append(todo, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		log.Fatalf("query: %v", err)
-	}
-
-	fmt.Printf("%d row(s) with a citizen id on file\n", len(todo))
-
-	// Decrypt-verify every row with the OLD key BEFORE writing anything —
-	// AAD-bound to the row's own user_id (see internal/service/citizen_id.go's
-	// storeCitizenID), so this also confirms no row was ever copied between
-	// users. A single bad row aborts the whole run: partial re-encryption
-	// would leave the table split across two keys with no record of which
-	// rows got done, which is worse than doing nothing.
-	reenc := make([][]byte, len(todo))
-	for i, r := range todo {
-		plain, err := oldCipher.Open(r.userID[:], r.sealed)
+	var jobs []work
+	for _, col := range sealedColumns {
+		rows, err := pool.Query(ctx, fmt.Sprintf(
+			`SELECT user_id, %s, COALESCE(%s, 0) FROM ta_profiles WHERE %s IS NOT NULL`,
+			col.name, col.version, col.name))
 		if err != nil {
-			log.Fatalf("decrypt failed for user %s (row %d/%d) — aborting, nothing written: %v",
-				r.userID, i+1, len(todo), err)
+			log.Fatalf("query %s: %v", col.name, err)
 		}
-		sealed, err := newCipher.Seal(r.userID[:], plain)
-		// Overwrite the plaintext buffer now that we're done with it — best
-		// effort only (Go's GC can still have moved/copied it), but there is
-		// no reason to let it sit in memory a moment longer than needed.
-		for j := range plain {
-			plain[j] = 0
+		var todo []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.userID, &r.sealed, &r.version); err != nil {
+				rows.Close()
+				log.Fatalf("scan: %v", err)
+			}
+			todo = append(todo, r)
 		}
-		if err != nil {
-			log.Fatalf("re-encrypt failed for user %s (row %d/%d) — aborting, nothing written: %v",
-				r.userID, i+1, len(todo), err)
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Fatalf("query %s: %v", col.name, err)
 		}
-		reenc[i] = sealed
+		fmt.Printf("%s: %d row(s) on file\n", col.name, len(todo))
+
+		// Decrypt-verify every row with the OLD key BEFORE writing anything —
+		// AAD-bound to the row's own user_id (see storeCitizenID / storePayee),
+		// so this also confirms no row was ever copied between users. A single
+		// bad row aborts the whole run: partial re-encryption would leave the
+		// table split across two keys with no record of which rows got done,
+		// which is worse than doing nothing.
+		reenc := make([][]byte, len(todo))
+		for i, r := range todo {
+			plain, err := oldCipher.Open(col.aad(r.userID), r.sealed)
+			if err != nil {
+				log.Fatalf("%s: decrypt failed for user %s (row %d/%d) — aborting, nothing written: %v",
+					col.name, r.userID, i+1, len(todo), err)
+			}
+			sealed, err := newCipher.Seal(col.aad(r.userID), plain)
+			// Overwrite the plaintext buffer now that we're done with it — best
+			// effort only (Go's GC can still have moved/copied it), but there is
+			// no reason to let it sit in memory a moment longer than needed.
+			for j := range plain {
+				plain[j] = 0
+			}
+			if err != nil {
+				log.Fatalf("%s: re-encrypt failed for user %s (row %d/%d) — aborting, nothing written: %v",
+					col.name, r.userID, i+1, len(todo), err)
+			}
+			reenc[i] = sealed
+		}
+		jobs = append(jobs, work{col: col, rows: todo, reenc: reenc})
 	}
-	fmt.Printf("decrypted and re-encrypted all %d row(s) successfully\n", len(todo))
+	fmt.Println("decrypted and re-encrypted every row successfully")
 
 	if !*apply {
 		fmt.Println("dry run — nothing written. Re-run with -apply -new-version=N once this looks right.")
@@ -162,19 +190,23 @@ func main() {
 		log.Fatalf("begin: %v", err)
 	}
 	defer tx.Rollback(ctx)
-	for i, r := range todo {
-		if _, err := tx.Exec(ctx,
-			`UPDATE ta_profiles SET citizen_id_enc = $1, citizen_id_key_version = $2 WHERE user_id = $3`,
-			reenc[i], *newVersion, r.userID); err != nil {
-			log.Fatalf("update failed for user %s (row %d/%d) — rolling back, nothing written: %v",
-				r.userID, i+1, len(todo), err)
+	total := 0
+	for _, j := range jobs {
+		for i, r := range j.rows {
+			if _, err := tx.Exec(ctx, fmt.Sprintf(
+				`UPDATE ta_profiles SET %s = $1, %s = $2 WHERE user_id = $3`, j.col.name, j.col.version),
+				j.reenc[i], *newVersion, r.userID); err != nil {
+				log.Fatalf("%s: update failed for user %s (row %d/%d) — rolling back, nothing written: %v",
+					j.col.name, r.userID, i+1, len(j.rows), err)
+			}
 		}
+		total += len(j.rows)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		log.Fatalf("commit: %v", err)
 	}
-	fmt.Printf("done — %d row(s) now under key version %d. "+
-		"Update PII_ENC_KEY to the new key's value and restart the service.\n", len(todo), *newVersion)
+	fmt.Printf("done — %d value(s) now under key version %d. "+
+		"Update PII_ENC_KEY to the new key's value and restart the service.\n", total, *newVersion)
 }
 
 func mustEnv(k string) string {

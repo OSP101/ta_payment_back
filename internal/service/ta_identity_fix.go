@@ -32,15 +32,18 @@ type TAIdentity struct {
 	Prefix         *string `json:"prefix"`
 	CitizenIDLast4 *string `json:"citizen_id_last4"`
 	HasProfile     bool    `json:"has_profile"`
+	// Foreign: the stored number is the tax ID, not a citizen ID.
+	Foreign bool `json:"foreign"`
 }
 
 func (s *DocsService) GetTAIdentity(ctx context.Context, userID uuid.UUID) (*TAIdentity, error) {
 	out := &TAIdentity{}
 	err := s.pool.QueryRow(ctx, `
-		SELECT u.student_id, p.prefix, NULLIF(p.citizen_id_last4, ''), p.user_id IS NOT NULL
+		SELECT u.student_id, p.prefix, NULLIF(p.citizen_id_last4, ''), p.user_id IS NOT NULL,
+		       u.nationality = 'foreign'
 		  FROM users u LEFT JOIN ta_profiles p ON p.user_id = u.id
 		 WHERE u.id = $1 AND u.deleted_at IS NULL`, userID,
-	).Scan(&out.StudentID, &out.Prefix, &out.CitizenIDLast4, &out.HasProfile)
+	).Scan(&out.StudentID, &out.Prefix, &out.CitizenIDLast4, &out.HasProfile, &out.Foreign)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -74,12 +77,12 @@ func (s *DocsService) CorrectTAIdentity(ctx context.Context, actor, userID uuid.
 		}
 	}
 	if in.NationalID != nil {
-		nid = stripNonDigits(*in.NationalID)
-		if len(nid) != 13 {
-			return Invalid("เลขบัตรประชาชนต้องเป็นตัวเลข 13 หลัก")
+		foreign, err := userIsForeign(ctx, s.pool, userID)
+		if err != nil {
+			return err
 		}
-		if !validThaiCitizenID(nid) {
-			return Invalid("เลขบัตรประชาชนไม่ถูกต้อง (หลักตรวจสอบไม่ตรง) กรุณาตรวจสอบอีกครั้ง")
+		if nid, err = validateIDNumber(*in.NationalID, foreign); err != nil {
+			return err
 		}
 	}
 	if in.Prefix != nil && !AllowedPrefixes[*in.Prefix] {

@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,9 +26,9 @@ import (
 	"ta-payment-back/internal/timeutil"
 )
 
-// requiredDocKinds is the closed set the review flow expects: without all
-// three there is nothing meaningful to approve.
-var requiredDocKinds = []string{"national_id", "bank_book", "creditor_form"}
+// The set of documents the review flow expects depends on the TA's
+// nationality and lives in SQL: ta_required_doc_kinds(user_id), migration
+// 0151. Without all of them there is nothing meaningful to approve.
 
 // zipTokenTTL keeps the one-shot approve→download handshake tight so a
 // captured token can't be replayed hours later.
@@ -88,10 +89,10 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 	rows, err := tx.Query(ctx, `
 		SELECT id, kind, status::text FROM ta_documents
 		WHERE user_id = $1
-		  AND kind = ANY($2)
+		  AND kind = ANY(ta_required_doc_kinds($1))
 		  AND superseded_at IS NULL
 		ORDER BY kind
-		FOR UPDATE`, userID, requiredDocKinds)
+		FOR UPDATE`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -114,8 +115,12 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		return nil, err
 	}
 	rows.Close()
-	if len(docs) < len(requiredDocKinds) {
-		return nil, Invalid("เอกสารบังคับยังไม่ครบ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)")
+	required, err := requiredDocKindsOf(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if len(docs) < len(required) {
+		return nil, Invalid("เอกสารบังคับยังไม่ครบ (" + kindShortList(required) + ")")
 	}
 
 	// Same rule as Review: a document the officer rejected stays rejected
@@ -310,12 +315,30 @@ func kindLabel(kind string) string {
 	switch kind {
 	case "national_id":
 		return "สำเนาบัตรประจำตัวประชาชน"
+	case "passport":
+		return "สำเนา Passport"
 	case "bank_book":
 		return "สำเนาหน้าสมุดบัญชีธนาคาร"
 	case "creditor_form":
 		return "แบบฟอร์มเจ้าหนี้"
 	}
 	return kind
+}
+
+// kindShortList names a set of kinds briefly for an error message, in review
+// order: "บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้".
+func kindShortList(kinds []string) string {
+	short := map[string]string{
+		"national_id": "บัตรประชาชน", "passport": "Passport",
+		"bank_book": "สมุดบัญชี", "creditor_form": "แบบฟอร์มเจ้าหนี้",
+	}
+	var out []string
+	for _, k := range []string{"national_id", "passport", "bank_book", "creditor_form"} {
+		if slices.Contains(kinds, k) {
+			out = append(out, short[k])
+		}
+	}
+	return strings.Join(out, "/")
 }
 
 // mintZipToken records a one-shot download token bound to (actor, userID,
@@ -385,7 +408,7 @@ func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UU
 	// No implicit "everyone": an empty list must not fall back to the whole
 	// database, which is exactly the behaviour being removed.
 	if len(userIDs) == 0 {
-		return "", 0, Invalid("ยังไม่มีใครในรายชื่อนี้ที่อนุมัติครบทั้ง 3 ไฟล์")
+		return "", 0, Invalid("ยังไม่มีใครในรายชื่อนี้ที่อนุมัติเอกสารครบทุกไฟล์")
 	}
 	if len(userIDs) > maxBulkUserIDs {
 		return "", 0, Invalid(fmt.Sprintf("เลือกได้ไม่เกิน %d คนต่อครั้ง กรุณาแบ่งดาวน์โหลดเป็นชุดย่อย", maxBulkUserIDs))
@@ -402,12 +425,12 @@ func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UU
 		  FROM ta_documents d
 		  JOIN ta_profiles p ON p.user_id = d.user_id AND p.status = 'approved'
 		  JOIN users u ON u.id = d.user_id
-		 WHERE d.kind = ANY($1)
-		   AND d.user_id = ANY($2)
+		 WHERE d.kind = ANY(ta_required_doc_kinds(d.user_id))
+		   AND d.user_id = ANY($1)
 		   AND d.superseded_at IS NULL
 		   AND d.status = 'approved'
 		   AND d.file_deleted_at IS NULL
-		 ORDER BY COALESCE(u.student_id, ''), u.first_name, d.kind`, requiredDocKinds, userIDs)
+		 ORDER BY COALESCE(u.student_id, ''), u.first_name, d.kind`, userIDs)
 	if err != nil {
 		return "", 0, err
 	}
@@ -504,10 +527,10 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 	rows, err := s.pool.Query(ctx, `
 		SELECT id FROM ta_documents
 		WHERE user_id = $1
-		  AND kind = ANY($2)
+		  AND kind = ANY(ta_required_doc_kinds($1))
 		  AND superseded_at IS NULL
 		  AND status = 'approved'
-		  AND file_deleted_at IS NULL`, userID, requiredDocKinds)
+		  AND file_deleted_at IS NULL`, userID)
 	if err != nil {
 		return "", err
 	}
@@ -581,8 +604,8 @@ func (s *DocsService) currentDocRound(ctx context.Context, userID uuid.UUID) (in
 	var round *int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT MAX(round) FROM ta_documents
-		 WHERE user_id = $1 AND superseded_at IS NULL AND kind = ANY($2)`,
-		userID, requiredDocKinds).Scan(&round); err != nil {
+		 WHERE user_id = $1 AND superseded_at IS NULL AND kind = ANY(ta_required_doc_kinds($1))`,
+		userID).Scan(&round); err != nil {
 		return 0, err
 	}
 	if round != nil {
@@ -843,6 +866,7 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 		         CASE d.kind
 		           WHEN 'creditor_form' THEN 1
 		           WHEN 'national_id'   THEN 2
+		           WHEN 'passport'      THEN 2
 		           WHEN 'bank_book'     THEN 3
 		           ELSE 4
 		         END`, docIDs)

@@ -115,9 +115,9 @@ func PatchCreditor(in CreditorPatchInput) ([]byte, error) {
 		drawOval(&pdf, ring.cx, c.prefixCY, ring.rx, c.prefixRY)
 	}
 	setTextInField(&pdf, c.name, in.FullName, alignLeft)
-	fillGrid(&pdf, c.nid, onlyDigits(in.NationalID))
+	fillGrid(&pdf, c.nid, idChars(in.NationalID))
 	if in.FullName != "" {
-		setTextInField(&pdf, c.printedName, in.Prefix+in.FullName, alignCenter)
+		setTextInField(&pdf, c.printedName, printedName(in.Prefix, in.FullName), alignCenter)
 	}
 
 	var buf bytes.Buffer

@@ -528,7 +528,7 @@ func (s *DashboardService) Executive(ctx context.Context, termID *uuid.UUID, bud
 	// form, so a card counting them would send officers to an empty list.
 	_ = s.pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM ta_profiles p
-		 WHERE p.status IN ('submitted','needs_fix') AND `+ProfileDocsInSQL("p.user_id")+` = 3`).Scan(&sum.PendingReviews)
+		 WHERE p.status IN ('submitted','needs_fix') AND `+ProfileDocsCompleteSQL("p.user_id")).Scan(&sum.PendingReviews)
 
 	// ขั้นที่ 3 — (period, TA, course) months with approved work that staff have
 	// not signed off yet. Mirrors ListReviewQueue's shape; see that query for

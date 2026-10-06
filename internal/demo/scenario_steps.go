@@ -423,16 +423,18 @@ func stepTADocs(ctx context.Context, svc *service.Container) (string, error) {
 		// validateProfileInput requires exactly "XXXXXXXXX-X" (9 digits, a
 		// dash, 1 check-like digit) — see docs.go.
 		profile := service.TAProfile{
-			StudentID:    fmt.Sprintf("64500000%d-%d", i+1, i+1),
-			Prefix:       "นาย",
-			Phone:        "0800000000",
-			NationalID:   "1234567890121", // passes the check digit, belongs to no one
-			BankName:     "ธนาคารกรุงไทย",
-			BankBranch:   "สาขามหาวิทยาลัยขอนแก่น",
-			BranchCode:   "0000",
-			AccountNo:    "1234567890",
-			AccountName:  "บัญชีทดลอง",
-			SignatureSVG: minimalSignatureSVG,
+			StudentID:     fmt.Sprintf("64500000%d-%d", i+1, i+1),
+			Prefix:        "นาย",
+			Phone:         "0800000000",
+			NationalID:    "1234567890121", // passes the check digit, belongs to no one
+			BankName:      "ธนาคารกรุงไทย",
+			BankBranch:    "สาขามหาวิทยาลัยขอนแก่น",
+			BranchCode:    "0000",
+			AccountNo:     "1234567890",
+			AccountName:   "บัญชีทดลอง",
+			AddressLine:   "123 ม.16",
+			SubDistrictID: 400101, // ต.ในเมือง อ.เมืองขอนแก่น จ.ขอนแก่น
+			SignatureSVG:  minimalSignatureSVG,
 		}
 		// The scripted walkthrough stands in for a TA who has already read and
 		// accepted the PDPA notice on the real form — UpsertProfile refuses

@@ -108,9 +108,39 @@ func TestUpsertProfile_SucceedsAfterPdpaConsent(t *testing.T) {
 		StudentID: "653020123-4", Prefix: "นาย", Phone: "0812345678",
 		NationalID: "1234567890121",
 		BankName:   "ธนาคารกสิกรไทย", AccountName: "นาย ทดสอบ ทีเอ", AccountNo: "1234567890",
+		AddressLine: "123 ม.16", SubDistrictID: 400101,
 		SignatureSVG: "<svg></svg>",
 	})
 	if err != nil {
 		t.Fatalf("UpsertProfile after consent: %v", err)
+	}
+}
+
+// /me's pdpa_consented_at gates the consent modal on the profile form. It must
+// follow the CURRENT notice version: a consent to an older notice has to bring
+// the modal back, or the TA fills the form and UpsertProfile refuses the save.
+func TestUserGet_PdpaConsentedAtFollowsCurrentVersion(t *testing.T) {
+	svc, ctx, userID := pdpaConsentFixture(t)
+	users := &UserService{pool: svc.pool, aud: svc.aud}
+	if _, err := svc.pool.Exec(ctx,
+		`INSERT INTO pdpa_consents (user_id, version, ip, user_agent) VALUES ($1, $2, '127.0.0.1', 't')`,
+		userID, pdpaConsentVersion-1); err != nil {
+		t.Fatal(err)
+	}
+	u, err := users.Get(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.PdpaConsentedAt != nil {
+		t.Error("consent to an older notice must not count as consent to the current one")
+	}
+	if err := svc.RecordPdpaConsent(ctx, userID, "127.0.0.1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if u, err = users.Get(ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	if u.PdpaConsentedAt == nil {
+		t.Error("consent to the current notice not reported")
 	}
 }

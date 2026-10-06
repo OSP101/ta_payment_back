@@ -16,7 +16,10 @@ import (
 // against. Bump this if the notice materially changes — HasPdpaConsent only
 // ever checks the current version, so every user is transparently asked to
 // re-consent, with no extra migration needed.
-const pdpaConsentVersion = 1
+//
+// 2 (06/10/2026): the notice now says the bank account and address are kept,
+// encrypted, for the finance office's Suppliers sheet (migration 0152).
+const pdpaConsentVersion = 2
 
 // RecordPdpaConsent stores that userID accepted the current PDPA notice, along
 // with where and when. Idempotent: accepting the same version twice (a

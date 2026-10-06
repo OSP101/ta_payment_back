@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -141,7 +142,8 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 		StudentID: "653020111-1", Prefix: "นาย", Phone: "0812345678",
 		NationalID: "1-2345-67890-12-1",
 		BankName:   "ธนาคารไทยพาณิชย์", BankBranch: "สาขามหาวิทยาลัยขอนแก่น",
-		BranchCode: "1234", AccountNo: "4091290303", AccountName: "นาย สุพพิธาน ภักสวัสดิ์",
+		BranchCode: "1234", AccountNo: "409-1-29030-3", AccountName: "นาย สุพพิธาน ภักสวัสดิ์",
+		AddressLine: "123  ม.16\n", SubDistrictID: 400101, // postal left blank: filled from the pick
 		SignatureSVG: "<svg><path d='M0 0 L9 9'/></svg>", SignaturePNGB64: "iVBORw0KGgo=",
 	}); err != nil {
 		t.Fatalf("UpsertProfile: %v", err)
@@ -191,6 +193,26 @@ func TestUpsertProfile_StoresNothingSensitive(t *testing.T) {
 	// — "1-2345-67890-12-1" becomes "1234567890121", so last4 is "0121".
 	if last4 != "0121" {
 		t.Errorf("citizen_id_last4 = %q, want 0121 (digits-only form of ...12-1)", last4)
+	}
+
+	// Bank account + address are stored too (migration 0152) — sealed, so the
+	// raw column must not contain the account number, and RevealPayee must
+	// give back the normalised values.
+	var payeeEnc []byte
+	if err := svc.pool.QueryRow(ctx,
+		`SELECT payee_enc FROM ta_profiles WHERE user_id=$1`, uid).Scan(&payeeEnc); err != nil {
+		t.Fatalf("payee_enc: %v", err)
+	}
+	if len(payeeEnc) == 0 || strings.Contains(string(payeeEnc), "4091290303") {
+		t.Errorf("payee_enc missing or not encrypted (len %d)", len(payeeEnc))
+	}
+	payee, err := svc.RevealPayee(ctx, uid, uid, "test")
+	if err != nil {
+		t.Fatalf("RevealPayee: %v", err)
+	}
+	if payee.AccountNo != "4091290303" || payee.PostalCode != "40000" || payee.Province != "ขอนแก่น" ||
+		payee.Address != "123 ม.16 ต.ในเมือง อ.เมืองขอนแก่น จ.ขอนแก่น" || payee.BankName != "ธนาคารไทยพาณิชย์" {
+		t.Errorf("RevealPayee = %+v", payee)
 	}
 
 	// The workflow state IS recorded, so the checklist can tell a submitted

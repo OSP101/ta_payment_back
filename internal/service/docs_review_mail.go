@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -18,7 +19,8 @@ import (
 // and it lists all three: which passed, which did not and why.
 
 // docReviewOrder is the order the TA's documents page lists the documents in.
-var docReviewOrder = []string{"creditor_form", "national_id", "bank_book"}
+// A TA owes only some of them; see ta_required_doc_kinds.
+var docReviewOrder = []string{"creditor_form", "national_id", "passport", "bank_book"}
 
 // docVerdict is one document's line in the review-result notice.
 type docVerdict struct {
@@ -42,8 +44,8 @@ func settledVerdicts(ctx context.Context, tx pgx.Tx, userID uuid.UUID) ([]docVer
 	rows, err := tx.Query(ctx, `
 		SELECT kind, status::text, COALESCE(reject_reason, '')
 		  FROM ta_documents
-		 WHERE user_id = $1 AND kind = ANY($2) AND superseded_at IS NULL`,
-		userID, requiredDocKinds)
+		 WHERE user_id = $1 AND kind = ANY(ta_required_doc_kinds($1)) AND superseded_at IS NULL`,
+		userID)
 	if err != nil {
 		return nil, err
 	}
@@ -65,8 +67,15 @@ func settledVerdicts(ctx context.Context, tx pgx.Tx, userID uuid.UUID) ([]docVer
 	if len(byKind) == 0 {
 		return nil, nil
 	}
+	required, err := requiredDocKindsOf(ctx, tx, userID)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]docVerdict, 0, len(docReviewOrder))
 	for _, k := range docReviewOrder {
+		if !slices.Contains(required, k) {
+			continue
+		}
 		v, ok := byKind[k]
 		if !ok {
 			v = docVerdict{Kind: k}

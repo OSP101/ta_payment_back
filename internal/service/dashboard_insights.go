@@ -287,7 +287,7 @@ func (s *DashboardService) pipeline(ctx context.Context, out *TermAnalytics, tid
 	_ = s.pool.QueryRow(ctx, `
 		SELECT EXTRACT(EPOCH FROM NOW() - MIN(p.completed_at)) / 86400
 		FROM ta_profiles p
-		WHERE p.status IN ('submitted','needs_fix') AND `+ProfileDocsInSQL("p.user_id")+` = 3`).Scan(&oldestDoc)
+		WHERE p.status IN ('submitted','needs_fix') AND `+ProfileDocsCompleteSQL("p.user_id")).Scan(&oldestDoc)
 	days := func(v *float64) *int {
 		if v == nil {
 			return nil
@@ -534,8 +534,8 @@ func (s *DashboardService) docStatus(ctx context.Context, out *TermAnalytics, ti
 		)
 		SELECT
 		  COUNT(*) FILTER (WHERE p.user_id IS NULL OR p.status = 'pending'
-		                   OR (p.status = 'submitted' AND `+ProfileDocsInSQL("t.ta_id")+` < 3)),
-		  COUNT(*) FILTER (WHERE p.status = 'submitted' AND `+ProfileDocsInSQL("t.ta_id")+` = 3),
+		                   OR (p.status = 'submitted' AND `+ProfileDocsMissingSQL("t.ta_id")+`)),
+		  COUNT(*) FILTER (WHERE p.status = 'submitted' AND `+ProfileDocsCompleteSQL("t.ta_id")+`),
 		  COUNT(*) FILTER (WHERE p.status = 'needs_fix'),
 		  COUNT(*) FILTER (WHERE p.status = 'rejected'),
 		  COUNT(*) FILTER (WHERE p.status = 'approved'),

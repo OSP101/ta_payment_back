@@ -1789,19 +1789,24 @@ func (s *TARequestService) checkTADocs(ctx context.Context, q querier, taID uuid
 	if profileStatus == nil || *profileStatus != "approved" {
 		return fmt.Errorf("%s ยังไม่ผ่านการอนุมัติเอกสารจากเจ้าหน้าที่", name)
 	}
-	// The three required documents must each exist as a current (not superseded)
-	// row with status='approved'. A profile can be approved independently of the
+	// The required documents (three, or four for a foreign TA — see
+	// ta_required_doc_kinds) must each exist as a current (not superseded) row
+	// with status='approved'. A profile can be approved independently of the
 	// documents, so this gate must be checked explicitly (rule C6).
-	var approvedDocKinds int
+	var complete bool
 	if err := q.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT kind) FROM ta_documents
+		SELECT COUNT(DISTINCT kind) = cardinality(ta_required_doc_kinds($1)) FROM ta_documents
 		WHERE user_id = $1 AND superseded_at IS NULL AND status = 'approved'
-		  AND kind IN ('national_id','bank_book','creditor_form')`,
-		taID).Scan(&approvedDocKinds); err != nil {
+		  AND kind = ANY(ta_required_doc_kinds($1))`,
+		taID).Scan(&complete); err != nil {
 		return err
 	}
-	if approvedDocKinds < 3 {
-		return fmt.Errorf("%s ยังมีเอกสารบังคับที่ไม่ครบหรือยังไม่ผ่านการอนุมัติ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)", name)
+	if !complete {
+		kinds, err := requiredDocKindsOf(ctx, q, taID)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%s ยังมีเอกสารบังคับที่ไม่ครบหรือยังไม่ผ่านการอนุมัติ (%s)", name, kindShortList(kinds))
 	}
 	return nil
 }

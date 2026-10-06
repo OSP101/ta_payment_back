@@ -82,15 +82,10 @@ type announceFilter struct {
 var announceFilters = map[string]announceFilter{
 	"ta_missing_documents": {
 		Label: "ยังส่งเอกสารไม่ครบ",
-		// Same three documents the review queue counts (see ProfileDocsInSQL),
-		// so "ยังไม่ครบ" here and on the review screen mean the same thing.
+		// Same documents the review queue counts (see ProfileDocsInSQL), so
+		// "ยังไม่ครบ" here and on the review screen mean the same thing.
 		SQL: `EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role = 'ta')
-		      AND ` + `(
-		        SELECT COUNT(*) FROM ta_documents d
-		         WHERE d.user_id = u.id
-		           AND d.kind IN ('national_id','bank_book','creditor_form')
-		           AND d.superseded_at IS NULL
-		      ) < 3`,
+		      AND ` + ProfileDocsMissingSQL("u.id"),
 	},
 	"ta_missing_schedule": {
 		Label: "ยังไม่กรอกตารางเรียนของตัวเอง",

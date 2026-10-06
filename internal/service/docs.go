@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,8 +64,14 @@ type zipTokenEntry struct {
 
 // DocKinds is the closed set of supporting-document kinds a TA can submit.
 // Kept as a package var so handlers/tests share the same source of truth.
+//
+// Which of them a TA owes depends on nationality: a Thai TA sends the
+// citizen-ID copy (national_id); a foreign TA sends the passport copy
+// (passport) instead — the office's rule, 06/10/2026. The per-user set lives
+// in SQL, ta_required_doc_kinds (0151).
 var DocKinds = map[string]bool{
 	"national_id":   true,
+	"passport":      true,
 	"bank_book":     true,
 	"creditor_form": true,
 }
@@ -181,22 +188,36 @@ type TAProfile struct {
 	StudentID string `json:"student_id" validate:"required"`
 	Prefix    string `json:"prefix" validate:"required,oneof=นาย นาง นางสาว"`
 	Phone     string `json:"phone" validate:"required"`
-	// Sensitive inputs. These arrive in the request, are rendered onto the
-	// creditor-form PDF, and are never written to any table (migration 0047).
-	// GetProfile always returns them empty.
+	// Sensitive inputs. These arrive in the request and are rendered onto the
+	// creditor-form PDF. The ID (0076) and bank fields (0152) are also kept,
+	// encrypted; the signature is never written anywhere. GetProfile always
+	// returns them empty.
 	NationalID string `json:"national_id" validate:"required"`
 	BankName   string `json:"bank_name" validate:"required,max=200"`
 	BankBranch string `json:"bank_branch" validate:"omitempty,max=200"`
 	BranchCode string `json:"branch_code" validate:"omitempty,max=50"`
 	// AccountNo is digit-stripped then length-checked against the selected
 	// bank by validateBank; required here only guards "missing entirely".
-	AccountNo       string  `json:"account_no" validate:"required"`
-	AccountName     string  `json:"account_name" validate:"required,max=200"`
+	AccountNo   string `json:"account_no" validate:"required"`
+	AccountName string `json:"account_name" validate:"required,max=200"`
+	// The address feeds the finance office's Template-Suppliers sheet only
+	// (not the PDF); sealed with the bank fields — see payee.go. The TA types
+	// AddressLine (บ้านเลขที่ หมู่ ถนน) and picks SubDistrictID from the list
+	// in thai_address.go; PostalCode is pre-filled from that pick but may be
+	// changed. Address is the joined line, built by validateProfileInput.
+	AddressLine     string  `json:"address_line" validate:"required,max=500"`
+	SubDistrictID   int     `json:"sub_district_id" validate:"required"`
+	PostalCode      string  `json:"postal_code"`
+	Address         string  `json:"-"`
 	SignatureSVG    string  `json:"signature_svg" validate:"required,max=300000"`
 	SignaturePNGB64 string  `json:"signature_png_b64" validate:"omitempty,max=300000"`
 	Status          string  `json:"status"`
 	CurrentRound    int     `json:"current_round"`
 	RejectReason    *string `json:"reject_reason,omitempty"`
+	// Nationality is output only ("thai" | "foreign"), read from users by
+	// GetProfile so the form knows which ID it asks for. Whatever a client
+	// sends here is ignored: staff set it on the account, not the TA.
+	Nationality string `json:"nationality"`
 }
 
 // AllowedPrefixes are the exact strings the PDF overlay knows how to circle.
@@ -212,16 +233,12 @@ var AllowedPrefixes = map[string]bool{
 // shared by the preview, the confirm, and the profile submit so all three agree
 // on what a complete form is — none of them can rely on a stored copy to fall
 // back on any more.
-func validateProfileInput(in *TAProfile) error {
-	nid := stripNonDigits(in.NationalID)
-	if len(nid) != 13 {
-		return Invalid("เลขบัตรประชาชนต้องเป็นตัวเลข 13 หลัก")
-	}
-	// The 13th digit is a check digit. A single mistyped digit otherwise went
-	// straight onto the creditor form and the transfer cover sent to finance,
-	// and surfaced only as a failed bank transfer weeks later.
-	if !validThaiCitizenID(nid) {
-		return Invalid("เลขบัตรประชาชนไม่ถูกต้อง (หลักตรวจสอบไม่ตรง) กรุณาตรวจสอบอีกครั้ง")
+//
+// foreign switches the ID rule: see validateIDNumber.
+func validateProfileInput(in *TAProfile, foreign bool) error {
+	nid, err := validateIDNumber(in.NationalID, foreign)
+	if err != nil {
+		return err
 	}
 	in.NationalID = nid
 
@@ -234,12 +251,36 @@ func validateProfileInput(in *TAProfile) error {
 		return Invalid("คำนำหน้าต้องเป็น นาย, นาง หรือ นางสาว")
 	}
 	// Phone goes onto the creditor form, so require a dialable TH number:
-	// 9 digits (landline) or 10 (mobile).
+	// 9 digits (landline) or 10 (mobile). A foreign TA may only have a home
+	// number, so theirs may carry a country code: up to 15 digits (E.164).
 	phone := stripNonDigits(in.Phone)
-	if len(phone) != 9 && len(phone) != 10 {
+	if foreign {
+		if len(phone) < 9 || len(phone) > 15 {
+			return Invalid("เบอร์โทรศัพท์ต้องเป็นตัวเลข 9–15 หลัก (ใส่รหัสประเทศได้)")
+		}
+	} else if len(phone) != 9 && len(phone) != 10 {
 		return Invalid("เบอร์โทรศัพท์ต้องเป็นตัวเลข 9–10 หลัก")
 	}
 	in.Phone = phone
+	in.AddressLine = strings.Join(strings.Fields(in.AddressLine), " ")
+	if in.AddressLine == "" {
+		return Invalid("กรุณากรอกบ้านเลขที่")
+	}
+	if len([]rune(in.AddressLine)) > 200 {
+		return Invalid("บ้านเลขที่ หมู่ ถนน ยาวเกิน 200 ตัวอักษร")
+	}
+	sd, ok := LookupSubDistrict(in.SubDistrictID)
+	if !ok {
+		return Invalid("กรุณาเลือกจังหวัด อำเภอ และตำบลจากรายการ")
+	}
+	in.Address = FormatThaiAddress(in.AddressLine, sd)
+	in.PostalCode = stripNonDigits(in.PostalCode)
+	if in.PostalCode == "" {
+		in.PostalCode = sd.Zip
+	}
+	if len(in.PostalCode) != 5 {
+		return Invalid("รหัสไปรษณีย์ต้องเป็นตัวเลข 5 หลัก")
+	}
 	if err := validateBank(*in); err != nil {
 		return err
 	}
@@ -261,8 +302,9 @@ func validateProfileInput(in *TAProfile) error {
 // workflow state only — status, round, timestamps — plus the student id and
 // phone, which live on `users` and are not part of the PDPA-sensitive set.
 //
-// Nothing sensitive is persisted: the national ID, bank details and signature
-// travel to BuildCreditorFormPDF in the same request and end up in the PDF.
+// The signature is never persisted. The national ID (migration 0076) and the
+// bank account + address (migration 0152) are kept encrypted; everything else
+// sensitive travels to BuildCreditorFormPDF in the same request and ends there.
 func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TAProfile) error {
 	// Defense-in-depth: the frontend already blocks this form behind
 	// PdpaConsentModal until /me/pdpa-consent succeeds, so this should be
@@ -276,7 +318,11 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 	} else if !consented {
 		return Forbidden("กรุณายอมรับข้อตกลงการเก็บและใช้ข้อมูลส่วนบุคคล (PDPA) ก่อนบันทึกข้อมูล")
 	}
-	if err := validateProfileInput(&in); err != nil {
+	foreign, err := userIsForeign(ctx, s.pool, userID)
+	if err != nil {
+		return err
+	}
+	if err := validateProfileInput(&in, foreign); err != nil {
 		return err
 	}
 	sid, phone := in.StudentID, in.Phone
@@ -384,6 +430,11 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 	if err := s.storeCitizenID(ctx, tx, userID, in.NationalID); err != nil {
 		return err
 	}
+	// Bank account + address, sealed the same way (migration 0152) for the
+	// finance office's Template-Suppliers sheet.
+	if err := s.storePayee(ctx, tx, userID, in); err != nil {
+		return err
+	}
 
 	// Insert (or upsert) the immutable snapshot for this round. The row is
 	// unique by (user_id, round) so re-saving the same round overwrites the
@@ -435,13 +486,14 @@ func (s *DocsService) GetProfile(ctx context.Context, userID uuid.UUID) (*TAProf
 		// RevealCitizenID for the one function allowed to read it back.
 		`SELECT COALESCE(u.student_id,''), COALESCE(p.prefix,''), COALESCE(u.phone,''),
 		        COALESCE(p.status::text, 'pending'), p.reject_reason, COALESCE(p.current_round, 1),
-		        COALESCE(u.title,''), COALESCE(u.first_name,''), COALESCE(u.last_name,'')
+		        COALESCE(u.title,''), COALESCE(u.first_name,''), COALESCE(u.last_name,''),
+		        u.nationality
 		 FROM users u
 		 LEFT JOIN ta_profiles p ON p.user_id = u.id
 		 WHERE u.id = $1`, userID).Scan(
 		&p.StudentID, &p.Prefix, &p.Phone,
 		&p.Status, &p.RejectReason, &p.CurrentRound,
-		&userTitle, &firstName, &lastName)
+		&userTitle, &firstName, &lastName, &p.Nationality)
 	if err != nil {
 		return nil, err
 	}
@@ -559,6 +611,13 @@ func (s *DocsService) assertMayStoreDocument(ctx context.Context, userID uuid.UU
 func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filename, mime string, size int64, r io.Reader) (uuid.UUID, error) {
 	if !DocKinds[kind] {
 		return uuid.Nil, Invalid("ประเภทเอกสารไม่ถูกต้อง")
+	}
+	// A kind that is valid but not this TA's (a passport from a Thai TA) would
+	// sit outside every completeness count and never be reviewed.
+	if required, err := requiredDocKindsOf(ctx, s.pool, userID); err != nil {
+		return uuid.Nil, err
+	} else if !slices.Contains(required, kind) {
+		return uuid.Nil, Invalid("เอกสารประเภทนี้ไม่ต้องส่งสำหรับบัญชีของท่าน")
 	}
 	// Both rules below live HERE, at the one function every document write goes
 	// through, rather than on individual routes. They used to be enforced only
@@ -952,15 +1011,15 @@ func (s *DocsService) finalizeProfileIfComplete(
 		return false, round, nil
 	}
 
-	var approved int
+	var complete bool
 	if err := tx.QueryRow(ctx, `
-		SELECT COUNT(*) FROM ta_documents
-		 WHERE user_id = $1 AND kind = ANY($2)
+		SELECT COUNT(*) = cardinality(ta_required_doc_kinds($1)) FROM ta_documents
+		 WHERE user_id = $1 AND kind = ANY(ta_required_doc_kinds($1))
 		   AND superseded_at IS NULL AND status = 'approved'`,
-		userID, requiredDocKinds).Scan(&approved); err != nil {
+		userID).Scan(&complete); err != nil {
 		return false, 0, err
 	}
-	if approved < len(requiredDocKinds) {
+	if !complete {
 		return false, round, nil
 	}
 
@@ -1012,18 +1071,22 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 	// document is present AND has cleared review. Require a current (not
 	// superseded) row of each kind sitting at status='approved'.
 	if approve {
-		var approvedRequired int
+		var complete bool
 		if err := tx.QueryRow(ctx, `
-			SELECT COUNT(DISTINCT kind) FROM ta_documents
+			SELECT COUNT(DISTINCT kind) = cardinality(ta_required_doc_kinds($1)) FROM ta_documents
 			WHERE user_id = $1
-			  AND kind IN ('national_id','bank_book','creditor_form')
+			  AND kind = ANY(ta_required_doc_kinds($1))
 			  AND superseded_at IS NULL
 			  AND status = 'approved'`, userID,
-		).Scan(&approvedRequired); err != nil {
+		).Scan(&complete); err != nil {
 			return err
 		}
-		if approvedRequired < 3 {
-			return Invalid("ไม่สามารถอนุมัติได้: เอกสารบังคับยังไม่ครบหรือยังไม่ผ่านการตรวจ (บัตรประชาชน/สมุดบัญชี/แบบฟอร์มเจ้าหนี้)")
+		if !complete {
+			kinds, err := requiredDocKindsOf(ctx, tx, userID)
+			if err != nil {
+				return err
+			}
+			return Invalid("ไม่สามารถอนุมัติได้: เอกสารบังคับยังไม่ครบหรือยังไม่ผ่านการตรวจ (" + kindShortList(kinds) + ")")
 		}
 	}
 
@@ -1094,10 +1157,13 @@ type PendingProfile struct {
 	// purpose: the "อย่าลืมดาวน์โหลด" reminder asks this question, and asking the
 	// quota counter instead made it nag about files already saved in bulk.
 	EverDownloaded bool `json:"ever_downloaded"`
-	// DocsIn is how many of the three required kinds currently have a document.
-	// Only interesting in the incomplete bucket, where it is the whole point:
-	// "2/3" tells the officer whether to nudge or wait.
-	DocsIn int `json:"docs_in"`
+	// DocsIn is how many of the required kinds currently have a document, out
+	// of DocsNeeded (3 for either nationality today). Only interesting in
+	// the incomplete bucket, where it is the whole point: "2/3" tells the
+	// officer whether to nudge or wait.
+	DocsIn     int  `json:"docs_in"`
+	DocsNeeded int  `json:"docs_needed"`
+	Foreign    bool `json:"foreign"`
 }
 
 // ProfileDocsInSQL counts the required documents a TA currently has, as a scalar
@@ -1105,7 +1171,11 @@ type PendingProfile struct {
 // place that decides whether a TA is "ส่งครบ" must use THIS, or the review page
 // and the dashboard card that links to it will disagree about who is waiting.
 //
-// COUNT(*) = 3 is sound as an all-three-present test only because of the partial
+// Compare it with ProfileDocsNeededSQL, never with a literal: a Thai TA owes
+// three documents and so does a foreign TA, but not the same three
+// (ta_required_doc_kinds, 0151).
+//
+// COUNT(*) = needed is sound as an all-present test only because of the partial
 // unique index ta_documents_current_uidx on (user_id, kind) WHERE superseded_at
 // IS NULL — without it, three uploads of the same kind would count as complete.
 //
@@ -1116,9 +1186,25 @@ func ProfileDocsInSQL(userCol string) string {
 	return `(
 		SELECT COUNT(*) FROM ta_documents d
 		WHERE d.user_id = ` + userCol + `
-		  AND d.kind IN ('national_id','bank_book','creditor_form')
+		  AND d.kind = ANY(ta_required_doc_kinds(` + userCol + `))
 		  AND d.superseded_at IS NULL
 	)`
+}
+
+// ProfileDocsNeededSQL is how many documents the TA owes in total; see
+// ProfileDocsInSQL.
+func ProfileDocsNeededSQL(userCol string) string {
+	return `cardinality(ta_required_doc_kinds(` + userCol + `))`
+}
+
+// ProfileDocsCompleteSQL / ProfileDocsMissingSQL are the two comparisons every
+// caller actually wants.
+func ProfileDocsCompleteSQL(userCol string) string {
+	return ProfileDocsInSQL(userCol) + ` = ` + ProfileDocsNeededSQL(userCol)
+}
+
+func ProfileDocsMissingSQL(userCol string) string {
+	return ProfileDocsInSQL(userCol) + ` < ` + ProfileDocsNeededSQL(userCol)
 }
 
 func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingProfile, error) {
@@ -1128,6 +1214,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 	// the LEFT: a TA who never opened the form has no ta_profiles row at all, and
 	// they are exactly the people staff most need to chase.
 	docsIn := ProfileDocsInSQL("u.id")
+	docsNeeded := ProfileDocsNeededSQL("u.id")
 	var where, order string
 	switch bucket {
 	case "approved":
@@ -1142,21 +1229,21 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		// together: staff asked to see how many TAs owe documents at all, and a
 		// TA with no profile row is invisible to any profile-driven query.
 		//
-		// Approved is excluded belt-and-braces: approval requires all three
-		// documents, so docs_in is already 3 for those rows.
+		// Approved is excluded belt-and-braces: approval requires every
+		// document, so docs_in already equals docs_needed for those rows.
 		where = `u.is_active
 			  AND EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role = 'ta')
 			  AND COALESCE(p.status::text, '') <> 'approved'
-			  AND ` + docsIn + ` < 3`
+			  AND ` + ProfileDocsMissingSQL("u.id")
 		// Furthest behind first: 0/3 is a different conversation from 2/3, and
 		// the people who have not started are the ones at risk of being missed.
-		order = docsIn + ` ASC, u.first_name, u.last_name`
+		order = docsNeeded + ` - ` + docsIn + ` DESC, u.first_name, u.last_name`
 	default: // pending
 		// Saving the step-1 profile form is what sets status='submitted', which
 		// happens before a single file is uploaded. Listing on status alone put
 		// TAs with 0 of 3 documents in the review queue, so an officer opened
 		// them only to find nothing to review.
-		where = "p.status IN ('submitted','needs_fix') AND " + docsIn + " = 3"
+		where = "p.status IN ('submitted','needs_fix') AND " + ProfileDocsCompleteSQL("u.id")
 		order = "p.completed_at NULLS LAST"
 	}
 	// LEFT JOIN a subquery on ta_documents so we can surface the retention
@@ -1171,7 +1258,8 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		       COALESCE(p.status::text, 'not_started'),
 		       COALESCE(p.current_round, 1), p.completed_at, p.verified_at,
 		       d.earliest_expires_at, COALESCE(d.all_deleted, FALSE),
-		       COALESCE(dl.used, 0), COALESCE(dl.ever, FALSE), `+docsIn+`
+		       COALESCE(dl.used, 0), COALESCE(dl.ever, FALSE), `+docsIn+`,
+		       COALESCE(`+docsNeeded+`, 0), u.nationality = 'foreign'
 		FROM users u
 		LEFT JOIN ta_profiles p ON p.user_id = u.id
 		LEFT JOIN LATERAL (
@@ -1179,7 +1267,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 			       BOOL_AND(file_deleted_at IS NOT NULL) AS all_deleted
 			FROM ta_documents
 			WHERE user_id = u.id
-			  AND kind IN ('national_id','bank_book','creditor_form')
+			  AND kind = ANY(ta_required_doc_kinds(u.id))
 			  AND superseded_at IS NULL
 			  AND status = 'approved'
 		) d ON TRUE
@@ -1205,7 +1293,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		var completedAt, verifiedAt, earliestExp *time.Time
 		if err := rows.Scan(&p.UserID, &p.FullName, &p.Email, &p.Status, &p.Round,
 			&completedAt, &verifiedAt, &earliestExp, &p.AllFilesDeleted,
-			&p.DownloadsUsed, &p.EverDownloaded, &p.DocsIn); err != nil {
+			&p.DownloadsUsed, &p.EverDownloaded, &p.DocsIn, &p.DocsNeeded, &p.Foreign); err != nil {
 			return nil, err
 		}
 		p.DownloadsLimit = maxDocDownloads
@@ -1304,7 +1392,11 @@ func (s *DocsService) GetHistory(ctx context.Context, userID uuid.UUID) (*Histor
 // tune the hard-coded field positions in internal/pdfgen. Never expose this
 // flag on a public route.
 func (s *DocsService) BuildCreditorFormPDF(ctx context.Context, userID uuid.UUID, in TAProfile, templatePath, fontDir string, grid bool) ([]byte, string, error) {
-	if err := validateProfileInput(&in); err != nil {
+	foreign, err := userIsForeign(ctx, s.pool, userID)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := validateProfileInput(&in, foreign); err != nil {
 		return nil, "", err
 	}
 	var fn, ln, phone, email, studentID string
@@ -1380,6 +1472,67 @@ func (s *DocsService) AttachGeneratedCreditorForm(ctx context.Context, userID uu
 	// (migration 0047). The PDF holds the data and the retention sweep deletes
 	// it on the same clock as every other uploaded document.
 	return s.Upload(ctx, userID, "creditor_form", filename, "application/pdf", int64(len(body)), bytes.NewReader(body))
+}
+
+// validateIDNumber normalises the number for the form's ID box
+// ("เลขบัตรประจำตัวประชาชน/เลขประจำตัวผู้เสียภาษี").
+//
+// A Thai TA gives the citizen ID, returned digits-only. Its 13th digit is a
+// check digit. A single mistyped digit otherwise went straight onto the
+// creditor form and the transfer cover sent to finance, and surfaced only as a
+// failed bank transfer weeks later.
+//
+// A foreign TA gives their passport number (the office, 06/10/2026), which also
+// becomes their PromptPay number on the transfer cover. Returned upper-case,
+// letters and digits only. Formats differ by country, so it is held to a
+// plausible shape only — 6 to 12 characters with at least one digit — and staff
+// check it against the passport copy.
+func validateIDNumber(raw string, foreign bool) (string, error) {
+	if foreign {
+		pp := passportNumber(raw)
+		if len(pp) < 6 || len(pp) > 12 || !strings.ContainsAny(pp, "0123456789") {
+			return "", Invalid("เลข Passport ต้องเป็นตัวอักษรภาษาอังกฤษหรือตัวเลข 6–12 ตัว และมีตัวเลขอย่างน้อย 1 ตัว")
+		}
+		return pp, nil
+	}
+	nid := stripNonDigits(raw)
+	if len(nid) != 13 {
+		return "", Invalid("เลขบัตรประชาชนต้องเป็นตัวเลข 13 หลัก")
+	}
+	if !validThaiCitizenID(nid) {
+		return "", Invalid("เลขบัตรประชาชนไม่ถูกต้อง (หลักตรวจสอบไม่ตรง) กรุณาตรวจสอบอีกครั้ง")
+	}
+	return nid, nil
+}
+
+// passportNumber keeps letters and digits, upper-cased: "ab 123-4567" → "AB1234567".
+func passportNumber(raw string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(raw) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// userIsForeign reports users.nationality = 'foreign'. A missing user reads as
+// Thai; every caller fails on the missing user a line later anyway.
+func userIsForeign(ctx context.Context, q querier, userID uuid.UUID) (bool, error) {
+	var foreign bool
+	err := q.QueryRow(ctx,
+		`SELECT nationality = 'foreign' FROM users WHERE id = $1`, userID).Scan(&foreign)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return foreign, err
+}
+
+// requiredDocKindsOf is ta_required_doc_kinds (0151) for one user.
+func requiredDocKindsOf(ctx context.Context, q querier, userID uuid.UUID) ([]string, error) {
+	var kinds []string
+	err := q.QueryRow(ctx, `SELECT COALESCE(ta_required_doc_kinds($1), '{}')`, userID).Scan(&kinds)
+	return kinds, err
 }
 
 // validThaiCitizenID checks the mod-11 check digit of a 13-digit Thai citizen

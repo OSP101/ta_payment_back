@@ -401,7 +401,8 @@ func (s *ExportService) buildTransferCoverSheets(ctx context.Context, termID uui
 	return sheets, warnings, nil
 }
 
-// fillPromptPay decrypts each row's citizen ID fresh, via the one audited
+// fillPromptPay decrypts each row's citizen ID (passport number for a
+// foreign TA) fresh, via the one audited
 // read path (RevealCitizenID) — called at both Build and Reprint, never
 // cached, so every appearance of the plaintext number is its own trail entry
 // and the number itself never sits in the reprint ledger.
@@ -410,6 +411,9 @@ func (s *ExportService) fillPromptPay(ctx context.Context, actor uuid.UUID, shee
 	for si := range sheets {
 		for ri := range sheets[si].Rows {
 			r := &sheets[si].Rows[ri]
+			// A foreign TA's stored number is their passport number, which the
+			// office uses as their PromptPay number too (06/10/2026) — so the
+			// same reveal fills the cell for both nationalities.
 			plain, err := s.docs.RevealCitizenID(ctx, actor, r.TAID, "ปะหน้าจ่ายตรง")
 			switch {
 			case err == nil:

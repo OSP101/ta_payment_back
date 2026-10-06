@@ -30,6 +30,9 @@ type User struct {
 	StudyLevel         *string   `json:"study_level,omitempty"`
 	StudyYear          *int      `json:"study_year,omitempty"`
 	StudentID          *string   `json:"student_id,omitempty"`
+	// Nationality is "thai" or "foreign" (migration 0151). It decides which ID
+	// a TA gives on the creditor form and which documents they owe.
+	Nationality string `json:"nationality"`
 	Department         *string   `json:"department,omitempty"`
 	IsActive           bool      `json:"is_active"`
 	ProfileComplete    bool      `json:"profile_completed"`
@@ -83,6 +86,8 @@ type CreateUserInput struct {
 	Roles      []string `json:"roles" validate:"required,min=1,dive,oneof=admin staff lecturer ta"`
 	StudyLevel *string  `json:"study_level,omitempty"`
 	StudyYear  *int     `json:"study_year,omitempty" validate:"omitempty,gte=1,lte=8"`
+	// Nationality: "thai" (the default when omitted) or "foreign".
+	Nationality *string `json:"nationality,omitempty" validate:"omitempty,oneof=thai foreign"`
 	// Password is intentionally untagged: Create's own logic (user.go) treats
 	// it as optional (nil/"" → a generated temp password) with a conditional
 	// length check only when it IS supplied — a blanket validate tag can't
@@ -162,11 +167,18 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 		}
 		pwHash = &h
 	}
+	nationality := "thai"
+	if in.Nationality != nil && *in.Nationality != "" {
+		if !validNationality(*in.Nationality) {
+			return nil, Invalid("สัญชาติต้องเป็น ไทย หรือ ต่างชาติ")
+		}
+		nationality = *in.Nationality
+	}
 	id := uuid.New()
 	_, err = tx.Exec(ctx,
-		`INSERT INTO users (id, email, title, first_name, last_name, phone, study_level, study_year, password_hash, must_change_password)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE)`,
-		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.Phone, in.StudyLevel, in.StudyYear, pwHash)
+		`INSERT INTO users (id, email, title, first_name, last_name, phone, study_level, study_year, password_hash, must_change_password, nationality)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10)`,
+		id, strings.ToLower(in.Email), in.Title, in.FirstName, in.LastName, in.Phone, in.StudyLevel, in.StudyYear, pwHash, nationality)
 	if isActiveEmailViolation(err) {
 		return nil, activeEmailConflict(ctx, s.pool, in.Email, id, "สร้างบัญชีใหม่")
 	}
@@ -198,7 +210,7 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 	var avatarAt *time.Time
 	var totpEnabledAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, department, is_active, profile_completed, must_change_password,
+		`SELECT email, title, first_name, last_name, phone, study_level::text, study_year, student_id, nationality, department, is_active, profile_completed, must_change_password,
 		        EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = users.id AND ao.is_active),
 		        -- The executive seat is the source of truth for the title;
 		        -- users.admin_position is a free-text fallback for people
@@ -206,9 +218,9 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 		        COALESCE((SELECT NULLIF(ao.title, '') FROM admin_officers ao WHERE ao.user_id = users.id AND ao.is_active LIMIT 1), NULLIF(admin_position, '')),
 		        avatar_key, avatar_updated_at, totp_enabled_at,
 		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL),
-		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = 1)
-		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(
-		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &totpEnabledAt, &u.RecoveryCodesRemaining, &u.PdpaConsentedAt,
+		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = $2)
+		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id, pdpaConsentVersion).Scan(
+		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Nationality, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &totpEnabledAt, &u.RecoveryCodesRemaining, &u.PdpaConsentedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -551,7 +563,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 	// over a non-unique sort key lets Postgres return tied rows in a different
 	// order per query — the same person could appear on two pages while someone
 	// else appeared on none.
-	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.department, u.is_active, u.profile_completed, u.must_change_password,
+	q := `SELECT u.id, u.email, u.title, u.first_name, u.last_name, u.phone, u.study_level::text, u.study_year, u.student_id, u.nationality, u.department, u.is_active, u.profile_completed, u.must_change_password,
 	             EXISTS (SELECT 1 FROM admin_officers ao WHERE ao.user_id = u.id AND ao.is_active),
 	             COALESCE((SELECT NULLIF(ao.title, '') FROM admin_officers ao WHERE ao.user_id = u.id AND ao.is_active LIMIT 1), NULLIF(u.admin_position, '')),
 	             u.avatar_key, u.avatar_updated_at, u.totp_enabled_at IS NOT NULL
@@ -568,7 +580,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 		var u User
 		var avatarKey *string
 		var avatarAt *time.Time
-		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &u.TOTPEnabled); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Nationality, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &u.TOTPEnabled); err != nil {
 			return nil, 0, err
 		}
 		u.AvatarURL = avatarURL(u.ID, avatarKey, avatarAt)
@@ -660,6 +672,9 @@ type UpdateUserInput struct {
 	StudyLevel *string   `json:"study_level,omitempty" validate:"omitempty,oneof=undergrad master phd"`
 	StudyYear  *int      `json:"study_year,omitempty" validate:"omitempty,gte=1,lte=8"`
 	Roles      *[]string `json:"roles,omitempty" validate:"omitempty,min=1,dive,oneof=admin staff lecturer ta"`
+	// Nationality: "thai" or "foreign". Refused once the TA's profile is
+	// approved — the approved documents were judged against the old set.
+	Nationality *string `json:"nationality,omitempty" validate:"omitempty,oneof=thai foreign"`
 	// AdminPosition: pass "" to clear. Staff/admin only — see the handler gate.
 	AdminPosition *string `json:"admin_position,omitempty" validate:"omitempty,max=200"`
 	// Bank* fields are accepted and ignored (see migration 0047 and Update's
@@ -670,6 +685,8 @@ type UpdateUserInput struct {
 	BranchCode *string `json:"branch_code,omitempty"`
 	AccountNo  *string `json:"account_no,omitempty"`
 }
+
+func validNationality(v string) bool { return v == "thai" || v == "foreign" }
 
 // assertMayManage keeps the admin account out of staff's reach. Staff run the
 // day-to-day user list, but every reversal in this system (unlocking a course,
@@ -781,6 +798,28 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 			sets = append(sets, "study_level=$"+itoa(i)+"::study_level")
 			args = append(args, *in.StudyLevel)
 			i++
+		}
+	}
+	if in.Nationality != nil {
+		if !validNationality(*in.Nationality) {
+			return nil, Invalid("สัญชาติต้องเป็น ไทย หรือ ต่างชาติ")
+		}
+		var cur string
+		var approved bool
+		if err := tx.QueryRow(ctx, `
+			SELECT u.nationality, COALESCE(p.status::text = 'approved', FALSE)
+			  FROM users u LEFT JOIN ta_profiles p ON p.user_id = u.id
+			 WHERE u.id = $1`, id).Scan(&cur, &approved); err != nil {
+			return nil, err
+		}
+		if cur != *in.Nationality {
+			// The approved set was checked as the other nationality's
+			// documents; switching would leave an approved profile missing
+			// documents nobody reviewed.
+			if approved {
+				return nil, Conflict("เอกสารของผู้ช่วยสอนคนนี้อนุมัติแล้ว จึงเปลี่ยนสัญชาติไม่ได้")
+			}
+			add("nationality", *in.Nationality)
 		}
 	}
 	if in.AdminPosition != nil {

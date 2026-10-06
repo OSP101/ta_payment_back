@@ -262,14 +262,15 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 	branch := "partial: payment history retained"
 	if !hasPayment {
 		if _, err := tx.Exec(ctx, `
-			UPDATE ta_profiles SET citizen_id_enc = NULL, citizen_id_last4 = NULL, citizen_id_key_version = NULL
+			UPDATE ta_profiles SET citizen_id_enc = NULL, citizen_id_last4 = NULL, citizen_id_key_version = NULL,
+			                       payee_enc = NULL, payee_key_version = NULL
 			WHERE user_id = $1`, userID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE users SET deleted_at = NOW() WHERE id = $1`, userID); err != nil {
 			return err
 		}
-		branch = "full: no payment history, citizen ID cleared"
+		branch = "full: no payment history, citizen ID and bank/address cleared"
 	}
 
 	if _, err := tx.Exec(ctx, `

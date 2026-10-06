@@ -37,6 +37,7 @@ var auditRedactedColumns = map[string]bool{
 	"password_hash":   true,
 	"totp_secret_enc": true,
 	"citizen_id_enc":  true,
+	"payee_enc":       true,
 	// Recovery codes are login credentials in their own right.
 	"recovery_codes":     true,
 	"recovery_code_hash": true,

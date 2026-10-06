@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 
 	"ta-payment-back/internal/audit"
@@ -127,6 +128,18 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	publicDPH := &DocProgressHandler{Svc: svc}
 	api.Get("/public/document-progress/:linkId", publicDPH.PublicGet)
 	api.Get("/public/document-progress/:linkId/checklist", publicDPH.PublicListChecklist)
+	// Login-page notice cards: the live TA-request deadline and how far the
+	// term's document bundle has travelled. Anonymous, college-wide and
+	// person-free; the service caches for a few seconds, so the 600/min
+	// baseline is the only ceiling it needs.
+	api.Get("/public/login-notices", func(c *fiber.Ctx) error {
+		out, err := svc.PublicNotices.Get(c.Context())
+		if err != nil {
+			return err
+		}
+		c.Set("Cache-Control", "no-store")
+		return c.JSON(out)
+	})
 	api.Post("/auth/logout", authH.Logout)
 
 	// TDBM webhook — called by another SYSTEM, not a signed-in user, so it
@@ -407,6 +420,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/me/data-deletion-request", RequireRole(rbac.RoleTA), ddh.MyRequest)
 	authed.Get("/staff/data-deletion-requests", RequireRole(rbac.RoleAdmin), ddh.ListRequests)
 	authed.Post("/staff/data-deletion-requests/:id/review", RequireRole(rbac.RoleAdmin), ddh.Review)
+	// 333 KB of JSON, ~74 KB gzipped — the one response worth compressing here.
+	authed.Get("/thai-address", compress.New(compress.Config{Level: compress.LevelBestSpeed}), dh.ThaiAddress)
 	authed.Get("/me/documents", RequireRole(rbac.RoleTA), dh.ListDocs)
 	authed.Post("/me/documents", RequireRole(rbac.RoleTA), heavyLimiter, dh.UploadDoc)
 	authed.Get("/me/history", RequireRole(rbac.RoleTA), dh.SelfHistory)
@@ -424,6 +439,9 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/ta-review/:userId/approve-all", adminOrStaff, dh.ApproveAll)
 	authed.Post("/ta-review/:userId/reject-batch", adminOrStaff, dh.RejectBatch)
 	authed.Post("/ta-review/:userId/zip-token", adminOrStaff, dh.MintZipToken)
+	// Finance office Template-Suppliers sheet: the term's new TAs (suppliers.go).
+	authed.Get("/ta-review/suppliers", adminOrStaff, dh.SuppliersPreview)
+	authed.Post("/ta-review/suppliers.xlsx", adminOrStaff, heavyLimiter, dh.SuppliersXLSX)
 	// Bulk: every approved TA's documents merged into one file. Two path
 	// segments, so these never collide with the three-segment ":userId" routes
 	// above — no ordering dependency to get wrong later.
