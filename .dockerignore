@@ -23,3 +23,7 @@
 .DS_Store
 *.log
 docs/
+
+# Local agent worktrees/settings: up to hundreds of MB of other checkouts,
+# never part of a build.
+.claude/

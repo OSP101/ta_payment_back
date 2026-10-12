@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -1118,7 +1119,7 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 				"ข้อมูลส่วนตัวของท่านผ่านการตรวจสอบจากเจ้าหน้าที่แล้ว", "/ta/documents")
 		} else {
 			s.notify.SendAction(ctx, userID, "ข้อมูลส่วนตัวต้องแก้ไข",
-				"ข้อมูลส่วนตัวของท่านยังไม่ผ่านการตรวจสอบ เนื่องจาก "+reason+" กรุณาแก้ไขและส่งข้อมูลใหม่อีกครั้ง",
+				fmt.Sprintf("ข้อมูลส่วนตัวของท่านยังไม่ผ่านการตรวจสอบ เนื่องจาก %s กรุณาแก้ไขและส่งข้อมูลใหม่อีกครั้ง", reason),
 				"/ta/documents")
 		}
 	}

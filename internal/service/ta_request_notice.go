@@ -242,28 +242,33 @@ func (s *TARequestService) sendNotices(ctx context.Context, w noticeWindow, kind
 }
 
 func openNoticeText(w noticeWindow, courses []noticeCourse) (string, string) {
-	title := "เปิดรับคำขอผู้ช่วยสอน " + w.term
-	var b strings.Builder
-	b.WriteString("ด้วยวิทยาลัยการคอมพิวเตอร์ได้เปิดรับคำขอผู้ช่วยสอนสำหรับ" + w.term +
-		" แล้ว โดยกำหนดให้ยื่นคำขอภายใน" + thaiDeadline(w.closesAt) + "\n\n")
-	fmt.Fprintf(&b, "ในภาคการศึกษานี้ ท่านเป็นอาจารย์ผู้สอน จำนวน %d รายวิชา ดังนี้\n", len(courses))
-	b.WriteString(noticeCourseList(courses) + "\n\n")
-	b.WriteString("ทั้งนี้ หากยื่นคำขอภายหลังกำหนด ระบบยังคงรับคำขอ แต่การเบิกจ่ายค่าตอบแทนจะล่าช้ากว่ากำหนด " +
-		"และหากรายวิชาข้างต้นไม่ครบถ้วนหรือไม่ถูกต้อง กรุณาแจ้งเจ้าหน้าที่\n\n")
-	b.WriteString(windowNoticeFooter)
-	return title, b.String()
+	title := fmt.Sprintf("เปิดรับคำขอผู้ช่วยสอน %s", w.term)
+	body := strings.Join([]string{
+		fmt.Sprintf("ด้วยวิทยาลัยการคอมพิวเตอร์ได้เปิดรับคำขอผู้ช่วยสอนสำหรับ%s แล้ว โดยกำหนดให้ยื่นคำขอภายใน%s", w.term, thaiDeadline(w.closesAt)),
+		"",
+		fmt.Sprintf("ในภาคการศึกษานี้ ท่านเป็นอาจารย์ผู้สอน จำนวน %d รายวิชา ดังนี้", len(courses)),
+		noticeCourseList(courses),
+		"",
+		"ทั้งนี้ หากยื่นคำขอภายหลังกำหนด ระบบยังคงรับคำขอ แต่การเบิกจ่ายค่าตอบแทนจะล่าช้ากว่ากำหนด และหากรายวิชาข้างต้นไม่ครบถ้วนหรือไม่ถูกต้อง กรุณาแจ้งเจ้าหน้าที่",
+		"",
+		windowNoticeFooter,
+	}, "\n")
+	return title, body
 }
 
 func closingNoticeText(w noticeWindow, pending []noticeCourse) (string, string) {
-	title := "ใกล้ครบกำหนดยื่นคำขอผู้ช่วยสอน " + w.term
-	var b strings.Builder
-	b.WriteString("ตามที่วิทยาลัยการคอมพิวเตอร์ได้เปิดรับคำขอผู้ช่วยสอนสำหรับ" + w.term +
-		" นั้น จะครบกำหนดยื่นคำขอใน" + thaiDeadline(w.closesAt) + "\n\n")
-	fmt.Fprintf(&b, "ขณะนี้ยังไม่มีคำขอผู้ช่วยสอนสำหรับรายวิชาของท่าน จำนวน %d รายวิชา ดังนี้\n", len(pending))
-	b.WriteString(noticeCourseList(pending) + "\n\n")
-	b.WriteString("ทั้งนี้ หากยื่นคำขอภายหลังกำหนด ระบบยังคงรับคำขอ แต่การเบิกจ่ายค่าตอบแทนจะล่าช้ากว่ากำหนด\n\n")
-	b.WriteString(windowNoticeFooter)
-	return title, b.String()
+	title := fmt.Sprintf("ใกล้ครบกำหนดยื่นคำขอผู้ช่วยสอน %s", w.term)
+	body := strings.Join([]string{
+		fmt.Sprintf("ตามที่วิทยาลัยการคอมพิวเตอร์ได้เปิดรับคำขอผู้ช่วยสอนสำหรับ%s นั้น จะครบกำหนดยื่นคำขอใน%s", w.term, thaiDeadline(w.closesAt)),
+		"",
+		fmt.Sprintf("ขณะนี้ยังไม่มีคำขอผู้ช่วยสอนสำหรับรายวิชาของท่าน จำนวน %d รายวิชา ดังนี้", len(pending)),
+		noticeCourseList(pending),
+		"",
+		"ทั้งนี้ หากยื่นคำขอภายหลังกำหนด ระบบยังคงรับคำขอ แต่การเบิกจ่ายค่าตอบแทนจะล่าช้ากว่ากำหนด",
+		"",
+		windowNoticeFooter,
+	}, "\n")
+	return title, body
 }
 
 // openNoticeLayout is the e-mail form of the open notice: the deadline in the
@@ -319,12 +324,17 @@ func noticeCourseTable(title string, courses []noticeCourse) *MailTable {
 func noticeCourseList(courses []noticeCourse) string {
 	items := make([]string, 0, len(courses))
 	for _, c := range courses {
-		it := c.code + " " + c.name
-		if c.sections > 0 {
-			it += fmt.Sprintf(" จำนวน %d กลุ่มเรียน", c.sections)
-		}
-		if c.requested {
-			it += " (ยื่นคำขอแล้ว)"
+		// One complete format per case, so the English catalog can match it.
+		var it string
+		switch {
+		case c.sections > 0 && c.requested:
+			it = fmt.Sprintf("%s %s จำนวน %d กลุ่มเรียน (ยื่นคำขอแล้ว)", c.code, c.name, c.sections)
+		case c.sections > 0:
+			it = fmt.Sprintf("%s %s จำนวน %d กลุ่มเรียน", c.code, c.name, c.sections)
+		case c.requested:
+			it = fmt.Sprintf("%s %s (ยื่นคำขอแล้ว)", c.code, c.name)
+		default:
+			it = fmt.Sprintf("%s %s", c.code, c.name)
 		}
 		items = append(items, it)
 	}

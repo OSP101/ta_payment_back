@@ -1193,13 +1193,11 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 		return
 	}
 	link := "/ta/courses/" + courseID.String() + "/worklog"
-	body := "อาจารย์ผู้สอนได้เปลี่ยนวิธีแบ่งงบประมาณรายวิชา " + code + " " + nameTH +
-		" เป็นแบบเฉลี่ยให้ได้รับครบทุกเดือน โดยทุกเดือนจะถูกหักเป็นสัดส่วนเท่ากัน " +
-		"ทั้งนี้ ยอดค่าตอบแทนรวมที่ท่านได้รับไม่เปลี่ยนแปลง"
+	body := fmt.Sprintf("อาจารย์ผู้สอนได้เปลี่ยนวิธีแบ่งงบประมาณรายวิชา %s %s เป็นแบบเฉลี่ยให้ได้รับครบทุกเดือน โดยทุกเดือนจะถูกหักเป็นสัดส่วนเท่ากัน "+
+		"ทั้งนี้ ยอดค่าตอบแทนรวมที่ท่านได้รับไม่เปลี่ยนแปลง", code, nameTH)
 	if mode == SettleChronological {
-		body = "อาจารย์ผู้สอนได้เปลี่ยนวิธีแบ่งงบประมาณรายวิชา " + code + " " + nameTH +
-			" กลับเป็นแบบจ่ายตามลำดับเดือนจนกว่างบประมาณจะหมด โดยเดือนต้นภาคการศึกษาจะได้รับเต็มจำนวน " +
-			"และเดือนท้ายภาคการศึกษาอาจไม่ได้รับค่าตอบแทน ทั้งนี้ ยอดค่าตอบแทนรวมที่ท่านได้รับไม่เปลี่ยนแปลง"
+		body = fmt.Sprintf("อาจารย์ผู้สอนได้เปลี่ยนวิธีแบ่งงบประมาณรายวิชา %s %s กลับเป็นแบบจ่ายตามลำดับเดือนจนกว่างบประมาณจะหมด โดยเดือนต้นภาคการศึกษาจะได้รับเต็มจำนวน "+
+			"และเดือนท้ายภาคการศึกษาอาจไม่ได้รับค่าตอบแทน ทั้งนี้ ยอดค่าตอบแทนรวมที่ท่านได้รับไม่เปลี่ยนแปลง", code, nameTH)
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT a.ta_id
@@ -1217,7 +1215,7 @@ func (s *ExportService) notifySettlementModeChanged(ctx context.Context, courseI
 			log.Printf("notifySettlementModeChanged scan %s: %v", courseID, err)
 			return
 		}
-		s.notify.Send(ctx, ta, "วิธีแบ่งงบประมาณรายวิชา "+code+" มีการเปลี่ยนแปลง", body, link)
+		s.notify.Send(ctx, ta, fmt.Sprintf("วิธีแบ่งงบประมาณรายวิชา %s มีการเปลี่ยนแปลง", code), body, link)
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("notifySettlementModeChanged rows %s: %v", courseID, err)
@@ -1291,21 +1289,30 @@ func (s *ExportService) NotifyBudgetShortfall(ctx context.Context, courseID uuid
 	var code, nameTH string
 	_ = s.pool.QueryRow(ctx,
 		`SELECT code, name_th FROM teaching_courses WHERE id = $1`, courseID).Scan(&code, &nameTH)
-	title := "งบประมาณรายวิชาไม่เพียงพอ " + code
+	title := fmt.Sprintf("งบประมาณรายวิชาไม่เพียงพอ %s", code)
 	// Two different sentences: a month paid part of its worth still pays
 	// something, and saying "จะไม่ได้รับค่าตอบแทน" about it would be wrong.
-	var what []string
-	if len(forecast.PartialMonths) > 0 {
-		what = append(what, "เดือน"+strings.Join(thaiMonthLabels(forecast.PartialMonths), ", ")+" จะได้รับค่าตอบแทนไม่เต็มจำนวน")
+	// One complete format per combination, so the English catalog can match
+	// the line whole.
+	partial := strings.Join(thaiMonthLabels(forecast.PartialMonths), ", ")
+	unpaid := strings.Join(thaiMonthLabels(forecast.UnpaidMonths), ", ")
+	short := thaiBaht(forecast.DroppedBaht)
+	var head string
+	switch {
+	case len(forecast.PartialMonths) > 0 && len(forecast.UnpaidMonths) > 0:
+		head = fmt.Sprintf("งบประมาณรายวิชา %s %s ไม่เพียงพอสำหรับการจ่ายค่าตอบแทนทั้งหมด โดยเดือน%s จะได้รับค่าตอบแทนไม่เต็มจำนวน และเดือน%s จะไม่ได้รับค่าตอบแทน "+
+			"ขาดรวมเป็นเงิน %s บาท ผู้ช่วยสอนทุกคนจะถูกหักค่าตอบแทนเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่พึงได้รับ", code, nameTH, partial, unpaid, short)
+	case len(forecast.PartialMonths) > 0:
+		head = fmt.Sprintf("งบประมาณรายวิชา %s %s ไม่เพียงพอสำหรับการจ่ายค่าตอบแทนทั้งหมด โดยเดือน%s จะได้รับค่าตอบแทนไม่เต็มจำนวน "+
+			"ขาดรวมเป็นเงิน %s บาท ผู้ช่วยสอนทุกคนจะถูกหักค่าตอบแทนเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่พึงได้รับ", code, nameTH, partial, short)
+	case len(forecast.UnpaidMonths) > 0:
+		head = fmt.Sprintf("งบประมาณรายวิชา %s %s ไม่เพียงพอสำหรับการจ่ายค่าตอบแทนทั้งหมด โดยเดือน%s จะไม่ได้รับค่าตอบแทน "+
+			"ขาดรวมเป็นเงิน %s บาท ผู้ช่วยสอนทุกคนจะถูกหักค่าตอบแทนเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่พึงได้รับ", code, nameTH, unpaid, short)
+	default:
+		head = fmt.Sprintf("งบประมาณรายวิชา %s %s ไม่เพียงพอสำหรับการจ่ายค่าตอบแทนทั้งหมด โดย "+
+			"ขาดรวมเป็นเงิน %s บาท ผู้ช่วยสอนทุกคนจะถูกหักค่าตอบแทนเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่พึงได้รับ", code, nameTH, short)
 	}
-	if len(forecast.UnpaidMonths) > 0 {
-		what = append(what, "เดือน"+strings.Join(thaiMonthLabels(forecast.UnpaidMonths), ", ")+" จะไม่ได้รับค่าตอบแทน")
-	}
-	body := fmt.Sprintf(
-		"งบประมาณรายวิชา %s %s ไม่เพียงพอสำหรับการจ่ายค่าตอบแทนทั้งหมด โดย%s "+
-			"ขาดรวมเป็นเงิน %s บาท ผู้ช่วยสอนทุกคนจะถูกหักค่าตอบแทนเป็นสัดส่วนเท่ากันตามค่าตอบแทนที่พึงได้รับ\n\n"+
-			"ทั้งนี้ ชั่วโมงปฏิบัติงานยังคงถูกบันทึกไว้ครบถ้วน และอาจารย์ผู้สอนยังคงอนุมัติบันทึกเวลาได้ตามปกติ",
-		code, nameTH, strings.Join(what, " และ"), thaiBaht(forecast.DroppedBaht))
+	body := head + "\n\n" + "ทั้งนี้ ชั่วโมงปฏิบัติงานยังคงถูกบันทึกไว้ครบถ้วน และอาจารย์ผู้สอนยังคงอนุมัติบันทึกเวลาได้ตามปกติ"
 
 	if lects, err := courseLecturerIDs(ctx, s.pool, courseID); err == nil {
 		for _, id := range lects {

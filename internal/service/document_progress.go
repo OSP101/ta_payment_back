@@ -1062,14 +1062,14 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
-	roundNote := ""
+	// One complete format per round, so the English catalog can match it.
+	first := "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนที่รอการลงนามของท่าน ในรายวิชา %s"
 	if round == 2 {
-		roundNote = " ซึ่งเป็นการเบิกจ่ายรอบที่ 2 ของปีงบประมาณใหม่"
+		first = "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนที่รอการลงนามของท่าน ในรายวิชา %s ซึ่งเป็นการเบิกจ่ายรอบที่ 2 ของปีงบประมาณใหม่"
 	}
 	for _, uid := range order {
-		body := "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนที่รอการลงนามของท่าน ในรายวิชา " +
-			strings.Join(byUser[uid], ", ") + roundNote +
-			"\n\nขอให้ท่านลงนามในเอกสารดังกล่าว เพื่อให้สามารถดำเนินการเบิกจ่ายในขั้นตอนต่อไปได้"
+		body := fmt.Sprintf(first, strings.Join(byUser[uid], ", ")) +
+			"\n\n" + "ขอให้ท่านลงนามในเอกสารดังกล่าว เพื่อให้สามารถดำเนินการเบิกจ่ายในขั้นตอนต่อไปได้"
 		s.notify.SendAction(ctx, uid, fmt.Sprintf("เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม รอบที่ %d", round), body, "/document-progress")
 	}
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind",

@@ -192,6 +192,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 
 	authed.Get("/me", authH.Me)
 	authed.Get("/me/data-export", authH.DataExport)
+	authed.Put("/me/preferences", authH.SetPreferences)
 	authed.Post("/me/password", authH.ChangePassword)
 	// Touched by AccountGuard itself (any POST does) — see AuthHandler.Heartbeat
 	// and SessionActivityGuard on the frontend.
@@ -206,6 +207,10 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/me/2fa/enable", mfaH.Enable)
 	authed.Post("/me/2fa/disable", mfaH.Disable)
 	authed.Post("/me/2fa/recovery-codes", mfaH.RegenerateRecoveryCodes)
+
+	// Fails on purpose: proves error reporting works end to end. See
+	// ErrorReportTest.
+	authed.Post("/admin/error-report-test", RequireRole(rbac.RoleAdmin), ErrorReportTest)
 
 	// Users (admin, staff)
 	adminOrStaff := RequireRole(rbac.RoleAdmin, rbac.RoleStaff)

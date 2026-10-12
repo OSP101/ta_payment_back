@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"ta-payment-back/internal/i18n"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -177,6 +178,9 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 		if mustChange &&
 			!isOwnAccountPath(p, "/me") &&
 			!isOwnAccountPath(p, "/me/password") &&
+			// Display preferences only, so the language/theme switch works on
+			// the forced-flow screens too.
+			!isOwnAccountPath(p, "/me/preferences") &&
 			!strings.HasSuffix(p, "/auth/heartbeat") {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "password_change_required"})
 		}
@@ -224,6 +228,7 @@ func AccountGuard(svc *service.Container) fiber.Handler {
 			totpEnabledAt == nil && mfaMandatoryFor(Roles(c), isExecutive)
 		if mustEnroll &&
 			!isOwnAccountPath(p, "/me") &&
+			!isOwnAccountPath(p, "/me/preferences") &&
 			!strings.Contains(p, "/me/2fa/") &&
 			!strings.HasSuffix(p, "/auth/heartbeat") {
 			// strings.Contains, not HasPrefix: demo mounts these same routes
@@ -353,7 +358,8 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 			"method", c.Method(), "route", c.Route().Path,
 			"status", status, "error", err.Error())
 	}
-	return c.Status(status).JSON(fiber.Map{"error": msg})
+	reportServerError(c, err, status)
+	return c.Status(status).JSON(fiber.Map{"error": i18n.T(Locale(c), msg)})
 }
 
 func isDBError(err error) bool {

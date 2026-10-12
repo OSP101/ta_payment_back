@@ -831,10 +831,9 @@ func (s *SubmissionPeriodService) MarkCourseExportedWithFigures(ctx context.Cont
 				// page for every course: a TA whose second course was exported
 				// lost the unread notice about the first.
 				s.notify.Send(ctx, taID,
-					"เจ้าหน้าที่จัดทำเอกสารเบิกจ่ายแล้ว "+code,
-					"เจ้าหน้าที่ได้ตรวจสอบและจัดทำเอกสารเบิกจ่ายค่าตอบแทนรายวิชา "+courseLabelOf(ctx, s.pool, tcID)+
-						" ของท่าน ประจำเดือน"+strings.Join(labels, ", ")+
-						" เรียบร้อยแล้ว บันทึกเวลาปฏิบัติงานของเดือนดังกล่าวจึงถูกล็อกและไม่สามารถแก้ไขได้",
+					fmt.Sprintf("เจ้าหน้าที่จัดทำเอกสารเบิกจ่ายแล้ว %s", code),
+					fmt.Sprintf("เจ้าหน้าที่ได้ตรวจสอบและจัดทำเอกสารเบิกจ่ายค่าตอบแทนรายวิชา %s ของท่าน ประจำเดือน%s เรียบร้อยแล้ว บันทึกเวลาปฏิบัติงานของเดือนดังกล่าวจึงถูกล็อกและไม่สามารถแก้ไขได้",
+						courseLabelOf(ctx, s.pool, tcID), strings.Join(labels, ", ")),
 					"/ta/reminders")
 			}
 		}
@@ -919,9 +918,9 @@ func (s *SubmissionPeriodService) MarkFinanceSent(ctx context.Context, actor, pe
 		_ = s.pool.QueryRow(ctx, `SELECT code FROM teaching_courses WHERE id = $1`, tcID).Scan(&code)
 		_ = s.pool.QueryRow(ctx, `SELECT label FROM submission_periods WHERE id = $1`, periodID).Scan(&month)
 		s.notify.Send(ctx, taID,
-			"ส่งเรื่องเบิกจ่ายไปยังงานการเงินแล้ว "+code,
-			"บันทึกเวลาปฏิบัติงานรายวิชา "+courseLabelOf(ctx, s.pool, tcID)+" ประจำเดือน"+month+
-				" ของท่านได้ถูกส่งไปยังงานการเงินเพื่อดำเนินการเบิกจ่ายเรียบร้อยแล้ว",
+			fmt.Sprintf("ส่งเรื่องเบิกจ่ายไปยังงานการเงินแล้ว %s", code),
+			fmt.Sprintf("บันทึกเวลาปฏิบัติงานรายวิชา %s ประจำเดือน%s ของท่านได้ถูกส่งไปยังงานการเงินเพื่อดำเนินการเบิกจ่ายเรียบร้อยแล้ว",
+				courseLabelOf(ctx, s.pool, tcID), month),
 			"/ta/reminders")
 	}
 	return nil
@@ -1169,22 +1168,36 @@ func (s *SubmissionPeriodService) notifyReopened(ctx context.Context, actor, per
 	}
 	label := courseLabelOf(ctx, s.pool, tcID)
 	code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
-	reissue := ""
-	if prev == "exported" {
-		reissue = " เมื่อแก้ไขและผ่านการตรวจอีกครั้ง เจ้าหน้าที่จะออกเอกสารเบิกจ่ายฉบับแก้ไขแทนฉบับเดิม"
+	// One complete format per sender, and per "a reissued document follows",
+	// so the English catalog can match each notice whole.
+	admin := by == "ผู้ดูแลระบบ"
+	var taBody, lecturerBody string
+	switch {
+	case admin && prev == "exported":
+		taBody = "ผู้ดูแลระบบได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน%s รายวิชา %s กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก %s เมื่อแก้ไขและผ่านการตรวจอีกครั้ง เจ้าหน้าที่จะออกเอกสารเบิกจ่ายฉบับแก้ไขแทนฉบับเดิม"
+	case admin:
+		taBody = "ผู้ดูแลระบบได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน%s รายวิชา %s กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก %s"
+	case prev == "exported":
+		taBody = "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน%s รายวิชา %s กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก %s เมื่อแก้ไขและผ่านการตรวจอีกครั้ง เจ้าหน้าที่จะออกเอกสารเบิกจ่ายฉบับแก้ไขแทนฉบับเดิม"
+	default:
+		taBody = "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน%s รายวิชา %s กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก %s"
 	}
-	s.notify.SendAction(ctx, taID, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month,
-		by+"ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+
-			" กลับมาให้ท่านแก้ไขและส่งอนุมัติอีกครั้ง เนื่องจาก "+reason+reissue,
+	if admin {
+		lecturerBody = "ผู้ดูแลระบบได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน%s ของ %s ผู้ช่วยสอนรายวิชา %s กลับไปให้แก้ไข เมื่อผู้ช่วยสอนส่งใหม่แล้ว ขอให้ท่านอนุมัติอีกครั้ง เนื่องจาก %s"
+	} else {
+		lecturerBody = "เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน%s ของ %s ผู้ช่วยสอนรายวิชา %s กลับไปให้แก้ไข เมื่อผู้ช่วยสอนส่งใหม่แล้ว ขอให้ท่านอนุมัติอีกครั้ง เนื่องจาก %s"
+	}
+	s.notify.SendAction(ctx, taID, fmt.Sprintf("บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข %s %s", code, month),
+		fmt.Sprintf(taBody, month, label, reason),
 		"/ta/courses/"+tcID.String()+"/worklog")
 	if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 		for _, lid := range lects {
 			if lid == actor {
 				continue
 			}
-			s.notify.Send(ctx, lid, "บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข "+code+" "+month+" "+personName(ctx, s.pool, taID),
-				by+"ได้ส่งบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
-					" ผู้ช่วยสอนรายวิชา "+label+" กลับไปให้แก้ไข เมื่อผู้ช่วยสอนส่งใหม่แล้ว ขอให้ท่านอนุมัติอีกครั้ง เนื่องจาก "+reason,
+			ta := personName(ctx, s.pool, taID)
+			s.notify.Send(ctx, lid, fmt.Sprintf("บันทึกเวลาประจำเดือนถูกส่งกลับให้แก้ไข %s %s %s", code, month, ta),
+				fmt.Sprintf(lecturerBody, month, ta, label, reason),
 				"/lecturer/courses/"+tcID.String()+"/reports")
 		}
 	}
@@ -1318,17 +1331,16 @@ func (s *SubmissionPeriodService) RevertFinanceSent(ctx context.Context, actor, 
 	if s.notify != nil {
 		label := courseLabelOf(ctx, s.pool, tcID)
 		code, month := periodNoticeKeys(ctx, s.pool, tcID, periodID)
-		s.notify.Send(ctx, taID, "ยกเลิกสถานะส่งการเงิน "+code+" "+month,
-			"ผู้ดูแลระบบได้ยกเลิกสถานะส่งการเงินของบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" รายวิชา "+label+
-				" ของท่าน กลับเป็นสถานะเจ้าหน้าที่ส่งเอกสารเบิกจ่ายแล้ว เนื่องจาก "+reason+
-				" บันทึกเวลาของเดือนนี้ยังคงถูกล็อก หากต้องแก้ไข เจ้าหน้าที่จะส่งกลับให้ท่านอีกครั้ง",
+		s.notify.Send(ctx, taID, fmt.Sprintf("ยกเลิกสถานะส่งการเงิน %s %s", code, month),
+			fmt.Sprintf("ผู้ดูแลระบบได้ยกเลิกสถานะส่งการเงินของบันทึกเวลาปฏิบัติงานประจำเดือน%s รายวิชา %s ของท่าน กลับเป็นสถานะเจ้าหน้าที่ส่งเอกสารเบิกจ่ายแล้ว เนื่องจาก %s บันทึกเวลาของเดือนนี้ยังคงถูกล็อก หากต้องแก้ไข เจ้าหน้าที่จะส่งกลับให้ท่านอีกครั้ง",
+				month, label, reason),
 			"/ta/reminders")
 		if lects, err := courseLecturerIDs(ctx, s.pool, tcID); err == nil {
 			for _, lid := range lects {
-				s.notify.Send(ctx, lid, "ยกเลิกสถานะส่งการเงิน "+code+" "+month+" "+personName(ctx, s.pool, taID),
-					"ผู้ดูแลระบบได้ยกเลิกสถานะส่งการเงินของบันทึกเวลาปฏิบัติงานประจำเดือน"+month+" ของ "+personName(ctx, s.pool, taID)+
-						" ผู้ช่วยสอนรายวิชา "+label+" กลับเป็นสถานะส่งเอกสารเบิกจ่ายแล้ว เนื่องจาก "+reason+
-						" บันทึกเวลาของเดือนนี้ยังคงถูกล็อก",
+				ta := personName(ctx, s.pool, taID)
+				s.notify.Send(ctx, lid, fmt.Sprintf("ยกเลิกสถานะส่งการเงิน %s %s %s", code, month, ta),
+					fmt.Sprintf("ผู้ดูแลระบบได้ยกเลิกสถานะส่งการเงินของบันทึกเวลาปฏิบัติงานประจำเดือน%s ของ %s ผู้ช่วยสอนรายวิชา %s กลับเป็นสถานะส่งเอกสารเบิกจ่ายแล้ว เนื่องจาก %s บันทึกเวลาของเดือนนี้ยังคงถูกล็อก",
+						month, ta, label, reason),
 					"/lecturer/courses/"+tcID.String()+"/reports")
 			}
 		}
@@ -1575,7 +1587,7 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 			it.label, it.code, it.nm, thaiLongDateISO(it.due))
 		// Code in the title: unread notices fold by (title, link), so a TA in
 		// two courses otherwise kept only the last course's reminder.
-		s.notify.SendAction(ctx, it.taID, "ใกล้ครบกำหนดส่งบันทึกเวลาปฏิบัติงาน "+it.code, body, "/ta/reminders")
+		s.notify.SendAction(ctx, it.taID, fmt.Sprintf("ใกล้ครบกำหนดส่งบันทึกเวลาปฏิบัติงาน %s", it.code), body, "/ta/reminders")
 		_, _ = s.pool.Exec(ctx, `
 			INSERT INTO submission_period_status
 			    (id, submission_period_id, ta_id, teaching_course_id, status, last_reminded_at)

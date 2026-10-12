@@ -215,6 +215,16 @@ type Config struct {
 	// derived from JWTSecret so flipping DEMO_MODE=true needs no new secret
 	// provisioned — see the WARN this logs, same pattern as TADocsEncKey.
 	DemoJWTSecret string
+	// SentryDSN is the GlitchTip project the API reports 5xx errors and
+	// panics to (deploy/docker-compose.yml runs GlitchTip). Empty disables
+	// reporting entirely; see internal/errtrack.
+	SentryDSN string
+	// SentryEnvironment separates test-rollout events from production ones
+	// in the same GlitchTip project. Defaults to APP_ENV.
+	SentryEnvironment string
+	// SentryRelease is the build an event came from — deploy.sh sets it to
+	// the backend repo's short commit hash.
+	SentryRelease string
 	// DemoIdleReclaimDays bounds how long a claimed slot sits untouched
 	// before Manager.Claim is willing to hand it to someone new when every
 	// slot is full — see that function's doc comment. Keeps a fixed-size
@@ -292,7 +302,10 @@ func Load() (Config, error) {
 		RegKKUBaseURL:        env("REG_KKU_BASE_URL", ""),
 		ClamAVAddr:           env("CLAMAV_ADDR", ""),
 		DemoJWTSecret:        env("DEMO_JWT_SECRET", ""),
+		SentryDSN:            strings.TrimSpace(env("SENTRY_DSN", "")),
+		SentryRelease:        strings.TrimSpace(env("SENTRY_RELEASE", "")),
 	}
+	c.SentryEnvironment = env("SENTRY_ENVIRONMENT", c.AppEnv)
 	c.MFAMandatoryEnforced = envBool("MFA_MANDATORY_ENFORCED", true)
 	c.DemoMode = envBool("DEMO_MODE", false)
 	c.DemoMaxWorkspaces = envInt("DEMO_MAX_WORKSPACES", 8)

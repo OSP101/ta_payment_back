@@ -311,7 +311,11 @@ func (s *WorkLogService) LecturerAdjust(ctx context.Context, actor uuid.UUID, pr
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		c := copies[0]
 		s.notify.Send(ctx, ac.TAID,
-			fmt.Sprintf("%sแก้ไขบันทึกเวลา %s วันที่ %s", actorRoleTH(ctx, s.pool, actor, privileged), t.Code, thaiLongDateISO(c.WorkDate)),
+			fmt.Sprintf(byActorRole(actorRoleTH(ctx, s.pool, actor, privileged),
+				"อาจารย์แก้ไขบันทึกเวลา %s วันที่ %s",
+				"เจ้าหน้าที่แก้ไขบันทึกเวลา %s วันที่ %s",
+				"ผู้ดูแลระบบแก้ไขบันทึกเวลา %s วันที่ %s"),
+				t.Code, thaiLongDateISO(c.WorkDate)),
 			fmt.Sprintf("%s ได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s จาก%s (%.2f ชั่วโมง) เป็น%s (%.2f ชั่วโมง) เนื่องจาก %s",
 				actorName, t.Label(), thaiLongDateISO(c.WorkDate),
 				thaiTimeRange(c.StartTime, c.EndTime), c.Hours, thaiTimeRange(start, end), in.Hours,
@@ -360,7 +364,11 @@ func (s *WorkLogService) LecturerCut(ctx context.Context, actor uuid.UUID, privi
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		c := copies[0]
 		s.notify.Send(ctx, ac.TAID,
-			fmt.Sprintf("%sตัดบันทึกเวลาออก %s วันที่ %s", actorRoleTH(ctx, s.pool, actor, privileged), t.Code, thaiLongDateISO(c.WorkDate)),
+			fmt.Sprintf(byActorRole(actorRoleTH(ctx, s.pool, actor, privileged),
+				"อาจารย์ตัดบันทึกเวลาออก %s วันที่ %s",
+				"เจ้าหน้าที่ตัดบันทึกเวลาออก %s วันที่ %s",
+				"ผู้ดูแลระบบตัดบันทึกเวลาออก %s วันที่ %s"),
+				t.Code, thaiLongDateISO(c.WorkDate)),
 			fmt.Sprintf("%s ได้ตัดบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s (%.2f ชั่วโมง) ออกจากการเบิก เนื่องจาก %s",
 				actorName, t.Label(), thaiLongDateISO(c.WorkDate),
 				thaiTimeRange(c.StartTime, c.EndTime), c.Hours, strings.TrimSpace(reason)),

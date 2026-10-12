@@ -13,7 +13,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
-	"github.com/gofiber/fiber/v2/middleware/recover"
 	pdfcpu "github.com/pdfcpu/pdfcpu/pkg/api"
 
 	"ta-payment-back/internal/audit"
@@ -21,6 +20,7 @@ import (
 	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/db"
 	"ta-payment-back/internal/demo"
+	"ta-payment-back/internal/errtrack"
 	"ta-payment-back/internal/handler"
 	"ta-payment-back/internal/mail"
 	"ta-payment-back/internal/pii"
@@ -94,6 +94,19 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	initLogging(cfg.AppEnv)
+	// Before anything else can fail at request time. A no-op without
+	// SENTRY_DSN; see internal/errtrack for what an event does and does not
+	// carry.
+	if err := errtrack.Init(errtrack.Options{
+		DSN:         cfg.SentryDSN,
+		Environment: cfg.SentryEnvironment,
+		Release:     cfg.SentryRelease,
+	}); err != nil {
+		// A typo in the DSN must not keep the API down; it only costs the
+		// error reports, and this line says so.
+		slog.Error("errtrack init failed, continuing without error reporting", "error", err)
+	}
+	defer errtrack.Flush(5 * time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -210,12 +223,14 @@ func main() {
 		// being passed through.
 		EnableIPValidation: true,
 	})
-	app.Use(recover.New())
+	app.Use(handler.Recover())
 	// Order matters. RequestID is first so that everything below it — including
 	// a panic recovered above, and the access log's own line — can name the
 	// request. AccessLog wraps the rest so its duration covers the real work.
 	app.Use(handler.RequestID())
 	app.Use(handler.AccessLog())
+	app.Use(handler.TranslateErrors())
+	app.Use(handler.TranslateFields())
 	app.Use(helmet.New(helmet.Config{
 		ContentTypeNosniff: "nosniff",
 		XFrameOptions:      "SAMEORIGIN",

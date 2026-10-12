@@ -175,62 +175,76 @@ func (s *TARequestService) lecturerDigestText(ctx context.Context, fresh, pendin
 	}
 	// The TAs are in the title: unread notices fold by (title, link), and a
 	// second submission for the course would otherwise overwrite this one.
-	who := " (" + strings.Join(names, ", ") + ")"
+	who := strings.Join(names, ", ")
 
-	withNote := func(line, note string) string {
+	// Every line is one complete format, with and without the clash note, so
+	// the English catalog can match it whole.
+	withNote := func(plain, noted string, note string, args ...any) string {
 		if note == "" {
-			return line
+			return fmt.Sprintf(plain, args...)
 		}
-		return line + " " + note
+		return fmt.Sprintf(noted, append(args, note)...)
 	}
 
 	// One TA and nothing else to say: the plain notice it always was.
 	if len(fresh) == 1 && len(pending) == 0 && !followUp {
 		d := fresh[0]
 		if d.status == "approved" {
-			return "คำขอผู้ช่วยสอนได้รับการอนุมัติ " + code + who,
-				withNote(fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนได้รับการอนุมัติเรียบร้อยแล้ว", label, d.taName), d.note)
+			return fmt.Sprintf("คำขอผู้ช่วยสอนได้รับการอนุมัติ %s (%s)", code, who),
+				withNote("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนได้รับการอนุมัติเรียบร้อยแล้ว",
+					"ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนได้รับการอนุมัติเรียบร้อยแล้ว %s",
+					d.note, label, d.taName)
 		}
-		return "คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ " + code + who,
-			withNote(fmt.Sprintf("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนไม่ผ่านการอนุมัติ เนื่องจาก %s", label, d.taName, d.reason), d.note)
+		return fmt.Sprintf("คำขอผู้ช่วยสอนไม่ผ่านการอนุมัติ %s (%s)", code, who),
+			withNote("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนไม่ผ่านการอนุมัติ เนื่องจาก %s",
+				"ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบแล้ว คำขอแต่งตั้ง %s เป็นผู้ช่วยสอนไม่ผ่านการอนุมัติ เนื่องจาก %s %s",
+				d.note, label, d.taName, d.reason)
 	}
 
 	var approved, rejected, waiting []string
 	for _, d := range fresh {
 		if d.status == "approved" {
-			approved = append(approved, withNote(d.taName, d.note))
+			approved = append(approved, withNote("%s", "%s %s", d.note, d.taName))
 		} else {
-			rejected = append(rejected, withNote(d.taName+" เนื่องจาก "+d.reason, d.note))
+			rejected = append(rejected, withNote("%s เนื่องจาก %s", "%s เนื่องจาก %s %s", d.note, d.taName, d.reason))
 		}
 	}
 	for _, d := range pending {
-		waiting = append(waiting, d.taName+" รอผู้ช่วยสอนบันทึกตารางเรียน")
+		waiting = append(waiting, fmt.Sprintf("%s รอผู้ช่วยสอนบันทึกตารางเรียน", d.taName))
 	}
 
-	when := ""
-	if !sent.IsZero() {
-		when = " เมื่อวันที่ " + thaiLongDateTime(sent)
-	}
 	var b strings.Builder
-	title := "ผลการพิจารณาคำขอผู้ช่วยสอน " + code + who
+	title := fmt.Sprintf("ผลการพิจารณาคำขอผู้ช่วยสอน %s (%s)", code, who)
+	// The intro names the day of the submission when it is known: one format
+	// for each case, with and without that date.
+	intro := func(plain, dated string) {
+		if sent.IsZero() {
+			b.WriteString(fmt.Sprintf(plain, label))
+			return
+		}
+		b.WriteString(fmt.Sprintf(dated, label, thaiLongDateTime(sent)))
+	}
 	switch {
 	case followUp:
-		title = "ผลการพิจารณาคำขอผู้ช่วยสอนเพิ่มเติม " + code + who
-		fmt.Fprintf(&b, "ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s%s และระบบได้แจ้งผลการพิจารณาบางส่วนไปแล้วนั้น บัดนี้ระบบได้พิจารณาผู้ช่วยสอนเพิ่มเติมแล้ว ผลการพิจารณามีดังนี้", label, when)
+		title = fmt.Sprintf("ผลการพิจารณาคำขอผู้ช่วยสอนเพิ่มเติม %s (%s)", code, who)
+		intro("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s และระบบได้แจ้งผลการพิจารณาบางส่วนไปแล้วนั้น บัดนี้ระบบได้พิจารณาผู้ช่วยสอนเพิ่มเติมแล้ว ผลการพิจารณามีดังนี้",
+			"ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s เมื่อวันที่ %s และระบบได้แจ้งผลการพิจารณาบางส่วนไปแล้วนั้น บัดนี้ระบบได้พิจารณาผู้ช่วยสอนเพิ่มเติมแล้ว ผลการพิจารณามีดังนี้")
 	case len(pending) > 0:
-		fmt.Fprintf(&b, "ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s%s นั้น ครบ 24 ชั่วโมงแล้วแต่ยังพิจารณาไม่ครบทุกคน ระบบจึงขอสรุปผลการพิจารณาเท่าที่ทราบในขณะนี้ ดังนี้", label, when)
+		intro("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ครบ 24 ชั่วโมงแล้วแต่ยังพิจารณาไม่ครบทุกคน ระบบจึงขอสรุปผลการพิจารณาเท่าที่ทราบในขณะนี้ ดังนี้",
+			"ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s เมื่อวันที่ %s นั้น ครบ 24 ชั่วโมงแล้วแต่ยังพิจารณาไม่ครบทุกคน ระบบจึงขอสรุปผลการพิจารณาเท่าที่ทราบในขณะนี้ ดังนี้")
 	default:
-		fmt.Fprintf(&b, "ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s%s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขของผู้ช่วยสอนเป็นรายบุคคลครบทุกคนแล้ว ผลการพิจารณามีดังนี้", label, when)
+		intro("ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขของผู้ช่วยสอนเป็นรายบุคคลครบทุกคนแล้ว ผลการพิจารณามีดังนี้",
+			"ตามที่ท่านได้ยื่นคำขอผู้ช่วยสอนสำหรับรายวิชา %s เมื่อวันที่ %s นั้น ระบบได้ตรวจสอบคุณสมบัติและเงื่อนไขของผู้ช่วยสอนเป็นรายบุคคลครบทุกคนแล้ว ผลการพิจารณามีดังนี้")
 	}
 	section := func(head string, lines []string) {
 		if len(lines) == 0 {
 			return
 		}
-		fmt.Fprintf(&b, "\n\n%s %d คน\n%s", head, len(lines), numberedLines(lines))
+		b.WriteString("\n\n" + fmt.Sprintf(head, len(lines)) + "\n" + numberedLines(lines))
 	}
-	section("ได้รับการอนุมัติ", approved)
-	section("ไม่ผ่านการอนุมัติ", rejected)
-	section("อยู่ระหว่างพิจารณา", waiting)
+	section("ได้รับการอนุมัติ %d คน", approved)
+	section("ไม่ผ่านการอนุมัติ %d คน", rejected)
+	section("อยู่ระหว่างพิจารณา %d คน", waiting)
 	if len(waiting) > 0 {
 		b.WriteString("\n\nระบบจะพิจารณาผู้ช่วยสอนที่รอตารางเรียนให้อัตโนมัติเมื่อบันทึกตารางเรียนแล้ว และจะแจ้งผลให้ท่านทราบอีกครั้ง")
 	}

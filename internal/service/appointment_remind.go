@@ -149,9 +149,9 @@ func nilIfEmpty(ids []uuid.UUID) []uuid.UUID {
 // timetableReminderContent is the notice: the plain body for the bell, and the
 // e-mail layout with the waiting courses as a table.
 func timetableReminderContent(term string, courses []waitingCourse) (string, string, MailLayout) {
-	title := "กรุณาบันทึกตารางเรียน " + term
+	title := fmt.Sprintf("กรุณาบันทึกตารางเรียน %s", term)
 	intro := fmt.Sprintf("ขณะนี้มีคำขอแต่งตั้งผู้ช่วยสอน จำนวน %d รายวิชา ที่ระบุชื่อท่านเป็นผู้ช่วยสอน "+
-		"แต่ยังพิจารณาไม่ได้ เนื่องจากท่านยังไม่ได้บันทึกตารางเรียนของ%s ในระบบ", len(courses), term)
+		"แต่ยังพิจารณาไม่ได้ เนื่องจากท่านยังไม่ได้บันทึกตารางเรียนของ%s ในระบบ ดังนี้", len(courses), term)
 	after := "ขอให้ท่านบันทึกตารางเรียนของภาคการศึกษานี้ให้ครบถ้วน เมื่อบันทึกแล้ว ระบบจะพิจารณาคำขอโดยอัตโนมัติ " +
 		"ทั้งนี้ จนกว่าคำขอจะได้รับการอนุมัติ ท่านจะยังไม่มีชื่อในคำสั่งแต่งตั้งผู้ช่วยสอน และยังบันทึกเวลาปฏิบัติงานไม่ได้"
 
@@ -168,9 +168,9 @@ func timetableReminderContent(term string, courses []waitingCourse) (string, str
 		}
 		lines = append(lines, line)
 	}
-	body := intro + " ดังนี้\n" + numberedLines(lines) + "\n\n" + after
+	body := intro + "\n" + numberedLines(lines) + "\n\n" + after
 	return title, body, MailLayout{
-		Intro:       intro + " ดังนี้",
+		Intro:       intro,
 		Table:       table,
 		After:       after,
 		ButtonLabel: "บันทึกตารางเรียน",

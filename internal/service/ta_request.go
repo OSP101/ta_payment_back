@@ -873,7 +873,7 @@ func (s *TARequestService) notifyTAsCancelled(ctx context.Context, reqID uuid.UU
 		return
 	}
 	for _, taID := range tas {
-		s.notify.Send(ctx, taID, "ยกเลิกการแต่งตั้งผู้ช่วยสอน "+code,
+		s.notify.Send(ctx, taID, fmt.Sprintf("ยกเลิกการแต่งตั้งผู้ช่วยสอน %s", code),
 			fmt.Sprintf("อาจารย์ผู้สอนรายวิชา %s %s ได้ยกเลิกคำขอผู้ช่วยสอนที่ระบุชื่อท่านแล้ว ท่านจึงไม่ต้องปฏิบัติงานและไม่สามารถบันทึกเวลาปฏิบัติงานของรายวิชานี้ได้", code, nameTH),
 			"/ta")
 	}
@@ -1148,7 +1148,7 @@ func (s *TARequestService) notifyTAsDecision(ctx context.Context, reqID uuid.UUI
 		if err := rows.Scan(&taID); err != nil {
 			return
 		}
-		s.notify.Send(ctx, taID, "คำขอแต่งตั้งผู้ช่วยสอนไม่ผ่านการอนุมัติ "+code,
+		s.notify.Send(ctx, taID, fmt.Sprintf("คำขอแต่งตั้งผู้ช่วยสอนไม่ผ่านการอนุมัติ %s", code),
 			fmt.Sprintf("คำขอผู้ช่วยสอนรายวิชา %s %s ซึ่งระบุชื่อท่านเป็นผู้ช่วยสอน ไม่ผ่านการอนุมัติ เนื่องจาก %s", code, nameTH, reason), "/ta")
 	}
 	if err := rows.Err(); err != nil {
@@ -2689,10 +2689,31 @@ func (s *TARequestService) notifyFiledOnBehalf(ctx context.Context, actor, lectu
 	}
 	code, name := s.courseLabel(ctx, courseID)
 	officer := personName(ctx, s.pool, actor)
-	s.notify.Send(ctx, lecturerID,
-		fmt.Sprintf("เจ้าหน้าที่%sแทนท่าน รายวิชา %s", what, code),
-		fmt.Sprintf("%s ได้%sรายวิชา %s %s แทนท่าน ท่านตรวจสอบรายละเอียดได้ที่หน้าคำขอผู้ช่วยสอนของรายวิชา", officer, what, code, name),
+	title := fmt.Sprintf("เจ้าหน้าที่%sแทนท่าน รายวิชา %s", what, code)
+	body := fmt.Sprintf("%s ได้%sรายวิชา %s %s แทนท่าน ท่านตรวจสอบรายละเอียดได้ที่หน้าคำขอผู้ช่วยสอนของรายวิชา", officer, what, code, name)
+	if text, ok := filedOnBehalfText[what]; ok {
+		title = fmt.Sprintf(text[0], code)
+		body = fmt.Sprintf(text[1], officer, code, name)
+	}
+	s.notify.Send(ctx, lecturerID, title, body,
 		"/lecturer/courses/"+courseID.String()+"/request")
+}
+
+// filedOnBehalfText is the title and body format of notifyFiledOnBehalf, one
+// complete sentence per action so the English catalog can match it whole.
+var filedOnBehalfText = map[string][2]string{
+	"ส่งคำขอผู้ช่วยสอน": {
+		"เจ้าหน้าที่ส่งคำขอผู้ช่วยสอนแทนท่าน รายวิชา %s",
+		"%s ได้ส่งคำขอผู้ช่วยสอนรายวิชา %s %s แทนท่าน ท่านตรวจสอบรายละเอียดได้ที่หน้าคำขอผู้ช่วยสอนของรายวิชา",
+	},
+	"ยกเลิกคำขอผู้ช่วยสอน": {
+		"เจ้าหน้าที่ยกเลิกคำขอผู้ช่วยสอนแทนท่าน รายวิชา %s",
+		"%s ได้ยกเลิกคำขอผู้ช่วยสอนรายวิชา %s %s แทนท่าน ท่านตรวจสอบรายละเอียดได้ที่หน้าคำขอผู้ช่วยสอนของรายวิชา",
+	},
+	"เพิ่ม section ในคำขอผู้ช่วยสอน": {
+		"เจ้าหน้าที่เพิ่ม section ในคำขอผู้ช่วยสอนแทนท่าน รายวิชา %s",
+		"%s ได้เพิ่ม section ในคำขอผู้ช่วยสอนรายวิชา %s %s แทนท่าน ท่านตรวจสอบรายละเอียดได้ที่หน้าคำขอผู้ช่วยสอนของรายวิชา",
+	},
 }
 
 // assertRequestWindowOpened refuses a new TA request for a term staff have not

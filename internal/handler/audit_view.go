@@ -62,11 +62,19 @@ func auditQueryFrom(c *fiber.Ctx) (service.AuditQuery, error) {
 // with its wording, category, severity and outcome. The screen used to carry
 // its own copy of this, which is how the two drifted.
 func (h *AuditHandler) Catalog(c *fiber.Ctx) error {
+	cats, actions := audit.Categories(), audit.Catalog()
+	localizeFields(Locale(c), &cats, "label")
+	localizeFields(Locale(c), &actions, "label")
 	return c.JSON(fiber.Map{
-		"categories": audit.Categories(),
-		"actions":    audit.Catalog(),
+		"categories": cats,
+		"actions":    actions,
 	})
 }
+
+// auditWordingFields are the derived, descriptive fields of the audit views —
+// translated for English readers. Names, addresses and stored values are not
+// in the list.
+var auditWordingFields = []string{"label", "category_label", "device", "network", "details", "reason", "title", "summary", "message"}
 
 // Sessions lists who is signed in right now, on what and from where.
 func (h *AuditHandler) Sessions(c *fiber.Ctx) error {
