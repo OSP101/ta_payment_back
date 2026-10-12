@@ -917,11 +917,11 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 	for taID, lines := range notices {
 		// A notice made only of restorations (restoreFromClash) is good news
 		// and must not arrive under a "ทับซ้อน" headline.
-		title := "ตารางเรียนของท่านทับซ้อนกับคาบสอน " + code
-		body := fmt.Sprintf("ระบบพบว่าตารางเรียนของท่านทับซ้อนกับคาบสอนของรายวิชา %s ดังนี้\n%s", label, strings.Join(lines, "\n"))
+		title := fmt.Sprintf("ตารางเรียนของท่านทับซ้อนกับคาบสอน %s", code)
+		body := fmt.Sprintf("ระบบพบว่าตารางเรียนของท่านทับซ้อนกับคาบสอนของรายวิชา %s ดังนี้", label) + "\n" + strings.Join(lines, "\n")
 		if allRestoreLines(lines) {
-			title = "คืนสิทธิ์ผู้ช่วยสอน " + code
-			body = fmt.Sprintf("ตารางเรียนของท่านไม่ทับซ้อนกับคาบสอนของรายวิชา %s แล้ว\n%s", label, strings.Join(lines, "\n"))
+			title = fmt.Sprintf("คืนสิทธิ์ผู้ช่วยสอน %s", code)
+			body = fmt.Sprintf("ตารางเรียนของท่านไม่ทับซ้อนกับคาบสอนของรายวิชา %s แล้ว", label) + "\n" + strings.Join(lines, "\n")
 		}
 		s.notify.Send(ctx, taID,
 			// Code in the title: unread notices fold by (title, link), and a
@@ -945,12 +945,12 @@ func (s *TARequestService) notifyClashOutcome(ctx context.Context, reqID uuid.UU
 	}
 	// The TA is in the title too: a course holds one request per TA (0149),
 	// and the code alone would fold one TA's notice into another's.
-	who := " (" + strings.Join(names, ", ") + ")"
-	lecTitle := "ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน " + code + who
-	lecBody := fmt.Sprintf("ระบบพบว่าผู้ช่วยสอนในคำขอรายวิชา %s มีตารางเรียนทับซ้อนกับคาบสอน ดังนี้\n%s", label, numberedLines(summary))
+	who := strings.Join(names, ", ")
+	lecTitle := fmt.Sprintf("ผู้ช่วยสอนบางรายมีตารางเรียนทับซ้อนกับคาบสอน %s (%s)", code, who)
+	lecBody := fmt.Sprintf("ระบบพบว่าผู้ช่วยสอนในคำขอรายวิชา %s มีตารางเรียนทับซ้อนกับคาบสอน ดังนี้", label) + "\n" + numberedLines(summary)
 	if allRestoreLines(summary) {
-		lecTitle = "คืนสิทธิ์ผู้ช่วยสอน " + code + who
-		lecBody = fmt.Sprintf("ผู้ช่วยสอนในคำขอรายวิชา %s แก้ตารางเรียนแล้ว ระบบคืนสิทธิ์ให้ ดังนี้\n%s", label, numberedLines(summary))
+		lecTitle = fmt.Sprintf("คืนสิทธิ์ผู้ช่วยสอน %s (%s)", code, who)
+		lecBody = fmt.Sprintf("ผู้ช่วยสอนในคำขอรายวิชา %s แก้ตารางเรียนแล้ว ระบบคืนสิทธิ์ให้ ดังนี้", label) + "\n" + numberedLines(summary)
 	}
 	s.notify.Send(ctx, lecturerID,
 		lecTitle,

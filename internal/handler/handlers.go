@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"ta-payment-back/internal/i18n"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -2607,6 +2608,14 @@ func (h *NotifyHandler) List(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// Stored in Thai (the same text went out by e-mail); shown in the
+	// reader's language.
+	if loc := Locale(c); loc != "th" {
+		for i := range out {
+			out[i].Title = i18n.T(loc, out[i].Title)
+			out[i].Body = i18n.T(loc, out[i].Body)
+		}
+	}
 	return c.JSON(out)
 }
 
@@ -3929,6 +3938,7 @@ func (h *AuditHandler) List(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	localizeFields(Locale(c), &items, auditWordingFields...)
 
 	// Looking someone up in the audit trail is itself an act worth recording —
 	// the trail's own blind spot is the person reading it. Only TARGETED
@@ -3987,6 +3997,7 @@ func (h *AuditHandler) Summary(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	localizeFields(Locale(c), sum, auditWordingFields...)
 	return c.JSON(sum)
 }
 

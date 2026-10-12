@@ -96,3 +96,16 @@ func thaiBaht(v float64) string {
 	}
 	return b.String()
 }
+
+// byActorRole picks, from one format written per role, the one for who — the
+// word actorRoleTH returned. Each notice is then one whole sentence the
+// English catalog can match, rather than a role glued onto a fragment.
+func byActorRole(who, lecturer, staff, admin string) string {
+	switch who {
+	case "เจ้าหน้าที่":
+		return staff
+	case "ผู้ดูแลระบบ":
+		return admin
+	}
+	return lecturer
+}

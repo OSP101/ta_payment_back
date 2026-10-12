@@ -1302,8 +1302,8 @@ func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid
 				openNotice = append(openNotice, l.ID)
 				continue
 			}
-			s.notify.SendLaidOut(ctx, l.ID, "ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอน "+code,
-				"ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอนรายวิชา "+code+" "+name+" ในระบบแล้ว", link, false,
+			s.notify.SendLaidOut(ctx, l.ID, fmt.Sprintf("ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอน %s", code),
+				fmt.Sprintf("ท่านได้รับการเพิ่มชื่อเป็นอาจารย์ผู้สอนรายวิชา %s %s ในระบบแล้ว", code, name), link, false,
 				MailLayout{Guides: lecturerStartGuides})
 		}
 		if len(openNotice) > 0 {
@@ -1313,8 +1313,8 @@ func (s *TeachingService) ReplaceLecturers(ctx context.Context, actor, tcID uuid
 		}
 		for _, l := range before {
 			if !afterIDs[l.ID] {
-				s.notify.Send(ctx, l.ID, "ชื่อของท่านถูกนำออกจากอาจารย์ผู้สอน "+code,
-					"ชื่อของท่านได้ถูกนำออกจากรายชื่ออาจารย์ผู้สอนรายวิชา "+code+" "+name+" ในระบบแล้ว", "/lecturer")
+				s.notify.Send(ctx, l.ID, fmt.Sprintf("ชื่อของท่านถูกนำออกจากอาจารย์ผู้สอน %s", code),
+					fmt.Sprintf("ชื่อของท่านได้ถูกนำออกจากรายชื่ออาจารย์ผู้สอนรายวิชา %s %s ในระบบแล้ว", code, name), "/lecturer")
 			}
 		}
 	}
@@ -2622,7 +2622,7 @@ func (s *TeachingService) DeleteMakeup(ctx context.Context, actor, sectionID, ma
 		for _, taID := range notifyTargets {
 			// Code in the title: unread notices fold by (title, link) and "/ta"
 			// is shared by every course.
-			s.notify.Send(ctx, taID, strings.TrimSpace("อาจารย์ผู้สอนยกเลิกวันสอนชดเชย "+code), body, "/ta")
+			s.notify.Send(ctx, taID, strings.TrimSpace(fmt.Sprintf("อาจารย์ผู้สอนยกเลิกวันสอนชดเชย %s", code)), body, "/ta")
 		}
 	}
 	return nil

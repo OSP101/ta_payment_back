@@ -99,15 +99,15 @@ func (s *DocsService) notifyReviewResult(ctx context.Context, userID uuid.UUID, 
 		switch v.Status {
 		case "approved":
 			passed++
-			lines = append(lines, label+": ผ่าน")
+			lines = append(lines, fmt.Sprintf("%s: ผ่าน", label))
 			rows = append(rows, []string{label, "ผ่าน", "-"})
 		case "rejected", "needs_fix":
 			failed++
-			lines = append(lines, label+": ไม่ผ่าน เนื่องจาก "+v.Reason)
+			lines = append(lines, fmt.Sprintf("%s: ไม่ผ่าน เนื่องจาก %s", label, v.Reason))
 			rows = append(rows, []string{label, "ไม่ผ่าน", v.Reason})
 		default:
 			missing++
-			lines = append(lines, label+": ยังไม่ได้ส่ง")
+			lines = append(lines, fmt.Sprintf("%s: ยังไม่ได้ส่ง", label))
 			rows = append(rows, []string{label, "ยังไม่ได้ส่ง", "กรุณาอัปโหลดในระบบ"})
 		}
 	}
@@ -121,7 +121,7 @@ func (s *DocsService) notifyReviewResult(ctx context.Context, userID uuid.UUID, 
 		title := fmt.Sprintf("เอกสารผ่านการตรวจสอบครบทั้ง %d รายการ", passed)
 		intro := "เจ้าหน้าที่ได้ตรวจสอบเอกสารประกอบการเบิกจ่ายของท่านแล้ว เอกสารผ่านการตรวจสอบครบทุกรายการ"
 		if profileApproved {
-			intro += " และข้อมูลส่วนตัวของท่านได้รับการอนุมัติแล้ว ท่านสามารถใช้งานเมนูอื่นของระบบได้ทันที"
+			intro = "เจ้าหน้าที่ได้ตรวจสอบเอกสารประกอบการเบิกจ่ายของท่านแล้ว เอกสารผ่านการตรวจสอบครบทุกรายการ และข้อมูลส่วนตัวของท่านได้รับการอนุมัติแล้ว ท่านสามารถใช้งานเมนูอื่นของระบบได้ทันที"
 		}
 		s.notify.SendLaidOut(ctx, userID, title, intro+"\n"+numberedLines(lines),
 			"/ta/documents", false, MailLayout{Intro: intro, Table: table})

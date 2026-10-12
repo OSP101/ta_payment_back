@@ -158,6 +158,22 @@ func (t appointedTA) levelYearTH() string {
 	return label
 }
 
+// noticeLine is the TA's line in the in-app notice, one complete format per
+// level so the English catalog can match it: "ชื่อ รหัส 653040000-1 ป.ตรี ปี 3
+// กลุ่มเรียนที่ 1, 2". Must read exactly as "%s รหัส %s %s กลุ่มเรียนที่ %s"
+// with levelYearTH did.
+func (t appointedTA) noticeLine(secs string) string {
+	switch {
+	case t.level == "master":
+		return fmt.Sprintf("%s รหัส %s ป.โท กลุ่มเรียนที่ %s", t.name, t.studentID, secs)
+	case t.level == "phd":
+		return fmt.Sprintf("%s รหัส %s ป.เอก กลุ่มเรียนที่ %s", t.name, t.studentID, secs)
+	case t.level == "undergrad" && t.studyYear > 0:
+		return fmt.Sprintf("%s รหัส %s ป.ตรี ปี %d กลุ่มเรียนที่ %s", t.name, t.studentID, t.studyYear, secs)
+	}
+	return fmt.Sprintf("%s รหัส %s ป.ตรี กลุ่มเรียนที่ %s", t.name, t.studentID, secs)
+}
+
 // lecturerAppointContent builds one lecturer's notice: the in-app body (plain
 // lines) and the e-mail with a table per course.
 func lecturerAppointContent(doc docxgen.AppointmentOrderData, round int, courses []appointedCourse) (string, string, MailLayout) {
@@ -171,7 +187,7 @@ func lecturerAppointContent(doc docxgen.AppointmentOrderData, round int, courses
 	}
 	// Order number and codes in the title: unread notices with the same
 	// title and link fold into one, and two rounds must stay two notices.
-	title := "ออกคำสั่งแต่งตั้งผู้ช่วยสอนแล้ว ที่ " + doc.OrderNo + " " + strings.Join(codes, " ")
+	title := fmt.Sprintf("ออกคำสั่งแต่งตั้งผู้ช่วยสอนแล้ว ที่ %s %s", doc.OrderNo, strings.Join(codes, " "))
 
 	kind := "คำสั่ง"
 	if round > 1 {
@@ -193,8 +209,13 @@ func lecturerAppointContent(doc docxgen.AppointmentOrderData, round int, courses
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("วิทยาลัยการคอมพิวเตอร์ได้ออก%sที่ %s ลงวันที่ %s แต่งตั้งผู้ช่วยสอนในรายวิชาของท่าน มีผลตั้งแต่วันที่ %s",
-		kind, doc.OrderNo, doc.OrderDate, doc.EffectiveDate))
+	// One complete format per kind of order, so the English catalog can
+	// match the line whole.
+	first := "วิทยาลัยการคอมพิวเตอร์ได้ออกคำสั่งที่ %s ลงวันที่ %s แต่งตั้งผู้ช่วยสอนในรายวิชาของท่าน มีผลตั้งแต่วันที่ %s"
+	if round > 1 {
+		first = "วิทยาลัยการคอมพิวเตอร์ได้ออกคำสั่งเพิ่มเติมที่ %s ลงวันที่ %s แต่งตั้งผู้ช่วยสอนในรายวิชาของท่าน มีผลตั้งแต่วันที่ %s"
+	}
+	b.WriteString(fmt.Sprintf(first, doc.OrderNo, doc.OrderDate, doc.EffectiveDate))
 	for _, c := range courses {
 		t := MailTable{
 			Title: c.label,
@@ -204,7 +225,7 @@ func lecturerAppointContent(doc docxgen.AppointmentOrderData, round int, courses
 		for _, ta := range c.tas {
 			secs := strings.Join(ta.sections, ", ")
 			t.Rows = append(t.Rows, []string{ta.name, ta.studentID, ta.levelYearTH(), secs})
-			lines = append(lines, fmt.Sprintf("%s รหัส %s %s กลุ่มเรียนที่ %s", ta.name, ta.studentID, ta.levelYearTH(), secs))
+			lines = append(lines, ta.noticeLine(secs))
 		}
 		layout.Tables = append(layout.Tables, t)
 		b.WriteString("\n\n" + c.label + "\n" + numberedLines(lines))

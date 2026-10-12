@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"fmt"
 	"net"
 	"strings"
 )
@@ -68,11 +69,12 @@ func Device(ua string) string {
 
 	switch {
 	case browser != "" && os != "":
-		return browser + " บน " + os
+		// One format string, so internal/i18n can put it into English whole.
+		return fmt.Sprintf("%s บน %s", browser, os)
 	case browser != "":
 		return browser
 	case os != "":
-		return "เบราว์เซอร์บน " + os
+		return fmt.Sprintf("เบราว์เซอร์บน %s", os)
 	}
 	return "อุปกรณ์ที่ไม่รู้จัก"
 }

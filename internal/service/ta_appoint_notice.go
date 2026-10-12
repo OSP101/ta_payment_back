@@ -58,8 +58,8 @@ func (s *TARequestService) notifyTAsAppointed(ctx context.Context, reqID, course
 	periods := s.upcomingPeriods(ctx, courseID)
 	label := strings.TrimSpace(code + " " + nameTH)
 	for _, p := range people {
-		title, body, layout := appointNoticeContent(label, p.sections, p.logsMonthly, periods)
-		s.notify.SendLaidOut(ctx, p.id, title+" "+code, body, "/ta", false, layout)
+		_, body, layout := appointNoticeContent(label, p.sections, p.logsMonthly, periods)
+		s.notify.SendLaidOut(ctx, p.id, fmt.Sprintf("ท่านได้รับการแต่งตั้งเป็นผู้ช่วยสอน %s", code), body, "/ta", false, layout)
 	}
 }
 
@@ -97,7 +97,7 @@ func appointNoticeContent(course string, sections []string, logsMonthly bool, pe
 	secText := strings.Join(sections, ", ")
 	intro := fmt.Sprintf("ท่านได้รับการอนุมัติให้เป็นผู้ช่วยสอนรายวิชา %s กลุ่มเรียนที่ %s", course, secText)
 	if logsMonthly {
-		intro += " และสามารถบันทึกเวลาปฏิบัติงานในระบบได้แล้ว"
+		intro = fmt.Sprintf("ท่านได้รับการอนุมัติให้เป็นผู้ช่วยสอนรายวิชา %s กลุ่มเรียนที่ %s และสามารถบันทึกเวลาปฏิบัติงานในระบบได้แล้ว", course, secText)
 	}
 
 	layout := MailLayout{

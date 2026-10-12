@@ -67,6 +67,10 @@ type User struct {
 	// picture, with the last-changed timestamp as a cache-buster. Nil when the
 	// user has not set one, which is what tells the UI to draw initials.
 	AvatarURL *string `json:"avatar_url,omitempty"`
+	// UITheme ("light", "dark", "system") and UILocale ("th", "en") are
+	// display preferences only (migration 0153). See SetUIPreferences.
+	UITheme  string `json:"ui_theme"`
+	UILocale string `json:"ui_locale"`
 }
 
 type UserService struct {
@@ -218,9 +222,11 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*User, error) {
 		        COALESCE((SELECT NULLIF(ao.title, '') FROM admin_officers ao WHERE ao.user_id = users.id AND ao.is_active LIMIT 1), NULLIF(admin_position, '')),
 		        avatar_key, avatar_updated_at, totp_enabled_at,
 		        (SELECT COUNT(*) FROM mfa_recovery_codes r WHERE r.user_id = users.id AND r.used_at IS NULL),
-		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = $2)
+		        (SELECT consented_at FROM pdpa_consents c WHERE c.user_id = users.id AND c.version = $2),
+		        ui_theme, ui_locale
 		 FROM users WHERE id = $1 AND deleted_at IS NULL`, id, pdpaConsentVersion).Scan(
 		&u.Email, &u.Title, &u.FirstName, &u.LastName, &u.Phone, &u.StudyLevel, &u.StudyYear, &u.StudentID, &u.Nationality, &u.Department, &u.IsActive, &u.ProfileComplete, &u.MustChangePassword, &u.IsExecutive, &u.AdminPosition, &avatarKey, &avatarAt, &totpEnabledAt, &u.RecoveryCodesRemaining, &u.PdpaConsentedAt,
+		&u.UITheme, &u.UILocale,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1300,4 +1306,21 @@ func userSnapshotWithRoles(ctx context.Context, tx pgx.Tx, id uuid.UUID) (map[st
 	}
 	row["roles"] = roles
 	return row, nil
+}
+
+// SetUIPreferences saves the caller's own theme and/or language. Either may
+// be empty to leave it unchanged. Not audited: it changes how the screen
+// looks, nothing anyone else sees or relies on.
+func (s *UserService) SetUIPreferences(ctx context.Context, id uuid.UUID, theme, locale string) error {
+	if theme != "" && theme != "light" && theme != "dark" && theme != "system" {
+		return fmt.Errorf("%w: theme", ErrInvalidInput)
+	}
+	if locale != "" && locale != "th" && locale != "en" {
+		return fmt.Errorf("%w: locale", ErrInvalidInput)
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET ui_theme = COALESCE(NULLIF($2, ''), ui_theme),
+		                  ui_locale = COALESCE(NULLIF($3, ''), ui_locale)
+		  WHERE id = $1 AND deleted_at IS NULL`, id, theme, locale)
+	return err
 }

@@ -11,6 +11,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"ta-payment-back/internal/audit"
@@ -249,7 +250,7 @@ func (s *AnnounceService) RemindUnread(ctx context.Context, actor, id uuid.UUID)
 	}
 	// The title differs from the first notice on purpose: an unread bell line
 	// with the same title would be folded into the old one and not move.
-	subject := "เตือนอีกครั้ง: " + announceSubject(category, title)
+	subject := fmt.Sprintf("เตือนอีกครั้ง: %s", announceSubject(category, title))
 	preview := truncateRunes(announceBodyPlain(body), 240)
 	link := "/announcements/" + id.String()
 	for _, u := range ids {
@@ -277,11 +278,11 @@ func (s *AnnounceService) SendTest(ctx context.Context, actor uuid.UUID, title, 
 func announceSubject(category, title string) string {
 	switch category {
 	case "urgent":
-		return "[ด่วน] " + title
+		return fmt.Sprintf("[ด่วน] %s", title)
 	case "warning":
-		return "[แจ้งเตือน] " + title
+		return fmt.Sprintf("[แจ้งเตือน] %s", title)
 	case "event":
-		return "[กิจกรรม] " + title
+		return fmt.Sprintf("[กิจกรรม] %s", title)
 	}
 	return title
 }

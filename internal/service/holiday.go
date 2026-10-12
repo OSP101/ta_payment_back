@@ -737,7 +737,7 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 		taName, courseCode, courseNameTH, thaiLongDateISO(originalDate), holidayName,
 	)
 	if note != "" {
-		body += "\nหมายเหตุ: " + note
+		body += "\n" + fmt.Sprintf("หมายเหตุ: %s", note)
 	}
 	link := fmt.Sprintf("/lecturer/courses/%s/holidays", tcID.String())
 	// Audit + rate-limit ledger FIRST. The ledger is what stops a TA sending the
@@ -757,7 +757,7 @@ func (s *HolidayService) RemindLecturer(ctx context.Context, taID, tcID uuid.UUI
 	}
 	if s.notify != nil {
 		for _, lid := range lecturerIDs {
-			s.notify.SendAction(ctx, lid, "ผู้ช่วยสอนแจ้งให้กำหนดวันสอนชดเชย "+thaiLongDateISO(originalDate), body, link)
+			s.notify.SendAction(ctx, lid, fmt.Sprintf("ผู้ช่วยสอนแจ้งให้กำหนดวันสอนชดเชย %s", thaiLongDateISO(originalDate)), body, link)
 		}
 	}
 	return nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -203,23 +204,42 @@ func (s *DocsService) CorrectTAIdentity(ctx context.Context, actor, userID uuid.
 	// digits of the citizen ID they can recognise. The date is in the title so
 	// two corrections on different days never fold into one notice.
 	if s.notify != nil {
-		var what []string
+		// Which fields changed picks one complete format, so the English
+		// catalog can match the notice whole.
+		mask := 0
+		var args []any
 		if v, ok := changed["student_id"].(map[string]any); ok {
-			what = append(what, "รหัสนักศึกษาเป็น "+v["after"].(string))
+			mask |= 1
+			args = append(args, v["after"].(string))
 		}
 		if v, ok := changed["prefix"].(map[string]any); ok {
-			what = append(what, "คำนำหน้าเป็น "+v["after"].(string))
+			mask |= 2
+			args = append(args, v["after"].(string))
 		}
 		if v, ok := changed["citizen_id_last4"].(string); ok {
-			what = append(what, "เลขบัตรประจำตัวประชาชน (ลงท้าย "+v+")")
+			mask |= 4
+			args = append(args, v)
 		}
 		s.notify.Send(ctx, userID,
-			"เจ้าหน้าที่แก้ไขข้อมูลส่วนตัวของท่าน วันที่ "+thaiDate(timeutil.Now()),
-			"เจ้าหน้าที่ได้แก้ไข"+strings.Join(what, " และ")+" ตามที่ท่านแจ้ง เหตุผล "+in.Reason+
-				" หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+			fmt.Sprintf("เจ้าหน้าที่แก้ไขข้อมูลส่วนตัวของท่าน วันที่ %s", thaiDate(timeutil.Now())),
+			fmt.Sprintf(identityFixBody[mask], append(args, in.Reason)...),
 			"/ta/documents")
 	}
 	return nil
+}
+
+// identityFixBody is the notice for each set of corrected fields (bit 1
+// student ID, 2 prefix, 4 citizen ID), the values in that order and the reason
+// last.
+var identityFixBody = [8]string{
+	"เจ้าหน้าที่ได้แก้ไข ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขรหัสนักศึกษาเป็น %s ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขคำนำหน้าเป็น %s ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขรหัสนักศึกษาเป็น %s และคำนำหน้าเป็น %s ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขเลขบัตรประจำตัวประชาชน (ลงท้าย %s) ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขรหัสนักศึกษาเป็น %s และเลขบัตรประจำตัวประชาชน (ลงท้าย %s) ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขคำนำหน้าเป็น %s และเลขบัตรประจำตัวประชาชน (ลงท้าย %s) ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
+	"เจ้าหน้าที่ได้แก้ไขรหัสนักศึกษาเป็น %s และคำนำหน้าเป็น %s และเลขบัตรประจำตัวประชาชน (ลงท้าย %s) ตามที่ท่านแจ้ง เหตุผล %s หากข้อมูลไม่ถูกต้อง กรุณาติดต่อเจ้าหน้าที่",
 }
 
 // RegenerateCreditorForm rebuilds the TA's signed creditor form with their

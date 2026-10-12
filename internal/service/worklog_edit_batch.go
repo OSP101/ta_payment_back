@@ -278,11 +278,13 @@ func (s *WorkLogService) notifyEditBatch(ctx context.Context, in EditBatchInput,
 	}
 	// Month and TA in the title: unread notices fold by (title, link), and the
 	// lecturer's link is one page for every TA of the course.
-	title := "เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน " + code + " " + month + " " + personName(ctx, s.pool, in.TAID)
+	ta := personName(ctx, s.pool, in.TAID)
+	title := fmt.Sprintf("เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน %s %s %s", code, month, ta)
 	body := fmt.Sprintf("เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานของ %s รายวิชา %s %s ประจำเดือน%s จำนวน %d รายการ เนื่องจาก %s",
-		personName(ctx, s.pool, in.TAID), code, nameTH, month, applied, strings.TrimSpace(in.Reason))
+		ta, code, nameTH, month, applied, strings.TrimSpace(in.Reason))
 	if files > 0 {
-		body += fmt.Sprintf(" โดยได้แนบหลักฐานประกอบจำนวน %d ภาพ", files)
+		body = fmt.Sprintf("เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานของ %s รายวิชา %s %s ประจำเดือน%s จำนวน %d รายการ เนื่องจาก %s โดยได้แนบหลักฐานประกอบจำนวน %d ภาพ",
+			ta, code, nameTH, month, applied, strings.TrimSpace(in.Reason), files)
 	}
 
 	s.notify.Send(ctx, in.TAID, title, body,

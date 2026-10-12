@@ -4151,7 +4151,7 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 			}
 			told[ta] = true
 			t := s.notifyTarget(ctx, ctxs[id].TeachingCourseID)
-			s.notify.Send(ctx, ta, "บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ "+t.Code, approvedBody(t, yearMonth), t.Link)
+			s.notify.Send(ctx, ta, fmt.Sprintf("บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ %s", t.Code), approvedBody(t, yearMonth), t.Link)
 		}
 	}
 	return nil
@@ -4232,7 +4232,7 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 	}
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
-		s.notify.Send(ctx, ac.TAID, "บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ "+t.Code, approvedBody(t, yearMonth), t.Link)
+		s.notify.Send(ctx, ac.TAID, fmt.Sprintf("บันทึกเวลาปฏิบัติงานได้รับการอนุมัติ %s", t.Code), approvedBody(t, yearMonth), t.Link)
 	}
 	s.warnBudgetAfterApproval(ctx, ac.TeachingCourseID)
 	return nil
@@ -4765,9 +4765,16 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
 		who := actorRoleTH(ctx, s.pool, actor, privileged)
 		s.notify.Send(ctx, ac.TAID,
-			who+"แก้ไขบันทึกเวลาปฏิบัติงาน "+t.Code+" วันที่ "+thaiLongDateISO(w.WorkDate),
-			fmt.Sprintf("%sได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s",
-				who, t.Label(), thaiLongDateISO(w.WorkDate), thaiTimeRange(w.StartTime, w.EndTime)),
+			fmt.Sprintf(byActorRole(who,
+				"อาจารย์แก้ไขบันทึกเวลาปฏิบัติงาน %s วันที่ %s",
+				"เจ้าหน้าที่แก้ไขบันทึกเวลาปฏิบัติงาน %s วันที่ %s",
+				"ผู้ดูแลระบบแก้ไขบันทึกเวลาปฏิบัติงาน %s วันที่ %s"),
+				t.Code, thaiLongDateISO(w.WorkDate)),
+			fmt.Sprintf(byActorRole(who,
+				"อาจารย์ได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s",
+				"เจ้าหน้าที่ได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s",
+				"ผู้ดูแลระบบได้แก้ไขบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s เป็น%s"),
+				t.Label(), thaiLongDateISO(w.WorkDate), thaiTimeRange(w.StartTime, w.EndTime)),
 			t.Link)
 		// A signed-off row changed: every lecturer on the course hears about it,
 		// with the reason. The batch path sends its own combined notice, so only
@@ -4779,7 +4786,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 						continue
 					}
 					s.notify.Send(ctx, lid,
-						"มีการแก้ไขบันทึกเวลาที่อนุมัติแล้ว "+t.Code,
+						fmt.Sprintf("มีการแก้ไขบันทึกเวลาที่อนุมัติแล้ว %s", t.Code),
 						fmt.Sprintf("บันทึกเวลาปฏิบัติงานของ %s รายวิชา %s วันที่ %s ซึ่งท่านได้อนุมัติแล้ว ได้ถูกแก้ไขเป็น%s รวม %.2f ชั่วโมง เนื่องจาก %s",
 							personName(ctx, s.pool, ac.TAID), t.Label(), thaiLongDateISO(w.WorkDate),
 							thaiTimeRange(w.StartTime, w.EndTime), w.Hours, strings.TrimSpace(stepUp.Reason)),
@@ -5094,8 +5101,16 @@ func (s *WorkLogService) StaffDelete(ctx context.Context, actor uuid.UUID, privi
 		t := s.notifyTarget(ctx, tcID)
 		who := actorRoleTH(ctx, s.pool, actor, privileged)
 		s.notify.Send(ctx, taID,
-			who+"ลบบันทึกเวลาปฏิบัติงาน "+t.Code+" วันที่ "+thaiLongDateISO(workDate),
-			fmt.Sprintf("%sได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s", who, t.Label(), thaiLongDateISO(workDate), timeSpan),
+			fmt.Sprintf(byActorRole(who,
+				"อาจารย์ลบบันทึกเวลาปฏิบัติงาน %s วันที่ %s",
+				"เจ้าหน้าที่ลบบันทึกเวลาปฏิบัติงาน %s วันที่ %s",
+				"ผู้ดูแลระบบลบบันทึกเวลาปฏิบัติงาน %s วันที่ %s"),
+				t.Code, thaiLongDateISO(workDate)),
+			fmt.Sprintf(byActorRole(who,
+				"อาจารย์ได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s",
+				"เจ้าหน้าที่ได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s",
+				"ผู้ดูแลระบบได้ลบรายการบันทึกเวลาปฏิบัติงานรายวิชา %s ของวันที่ %s %s"),
+				t.Label(), thaiLongDateISO(workDate), timeSpan),
 			t.Link)
 	}
 	return nil
@@ -5160,15 +5175,24 @@ func (s *WorkLogService) Reject(ctx context.Context, actor, assignmentID uuid.UU
 	}
 	if s.notify != nil {
 		t := s.notifyTarget(ctx, ac.TeachingCourseID)
-		when := thaiYearMonth(yearMonth)
-		if when != "" {
-			when = " ประจำเดือน" + when
+		// One complete format per sender and per "one month or the whole
+		// batch", so the English catalog can match each notice whole.
+		month := thaiYearMonth(yearMonth)
+		title := fmt.Sprintf("บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข %s", t.Code)
+		var body string
+		switch {
+		case month != "" && byRole == "staff":
+			title = fmt.Sprintf("บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข %s %s", t.Code, month)
+			body = fmt.Sprintf("เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา %s ประจำเดือน%s กลับมาให้ท่านแก้ไข เนื่องจาก %s", t.Label(), month, reason)
+		case month != "":
+			title = fmt.Sprintf("บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข %s %s", t.Code, month)
+			body = fmt.Sprintf("อาจารย์ผู้สอนได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา %s ประจำเดือน%s กลับมาให้ท่านแก้ไข เนื่องจาก %s", t.Label(), month, reason)
+		case byRole == "staff":
+			body = fmt.Sprintf("เจ้าหน้าที่ได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา %s กลับมาให้ท่านแก้ไข เนื่องจาก %s", t.Label(), reason)
+		default:
+			body = fmt.Sprintf("อาจารย์ผู้สอนได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา %s กลับมาให้ท่านแก้ไข เนื่องจาก %s", t.Label(), reason)
 		}
-		s.notify.SendAction(ctx, ac.TAID,
-			strings.TrimSpace("บันทึกเวลาปฏิบัติงานถูกส่งกลับให้แก้ไข "+t.Code+" "+thaiYearMonth(yearMonth)),
-			map[string]string{"lecturer": "อาจารย์ผู้สอน", "staff": "เจ้าหน้าที่"}[byRole]+
-				"ได้ส่งบันทึกเวลาปฏิบัติงานรายวิชา "+t.Label()+when+" กลับมาให้ท่านแก้ไข เนื่องจาก "+reason,
-			t.Link)
+		s.notify.SendAction(ctx, ac.TAID, strings.TrimSpace(title), body, t.Link)
 	}
 	return nil
 }
@@ -5195,11 +5219,10 @@ func (t worklogNotifyTarget) Label() string {
 // approvedBody is the body of the "hours approved" notice, with the month
 // spelled out when the approval covered one month.
 func approvedBody(t worklogNotifyTarget, yearMonth string) string {
-	when := ""
 	if m := thaiYearMonth(yearMonth); m != "" {
-		when = " ประจำเดือน" + m
+		return fmt.Sprintf("บันทึกเวลาปฏิบัติงานรายวิชา %s ประจำเดือน%s ของท่านได้รับการอนุมัติจากอาจารย์ผู้สอนแล้ว", t.Label(), m)
 	}
-	return "บันทึกเวลาปฏิบัติงานรายวิชา " + t.Label() + when + " ของท่านได้รับการอนุมัติจากอาจารย์ผู้สอนแล้ว"
+	return fmt.Sprintf("บันทึกเวลาปฏิบัติงานรายวิชา %s ของท่านได้รับการอนุมัติจากอาจารย์ผู้สอนแล้ว", t.Label())
 }
 
 func (s *WorkLogService) notifyTarget(ctx context.Context, tcID uuid.UUID) worklogNotifyTarget {

@@ -325,6 +325,22 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	return c.JSON(meResponse{User: u, SelectedEnrollmentID: SelectedEnrollmentID(c), MFASetupRequired: need})
 }
 
+// SetPreferences is PUT /me/preferences: the caller's own theme and/or
+// language (see UserService.SetUIPreferences).
+func (h *AuthHandler) SetPreferences(c *fiber.Ctx) error {
+	var in struct {
+		Theme  string `json:"theme"`
+		Locale string `json:"locale"`
+	}
+	if err := c.BodyParser(&in); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if err := h.Svc.Users.SetUIPreferences(c.Context(), UserID(c), in.Theme, in.Locale); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"ok": true})
+}
+
 // DataExport answers the PDPA "what do you have on me" request — see
 // UserService.ExportMyData. Requesting your own export is itself audit-worthy,
 // the same reasoning DocsService.RevealCitizenID already applies to reading
