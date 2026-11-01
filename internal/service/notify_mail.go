@@ -50,7 +50,7 @@ var mailNow = time.Now
 // footer is ("© 2026 College of Computing, Khon Kaen University", see
 // ta_payment_front app/login/LoginForm.tsx). English only, by request.
 func mailCopyright() string {
-	return "© " + strconv.Itoa(mailNow().In(timeutil.Bangkok).Year()) + " " + mailUnitEN + ". All rights reserved."
+	return "© " + strconv.Itoa(mailNow().In(timeutil.Bangkok).Year()) + " " + mailUnitEN + ". All rights reserved. Powered by "
 }
 
 // MailFact is one "label : value" line.
