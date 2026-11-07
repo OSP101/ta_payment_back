@@ -1,17 +1,17 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/text/encoding/charmap"
 )
 
 type regSec struct{ no, open, enrolled int }
@@ -26,75 +26,73 @@ var fakeRegCourses = map[string]struct {
 	"CP363205": {"3613670353", []regSec{{1, 51, 49}, {2, 45, 41}}},
 }
 
-func regListRow(code, id string, sc regSec) string {
-	return fmt.Sprintf(`<TR VALIGN=TOP Class=NormalDetail><TD WIDTH=30></TD><TD BGCOLOR=#F0F0F5>&nbsp;<A HREF=class_info_2.asp?backto=HOME&option=0&courseid=%s&acadyear=2569&semester=1&avs5931437=1>%s</A>&nbsp;</TD><TD BGCOLOR=#F0F0F5>&nbsp;Name</TD><TD NOWRAP BGCOLOR=#F0F0F5>&nbsp;3 (2-2-5)</TD><TD ALIGN=RIGHT BGCOLOR=#F0F0F5>%d&nbsp;</TD><TD ALIGN=RIGHT BGCOLOR=#F0F0F5>%d&nbsp;</TD><TD ALIGN=RIGHT BGCOLOR=#F0F0F5>%d&nbsp;</TD><TD ALIGN=RIGHT BGCOLOR=#F0F0F5>%d&nbsp;</TD><TD BGCOLOR=#F0F0F5>&nbsp;W</TD><TD></TD></TR>`,
-		id, code, sc.no, sc.open, sc.enrolled, sc.open-sc.enrolled)
-}
-
-// fakeReg serves search and detail pages in TIS-620 like the real site and
-// counts requests by kind ("list", "search" for a wildcard, "detail").
+// fakeReg serves the new guest API and counts data searches separately from
+// token/metadata calls. Section 2 is special in these fixtures.
 func fakeReg(t *testing.T, extra map[string][]regSec) (*httptest.Server, *int32, *sync.Map) {
 	t.Helper()
-	read := func(name string) string {
-		b, err := os.ReadFile("../regkku/testdata/" + name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(b)
+	courses := map[string][]regSec{}
+	for code, c := range fakeRegCourses {
+		courses[code] = c.secs
 	}
-	detail := map[string]string{
-		"3613665151": read("class_info_2_SC363001.html"),
-		"3613670353": read("class_info_2_CP363205.html"),
+	for code, secs := range extra {
+		courses[code] = secs
 	}
-	courses := map[string]struct {
-		id   string
-		secs []regSec
-	}{}
-	for k, v := range fakeRegCourses {
-		courses[k] = v
-	}
-	for k, v := range extra {
-		courses[k] = struct {
-			id   string
-			secs []regSec
-		}{"9" + k[len(k)-6:], v}
-	}
-	enc := func(s string) []byte { b, _ := charmap.Windows874.NewEncoder().String(s); return []byte(b) }
 	var hits int32
 	kinds := &sync.Map{}
-	count := func(k string) {
-		n, _ := kinds.LoadOrStore(k, new(int32))
-		atomic.AddInt32(n.(*int32), 1)
-	}
+	count := func(k string) { n, _ := kinds.LoadOrStore(k, new(int32)); atomic.AddInt32(n.(*int32), 1) }
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		q := r.URL.Query()
-		switch {
-		case strings.HasSuffix(r.URL.Path, "class_info_1.asp"):
-			want := q.Get("coursecode")
-			prefix, wild := strings.CutSuffix(want, "*")
-			if wild {
-				count("search")
-			} else {
-				count("list")
-			}
-			var b strings.Builder
-			b.WriteString("<html>รหัสวิชา <TABLE>")
-			for code, c := range courses {
-				if (wild && strings.HasPrefix(code, prefix)) || code == want {
-					for _, sc := range c.secs {
-						b.WriteString(regListRow(code, c.id, sc))
-					}
-				}
-			}
-			b.WriteString("</TABLE></html>")
-			w.Write(enc(b.String()))
-		case strings.HasSuffix(r.URL.Path, "class_info_2.asp"):
-			count("detail")
-			w.Write(enc(detail[q.Get("courseid")]))
-		default:
-			http.NotFound(w, r)
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		if r.URL.Path == "/Validate/tokenservice" {
+			enc.Encode(map[string]string{"token": "guest"})
+			return
 		}
+		if r.Header.Get("Authorization") != "Bearer guest" {
+			w.WriteHeader(401)
+			return
+		}
+		if r.URL.Path == "/ComboLev/AllClassinfo" {
+			enc.Encode([]map[string]any{{"comboid": 31, "comboshow": "ปริญญาตรี ภาคปกติ"}, {"comboid": 34, "comboshow": "ปริญญาตรี โครงการพิเศษ"}})
+			return
+		}
+		p := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(p) != 11 || p[0] != "Classinfo" || p[1] != "Classinfo" {
+			http.NotFound(w, r)
+			return
+		}
+		prefix, level := p[8], p[7]
+		if len(prefix) < 8 {
+			count("search")
+		} else {
+			count("list")
+		}
+		var codes []string
+		for code := range courses {
+			codes = append(codes, code)
+		}
+		sort.Strings(codes)
+		rows := []map[string]any{}
+		for index, code := range codes {
+			if !strings.HasPrefix(code, prefix) {
+				continue
+			}
+			for _, sc := range courses[code] {
+				special := sc.no == 2
+				if level == "31" && special || level == "34" && !special {
+					continue
+				}
+				year, _ := strconv.Atoi(p[4])
+				sem, _ := strconv.Atoi(p[5])
+				rows = append(rows, map[string]any{"classid": 1000 + index*100 + sc.no, "courseid": 9000 + index, "acadyear": year, "semester": sem, "coursecode": code, "section": strconv.Itoa(sc.no), "totalseat": sc.open, "enrollseat": sc.enrolled})
+			}
+		}
+		start, _ := strconv.Atoi(p[2])
+		limit, _ := strconv.Atoi(p[3])
+		total := len(rows)
+		begin := min(start-1, total)
+		end := min(begin+limit, total)
+		enc.Encode([]map[string]any{{"row": start, "limit": limit, "count": total, "classinfolist": rows[begin:end]}})
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &hits, kinds
@@ -134,8 +132,8 @@ func waitRegJob(t *testing.T, s *RegEnrolmentService, f *fixture) *RegEnrolmentJ
 	return nil
 }
 
-func TestRegEnrolment_SumsByTrackAndRemembersTracks(t *testing.T) {
-	f := regFixture(t, `ARRAY['CP363205','XX000001']`)
+func TestRegEnrolment_SumsByAPITrackAndCachesResults(t *testing.T) {
+	f := regFixture(t, `ARRAY['CP363205']`)
 	srv, hits, kinds := fakeReg(t, nil)
 	s := NewRegEnrolmentService(f.Pool, srv.URL)
 	s.reg.Gap, s.reg.Jitter = 0, 0
@@ -147,7 +145,7 @@ func TestRegEnrolment_SumsByTrackAndRemembersTracks(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	j := waitRegJob(t, s, f)
-	if j.Status != "done" || j.Done != 3 || j.Total != 3 {
+	if j.Status != "done" || j.Done != 2 || j.Total != 2 {
 		t.Fatalf("job = %+v", j)
 	}
 	got := map[string]RegEnrolmentRow{}
@@ -160,27 +158,22 @@ func TestRegEnrolment_SumsByTrackAndRemembersTracks(t *testing.T) {
 	if r := got["CP363205"]; r.Regular != 49 || r.Special != 41 {
 		t.Errorf("CP363205 = %+v, want 49 / 41", r)
 	}
-	if r := got["XX000001"]; r.Error != regErrNotFound {
-		t.Errorf("unknown code = %+v, want not-found", r)
-	}
-	// One search per code; the detail page only for CP363205, a merged code
-	// whose tracks our sections cannot tell.
-	if *hits != 4 || kindCount(kinds, "detail") != 1 {
-		t.Errorf("first run: %d requests (%d detail), want 4 (1 detail)", *hits, kindCount(kinds, "detail"))
-	}
 
-	// Within ten minutes the result is reused: no request at all.
+	if kindCount(kinds, "detail") != 0 {
+		t.Fatal("new API must not request ASP detail pages")
+	}
+	first := atomic.LoadInt32(hits)
 	if _, err := s.Start(f.ctx, f.StaffID, f.TermID, RegScopeAll); err != nil {
 		t.Fatal(err)
 	}
-	if *hits != 4 {
-		t.Errorf("a fresh result was fetched again (%d requests)", *hits)
+	if atomic.LoadInt32(hits) != first {
+		t.Fatal("fresh result fetched again")
 	}
-
-	// Later, CP363205's tracks are remembered: one request per code.
 	old := time.Now().Add(-time.Hour)
 	age := func() {
-		s.jobs[f.TermID].FinishedAt = &old
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.jobs[regJobKey{f.TermID, "new"}].FinishedAt = &old
 		for k, v := range s.codes {
 			v.at = old
 			s.codes[k] = v
@@ -191,8 +184,8 @@ func TestRegEnrolment_SumsByTrackAndRemembersTracks(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitRegJob(t, s, f)
-	if *hits != 4+3 || kindCount(kinds, "detail") != 1 {
-		t.Errorf("second run: %d requests (%d detail in total), want 3 and no new detail page", *hits-4, kindCount(kinds, "detail"))
+	if atomic.LoadInt32(hits) <= first {
+		t.Fatal("expired results must refresh")
 	}
 
 	// Exported courses can no longer change and are not fetched.
@@ -230,11 +223,10 @@ func TestRegEnrolment_LargeGroupUsesOneWildcardSearch(t *testing.T) {
 			t.Errorf("CP000003 = %+v, want 13 regular from the wildcard page", r)
 		}
 	}
-	// CP* (5 codes): one search. SC363001 alone: one search. CP363205's
-	// tracks: one detail page.
-	if kindCount(kinds, "search") != 1 || kindCount(kinds, "list") != 1 || kindCount(kinds, "detail") != 1 || *hits != 3 {
-		t.Errorf("requests: %d search, %d list, %d detail (total %d); want 1/1/1",
-			kindCount(kinds, "search"), kindCount(kinds, "list"), kindCount(kinds, "detail"), *hits)
+	// Three CP prefix searches (all, regular, special), three for SC,
+	// plus one token and one level metadata request; no per-code CP queries.
+	if kindCount(kinds, "search") != 3 || kindCount(kinds, "list") != 3 || atomic.LoadInt32(hits) != 8 {
+		t.Fatalf("requests: %d prefix, %d exact, total %d", kindCount(kinds, "search"), kindCount(kinds, "list"), atomic.LoadInt32(hits))
 	}
 }
 
@@ -319,5 +311,69 @@ func TestRegEnrolment_StopKeepsPartialResult(t *testing.T) {
 	j2 := waitRegJob(t, s, f)
 	if j2.Status != "done" || j2.Reused != kept || len(j2.Rows) != j2.Total {
 		t.Fatalf("restart: %+v (want the %d stopped-run answers reused)", j2, kept)
+	}
+}
+
+func TestRegEnrolment_IncompleteMergedCourseIsNotUsable(t *testing.T) {
+	f := regFixture(t, `ARRAY['XX000001']`)
+	srv, _, _ := fakeReg(t, nil)
+	s := NewRegEnrolmentService(f.Pool, srv.URL)
+	s.reg.Gap, s.reg.Jitter = 0, 0
+	if _, err := s.Start(f.ctx, f.StaffID, f.TermID, RegScopeAll); err != nil {
+		t.Fatal(err)
+	}
+	j := waitRegJob(t, s, f)
+	for _, row := range j.Rows {
+		if row.Error == "" {
+			t.Fatalf("partial merged total must not be usable: %+v", row)
+		}
+	}
+}
+
+func TestRegEnrolment_CacheDoesNotCrossAcademicYear(t *testing.T) {
+	f := regFixture(t, `'{}'`)
+	srv, hits, _ := fakeReg(t, nil)
+	s := NewRegEnrolmentService(f.Pool, srv.URL)
+	s.reg.Gap, s.reg.Jitter = 0, 0
+	if _, err := s.Start(f.ctx, f.StaffID, f.TermID, RegScopeAll); err != nil {
+		t.Fatal(err)
+	}
+	first := waitRegJob(t, s, f)
+	before := atomic.LoadInt32(hits)
+	f.exec(`UPDATE academic_terms SET academic_year = academic_year + 1 WHERE id = $1`, f.TermID)
+	if stale, err := s.Status(f.ctx, f.StaffID, f.TermID); err != nil || stale != nil {
+		t.Fatalf("old completed job would populate the edited term: job=%+v err=%v", stale, err)
+	}
+	if _, err := s.Start(f.ctx, f.StaffID, f.TermID, RegScopeAll); err != nil {
+		t.Fatal(err)
+	}
+	second := waitRegJob(t, s, f)
+	if second.Year != first.Year+1 || second.Reused != 0 || atomic.LoadInt32(hits) <= before {
+		t.Fatalf("stale term cache used: %+v", second)
+	}
+}
+
+func TestRegEnrolment_FailedPrefixDoesNotFanOut(t *testing.T) {
+	f := regFixture(t, `ARRAY['CP000001','CP000002','CP000003','CP000004','CP000005']`)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/Validate/tokenservice" {
+			json.NewEncoder(w).Encode(map[string]string{"token": "guest"})
+			return
+		}
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(503)
+	}))
+	defer srv.Close()
+	s := NewRegEnrolmentService(f.Pool, srv.URL)
+	s.reg.Gap, s.reg.Jitter = 0, 0
+	s.reg.MaxBackoff = time.Millisecond
+	if _, err := s.Start(f.ctx, f.StaffID, f.TermID, RegScopeAll); err != nil {
+		t.Fatal(err)
+	}
+	j := waitRegJob(t, s, f)
+	if j.Status != "failed" || hits.Load() != 2 {
+		t.Fatalf("job=%+v requests=%d", j, hits.Load())
 	}
 }

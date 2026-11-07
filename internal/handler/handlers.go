@@ -749,6 +749,14 @@ func (h *TeachingHandler) BulkNumStudents(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"items": items})
 }
 
+func (h *TeachingHandler) RegSources(c *fiber.Ctx) error {
+	sources, err := h.Svc.RegEnrolment.Sources(c.Context(), UserID(c))
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"sources": sources})
+}
+
 // RegEnrolment is GET /terms/:id/reg-enrolment — the term's fetch from the
 // registrar (running or finished), {job: null} when none was started.
 func (h *TeachingHandler) RegEnrolment(c *fiber.Ctx) error {
@@ -756,18 +764,37 @@ func (h *TeachingHandler) RegEnrolment(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	job, err := h.Svc.RegEnrolment.Status(c.Context(), UserID(c), termID)
+	job, err := h.Svc.RegEnrolment.Status(c.Context(), UserID(c), termID, c.Query("source"))
 	if err != nil {
 		return err
 	}
 	return c.JSON(fiber.Map{"job": job})
 }
 
-// StartRegEnrolment is temporarily suspended while the integration is rebuilt
-// for KKU REG's replacement website. Keep status/stop available for old clients.
+// StartRegEnrolment starts a paced, read-only fetch for the selected term.
 func (h *TeachingHandler) StartRegEnrolment(c *fiber.Ctx) error {
-	return fiber.NewError(fiber.StatusServiceUnavailable,
-		"ปิดการดึงข้อมูลจาก KKU REG ชั่วคราว เนื่องจากระบบทะเบียนเปลี่ยนเว็บไซต์ อยู่ระหว่างพัฒนาใหม่ กรุณาวางข้อมูลจาก Excel แทน")
+	termID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
+	}
+	var body struct {
+		Scope  string `json:"scope"`
+		Source string `json:"source"`
+	}
+	if err := Bind(c, &body); err != nil {
+		return err
+	}
+	if body.Scope != "" && body.Scope != service.RegScopeAll && body.Scope != service.RegScopeRequested {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid scope")
+	}
+	if body.Source != "" && body.Source != "new" && body.Source != "legacy" {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid REG source")
+	}
+	job, err := h.Svc.RegEnrolment.Start(c.Context(), UserID(c), termID, body.Scope, body.Source)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"job": job})
 }
 
 // StopRegEnrolment is DELETE /terms/:id/reg-enrolment — stop the running
@@ -777,7 +804,7 @@ func (h *TeachingHandler) StopRegEnrolment(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	job, err := h.Svc.RegEnrolment.Stop(c.Context(), UserID(c), termID)
+	job, err := h.Svc.RegEnrolment.Stop(c.Context(), UserID(c), termID, c.Query("source"))
 	if err != nil {
 		return err
 	}

@@ -1,30 +1,12 @@
-// Package regkku reads class information from the university registrar's
-// public pages (reg.kku.ac.th/registrar): which sections a course opens in a
-// term, their track, and how many students registered.
-//
-// There is no API. The pages are classic ASP rendered in TIS-620 (Windows-874)
-// and are read here the way a browser reads them, with rules that keep the
-// load on the registrar's server at the level of one person clicking through
-// it, so it never looks like abuse:
-//
-//   - one request at a time per Client, spaced by Gap plus a random Jitter;
-//   - a "busy" answer (429/503) is waited out (Retry-After, at most a minute)
-//     and asked once more, never hammered;
-//   - one search request (List) gives a code's class groups and seats; the
-//     detail page (Sections), the only place that tells regular from
-//     special, is fetched only when the caller does not already know the
-//     groups' tracks.
-//
-// Production reaches reg.kku.ac.th through the campus DNS even without an
-// outside internet route, so no proxy setting exists.
+// Package regkku reads KKU enrolment from the new guest JSON API or the
+// legacy registrar mirror. Both providers pace requests and expose bounded
+// availability probes without bypassing access controls or rate limits.
 package regkku
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"html"
-	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -38,7 +20,7 @@ import (
 )
 
 // DefaultBase is the registrar application's root.
-const DefaultBase = "https://reg.kku.ac.th/registrar"
+const DefaultBase = "https://reg-mirror.kku.ac.th/registrar"
 
 // ErrNotFound means the registrar has no such code open in that term.
 var ErrNotFound = errors.New("regkku: course not found")
@@ -67,8 +49,10 @@ type Client struct {
 	// MaxBackoff caps how long a 429/503 answer is waited out.
 	MaxBackoff time.Duration
 
-	mu   sync.Mutex
-	last time.Time
+	mu            sync.Mutex
+	last          time.Time
+	cooldownUntil time.Time
+	lastAccess    *AccessError
 }
 
 // New returns a client for base ("" = DefaultBase) with conservative pacing.
@@ -94,13 +78,20 @@ var ErrBusy = errors.New("regkku: registrar busy")
 func (c *Client) get(ctx context.Context, path string, q url.Values) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if time.Now().Before(c.cooldownUntil) {
+		return "", c.lastAccess
+	}
 	for attempt := 0; ; attempt++ {
 		page, retryAfter, err := c.once(ctx, path, q)
 		if !errors.Is(err, ErrBusy) || attempt > 0 {
+			if errors.Is(err, ErrBusy) && retryAfter < 30*time.Second {
+				c.cooldownUntil = time.Now().Add(30 * time.Second)
+				c.lastAccess.RetryAt = c.cooldownUntil
+			}
 			return page, err
 		}
 		if retryAfter > c.MaxBackoff {
-			retryAfter = c.MaxBackoff
+			return "", err
 		}
 		select {
 		case <-time.After(retryAfter):
@@ -135,17 +126,29 @@ func (c *Client) once(ctx context.Context, path string, q url.Values) (string, t
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusServiceUnavailable {
-		after := 30 * time.Second
-		if n, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && n >= 0 {
-			after = time.Duration(n) * time.Second
-		}
-		return "", after, ErrBusy
+		after := retryDelay(res.Header)
+		c.cooldownUntil = time.Now().Add(after)
+		c.lastAccess = &AccessError{Status: res.StatusCode, RetryAt: c.cooldownUntil}
+		return "", after, c.lastAccess
 	}
 	if res.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("regkku: %s answered %d", path, res.StatusCode)
+		c.lastAccess = &AccessError{Status: res.StatusCode}
+		if res.StatusCode == 401 || res.StatusCode == 403 {
+			c.cooldownUntil = time.Now().Add(time.Minute)
+			c.lastAccess.RetryAt = c.cooldownUntil
+		}
+		return "", 0, c.lastAccess
 	}
-	body, err := io.ReadAll(io.LimitReader(charmap.Windows874.NewDecoder().Reader(res.Body), 4<<20))
+	body, err := limitedRead(charmap.Windows874.NewDecoder().Reader(res.Body))
 	if err != nil {
+		return "", 0, err
+	}
+	if challengePage(string(body)) && !strings.Contains(strings.ToLower(string(body)), "coursecode") {
+		c.cooldownUntil = time.Now().Add(time.Minute)
+		c.lastAccess = &AccessError{Status: 403, Challenge: true, RetryAt: c.cooldownUntil}
+		return "", 0, c.lastAccess
+	}
+	if err := validateLegacyTerm(string(body), path, q); err != nil {
 		return "", 0, err
 	}
 	return string(body), 0, nil
@@ -267,9 +270,13 @@ func (c *Client) Search(ctx context.Context, pattern, faculty string, year, seme
 	}
 	out := map[string]*Course{}
 	for page := 0; page < maxPages; page++ {
+		legacyTermQuery(q, year, semester)
 		body, err := c.get(ctx, "class_info_1.asp", q)
 		if err != nil {
 			return nil, err
+		}
+		if !strings.Contains(body, "รหัสวิชา") && !strings.Contains(body, "class_info_1.asp") {
+			return nil, ErrLayout
 		}
 		rows, err := ParseListAll(body)
 		if err != nil {
@@ -298,7 +305,7 @@ func (c *Client) Search(ctx context.Context, pattern, faculty string, year, seme
 			q.Set(k, cp874(v))
 		}
 	}
-	return out, nil
+	return nil, ErrLayout
 }
 
 var (

@@ -17,44 +17,33 @@ import (
 	"ta-payment-back/internal/timeutil"
 )
 
-// RegEnrolmentService fetches the real enrolment of a term's courses from the
-// registrar (reg.kku.ac.th), for staff to review in the bulk-count dialog
-// (requested 03/10/2026). It never writes a count itself: the result is
-// handed to the page, which runs it through BulkSetNumStudents — the same
-// preview, export lock and budget confirmation as a paste from Excel.
-//
-// It is built to cost the registrar as little as possible, so it is never
-// mistaken for abuse and blocked:
-//   - one fetch runs at a time in the whole system, requests one by one,
-//     ~1–1.5 s apart, backing off when the registrar says it is busy
-//     (regkku.Client);
-//   - staff choose the scope: only courses that asked for a TA (the usual
-//     need, a fraction of the term) or all of them;
-//   - only courses that can still change (not exported) are fetched;
-//   - large groups of codes ("CP*", "SC*", old "34*") are read with one
-//     wildcard search limited to the college — a whole term is about seven
-//     requests — and the rest with one search each (searchGroups);
-//   - a code costs no more than that search when the tracks of its
-//     class groups are known — from our sections, or remembered from an
-//     earlier detail page (reg_kku_section_tracks); see fetchCode;
-//   - each code's answer is reused for regResultTTL, across scopes: fetching
-//     "requested" and then "all" only fetches the rest.
-//
-// The fetch outlives the HTTP request that starts it (a term is a few
-// minutes of paced requests); the page polls Status.
+// RegEnrolmentService reads the selected term from REG's guest JSON API.
+// One job runs at a time; paced prefix searches and a ten-minute per-code
+// cache reduce traffic. Results still require staff preview and confirmation.
 type RegEnrolmentService struct {
-	pool *pgxpool.Pool
-	reg  *regkku.Client
+	pool        *pgxpool.Pool
+	reg         *regkku.APIClient
+	legacy      *regkku.Client
+	healthMu    sync.Mutex
+	health      []regkku.Availability
+	healthUntil time.Time
 
 	mu    sync.Mutex
-	jobs  map[uuid.UUID]*RegEnrolmentJob // the latest per term
+	jobs  map[regJobKey]*RegEnrolmentJob // the latest per term
 	codes map[regCodeKey]regCached       // per-code answers, see regResultTTL
 	busy  bool
 }
 
+type regJobKey struct {
+	term   uuid.UUID
+	source string
+}
+
 type regCodeKey struct {
-	term uuid.UUID
-	code string
+	source         string
+	term           uuid.UUID
+	code           string
+	year, semester int
 }
 
 type regCached struct {
@@ -78,31 +67,42 @@ type RegEnrolmentRow struct {
 	Sections string `json:"sections,omitempty"` // "01 ปกติ 73, 02 พิเศษ 7" — what the sums came from
 	// SectionCounts is the same per section, sent back with the save so each
 	// section — not just the course — takes its real enrolment.
-	SectionCounts []SectionCount `json:"section_counts,omitempty"`
-	Error         string         `json:"error,omitempty"`
+	SectionCounts []SectionCount       `json:"section_counts,omitempty"`
+	Error         string               `json:"error,omitempty"`
+	Problem       *regkku.Availability `json:"problem,omitempty"`
 }
 
 // RegEnrolmentJob is what the page polls.
 type RegEnrolmentJob struct {
-	Scope      string            `json:"scope"`
-	Status     string            `json:"status"` // running | done | stopped | failed
-	Done       int               `json:"done"`
-	Total      int               `json:"total"`
-	Rows       []RegEnrolmentRow `json:"rows"`
-	Skipped    int               `json:"skipped_exported"`
-	Reused     int               `json:"reused"` // answered from the 10-minute cache, no request
-	Error      string            `json:"error,omitempty"`
-	StartedAt  time.Time         `json:"started_at"`
-	FinishedAt *time.Time        `json:"finished_at,omitempty"`
+	Source     string               `json:"source"`
+	Problem    *regkku.Availability `json:"problem,omitempty"`
+	Year       int                  `json:"academic_year"`
+	Semester   int                  `json:"semester"`
+	Scope      string               `json:"scope"`
+	Status     string               `json:"status"` // running | done | stopped | failed
+	Done       int                  `json:"done"`
+	Total      int                  `json:"total"`
+	Rows       []RegEnrolmentRow    `json:"rows"`
+	Skipped    int                  `json:"skipped_exported"`
+	Reused     int                  `json:"reused"` // answered from the 10-minute cache, no request
+	Error      string               `json:"error,omitempty"`
+	StartedAt  time.Time            `json:"started_at"`
+	FinishedAt *time.Time           `json:"finished_at,omitempty"`
 
-	stop     context.CancelFunc // set while running; Stop calls it
-	stopping bool
+	stop       context.CancelFunc // set while running; Stop calls it
+	stopping   bool
+	codeGroups [][]string
 }
 
-func NewRegEnrolmentService(pool *pgxpool.Pool, base string) *RegEnrolmentService {
+func NewRegEnrolmentService(pool *pgxpool.Pool, base string, legacyBase ...string) *RegEnrolmentService {
+	oldBase := ""
+	if len(legacyBase) > 0 {
+		oldBase = legacyBase[0]
+	}
 	return &RegEnrolmentService{
-		pool: pool, reg: regkku.New(base),
-		jobs: map[uuid.UUID]*RegEnrolmentJob{}, codes: map[regCodeKey]regCached{},
+		legacy: regkku.New(oldBase),
+		pool:   pool, reg: regkku.NewAPI(base),
+		jobs: map[regJobKey]*RegEnrolmentJob{}, codes: map[regCodeKey]regCached{},
 	}
 }
 
@@ -113,13 +113,25 @@ func (s *RegEnrolmentService) snapshot(j *RegEnrolmentJob) *RegEnrolmentJob {
 }
 
 // Status returns the term's current or last fetch, nil when there is none.
-func (s *RegEnrolmentService) Status(ctx context.Context, actor, termID uuid.UUID) (*RegEnrolmentJob, error) {
+func (s *RegEnrolmentService) Status(ctx context.Context, actor, termID uuid.UUID, selected ...string) (*RegEnrolmentJob, error) {
+	source, err := regSource(selected)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.mayFetch(ctx, actor); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if j := s.jobs[termID]; j != nil {
+	if j := s.jobs[regJobKey{termID, source}]; j != nil {
+		var year, semester int
+		if err := s.pool.QueryRow(ctx, `SELECT academic_year, semester FROM academic_terms WHERE id = $1`, termID).Scan(&year, &semester); err != nil {
+			return nil, NotFound("ไม่พบภาคการศึกษานี้")
+		}
+		// Running jobs remain stoppable; completed old-term data is hidden.
+		if j.Status != "running" && (j.Year != year || j.Semester != semester) {
+			return nil, nil
+		}
 		return s.snapshot(j), nil
 	}
 	return nil, nil
@@ -138,8 +150,15 @@ func (s *RegEnrolmentService) mayFetch(ctx context.Context, actor uuid.UUID) err
 
 // Start begins fetching the term's courses in scope, or returns the term's
 // fetch already running, or the same scope's result if it is still fresh.
-func (s *RegEnrolmentService) Start(ctx context.Context, actor, termID uuid.UUID, scope string) (*RegEnrolmentJob, error) {
+func (s *RegEnrolmentService) Start(ctx context.Context, actor, termID uuid.UUID, scope string, selected ...string) (*RegEnrolmentJob, error) {
+	source, err := regSource(selected)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.mayFetch(ctx, actor); err != nil {
+		return nil, err
+	}
+	if err := s.sourceAllowed(source); err != nil {
 		return nil, err
 	}
 	if scope != RegScopeAll {
@@ -152,9 +171,9 @@ func (s *RegEnrolmentService) Start(ctx context.Context, actor, termID uuid.UUID
 	}
 
 	s.mu.Lock()
-	if j := s.jobs[termID]; j != nil {
-		if j.Status == "running" ||
-			(j.Scope == scope && j.Status == "done" && j.FinishedAt != nil && time.Since(*j.FinishedAt) < regResultTTL) {
+	if j := s.jobs[regJobKey{termID, source}]; j != nil {
+		if (j.Status == "running" && j.Year == year && j.Semester == semester) ||
+			(j.Year == year && j.Semester == semester && j.Scope == scope && j.Status == "done" && regRowsComplete(j.Rows) && j.FinishedAt != nil && time.Since(*j.FinishedAt) < regResultTTL) {
 			snap := s.snapshot(j)
 			s.mu.Unlock()
 			return snap, nil
@@ -162,12 +181,12 @@ func (s *RegEnrolmentService) Start(ctx context.Context, actor, termID uuid.UUID
 	}
 	if s.busy {
 		s.mu.Unlock()
-		return nil, Conflict("กำลังดึงข้อมูลจากระบบทะเบียนของภาคอื่นอยู่ กรุณารอสักครู่แล้วลองใหม่")
+		return nil, Conflict("กำลังดึงข้อมูลจากระบบทะเบียนอยู่ กรุณารอให้งานเดิมเสร็จหรือหยุดงานเดิมก่อน")
 	}
 	s.busy = true
 	s.mu.Unlock()
 
-	codes, skipped, err := s.termCodes(ctx, termID, scope)
+	codes, skipped, groups, err := s.termCodes(ctx, termID, scope)
 	if err != nil {
 		s.release()
 		return nil, err
@@ -181,11 +200,11 @@ func (s *RegEnrolmentService) Start(ctx context.Context, actor, termID uuid.UUID
 	}
 
 	j := &RegEnrolmentJob{
-		Scope: scope, Status: "running", Total: len(codes), Skipped: skipped,
-		Rows: []RegEnrolmentRow{}, StartedAt: timeutil.Now(),
+		Source: source, Year: year, Semester: semester, Scope: scope, Status: "running", Total: len(codes), Skipped: skipped,
+		Rows: []RegEnrolmentRow{}, StartedAt: timeutil.Now(), codeGroups: groups,
 	}
 	s.mu.Lock()
-	s.jobs[termID] = j
+	s.jobs[regJobKey{termID, source}] = j
 	snap := s.snapshot(j)
 	s.mu.Unlock()
 
@@ -203,7 +222,7 @@ func (s *RegEnrolmentService) release() {
 // counts can still change, and how many courses were left out as exported.
 // scope "requested" keeps the courses the staff list shows as "ขอ TA แล้ว":
 // a submitted or approved TA request.
-func (s *RegEnrolmentService) termCodes(ctx context.Context, termID uuid.UUID, scope string) ([]string, int, error) {
+func (s *RegEnrolmentService) termCodes(ctx context.Context, termID uuid.UUID, scope string) ([]string, int, [][]string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT code, COALESCE(alt_codes, '{}'), exported_at IS NOT NULL
 		  FROM teaching_courses tc
@@ -213,43 +232,51 @@ func (s *RegEnrolmentService) termCodes(ctx context.Context, termID uuid.UUID, s
 		          WHERE r.teaching_course_id = tc.id AND r.status IN ('submitted', 'approved')))`,
 		termID, scope)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	defer rows.Close()
 	seen := map[string]bool{}
 	var codes []string
+	var groups [][]string
 	skipped := 0
 	for rows.Next() {
 		var code string
 		var alts []string
 		var exported bool
 		if err := rows.Scan(&code, &alts, &exported); err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		if exported {
 			skipped++
 			continue
 		}
+		var group []string
 		for _, c := range append([]string{code}, alts...) {
 			c = normalizeCode(c)
+			if c != "" {
+				group = append(group, c)
+			}
 			if c != "" && !seen[c] {
 				seen[c] = true
 				codes = append(codes, c)
 			}
 		}
+		groups = append(groups, group)
 	}
 	sort.Strings(codes)
-	return codes, skipped, rows.Err()
+	return codes, skipped, groups, rows.Err()
 }
 
 func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []string, year, semester int) {
-	defer s.release()
 	// Paced at ~1.25 s a request, a whole term of 150 codes is 3–6 minutes;
 	// the cap only stops a hung registrar from holding the single slot forever.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	s.mu.Lock()
 	j.stop = cancel
+	if j.stopping {
+		cancel()
+	}
 	s.mu.Unlock()
 	stopped := func() bool {
 		s.mu.Lock()
@@ -257,7 +284,8 @@ func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []
 		return j.stopping
 	}
 
-	listed := s.searchGroups(ctx, termID, codes, year, semester)
+	source := j.Source
+	listed, groupErrors := s.searchGroups(ctx, termID, codes, year, semester, source)
 
 	consecutiveNetErr := 0
 	for _, code := range codes {
@@ -265,14 +293,18 @@ func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []
 			s.finish(j, "stopped", "")
 			return
 		}
-		key := regCodeKey{termID, code}
+		key := regCodeKey{term: termID, code: code, year: year, semester: semester, source: source}
 		s.mu.Lock()
 		c, ok := s.codes[key]
 		s.mu.Unlock()
 		reused := ok && time.Since(c.at) < regResultTTL
 		row := c.row
 		if !reused {
-			row = s.fetchCode(ctx, termID, code, listed[code], year, semester)
+			if err := groupErrors[code]; err != nil {
+				row = regFailure(code, source, err)
+			} else {
+				row = s.fetchCode(ctx, termID, code, listed[code], year, semester, source)
+			}
 		}
 		// Stopped mid-request: that code's answer is the cancellation, not
 		// the registrar's — leave it out rather than report it as an error.
@@ -281,7 +313,13 @@ func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []
 			return
 		}
 
+		if row.Problem != nil {
+			s.rememberSourceProblem(*row.Problem)
+		}
 		s.mu.Lock()
+		if row.Problem != nil {
+			j.Problem = row.Problem
+		}
 		j.Rows = append(j.Rows, row)
 		j.Done++
 		if reused {
@@ -296,7 +334,7 @@ func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []
 		if row.Error == regErrNetwork {
 			consecutiveNetErr++
 			if consecutiveNetErr >= 3 {
-				s.finish(j, "failed", "ติดต่อระบบทะเบียน (reg.kku.ac.th) ไม่ได้ หรือระบบทะเบียนขอให้ชะลอ จึงหยุดดึงไว้ก่อน กรุณาลองใหม่ภายหลัง")
+				s.finish(j, "failed", "ติดต่อระบบทะเบียนที่เลือกไม่ได้ หรือระบบทะเบียนขอให้ชะลอ จึงหยุดดึงไว้ก่อน กรุณาลองใหม่ภายหลัง")
 				return
 			}
 		} else {
@@ -312,8 +350,37 @@ func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []
 
 func (s *RegEnrolmentService) finish(j *RegEnrolmentJob, status, msg string) {
 	now := timeutil.Now()
+	s.healthMu.Lock()
+	s.healthUntil = time.Time{}
+	s.healthMu.Unlock()
 	s.mu.Lock()
+	// A merged course is usable only when ALL of its codes were fetched.
+	// Cache entries remain reusable, so resuming can complete the group.
+	good := map[string]bool{}
+	for _, row := range j.Rows {
+		good[row.Code] = row.Error == ""
+	}
+	incomplete := map[string]bool{}
+	for _, group := range j.codeGroups {
+		complete := true
+		for _, code := range group {
+			if !good[code] {
+				complete = false
+			}
+		}
+		if !complete {
+			for _, code := range group {
+				incomplete[code] = true
+			}
+		}
+	}
+	for i := range j.Rows {
+		if incomplete[j.Rows[i].Code] && j.Rows[i].Error == "" {
+			j.Rows[i].Error = "ข้อมูลรหัสวิชาควบรวมยังไม่ครบ กรุณาดึงต่อหรือตรวจสอบทุกรหัสใน REG ก่อนบันทึก"
+		}
+	}
 	j.Status, j.Error, j.FinishedAt, j.stop = status, msg, &now, nil
+	s.busy = false
 	s.mu.Unlock()
 }
 
@@ -321,12 +388,16 @@ func (s *RegEnrolmentService) finish(j *RegEnrolmentJob, status, msg string) {
 // abandoned, nothing more is sent to the registrar. What was fetched so far
 // stays in the job (status "stopped") for staff to use, and each fetched
 // code's answer stays cached, so starting again only fetches the rest.
-func (s *RegEnrolmentService) Stop(ctx context.Context, actor, termID uuid.UUID) (*RegEnrolmentJob, error) {
+func (s *RegEnrolmentService) Stop(ctx context.Context, actor, termID uuid.UUID, selected ...string) (*RegEnrolmentJob, error) {
+	source, err := regSource(selected)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.mayFetch(ctx, actor); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
-	j := s.jobs[termID]
+	j := s.jobs[regJobKey{termID, source}]
 	if j == nil || j.Status != "running" {
 		s.mu.Unlock()
 		return nil, Invalid("ไม่มีการดึงข้อมูลที่กำลังทำงานอยู่")
@@ -357,109 +428,64 @@ func (s *RegEnrolmentService) Stop(ctx context.Context, actor, termID uuid.UUID)
 const (
 	regErrNetwork  = "ติดต่อระบบทะเบียนไม่ได้"
 	regErrNotFound = "ไม่พบรหัสวิชานี้ในระบบทะเบียนภาคนี้"
-	regErrLayout   = "อ่านหน้าระบบทะเบียนไม่ได้ (หน้าเว็บอาจเปลี่ยนรูปแบบ)"
+	regErrLayout   = "ข้อมูลจาก REG ไม่ครบ เปลี่ยนระหว่างดึง หรือมีประเภทกลุ่มเรียนที่ยังไม่รองรับ กรุณาตรวจสอบใน REG"
 )
 
-// fetchCode reads one code's enrolment by track.
-//
-// One request, the registrar's search page, gives every class group with its
-// "ลง" count — but not whether a group is regular or special. That comes from
-// what we already know (knownTracks): our own sections for a course's own
-// code, and tracks remembered from an earlier detail page. Only when a group
-// is still unknown — a merged code, whose sections were folded away, or a
-// group the registrar opened after our import — is the detail page read
-// (a second request), and its tracks are remembered for next time.
-//
-// pre is the code's rows from a wildcard search (searchGroups), nil when the
-// code was not covered by one — then the code is searched on its own.
-func (s *RegEnrolmentService) fetchCode(ctx context.Context, termID uuid.UUID, code string, pre *regkku.Course, year, semester int) RegEnrolmentRow {
+// fetchCode uses authoritative level-filtered API results. Sum repeated
+// section numbers across revisions only after class-ID deduplication in Fetch.
+func (s *RegEnrolmentService) fetchCode(ctx context.Context, termID uuid.UUID, code string, pre []regkku.Section, year, semester int, selected ...string) RegEnrolmentRow {
+	source, _ := regSource(selected)
 	row := RegEnrolmentRow{Code: code}
-	var courseID string
-	var listed []regkku.Listed
-	if pre != nil {
-		courseID, listed = pre.ID, pre.Sections
-	} else {
-		var err error
-		courseID, listed, err = s.reg.List(ctx, code, year, semester)
+	if pre == nil {
+		found, err := s.fetchReg(ctx, source, code, year, semester, map[string]bool{code: true})
 		if err != nil {
-			row.Error = regFetchError(code, err)
-			return row
+			return regFailure(code, source, err)
 		}
+		pre = found[code]
 	}
-	known, err := s.knownTracks(ctx, termID, code, year, semester)
-	if err != nil {
-		log.Printf("reg enrolment: tracks of %s: %v", code, err)
-		known = map[string]bool{}
+	if len(pre) == 0 {
+		row.Error = regErrNotFound
+		return row
 	}
-	// The detail page of every registrar course id that has a group we
-	// cannot place — usually one id, two when the registrar lists an old
-	// revision's group under the same code.
-	var ids []string
-	seenID := map[string]bool{}
-	for _, l := range listed {
-		if _, ok := known[l.No]; ok {
-			continue
-		}
-		id := l.CourseID
-		if id == "" {
-			id = courseID
-		}
-		if !seenID[id] {
-			seenID[id] = true
-			ids = append(ids, id)
-		}
+	type key struct {
+		no      string
+		special bool
 	}
-	for _, id := range ids {
-		secs, err := s.reg.Sections(ctx, id, code, year, semester)
-		if err != nil {
-			row.Error = regFetchError(code, err)
-			return row
-		}
-		for _, sec := range secs {
-			no := strings.TrimLeft(sec.No, "0")
-			known[no] = sec.Special
-			if _, err := s.pool.Exec(ctx, `
-				INSERT INTO reg_kku_section_tracks (academic_year, semester, code, sec_no, special)
-				VALUES ($1, $2, $3, $4, $5)
-				ON CONFLICT (academic_year, semester, code, sec_no)
-				DO UPDATE SET special = EXCLUDED.special, fetched_at = NOW()`,
-				year, semester, code, no, sec.Special); err != nil {
-				log.Printf("reg enrolment: remember %s sec %s: %v", code, no, err)
-			}
-		}
-	}
-
-	parts := make([]string, 0, len(listed))
-	for _, l := range listed {
-		special, ok := known[l.No]
-		if !ok {
-			// Listed on the search page yet absent from the detail page:
-			// the two disagree, so no number is safer than a guessed track.
+	counts := map[key]int{}
+	for _, sec := range pre {
+		no := strings.TrimLeft(sec.No, "0")
+		if no == "" {
 			row.Error = regErrLayout
 			return row
 		}
+		counts[key{no, sec.Special}] += sec.Enrolled
+	}
+	var parts []string
+	for k, count := range counts {
 		track := "ปกติ"
-		if special {
-			row.Special += l.Enrolled
+		if k.special {
+			row.Special += count
 			track = "พิเศษ"
 		} else {
-			row.Regular += l.Enrolled
+			row.Regular += count
 		}
-		parts = append(parts, fmt.Sprintf("%s %s %d", l.No, track, l.Enrolled))
-		row.SectionCounts = append(row.SectionCounts, SectionCount{SecNo: l.No, Special: special, Count: l.Enrolled})
+		parts = append(parts, fmt.Sprintf("%s %s %d", k.no, track, count))
+		row.SectionCounts = append(row.SectionCounts, SectionCount{SecNo: k.no, Special: k.special, Count: count})
 	}
+	sort.Strings(parts)
+	sort.Slice(row.SectionCounts, func(i, j int) bool {
+		a, b := row.SectionCounts[i], row.SectionCounts[j]
+		if a.SecNo == b.SecNo {
+			return !a.Special && b.Special
+		}
+		return a.SecNo < b.SecNo
+	})
 	row.Sections = strings.Join(parts, ", ")
 	return row
 }
 
-// regWildcardMin is the group size from which one wildcard search ("CP*",
-// a few pages of 250 rows) costs the registrar less than searching each code.
-// Measured 03/10/2026: the college's CP* and SC* are 3 pages each, its 34*
-// one page — against 124 and 103 single searches.
 const regWildcardMin = 5
 
-// regPattern is the wildcard group of a code: its letter prefix ("CP*",
-// "SC*") or, for the old all-digit codes, its first two digits ("34*").
 func regPattern(code string) string {
 	i := 0
 	for i < len(code) && code[i] >= 'A' && code[i] <= 'Z' {
@@ -474,95 +500,57 @@ func regPattern(code string) string {
 	return ""
 }
 
-// searchGroups runs one wildcard search, limited to the College of
-// Computing, for each group of still-needed codes large enough to be worth
-// it, and returns the rows found by code. Codes it does not return (fewer
-// in their group, or owned by another faculty) are searched one by one. A
-// failed group search is logged and simply falls back the same way.
-func (s *RegEnrolmentService) searchGroups(ctx context.Context, termID uuid.UUID, codes []string, year, semester int) map[string]*regkku.Course {
-	groups := map[string]int{}
+// Large groups are fetched once. A failed prefix is NOT retried for every
+// code: that would multiply traffic during a REG outage or rate limit.
+func (s *RegEnrolmentService) searchGroups(ctx context.Context, termID uuid.UUID, codes []string, year, semester int, selected ...string) (map[string][]regkku.Section, map[string]error) {
+	source, _ := regSource(selected)
+	groups := map[string][]string{}
 	s.mu.Lock()
-	for _, c := range codes {
-		if cached, ok := s.codes[regCodeKey{termID, c}]; ok && time.Since(cached.at) < regResultTTL {
+	for _, code := range codes {
+		if cached, ok := s.codes[regCodeKey{term: termID, code: code, year: year, semester: semester, source: source}]; ok && time.Since(cached.at) < regResultTTL {
 			continue
 		}
-		if p := regPattern(c); p != "" {
-			groups[p]++
+		if p := regPattern(code); p != "" {
+			groups[p] = append(groups[p], code)
 		}
 	}
 	s.mu.Unlock()
-
-	out := map[string]*regkku.Course{}
-	patterns := make([]string, 0, len(groups))
-	for p, n := range groups {
-		if n >= regWildcardMin {
+	out := map[string][]regkku.Section{}
+	failures := map[string]error{}
+	var patterns []string
+	for p, list := range groups {
+		if len(list) >= regWildcardMin {
 			patterns = append(patterns, p)
 		}
 	}
 	sort.Strings(patterns)
 	for _, p := range patterns {
-		found, err := s.reg.Search(ctx, p, regkku.CollegeOfComputing, year, semester, 10)
-		if err != nil {
-			if ctx.Err() == nil {
-				log.Printf("reg enrolment: search %s: %v (falling back to single searches)", p, err)
+		wanted := map[string]bool{}
+		for _, code := range groups[p] {
+			wanted[code] = true
+		}
+		found, err := s.fetchReg(ctx, source, p, year, semester, wanted)
+		for _, code := range groups[p] {
+			if err != nil && len(found[code]) == 0 {
+				failures[code] = err
+			} else {
+				out[code] = found[code]
+				if out[code] == nil {
+					out[code] = []regkku.Section{}
+				}
 			}
-			continue
 		}
-		for k, v := range found {
-			out[k] = v
+		if err != nil && !errors.Is(err, regkku.ErrLayout) {
+			// Stop prefetching other prefixes after any transport/busy error.
+			for _, code := range codes {
+				if _, ok := out[code]; !ok {
+					failures[code] = err
+				}
+			}
+			break
 		}
 	}
-	return out
-}
-
-// knownTracks maps a code's class-group numbers ("1", no leading zero) to
-// special/regular from what needs no request: tracks remembered from the
-// registrar's detail page first (the registrar's own word), then our
-// sections — the course's own sections for its primary code, and any
-// not-yet-folded "SC361002-3" section for a merged code.
-func (s *RegEnrolmentService) knownTracks(ctx context.Context, termID uuid.UUID, code string, year, semester int) (map[string]bool, error) {
-	out := map[string]bool{}
-	rows, err := s.pool.Query(ctx, `
-		SELECT ltrim(CASE WHEN s.course_code IS NULL THEN s.sec_no
-		                  ELSE substr(s.sec_no, length(s.course_code) + 2) END, '0'),
-		       s.track = 'special'
-		  FROM sections s
-		  JOIN teaching_courses tc ON tc.id = s.teaching_course_id
-		 WHERE tc.term_id = $1
-		   AND ((s.course_code IS NULL AND upper(tc.code) = $2) OR upper(s.course_code) = $2)`,
-		termID, code)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var no string
-		var special bool
-		if err := rows.Scan(&no, &special); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		out[no] = special
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	rows, err = s.pool.Query(ctx, `
-		SELECT sec_no, special FROM reg_kku_section_tracks
-		 WHERE academic_year = $1 AND semester = $2 AND code = $3`, year, semester, code)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var no string
-		var special bool
-		if err := rows.Scan(&no, &special); err != nil {
-			return nil, err
-		}
-		out[no] = special
-	}
-	return out, rows.Err()
+	return out, failures
 }
 
 func regFetchError(code string, err error) string {
@@ -578,4 +566,36 @@ func regFetchError(code string, err error) string {
 		}
 		return regErrNetwork
 	}
+}
+
+func regRowsComplete(rows []RegEnrolmentRow) bool {
+	for _, r := range rows {
+		if r.Error != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func regSource(selected []string) (string, error) {
+	source := regkku.SourceNew
+	if len(selected) > 0 && selected[0] != "" {
+		source = selected[0]
+	}
+	if source != regkku.SourceNew && source != regkku.SourceLegacy {
+		return "", Invalid("invalid REG source")
+	}
+	return source, nil
+}
+
+func (s *RegEnrolmentService) fetchReg(ctx context.Context, source, pattern string, year, semester int, wanted map[string]bool) (map[string][]regkku.Section, error) {
+	if source == regkku.SourceLegacy {
+		return s.legacy.Fetch(ctx, pattern, year, semester, wanted)
+	}
+	return s.reg.Fetch(ctx, pattern, year, semester, wanted)
+}
+
+func regFailure(code, source string, err error) RegEnrolmentRow {
+	problem := regkku.DescribeAccess(source, err)
+	return RegEnrolmentRow{Code: code, Error: regFetchError(code, err), Problem: &problem}
 }

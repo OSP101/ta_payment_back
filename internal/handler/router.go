@@ -298,6 +298,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/terms/:id/usage", adminOrStaff, editGuard, th.TermUsage)
 	authed.Delete("/terms/:id", adminOrStaff, editGuard, th.DeleteTerm)
 	authed.Post("/terms/:id/num-students/bulk", adminOrStaff, heavyLimiter, editGuard, th.BulkNumStudents)
+	authed.Get("/reg-enrolment/sources", adminOrStaff, editGuard, th.RegSources)
 	authed.Get("/terms/:id/reg-enrolment", adminOrStaff, editGuard, th.RegEnrolment)
 	authed.Post("/terms/:id/reg-enrolment", adminOrStaff, heavyLimiter, editGuard, th.StartRegEnrolment)
 	authed.Delete("/terms/:id/reg-enrolment", adminOrStaff, editGuard, th.StopRegEnrolment)

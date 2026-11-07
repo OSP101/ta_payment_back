@@ -2,6 +2,7 @@ package regkku
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -78,7 +79,7 @@ func TestList_DecodesThaiReadsSeatsAndPacesRequests(t *testing.T) {
 			return
 		}
 		// The real site answers in TIS-620; so does this fake.
-		b, _ := charmap.Windows874.NewEncoder().String("<html>รหัสวิชา: CP999999</html>")
+		b, _ := charmap.Windows874.NewEncoder().String("<html>รหัสวิชา: CP999999 ปีการศึกษา 2569 / 1</html>")
 		w.Write([]byte(b))
 	}))
 	defer srv.Close()
@@ -116,7 +117,7 @@ func TestGet_WaitsOutBusyOnceThenGivesUp(t *testing.T) {
 	defer srv.Close()
 	c := New(srv.URL)
 	c.Gap, c.Jitter = 0, 0
-	if _, _, err := c.List(context.Background(), "SC363001", 2569, 1); err != ErrBusy {
+	if _, _, err := c.List(context.Background(), "SC363001", 2569, 1); !errors.Is(err, ErrBusy) {
 		t.Fatalf("err = %v, want ErrBusy", err)
 	}
 	if hits != 2 {
@@ -142,11 +143,11 @@ func TestSearch_FollowsPagesAndSendsFacultyInTIS620(t *testing.T) {
 		faculties = append(faculties, q.Get("facultyid"))
 		if q.Get("page") == "" {
 			// A course split across pages: CP363205 sec 1 here, sec 2 on page 2.
-			w.Write(enc(`<html><TABLE>` + listRow("CP363205", "3613670353", 1, 51, 49) + listRow("CP352201", "11", 1, 50, 19) +
+			w.Write(enc(`<html>รหัสวิชา: CP* ปีการศึกษา 2569 / 1<TABLE>` + listRow("CP363205", "3613670353", 1, 51, 49) + listRow("CP352201", "11", 1, 50, 19) +
 				`</TABLE><A HREF="class_info_1.asp?facultyid=038วิทยาลัยการคอมพิวเตอร์&amp;coursecode=CP*&amp;maxrow=250&amp;page=2&amp;backto=HOME">[หน้าต่อไป]</A></html>`))
 			return
 		}
-		w.Write(enc(`<html><TABLE>` + listRow("CP363205", "3613670353", 2, 45, 41) + `</TABLE>[หน้าก่อน] [หน้าต่อไป]</html>`))
+		w.Write(enc(`<html>รหัสวิชา: CP* ปีการศึกษา 2569 / 1<TABLE>` + listRow("CP363205", "3613670353", 2, 45, 41) + `</TABLE>[หน้าก่อน] [หน้าต่อไป]</html>`))
 	}))
 	defer srv.Close()
 	c := New(srv.URL)
