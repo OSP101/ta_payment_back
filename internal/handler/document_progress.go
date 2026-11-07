@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -18,14 +19,11 @@ type DocProgressHandler struct{ Svc *service.Container }
 // getting exactly what it always got.
 func roundParam(c *fiber.Ctx) (int, error) {
 	raw := c.Query("round", "1")
-	switch raw {
-	case "1":
-		return 1, nil
-	case "2":
-		return 2, nil
-	default:
-		return 0, fiber.NewError(fiber.StatusBadRequest, "round must be 1 or 2")
+	n, err := strconv.Atoi(raw)
+	if err != nil || !service.ProgressScopeValid(n) {
+		return 0, fiber.NewError(fiber.StatusBadRequest, "invalid document scope")
 	}
+	return n, nil
 }
 
 // Get returns every round of the term's document progress (?term_id=).

@@ -57,6 +57,9 @@ func loadFrozenGradLump(ctx context.Context, q ledgerQuerier, courseID, taID uui
 		if err := rows.Scan(&ym, &baht, &basis); err != nil {
 			return nil, err
 		}
+		if len(out.months) > 0 && math.Abs(out.basis-basis) > 0.005 {
+			return nil, Conflict("บัญชียอดเหมาจ่ายมีวงเงินต้นทางไม่ตรงกัน กรุณาตรวจสอบก่อนส่งออก")
+		}
 		out.months[ym] = baht
 		out.total += baht
 		out.basis = basis
@@ -109,8 +112,8 @@ type GradLumpSnapshot struct {
 
 	mu       sync.Mutex
 	lumpRead bool
-	byTA  map[uuid.UUID]map[string]float64
-	basis map[uuid.UUID]float64
+	byTA     map[uuid.UUID]map[string]float64
+	basis    map[uuid.UUID]float64
 }
 
 func copyMonths(m map[string]float64) map[string]float64 {
@@ -236,6 +239,18 @@ func (s *ExportService) FreezeGradLumps(ctx context.Context, actor, courseID uui
 // must not leave the server — the caller fails the request, and a re-download
 // prints the frozen figures. An empty month list means the whole term.
 func (s *ExportService) FreezeGradLumpSnapshot(ctx context.Context, actor uuid.UUID, snap *GradLumpSnapshot, months []string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err = s.FreezeGradLumpSnapshotTx(ctx, tx, actor, snap, months); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *ExportService) FreezeGradLumpSnapshotTx(ctx context.Context, tx pgx.Tx, actor uuid.UUID, snap *GradLumpSnapshot, months []string) error {
 	if snap == nil {
 		return nil
 	}
@@ -266,15 +281,42 @@ func (s *ExportService) FreezeGradLumpSnapshot(ctx context.Context, actor uuid.U
 	}
 	sort.Slice(holders, func(i, j int) bool { return holders[i].String() < holders[j].String() })
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
 	// Two exports of the same course at once must not interleave their rows.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 7))`,
 		"grad_lump_ledger/"+courseID.String()); err != nil {
 		return err
+	}
+
+	// Month issuers serialize per course, then re-read the entire term's
+	// payments. A snapshot built before another month committed must never
+	// replace the frozen basis or overdraw the remaining lump.
+	for _, ta := range holders {
+		incomingBasis := round2(basis[ta])
+		if math.IsNaN(incomingBasis) || math.IsInf(incomingBasis, 0) || incomingBasis < 0 {
+			return Invalid("วงเงินเหมาจ่ายไม่ถูกต้อง")
+		}
+		frozen, e := loadFrozenGradLump(ctx, tx, courseID, ta)
+		if e != nil {
+			return e
+		}
+		if frozen.any() && math.Abs(frozen.basis-incomingBasis) > 0.005 {
+			return Conflict("วงเงินเหมาจ่ายถูกกำหนดจากการส่งออกก่อนหน้าแล้ว กรุณาคำนวณและดาวน์โหลดใหม่")
+		}
+		extra := 0.0
+		seen := map[string]bool{}
+		for _, ym := range months {
+			amount := round2(byTA[ta][ym])
+			if math.IsNaN(amount) || math.IsInf(amount, 0) || amount < 0 {
+				return Invalid("ยอดเหมาจ่ายรายเดือนไม่ถูกต้อง")
+			}
+			if _, exists := frozen.months[ym]; !exists && !seen[ym] {
+				extra += amount
+				seen[ym] = true
+			}
+		}
+		if round2(frozen.total+extra) > incomingBasis+0.005 {
+			return Conflict("ยอดเหมาจ่ายรวมทุกเดือนจะเกินวงเงินทั้งภาคเรียน กรุณาคำนวณและดาวน์โหลดใหม่")
+		}
 	}
 	for _, ta := range holders {
 		for _, ym := range months {
@@ -321,7 +363,7 @@ func (s *ExportService) FreezeGradLumpSnapshot(ctx context.Context, actor uuid.U
 			"ยอดเหมาจ่ายบัณฑิตภาคพิเศษของเดือน %s ถูกกำหนดไว้แล้วจากการส่งออกอีกครั้งที่เกิดพร้อมกัน "+
 				"เอกสารชุดนี้จึงไม่ถูกส่งออก — กรุณากดดาวน์โหลดใหม่", strings.Join(uniqueStrings(drift), ", ")))
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func uniqueStrings(in []string) []string {

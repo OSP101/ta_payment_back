@@ -57,7 +57,7 @@ type ApproveAllResult struct {
 //     re-upload can't race in between.
 //   - if any of the three required kinds is missing (superseded_at IS NULL
 //     count < 3), the caller sees a UserError explaining why.
-//   - expires_at is set to NOW()+7d so the retention job scrubs the file
+//   - expires_at is set using the configured retention period for every file
 //     later without the officer having to do anything.
 func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (*ApproveAllResult, error) {
 	tx, err := s.pool.Begin(ctx)
@@ -71,7 +71,7 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 	var profStatus string
 	var round int
 	err = tx.QueryRow(ctx,
-		`SELECT status::text, COALESCE(current_round, 1) FROM ta_profiles WHERE user_id = $1`,
+		`SELECT status::text, COALESCE(current_round, 1) FROM ta_profiles WHERE user_id = $1 FOR UPDATE`,
 		userID,
 	).Scan(&profStatus, &round)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -137,18 +137,19 @@ func (s *DocsService) ApproveAll(ctx context.Context, actor, userID uuid.UUID) (
 		ids = append(ids, d.id)
 	}
 
-	// Approve every locked doc. Clearing expires_at first would matter only
-	// if a doc had been re-approved after a purge — that path never happens
-	// in the current flow, but setting NOW()+7d unconditionally is safe.
+	// Approve every locked document, then start the complete set together.
 	if _, err := tx.Exec(ctx, `
 		UPDATE ta_documents
 		SET status='approved',
 		    reject_reason=NULL,
 		    reviewed_at=NOW(),
-		    reviewed_by=$1,
-		    expires_at=NOW() + INTERVAL '7 days'
+		    reviewed_by=$1
 		WHERE id = ANY($2)`,
 		actor, ids); err != nil {
+		return nil, err
+	}
+
+	if err := startDocumentRetention(ctx, tx, userID); err != nil {
 		return nil, err
 	}
 
@@ -217,7 +218,7 @@ func (s *DocsService) RejectBatch(ctx context.Context, actor, userID uuid.UUID, 
 
 	var round int
 	err = tx.QueryRow(ctx,
-		`SELECT COALESCE(current_round, 1) FROM ta_profiles WHERE user_id = $1`, userID,
+		`SELECT COALESCE(current_round, 1) FROM ta_profiles WHERE user_id = $1 FOR UPDATE`, userID,
 	).Scan(&round)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Invalid("ไม่พบโปรไฟล์ของ TA คนนี้")
@@ -547,7 +548,7 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 		return "", err
 	}
 	if len(ids) == 0 {
-		return "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน"}
+		return "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามระยะเวลาเก็บรักษาที่กำหนดแล้ว"}
 	}
 	// Check the quota here as well as at the download itself. This is the copy
 	// that produces a useful message: the officer is standing at the password
@@ -557,8 +558,12 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 	if err != nil {
 		return "", err
 	}
-	if used >= maxDocDownloads {
-		return "", quotaExceeded(used)
+	policy, err := s.DocumentPolicy(ctx)
+	if err != nil {
+		return "", err
+	}
+	if used >= policy.DownloadLimit {
+		return "", quotaExceeded(used, policy.DownloadLimit)
 	}
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "ta_docs.redownload_verify", Entity: "ta_profile",
 		EntityID: userID.String(), After: map[string]any{"doc_count": len(ids), "downloads_used": used}}); err != nil {
@@ -567,7 +572,8 @@ func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID,
 	return s.mintZipToken(actor, userID, ids)
 }
 
-// maxDocDownloads caps how many times one TA's approved bundle may be
+// maxDocDownloads is the default policy value used in regression tests.
+// The live limit is read from document_policy. One TA's approved bundle may be
 // downloaded. The bundle holds a national ID, a bank account number and a
 // signature; the password gate proves who is pulling it, this limits how many
 // copies exist at all.
@@ -625,12 +631,12 @@ func (s *DocsService) currentDocRound(ctx context.Context, userID uuid.UUID) (in
 
 // quotaExceeded is the shared refusal, so the message the officer sees is the
 // same whether they hit the limit at the password prompt or at the download.
-func quotaExceeded(used int) error {
+func quotaExceeded(used, limit int) error {
 	return &UserError{
 		Status: 403,
 		Msg: fmt.Sprintf(
 			"ดาวน์โหลดครบ %d ครั้งแล้ว (จำกัด %d ครั้งต่อ TA หนึ่งคน) ไม่สามารถดาวน์โหลดเพิ่มได้อีก โปรดใช้ไฟล์ที่ดาวน์โหลดไปแล้ว",
-			used, maxDocDownloads),
+			used, limit),
 	}
 }
 
@@ -659,8 +665,12 @@ func (s *DocsService) recordDocDownload(ctx context.Context, actor, userID uuid.
 		  WHERE user_id = $1 AND counts_toward_quota`, userID).Scan(&used); err != nil {
 		return err
 	}
-	if used >= maxDocDownloads {
-		return quotaExceeded(used)
+	policy, err := readDocumentPolicy(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if used >= policy.DownloadLimit {
+		return quotaExceeded(used, policy.DownloadLimit)
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ta_doc_downloads (user_id, round, actor_id, counts_toward_quota)
@@ -904,7 +914,7 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 	// copy must be complete or it isn't an audit copy.
 	for _, e := range entries {
 		if e.deletedAt != nil {
-			return nil, "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน"}
+			return nil, "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามระยะเวลาเก็บรักษาที่กำหนดแล้ว"}
 		}
 	}
 
@@ -920,7 +930,7 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 		rc, err := s.store.Open(e.key)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil, "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน"}
+				return nil, "", &UserError{Status: 410, Msg: "ไฟล์ถูกลบตามระยะเวลาเก็บรักษาที่กำหนดแล้ว"}
 			}
 			return nil, "", err
 		}

@@ -27,7 +27,7 @@ func sheetRowNames(sheets []transferCoverSheet) map[string]float64 {
 // Each file must contain ONLY its own level, and the two totals must sum to
 // the combined money actually earned (no double count, no drop).
 func TestBuildTransferCoverSheets_LevelSplitsFiles(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP410", Curriculum: "CY", LectureHrs: 100})
 	courseB, regB, _ := f.insertCourse(tcCourseOpts{Code: "CP420", Curriculum: "CY", LectureHrs: 100})
 
@@ -77,7 +77,7 @@ func TestBuildTransferCoverSheets_LevelSplitsFiles(t *testing.T) {
 // appear on BOTH files — never merged into one, never silently dropped from
 // either — each with only that assignment's own money.
 func TestBuildTransferCoverSheets_SamePersonBothLevelAssignments(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP430", Curriculum: "CY", LectureHrs: 100})
 	courseB, regB, _ := f.insertCourse(tcCourseOpts{Code: "CP440", Curriculum: "CY", LectureHrs: 100})
 
@@ -110,7 +110,7 @@ func TestBuildTransferCoverSheets_SamePersonBothLevelAssignments(t *testing.T) {
 // The gate must be independent per level: a graduate course still mid-review
 // must not hold the undergrad file's export shut, and the reverse.
 func TestTermExportBlockers_LevelIsolated(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP450", Curriculum: "CY", LectureHrs: 100})
 	courseB, regB, _ := f.insertCourse(tcCourseOpts{Code: "CP460", Curriculum: "CY", LectureHrs: 100})
 
@@ -147,7 +147,7 @@ func TestTermExportBlockers_LevelIsolated(t *testing.T) {
 // undergrad file must not make the graduate screen believe its own months are
 // already covered, and vice versa.
 func TestTransferCoverCoverage_LevelIsolated(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	// Pinned to one month inside the fixture's term (Jun–Oct 2026) and inside
 	// ONE fiscal year. It used to follow the real calendar (day()/f.ym), which
 	// broke on 1 October — the term then spanned two fiscal years and the
@@ -193,7 +193,7 @@ func TestTransferCoverCoverage_LevelIsolated(t *testing.T) {
 // (level IS NULL) in EVERY level's history — that generation genuinely did
 // cover both files at once, back before the split existed.
 func TestListTransferCoverExports_PreSplitRowCountsForBothLevels(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	f.exec(`INSERT INTO transfer_cover_exports (id, term_id, generated_by, total_baht, sheet_count, document, months, level)
 	        VALUES (gen_random_uuid(), $1, NULL, 500, 1, '{}'::jsonb, NULL, NULL)`, f.termID)
 
@@ -218,7 +218,8 @@ func TestListTransferCoverExports_PreSplitRowCountsForBothLevels(t *testing.T) {
 // stage to review — but the build should say so via a warning rather than
 // silence, since staff might otherwise assume the usual review happened.
 func TestBuildTransferCoverWorkbook_GradSpecialOnlyWarnsButDoesNotBlock(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
+	f.ensurePeriod()
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP480", Curriculum: "CY", LectureHrs: 100})
 	f.newTA("เหมาจ่าย อย่างเดียว", "master")
 	grad := f.newTA("เหมาจ่าย อย่างเดียว2", "master")
@@ -253,7 +254,7 @@ func TestBuildTransferCoverWorkbook_GradSpecialOnlyWarnsButDoesNotBlock(t *testi
 // Invalid level values are rejected outright rather than silently treated as
 // "both" or "undergrad" — a caller must say which file it wants.
 func TestBuildTransferCoverSheets_RejectsInvalidLevel(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	if _, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, ""); err == nil {
 		t.Error("empty level must be rejected")
 	}

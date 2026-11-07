@@ -19,7 +19,7 @@ import (
 //     payout file; the numbers must not change under it). Admin can send it
 //     back to pending to reopen for edits;
 //   - a month whose submission_period is closed (is_closed, or past the
-//     due_date + 1-day grace used by AutoCloseExpired) is frozen for EVERY
+//     due_date used by AutoCloseExpired) is frozen for EVERY
 //     role. It used to be frozen for TA actors only, so staff could still edit
 //     on a TA's behalf; that was closed on 03/08/2026 at the staff's own
 //     request — no back-dated entry at all, by anyone. Rows not submitted by
@@ -54,9 +54,9 @@ func workLogInPeriodSQL(wlAlias, termAlias, spAlias string) string {
 }
 
 // periodClosedSQL is "this period no longer takes submissions": the is_closed
-// flag, or past due_date plus the one-day grace AutoCloseExpired allows.
+// flag, or the first date after due_date. There is no late-submission grace.
 func periodClosedSQL(spAlias string) string {
-	return fmt.Sprintf("(%[1]s.is_closed OR CURRENT_DATE > %[1]s.due_date + INTERVAL '1 day')", spAlias)
+	return fmt.Sprintf("(%[1]s.is_closed OR CURRENT_DATE > %[1]s.due_date)", spAlias)
 }
 
 // periodState is the resolved submission-period condition covering one
@@ -66,14 +66,14 @@ func periodClosedSQL(spAlias string) string {
 type periodState struct {
 	Found    bool
 	Label    string
-	IsClosed bool   // is_closed flag OR past due_date + 1-day grace
+	IsClosed bool   // is_closed flag OR past due_date
 	Status   string // submission_period_status.status, 'pending' when no row
 }
 
 func resolvePeriodState(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.UUID, workDate string) (periodState, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT sp.label,
-		       (sp.is_closed OR CURRENT_DATE > sp.due_date + INTERVAL '1 day'),
+		       (sp.is_closed OR CURRENT_DATE > sp.due_date),
 		       COALESCE(st.status, 'pending')
 		FROM teaching_courses tc
 		JOIN academic_terms trm ON trm.id = tc.term_id
@@ -100,14 +100,14 @@ func resolvePeriodState(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid
 
 // monthClosedForCourse is the TA-agnostic half of resolvePeriodState: whether
 // the submission_periods row covering workDate's month is closed (is_closed,
-// or past due_date + 1-day grace), without the per-TA submission_period_status
+// or past due_date), without the per-TA submission_period_status
 // join. found=false means no period is defined for that month at all —
 // callers treat that as unrestricted, matching resolvePeriodState's own
 // backward-compatibility stance for terms that never adopted the monthly
 // workflow.
 func monthClosedForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) (closed bool, label string, found bool, err error) {
 	err = pool.QueryRow(ctx, `
-		SELECT sp.label, (sp.is_closed OR CURRENT_DATE > sp.due_date + INTERVAL '1 day')
+		SELECT sp.label, (sp.is_closed OR CURRENT_DATE > sp.due_date)
 		FROM teaching_courses tc
 		JOIN academic_terms trm ON trm.id = tc.term_id
 		JOIN submission_periods sp ON sp.term_id = tc.term_id
@@ -336,7 +336,7 @@ type blockedMonth struct {
 func loadBlockedMonths(ctx context.Context, pool *pgxpool.Pool, tcID, taID uuid.UUID) (map[string]blockedMonth, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT RIGHT(sp.year_month, 2), sp.label,
-		       (sp.is_closed OR CURRENT_DATE > sp.due_date + INTERVAL '1 day'),
+		       (sp.is_closed OR CURRENT_DATE > sp.due_date),
 		       (COALESCE(st.status, '') IN ('exported','finance_sent'))
 		FROM teaching_courses tc
 		JOIN submission_periods sp ON sp.term_id = tc.term_id
@@ -375,7 +375,7 @@ func submittableRowSQL(wl string) string {
 }
 
 // unsubmittableMonthSQL is the predicate that decides whether a work_log's month
-// is beyond a TA's reach: the period is closed (flag or past the grace day), or
+// is beyond a TA's reach: the period is closed (flag or past the deadline), or
 // staff have already exported / sent it to finance.
 //
 // Shared between WorkLogService.Submit, which skips such rows, and the
@@ -386,7 +386,13 @@ func submittableRowSQL(wl string) string {
 // server acts on now come from one predicate.
 //
 // The parameter is the alias of the work_logs row in the caller's query.
-func unsubmittableMonthSQL(wl string) string {
+func unsubmittableMonthSQL(wl string) string { return worklogMonthBlockedSQL(wl, true) }
+
+func worklogMonthBlockedSQL(wl string, includeDeadline bool) string {
+	deadline := ""
+	if includeDeadline {
+		deadline = "sp2.is_closed OR CURRENT_DATE > sp2.due_date OR "
+	}
 	return `EXISTS (
 		SELECT 1
 		FROM ta_request_assignments a2
@@ -400,8 +406,7 @@ func unsubmittableMonthSQL(wl string) string {
 		 AND st2.ta_id = a2.ta_id
 		 AND st2.teaching_course_id = tc2.id
 		WHERE a2.id = ` + wl + `.assignment_id
-		  AND (sp2.is_closed OR CURRENT_DATE > sp2.due_date + INTERVAL '1 day'
-		       OR COALESCE(st2.status, '') IN ('exported','finance_sent'))
+		  AND (` + deadline + `COALESCE(st2.status, '') IN ('exported','finance_sent'))
 	)`
 }
 
@@ -423,4 +428,9 @@ func waitingTASQL(wl string) string {
 
 func outstandingRowSQL(wl string) string {
 	return `(` + waitingLecturerSQL(wl) + ` OR ` + waitingTASQL(wl) + `)`
+}
+
+// Staff editors may correct closed-month rows; export locks still apply.
+func financeLockedRowSQL(wl string) string {
+	return worklogMonthBlockedSQL(wl, false)
 }

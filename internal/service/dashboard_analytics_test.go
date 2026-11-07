@@ -271,7 +271,7 @@ func TestAnalyticsStaffingVerdict(t *testing.T) {
 // monthly series carries it in the right months and the running total ends
 // on BudgetUsed — the KPI and the chart's last point are one figure (26/09/2026).
 func TestAnalyticsMonthlyCarriesTheDatedLump(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}

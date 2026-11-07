@@ -682,115 +682,9 @@ func (s *SubmissionPeriodService) MarkCourseExportedWithFigures(ctx context.Cont
 	}
 	defer tx.Rollback(ctx)
 
-	if builtFP != "" {
-		if _, err := tx.Exec(ctx, `LOCK TABLE work_logs IN SHARE MODE`); err != nil {
-			return 0, err
-		}
-		var nowFP string
-		if err := tx.QueryRow(ctx, courseWorklogFingerprintSQL, tcID, months).Scan(&nowFP); err != nil {
-			return 0, err
-		}
-		if nowFP != builtFP {
-			return 0, Conflict("บันทึกเวลาของรายวิชานี้เปลี่ยนระหว่างสร้างไฟล์ จึงยังไม่ล็อกและไม่ส่งไฟล์ กรุณากดดาวน์โหลดอีกครั้ง")
-		}
-	}
-
-	rows, err := tx.Query(ctx, `
-		INSERT INTO submission_period_status
-		    (id, submission_period_id, ta_id, teaching_course_id, status,
-		     exported_at, exported_by, exported_name)
-		SELECT gen_random_uuid(), sp.id, a.ta_id, tc.id, 'exported', now(), $2, $3
-		FROM teaching_courses tc
-		JOIN academic_terms trm ON trm.id = tc.term_id
-		JOIN submission_periods sp ON sp.term_id = tc.term_id
-		JOIN ta_request_assignments a
-		    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
-		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
-		LEFT JOIN submission_period_status st
-		    ON st.submission_period_id = sp.id
-		   AND st.ta_id = a.ta_id
-		   AND st.teaching_course_id = tc.id
-		WHERE tc.id = $1
-		  -- Only months staff have signed off may be exported. Previously any
-		  -- lecturer-approved month qualified, which is the gap the meeting
-		  -- closed by making "ตรวจสอบเบิกจ่ายค่าตอบแทน" its own step.
-		  AND COALESCE(st.status,'pending') = 'staff_reviewed'
-		  -- Never lock a pair absent from a printed order. MarkStaffReviewed now
-		  -- refuses such pairs, but rows reviewed before that check existed can
-		  -- still be sitting at staff_reviewed.
-		  AND `+AppointedSQL("tc.id", "a.ta_id")+`
-		  -- The approved work this period is locked FOR must fall inside the
-		  -- fiscal slice being exported. Without this, issuing มิ.ย.–ก.ย. in
-		  -- September would also freeze ตุลาคม, which is still being taught and
-		  -- belongs to the next budget year's document.
-		  AND EXISTS (
-		        SELECT 1 FROM work_logs wl
-		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
-		        JOIN sections s2 ON s2.id = a2.section_id
-		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
-		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
-		          AND wl.status = 'approved'
-		          AND (COALESCE(cardinality($4::text[]), 0) = 0
-		               OR to_char(wl.work_date,'YYYY-MM') = ANY($4::text[])))
-		  AND NOT EXISTS (
-		        SELECT 1 FROM work_logs wl
-		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
-		        JOIN sections s2 ON s2.id = a2.section_id
-		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
-		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
-		          -- Forfeited rows (unsent when the period closed) do not hold
-		          -- the month open — same rule as monthWorklogReadiness.
-		          AND (wl.status = 'submitted'
-		               OR (wl.status IN ('draft','rejected') AND NOT `+unsubmittableMonthSQL("wl")+`))
-		          -- Same grad-special exclusion as monthWorklogReadiness: a
-		          -- leftover 'submitted' row on a dead grad-special assignment
-		          -- must not block locking the TA's real (regular-track or
-		          -- undergrad) hours once staff have signed those off.
-		          AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special'))
-		GROUP BY sp.id, a.ta_id, tc.id
-		ON CONFLICT (submission_period_id, ta_id, teaching_course_id) DO UPDATE
-		SET status        = 'exported',
-		    exported_at   = now(),
-		    exported_by   = EXCLUDED.exported_by,
-		    exported_name = EXCLUDED.exported_name
-		WHERE submission_period_status.status NOT IN ('exported','finance_sent')
-		RETURNING ta_id, submission_period_id`, tcID, actor, name, months)
+	cells, err := s.MarkCourseExportedInTx(ctx, tx, actor, tcID, months, builtFP, figs, name)
 	if err != nil {
 		return 0, err
-	}
-	type cell = lockedCell
-	var cells []cell
-	for rows.Next() {
-		var c cell
-		if err := rows.Scan(&c.taID, &c.periodID); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		cells = append(cells, c)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	for i := range cells {
-		var periodYM string
-		if err := tx.QueryRow(ctx, `SELECT year_month FROM submission_periods WHERE id = $1`,
-			cells[i].periodID).Scan(&periodYM); err != nil {
-			return 0, err
-		}
-		if cells[i].gregYM, err = gregorianYearMonth(periodYM); err != nil {
-			return 0, err
-		}
-	}
-	if err := writeMonthLedger(ctx, tx, actor, tcID, cells, figs); err != nil {
-		return 0, err
-	}
-	if len(cells) > 0 {
-		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.exported",
-			Entity: "teaching_course", EntityID: tcID.String(),
-			After: map[string]int{"locked_cells": len(cells)}}); err != nil {
-			return 0, err
-		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
@@ -1599,14 +1493,130 @@ func (s *SubmissionPeriodService) SweepReminders(ctx context.Context) (int, erro
 	return len(items), nil
 }
 
-// AutoCloseExpired flips any period whose due_date is more than 1 day past to
+// AutoCloseExpired closes a period on the first date after its due_date:
 // is_closed=true. Called from the scheduler once a day.
 func (s *SubmissionPeriodService) AutoCloseExpired(ctx context.Context) (int, error) {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE submission_periods SET is_closed = TRUE
-		WHERE is_closed = FALSE AND due_date < CURRENT_DATE - INTERVAL '1 day'`)
+		WHERE is_closed = FALSE AND due_date < CURRENT_DATE`)
 	if err != nil {
 		return 0, err
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// MarkCourseExportedInTx allows a combined month to freeze ALL courses in the
+// same transaction. The caller sends notifications only after committing it.
+func (s *SubmissionPeriodService) MarkCourseExportedInTx(ctx context.Context, tx pgx.Tx, actor, tcID uuid.UUID, months []string, builtFP string, figs MonthFigures, name string) ([]lockedCell, error) {
+	if builtFP != "" {
+		if _, err := tx.Exec(ctx, `LOCK TABLE work_logs IN SHARE MODE`); err != nil {
+			return nil, err
+		}
+		var nowFP string
+		if err := tx.QueryRow(ctx, courseWorklogFingerprintSQL, tcID, months).Scan(&nowFP); err != nil {
+			return nil, err
+		}
+		if nowFP != builtFP {
+			return nil, Conflict("บันทึกเวลาของรายวิชานี้เปลี่ยนระหว่างสร้างไฟล์ จึงยังไม่ล็อกและไม่ส่งไฟล์ กรุณากดดาวน์โหลดอีกครั้ง")
+		}
+	}
+
+	rows, err := tx.Query(ctx, `
+		INSERT INTO submission_period_status
+		    (id, submission_period_id, ta_id, teaching_course_id, status,
+		     exported_at, exported_by, exported_name)
+		SELECT gen_random_uuid(), sp.id, a.ta_id, tc.id, 'exported', now(), $2, $3
+		FROM teaching_courses tc
+		JOIN academic_terms trm ON trm.id = tc.term_id
+		JOIN submission_periods sp ON sp.term_id = tc.term_id
+		JOIN ta_request_assignments a
+		    ON a.section_id IN (SELECT id FROM sections WHERE teaching_course_id = tc.id)
+		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
+		LEFT JOIN submission_period_status st
+		    ON st.submission_period_id = sp.id
+		   AND st.ta_id = a.ta_id
+		   AND st.teaching_course_id = tc.id
+		WHERE tc.id = $1
+		  -- Only months staff have signed off may be exported. Previously any
+		  -- lecturer-approved month qualified, which is the gap the meeting
+		  -- closed by making "ตรวจสอบเบิกจ่ายค่าตอบแทน" its own step.
+		  AND COALESCE(st.status,'pending') = 'staff_reviewed'
+		  -- Never lock a pair absent from a printed order. MarkStaffReviewed now
+		  -- refuses such pairs, but rows reviewed before that check existed can
+		  -- still be sitting at staff_reviewed.
+		  AND `+AppointedSQL("tc.id", "a.ta_id")+`
+		  -- The approved work this period is locked FOR must fall inside the
+		  -- fiscal slice being exported. Without this, issuing มิ.ย.–ก.ย. in
+		  -- September would also freeze ตุลาคม, which is still being taught and
+		  -- belongs to the next budget year's document.
+		  AND EXISTS (
+		        SELECT 1 FROM work_logs wl
+		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+		        JOIN sections s2 ON s2.id = a2.section_id
+		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
+		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
+		          AND wl.status = 'approved'
+		          AND (COALESCE(cardinality($4::text[]), 0) = 0
+		               OR to_char(wl.work_date,'YYYY-MM') = ANY($4::text[])))
+		  AND NOT EXISTS (
+		        SELECT 1 FROM work_logs wl
+		        JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+		        JOIN sections s2 ON s2.id = a2.section_id
+		        WHERE a2.ta_id = a.ta_id AND s2.teaching_course_id = tc.id
+		          AND `+workLogInPeriodSQL("wl", "trm", "sp")+`
+		          -- Forfeited rows (unsent when the period closed) do not hold
+		          -- the month open — same rule as monthWorklogReadiness.
+		          AND (wl.status = 'submitted'
+		               OR (wl.status IN ('draft','rejected') AND NOT `+unsubmittableMonthSQL("wl")+`))
+		          -- Same grad-special exclusion as monthWorklogReadiness: a
+		          -- leftover 'submitted' row on a dead grad-special assignment
+		          -- must not block locking the TA's real (regular-track or
+		          -- undergrad) hours once staff have signed those off.
+		          AND (a2.level::text NOT IN ('master','phd') OR s2.track <> 'special'))
+		GROUP BY sp.id, a.ta_id, tc.id
+		ON CONFLICT (submission_period_id, ta_id, teaching_course_id) DO UPDATE
+		SET status        = 'exported',
+		    exported_at   = now(),
+		    exported_by   = EXCLUDED.exported_by,
+		    exported_name = EXCLUDED.exported_name
+		WHERE submission_period_status.status NOT IN ('exported','finance_sent')
+		RETURNING ta_id, submission_period_id`, tcID, actor, name, months)
+	if err != nil {
+		return nil, err
+	}
+	type cell = lockedCell
+	var cells []cell
+	for rows.Next() {
+		var c cell
+		if err := rows.Scan(&c.taID, &c.periodID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		cells = append(cells, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range cells {
+		var periodYM string
+		if err := tx.QueryRow(ctx, `SELECT year_month FROM submission_periods WHERE id = $1`,
+			cells[i].periodID).Scan(&periodYM); err != nil {
+			return nil, err
+		}
+		if cells[i].gregYM, err = gregorianYearMonth(periodYM); err != nil {
+			return nil, err
+		}
+	}
+	if err := writeMonthLedger(ctx, tx, actor, tcID, cells, figs); err != nil {
+		return nil, err
+	}
+	if len(cells) > 0 {
+		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "submission_period.exported",
+			Entity: "teaching_course", EntityID: tcID.String(),
+			After: map[string]int{"locked_cells": len(cells)}}); err != nil {
+			return nil, err
+		}
+	}
+	return cells, nil
 }

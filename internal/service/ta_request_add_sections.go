@@ -74,6 +74,9 @@ func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, pri
 		}
 		return nil, err
 	}
+	if err := lockRequestTAs(ctx, tx, reqID); err != nil {
+		return nil, err
+	}
 	teaches := privileged
 	if !teaches {
 		if err := tx.QueryRow(ctx, `

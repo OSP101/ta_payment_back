@@ -182,6 +182,9 @@ var catalog = map[string]ActionInfo{
 	"export_batch.record":                 ok("บันทึกชุดเอกสารที่ส่งออก", CatPayment),
 	"export.transfer_cover":               ok("ออกใบปะหน้าโอนเงิน", CatPayment),
 	"export.transfer_cover.reprint":       ok("พิมพ์ใบปะหน้าโอนเงินซ้ำ", CatPayment),
+	"export.month":                        ok("ออกชุดเบิกรวมประจำเดือน", CatPayment),
+	"export.month_revision":               ok("ออกฉบับแก้ไขชุดเบิกประจำเดือน", CatPayment),
+	"export.month_reprint":                view("ดาวน์โหลดชุดเบิกประจำเดือนซ้ำ"),
 	"export.course_summary":               ok("ออกสรุปงบรายวิชา", CatPayment),
 	"export.course_summary.reprint":       ok("พิมพ์สรุปงบรายวิชาซ้ำ", CatPayment),
 	"document_progress.set_stage":         ok("เปลี่ยนขั้นความคืบหน้าเอกสาร", CatPayment),
@@ -278,11 +281,12 @@ var catalog = map[string]ActionInfo{
 	"audit_log.export":              sensitive("ส่งออกบันทึกการใช้งานเป็นไฟล์"),
 
 	// ── Settings and housekeeping ───────────────────────────────────────────
-	"mail_settings.update": warn("แก้ไขการตั้งค่าอีเมลของระบบ", CatSystem),
-	"mail.check":           ok("ทดสอบการเชื่อมต่อเซิร์ฟเวอร์อีเมล", CatSystem),
-	"mail.test_send":       ok("ส่งอีเมลทดสอบ", CatSystem),
-	"system.db_restore":    danger("กู้คืนฐานข้อมูลจากไฟล์สำรอง", CatSystem),
-	"audit_log.purge":      system(ok("ย้ายบันทึกที่พ้นอายุเก็บ 5 ปีเข้าคลังถาวร", CatSystem)),
+	"document_policy.update": warn("แก้ไขอายุเก็บไฟล์และจำนวนดาวน์โหลดเอกสาร", CatSystem),
+	"mail_settings.update":   warn("แก้ไขการตั้งค่าอีเมลของระบบ", CatSystem),
+	"mail.check":             ok("ทดสอบการเชื่อมต่อเซิร์ฟเวอร์อีเมล", CatSystem),
+	"mail.test_send":         ok("ส่งอีเมลทดสอบ", CatSystem),
+	"system.db_restore":      danger("กู้คืนฐานข้อมูลจากไฟล์สำรอง", CatSystem),
+	"audit_log.purge":        system(ok("ย้ายบันทึกที่พ้นอายุเก็บ 5 ปีเข้าคลังถาวร", CatSystem)),
 }
 
 // families describe an action that has no entry of its own, from its prefix,

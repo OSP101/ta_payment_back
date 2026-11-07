@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -111,34 +112,76 @@ func TestReview_ApprovesProfileOnlyWhenAllThreeDocsPass(t *testing.T) {
 	}
 }
 
-// The retention clock used to be started by the approve-all click. Now that
-// every approval goes through Review, it has to start here — otherwise approved
-// documents would sit on disk forever, which is the PDPA promise broken.
+// A partial approval must never start a file's countdown. All required files
+// get the same configured deadline when the last verdict arrives.
 func TestReview_ApprovalStartsRetentionClock(t *testing.T) {
-	svc, _, docs := autoApproveFixture(t)
+	svc, ta, docs := autoApproveFixture(t)
 	ctx := context.Background()
 	officer := uuid.New()
-	if _, err := svc.pool.Exec(ctx,
-		`INSERT INTO users (id, email, first_name, last_name, is_active)
-		 VALUES ($1, $2, 'จ.น.', 'ทดสอบ', TRUE)`,
-		officer, "auto-officer2-"+officer.String()+"@example.test"); err != nil {
+	if _, err := svc.pool.Exec(ctx, `INSERT INTO users (id,email,first_name,last_name,is_active)
+        VALUES ($1,$2,'จ.น.','ทดสอบ',TRUE)`, officer, officer.String()+"@example.test"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := svc.UpdateDocumentPolicy(ctx, officer, DocumentPolicy{RetentionDays: 30, DownloadLimit: 5}); err != nil {
+		t.Fatal(err)
+	}
+	for i, kind := range requiredDocKinds {
+		if err := svc.Review(ctx, officer, docs[kind], true, ""); err != nil {
+			t.Fatal(err)
+		}
+		var timed int
+		if err := svc.pool.QueryRow(ctx, `SELECT COUNT(*) FROM ta_documents WHERE user_id=$1 AND expires_at IS NOT NULL`, ta).Scan(&timed); err != nil {
+			t.Fatal(err)
+		}
+		if i < len(requiredDocKinds)-1 && timed != 0 {
+			t.Fatalf("%d of %d approved: %d clocks already started", i+1, len(requiredDocKinds), timed)
+		}
+	}
+	var distinct int
+	var days float64
+	if err := svc.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT expires_at), MIN(EXTRACT(EPOCH FROM (expires_at-NOW()))/86400) FROM ta_documents WHERE user_id=$1`, ta).Scan(&distinct, &days); err != nil {
+		t.Fatal(err)
+	}
+	if distinct != 1 || days < 29.9 || days > 30.1 {
+		t.Fatalf("deadlines: distinct=%d, days=%f", distinct, days)
+	}
+	var before string
+	if err := svc.pool.QueryRow(ctx, `SELECT MIN(expires_at)::text FROM ta_documents WHERE user_id=$1`, ta).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.UpdateDocumentPolicy(ctx, officer, DocumentPolicy{RetentionDays: 1, DownloadLimit: 3}); err != nil {
+		t.Fatal(err)
+	}
+	// A settings edit or repeated approval cannot extend an existing clock.
+	if err := svc.Review(ctx, officer, docs[requiredDocKinds[0]], true, ""); err != nil {
+		t.Fatal(err)
+	}
+	var after string
+	if err := svc.pool.QueryRow(ctx, `SELECT MIN(expires_at)::text FROM ta_documents WHERE user_id=$1`, ta).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("deadline changed from %s to %s", before, after)
+	}
+}
 
-	if err := svc.Review(ctx, officer, docs["national_id"], true, ""); err != nil {
-		t.Fatalf("approve: %v", err)
-	}
-	var days *float64
-	if err := svc.pool.QueryRow(ctx,
-		`SELECT EXTRACT(EPOCH FROM (expires_at - NOW())) / 86400
-		   FROM ta_documents WHERE id = $1`, docs["national_id"]).Scan(&days); err != nil {
+func TestApproveAll_UsesConfiguredRetention(t *testing.T) {
+	svc, ta, _ := autoApproveFixture(t)
+	ctx := context.Background()
+	// The fixture TA is also a valid actor for this service-level policy test.
+	if _, err := svc.UpdateDocumentPolicy(ctx, ta, DocumentPolicy{RetentionDays: 14, DownloadLimit: 4}); err != nil {
 		t.Fatal(err)
 	}
-	if days == nil {
-		t.Fatal("expires_at is NULL after approval — the file would never be purged")
+	if _, err := svc.ApproveAll(ctx, ta, ta); err != nil {
+		t.Fatal(err)
 	}
-	if *days < 6.9 || *days > 7.1 {
-		t.Errorf("expires_at is %.2f days out, want ~7", *days)
+	var count, distinct int
+	var days float64
+	if err := svc.pool.QueryRow(ctx, `SELECT COUNT(expires_at),COUNT(DISTINCT expires_at),MIN(EXTRACT(EPOCH FROM (expires_at-NOW()))/86400) FROM ta_documents WHERE user_id=$1`, ta).Scan(&count, &distinct, &days); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(requiredDocKinds) || distinct != 1 || days < 13.9 || days > 14.1 {
+		t.Fatalf("count=%d distinct=%d days=%f", count, distinct, days)
 	}
 }
 
@@ -174,4 +217,52 @@ func TestReview_RejectingAfterApprovalIsNotAutoApproved(t *testing.T) {
 	}
 	// RejectBatch refuses an already-approved doc by design; either way the
 	// invariant that matters is checked above.
+}
+
+func TestReview_ConcurrentFinalApprovalsStartOneClock(t *testing.T) {
+	svc, ta, docs := autoApproveFixture(t)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	errs := make(chan error, len(docs))
+	for _, doc := range docs {
+		wg.Add(1)
+		go func(id uuid.UUID) { defer wg.Done(); errs <- svc.Review(ctx, ta, id, true, "") }(doc)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := profileStatus(t, svc, ta); got != "approved" {
+		t.Fatalf("profile=%s", got)
+	}
+	var count, distinct int
+	if err := svc.pool.QueryRow(ctx, `SELECT COUNT(expires_at),COUNT(DISTINCT expires_at) FROM ta_documents WHERE user_id=$1`, ta).Scan(&count, &distinct); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(docs) || distinct != 1 {
+		t.Fatalf("count=%d distinct=%d", count, distinct)
+	}
+}
+
+func TestReview_RejectAfterApprovalPausesCurrentClocks(t *testing.T) {
+	svc, ta, docs := autoApproveFixture(t)
+	ctx := context.Background()
+	for _, doc := range docs {
+		if err := svc.Review(ctx, ta, doc, true, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.Review(ctx, ta, docs[requiredDocKinds[0]], false, "แก้ไขไฟล์"); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := svc.pool.QueryRow(ctx, `SELECT COUNT(expires_at) FROM ta_documents WHERE user_id=$1`, ta).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("%d clocks still running on incomplete set", count)
+	}
 }

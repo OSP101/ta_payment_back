@@ -183,3 +183,37 @@ func TestDocDownloadQuota_IsPerTA(t *testing.T) {
 		t.Fatalf("another TA's allowance must be untouched, got %v", err)
 	}
 }
+
+func TestDocDownloadQuota_ConfiguredLimitPreservesHistory(t *testing.T) {
+	svc, officer, ta := quotaFixture(t)
+	ctx := context.Background()
+	if err := svc.recordDocDownload(ctx, officer, ta, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.UpdateDocumentPolicy(ctx, officer, DocumentPolicy{RetentionDays: 7, DownloadLimit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.recordDocDownload(ctx, officer, ta, 1); err == nil {
+		t.Fatal("lowered limit ignored existing download")
+	}
+	if _, err := svc.UpdateDocumentPolicy(ctx, officer, DocumentPolicy{RetentionDays: 7, DownloadLimit: 3}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := svc.recordDocDownload(ctx, officer, ta, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.recordDocDownload(ctx, officer, ta, 1); err == nil {
+		t.Fatal("configured limit not enforced")
+	}
+}
+
+func TestDocumentPolicy_RejectsInvalidValues(t *testing.T) {
+	svc, officer, _ := quotaFixture(t)
+	for _, p := range []DocumentPolicy{{0, 2}, {-1, 2}, {3651, 2}, {7, 0}, {7, -1}, {7, 1001}} {
+		if _, err := svc.UpdateDocumentPolicy(context.Background(), officer, p); err == nil {
+			t.Fatalf("accepted invalid policy %+v", p)
+		}
+	}
+}

@@ -34,7 +34,7 @@ import (
 // Returns (nil, nil) when the course has no regular-track schedule to weight
 // by (e.g. not filled in yet) — callers should fall back to an even split
 // across the term's months in that case rather than fail outright.
-func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID) (map[string]float64, error) {
+func gradSpecialMonthHours(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID) (map[string]float64, error) {
 	// The shared course-window definition. No dates at all → nothing to weight
 	// by, same as "no schedule": the caller splits evenly.
 	var startP, endP *time.Time
@@ -135,11 +135,25 @@ func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.U
 	if total <= 0 {
 		return nil, nil
 	}
-	out := make(map[string]float64, len(byMonth))
-	for ym, hrs := range byMonth {
-		out[ym] = hrs / total
+	return byMonth, nil
+}
+
+func gradSpecialMonthShares(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID) (map[string]float64, error) {
+	hours, err := gradSpecialMonthHours(ctx, pool, tcID)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	var total float64
+	for _, h := range hours {
+		total += h
+	}
+	if total <= 0 {
+		return nil, nil
+	}
+	for ym, h := range hours {
+		hours[ym] = h / total
+	}
+	return hours, nil
 }
 
 // gradLumpByMonth places ONE graduate-special TA's flat term lump on the
@@ -215,7 +229,6 @@ func (s *ExportService) gradLumpSplit(
 		return nil, 0, err
 	}
 	weights := map[string]float64{}
-	var total float64
 	for rows.Next() {
 		var ym string
 		var hrs float64
@@ -225,39 +238,56 @@ func (s *ExportService) gradLumpSplit(
 		}
 		if hrs > 0 {
 			weights[ym] = hrs
-			total += hrs
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
-	if total <= 0 {
-		// Nothing logged yet: the regular-track schedule estimate.
-		weights, err = gradSpecialMonthShares(ctx, s.pool, courseID)
-		if err != nil {
-			return nil, 0, err
+	// Actual approved hours replace the estimate only for that month. Months
+	// without logs retain their planned hours: no log never forfeits a lump,
+	// and one early log must not pull the entire term's money into that month.
+	planned, err := gradSpecialMonthHours(ctx, s.pool, courseID)
+	if err != nil {
+		return nil, 0, err
+	}
+	all, err := s.CourseTermMonths(ctx, courseID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(all) == 0 {
+		cal, e := courseCalendarMonths(ctx, s.pool, courseID)
+		if e != nil {
+			return nil, 0, e
+		}
+		for _, ym := range cal {
+			all = append(all, TermMonth{YearMonth: ym})
 		}
 	}
-	if len(weights) == 0 {
-		// No schedule either: evenly over the term's months.
-		weights = map[string]float64{}
-		all, err := s.CourseTermMonths(ctx, courseID)
-		if err != nil {
-			return nil, 0, err
+
+	var termID uuid.UUID
+	if err = s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id=$1`, courseID).Scan(&termID); err != nil {
+		return nil, 0, err
+	}
+	legacy, err := s.LegacyPayoutMonths(ctx, termID)
+	if err != nil {
+		return nil, 0, err
+	}
+	historical := len(all) > 0
+	for _, m := range all {
+		if !legacy[m.YearMonth] {
+			historical = false
 		}
-		for _, m := range all {
-			weights[m.YearMonth] = 1
+	}
+	if historical {
+		if len(weights) == 0 {
+			weights = planned
 		}
 		if len(weights) == 0 {
-			cal, err := courseCalendarMonths(ctx, s.pool, courseID)
-			if err != nil {
-				return nil, 0, err
-			}
-			for _, ym := range cal {
-				weights[ym] = 1
-			}
+			weights = monthlyLumpWeights(all, nil, nil)
 		}
+	} else {
+		weights = monthlyLumpWeights(all, weights, planned)
 	}
 	open := withoutFrozen(weights, frozen)
 	if len(open) == 0 && remaining > 0 {
@@ -320,4 +350,21 @@ func sumMonths(byMonth map[string]float64, months []string) float64 {
 		t += byMonth[ym]
 	}
 	return t
+}
+
+// monthlyLumpWeights fills every claim month, even when nobody submitted a
+// log. Actual hours and estimates use the SAME unit (hours, not fractions).
+func monthlyLumpWeights(all []TermMonth, actual, planned map[string]float64) map[string]float64 {
+	out := map[string]float64{}
+	for _, m := range all {
+		w := actual[m.YearMonth]
+		if w <= 0 {
+			w = planned[m.YearMonth]
+		}
+		if w <= 0 {
+			w = 1
+		}
+		out[m.YearMonth] = w
+	}
+	return out
 }

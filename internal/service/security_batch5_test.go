@@ -277,6 +277,8 @@ func gradLumpFixture(t *testing.T) (*fixture, *ExportService, float64, string, s
 	}
 	m1 := monthStart().Format("2006-01")
 	m3 := monthStart().AddDate(0, 2, 0).Format("2006-01")
+
+	f.exec(`INSERT INTO payout_legacy_months(term_id,year_month) SELECT term_id,(left(year_month,4)::int-543+CASE WHEN right(year_month,2)::int<=5 THEN 1 ELSE 0 END)::text||'-'||right(year_month,2) FROM submission_periods WHERE term_id=$1 ON CONFLICT DO NOTHING`, f.TermID)
 	return f, exp, lump, m1, m3
 }
 

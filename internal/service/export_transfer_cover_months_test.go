@@ -21,6 +21,9 @@ import (
 // ("2569-09"), which is what TermMonths reads to learn a term's months.
 func (f *tcFixture) addPeriod(ym string) uuid.UUID {
 	f.t.Helper()
+	if f.legacy {
+		defer f.markLegacyMonth(ym)
+	}
 	var id uuid.UUID
 	err := f.pool.QueryRow(f.ctx, `SELECT id FROM submission_periods WHERE term_id=$1 AND year_month=$2`,
 		f.termID, ym).Scan(&id)
@@ -101,7 +104,7 @@ func sheetsTotal(sheets []transferCoverSheet) float64 {
 // is being paid twice across two documents or a month has silently fallen
 // between them — the two failures this whole feature exists to prevent.
 func TestTransferCoverMonthSlices_SumToTheWholeTerm(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -149,7 +152,7 @@ func TestTransferCoverMonthSlices_SumToTheWholeTerm(t *testing.T) {
 // October has been taught, reviewed and sent to finance, i.e. only after the
 // budget year it belongs to has already closed.
 func TestTermExportBlockers_ScopedToSelectedMonths(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -181,7 +184,7 @@ func TestTermExportBlockers_ScopedToSelectedMonths(t *testing.T) {
 // (11/09/2026 rule), so a month slice carries the share of the term that was
 // actually worked in it — and the slices always sum back to the whole lump.
 func TestTransferCoverMonthSlices_GradLumpFollowsTheHoldersOwnHours(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -228,7 +231,7 @@ func TestTransferCoverMonthSlices_GradLumpFollowsTheHoldersOwnHours(t *testing.T
 // course's regular-track schedule when there is one, else evenly over the
 // term — so no month's document ever loses a real payment.
 func TestTransferCoverMonthSlices_GradLumpWithoutHoursFallsBackToAnEvenSplit(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -259,7 +262,7 @@ func TestTransferCoverMonthSlices_GradLumpWithoutHoursFallsBackToAnEvenSplit(t *
 // (2026 meeting correction) instead of falling back to an even per-month
 // split — confirming the fallback and the real path never silently merge.
 func TestTransferCoverMonthSlices_GradLumpFollowsRealScheduleWhenAvailable(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -298,7 +301,7 @@ func TestTransferCoverMonthSlices_GradLumpFollowsRealScheduleWhenAvailable(t *te
 // report the term's months, which are already on paper, and where the budget
 // year cuts — read from the ledger, not from anyone's memory.
 func TestTransferCoverCoverage_TracksIssuedMonths(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}

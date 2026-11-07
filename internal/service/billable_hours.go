@@ -111,7 +111,7 @@ func forfeitedDraftMonthSQL(wl, sec string) string {
 	            JOIN submission_periods spx ON spx.term_id = tcx.term_id
 	             AND spx.year_month = tx.academic_year::text || '-' || to_char(` + wl + `.work_date, 'MM')
 	           WHERE tcx.id = ` + sec + `.teaching_course_id
-	             AND (spx.is_closed OR CURRENT_DATE > spx.due_date + INTERVAL '1 day'))`
+	             AND (spx.is_closed OR CURRENT_DATE > spx.due_date))`
 }
 
 // billableHoursGo is the Go side of the same rule, expressed through the code

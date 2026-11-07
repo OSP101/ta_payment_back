@@ -58,6 +58,8 @@ type TermProgress struct {
 	// "รอบ 1 · งบ 2569 (มิ.ย.–ก.ย.)" once a term has two.
 	Round      int    `json:"round"`
 	RoundLabel string `json:"round_label,omitempty"`
+	YearMonth  string `json:"year_month,omitempty"`
+	Legacy     bool   `json:"legacy,omitempty"`
 
 	// Export readiness — signing can only start once ALL courses that have
 	// billable work THIS ROUND are exported. TotalCourses counts courses with
@@ -68,6 +70,8 @@ type TermProgress struct {
 	AllExported       bool        `json:"all_exported"`
 	UnexportedCourses []CourseRef `json:"unexported_courses"`
 
+	PeriodClosed      bool    `json:"period_closed"`
+	IssuedVersion     int     `json:"issued_version"`
 	Stage             int     `json:"stage"` // 0..5
 	TASignedAt        *string `json:"ta_signed_at,omitempty"`
 	LecturerSignedAt  *string `json:"lecturer_signed_at,omitempty"`
@@ -130,6 +134,7 @@ func roundBillableSQL(param string) string {
 		EXISTS (
 		    SELECT 1 FROM work_logs wl
 		    JOIN ta_request_assignments a2 ON a2.id = wl.assignment_id
+            JOIN ta_requests req2 ON req2.id=a2.request_id AND req2.status='approved'
 		    JOIN sections sec2 ON sec2.id = a2.section_id
 		    WHERE sec2.teaching_course_id = tc.id AND wl.status = 'approved'
 		      AND to_char(wl.work_date,'YYYY-MM') = ANY(` + param + `::text[])
@@ -138,8 +143,7 @@ func roundBillableSQL(param string) string {
 		    SELECT 1 FROM ta_request_assignments a3
 		    JOIN ta_requests r3 ON r3.id = a3.request_id AND r3.status = 'approved'
 		    JOIN sections sec3 ON sec3.id = a3.section_id AND sec3.track = 'special'
-		    JOIN users u3 ON u3.id = a3.ta_id
-		    WHERE sec3.teaching_course_id = tc.id AND u3.study_level::text IN ('master','phd')
+		    WHERE sec3.teaching_course_id = tc.id AND a3.level::text IN ('master','phd') AND a3.state <> 'dropped'
 		)
 	)`
 }
@@ -206,13 +210,17 @@ func (s *DocumentProgressService) exportReadiness(
 	if len(gregMonths) == 0 {
 		return 0, 0, unexported, nil
 	}
+	exportedSQL := roundExportedSQL("$2")
+	if round > 2 {
+		exportedSQL = monthlyCourseExportedSQL("$2")
+	}
 	err = s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FILTER (WHERE has_ta AND billable),
 		       COUNT(*) FILTER (WHERE has_ta AND billable AND exported)
 		FROM teaching_courses tc,
 		     LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
 		     LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y,
-		     LATERAL (SELECT `+roundExportedSQL("$2")+` AS exported) z
+		     LATERAL (SELECT `+exportedSQL+` AS exported) z
 		WHERE tc.term_id = $1`, termID, gregMonths).Scan(&total, &exported)
 	if err != nil {
 		return
@@ -222,7 +230,7 @@ func (s *DocumentProgressService) exportReadiness(
 		FROM teaching_courses tc,
 		     LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
 		     LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y,
-		     LATERAL (SELECT `+roundExportedSQL("$2")+` AS exported) z
+		     LATERAL (SELECT `+exportedSQL+` AS exported) z
 		WHERE tc.term_id = $1 AND has_ta AND billable AND NOT exported
 		ORDER BY tc.code`, termID, gregMonths)
 	if rErr != nil {
@@ -301,6 +309,24 @@ func (s *DocumentProgressService) termFiscalSplit(ctx context.Context, termID uu
 // and the round-1 checklist read as "unscoped", exactly the pre-round
 // behaviour.
 func (s *DocumentProgressService) roundMonths(ctx context.Context, termID uuid.UUID, round int) (greg []string, exists bool, err error) {
+	if round > 2 {
+		all, e := s.export.TermMonths(ctx, termID)
+		if e != nil {
+			return nil, false, e
+		}
+		legacy, e := s.export.LegacyPayoutMonths(ctx, termID)
+		if e != nil {
+			return nil, false, e
+		}
+		ym := scopeMonth(round)
+		for _, m := range all {
+			if m.YearMonth == ym && !legacy[ym] {
+				return []string{ym}, true, nil
+			}
+		}
+		return nil, false, nil
+	}
+
 	if round == 1 {
 		return nil, true, nil
 	}
@@ -366,6 +392,10 @@ func (s *DocumentProgressService) resolveFiscalRounds(ctx context.Context, termI
 // payable content. Readable by any authenticated user (the shared "where are
 // the documents" board).
 func (s *DocumentProgressService) GetOverview(ctx context.Context, termID uuid.UUID) (*TermProgressOverview, error) {
+	if s.export != nil {
+		return s.monthlyOverview(ctx, termID)
+	}
+
 	fr, err := s.resolveFiscalRounds(ctx, termID)
 	if err != nil {
 		return nil, err
@@ -389,12 +419,21 @@ func (s *DocumentProgressService) GetOverview(ctx context.Context, termID uuid.U
 // tests) that already know which round they want without paying for the
 // other round's readiness query.
 func (s *DocumentProgressService) GetRound(ctx context.Context, termID uuid.UUID, round int) (*TermProgress, error) {
-	if round != 1 && round != 2 {
+	if !ProgressScopeValid(round) {
 		return nil, Invalid("รอบไม่ถูกต้อง")
 	}
 	fr, err := s.resolveFiscalRounds(ctx, termID)
 	if err != nil {
 		return nil, err
+	}
+	if round > 2 {
+		_, exists, e := s.roundMonths(ctx, termID, round)
+		if e != nil {
+			return nil, e
+		}
+		if !exists {
+			return nil, Invalid("เดือนนี้ไม่ใช่ชุดเบิกรายเดือนของภาคเรียนนี้")
+		}
 	}
 	if round == 2 && !fr.twoRounds {
 		return nil, Invalid("เทอมนี้ไม่มีรอบ 2")
@@ -406,6 +445,8 @@ func (s *DocumentProgressService) getRoundProgress(ctx context.Context, termID u
 	var gregMonths []string
 	if round == 2 {
 		gregMonths = fr.round2Greg
+	} else if round > 2 {
+		gregMonths = []string{scopeMonth(round)}
 	}
 	total, exported, unexported, err := s.exportReadiness(ctx, termID, round, gregMonths)
 	if err != nil {
@@ -414,6 +455,9 @@ func (s *DocumentProgressService) getRoundProgress(ctx context.Context, termID u
 	label := fr.round1Label
 	if round == 2 {
 		label = fr.round2Label
+	}
+	if round > 2 {
+		label = thaiSelectedMonthsLabel([]string{scopeMonth(round)})
 	}
 	p := &TermProgress{
 		TermID:            termID,
@@ -424,6 +468,12 @@ func (s *DocumentProgressService) getRoundProgress(ctx context.Context, termID u
 		AllExported:       total > 0 && exported == total,
 		UnexportedCourses: unexported,
 	}
+	if round > 2 {
+		p.YearMonth = scopeMonth(round)
+	} else {
+		p.Legacy = true
+	}
+
 	// LEFT-style load: no row yet → stage 0.
 	err = s.pool.QueryRow(ctx, `
 		SELECT stage,
@@ -439,6 +489,9 @@ func (s *DocumentProgressService) getRoundProgress(ctx context.Context, termID u
 		&p.SentFinanceAt, &p.SentTreasuryAt, &p.Note, &p.UpdatedByName, &p.UpdatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
+	}
+	if e := s.applyMonthlyIssueReadiness(ctx, p); e != nil {
+		return nil, e
 	}
 	if aErr := s.fillAdvance(ctx, p); aErr != nil {
 		return nil, aErr
@@ -478,7 +531,7 @@ func (s *DocumentProgressService) fillAdvance(ctx context.Context, p *TermProgre
 // content has been exported (moving back to 0 is always allowed as a
 // correction).
 func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uuid.UUID, stage int, note string, round int) error {
-	if round != 1 && round != 2 {
+	if !ProgressScopeValid(round) {
 		return Invalid("รอบไม่ถูกต้อง")
 	}
 	if stage < 0 || stage > 5 {
@@ -491,14 +544,36 @@ func (s *DocumentProgressService) SetStage(ctx context.Context, actor, termID uu
 	if !priv {
 		return ErrForbidden
 	}
+	if e := s.validateLegacyMutation(ctx, termID, round); e != nil {
+		return e
+	}
 	gregMonths, exists, err := s.roundMonths(ctx, termID, round)
 	if err != nil {
 		return err
 	}
-	if round == 2 && !exists {
+	if round != 1 && !exists {
 		return Invalid("เทอมนี้ไม่มีรอบ 2")
 	}
-	if stage > 0 {
+	if round > 2 && stage > 0 {
+		var issued bool
+		if e := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM monthly_payout_batches WHERE term_id=$1 AND year_month=$2)`, termID, scopeMonth(round)).Scan(&issued); e != nil {
+			return e
+		}
+		if !issued {
+			return Invalid("ต้องออกชุดเบิกรวมประจำเดือนก่อนอัปเดตความคืบหน้า")
+		}
+	}
+	if round > 2 && stage > 0 {
+		progress := &TermProgress{TermID: termID, YearMonth: scopeMonth(round)}
+		if e := s.applyMonthlyIssueReadiness(ctx, progress); e != nil {
+			return e
+		}
+		if !progress.AllExported {
+			return Invalid("ชุดเบิกประจำเดือนถูกส่งกลับแก้ไข ต้องออกฉบับแก้ไขก่อนอัปเดตความคืบหน้า")
+		}
+	}
+
+	if stage > 0 && round <= 2 {
 		total, exported, _, rErr := s.exportReadiness(ctx, termID, round, gregMonths)
 		if rErr != nil {
 			return rErr
@@ -713,10 +788,25 @@ func roleForStage(stage int) string {
 // TA added after the first export still appears — the checklist table only ever
 // holds the ticks. Readable by any authenticated user.
 func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid.UUID, round int) ([]SignatureItem, error) {
+	if round > 2 {
+		snapshot, found, e := s.monthlySignerSnapshot(ctx, termID, round)
+		if e != nil {
+			return nil, e
+		}
+		if found {
+			return snapshot, nil
+		}
+	}
+
+	return s.MonthlySignerCandidates(ctx, termID, round)
+}
+
+func (s *DocumentProgressService) MonthlySignerCandidates(ctx context.Context, termID uuid.UUID, round int) ([]SignatureItem, error) {
+
 	var rows pgx.Rows
 	var err error
-	switch round {
-	case 1:
+	switch {
+	case round == 1:
 		rows, err = s.pool.Query(ctx, `
 			WITH courses AS (
 			    SELECT tc.id, tc.code, tc.name_th, (tc.exported_at IS NOT NULL) AS exported
@@ -755,8 +845,8 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 			      AND sc.fiscal_round = 1
 			ORDER BY c.code, CASE p.role WHEN 'ta' THEN 1 WHEN 'lecturer' THEN 2 ELSE 3 END,
 			         COALESCE(p.signer_name, '')`, termID)
-	case 2:
-		gregMonths, exists, rErr := s.roundMonths(ctx, termID, 2)
+	case round >= 2:
+		gregMonths, exists, rErr := s.roundMonths(ctx, termID, round)
 		if rErr != nil {
 			return nil, rErr
 		}
@@ -766,7 +856,7 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 		rows, err = s.pool.Query(ctx, `
 			WITH courses AS (
 			    SELECT tc.id, tc.code, tc.name_th,
-			           `+roundExportedSQL("$2")+` AS exported
+			           `+scopedCourseExportedSQL(round, "$2")+` AS exported
 			    FROM teaching_courses tc,
 			         LATERAL (SELECT `+courseHasTA+` AS has_ta) x,
 			         LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y
@@ -782,6 +872,8 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 			    JOIN ta_requests r            ON r.id = a.request_id AND r.status = 'approved'
 			    JOIN users u                  ON u.id = a.ta_id
 			    LEFT JOIN ta_profiles tp      ON tp.user_id = u.id
+                WHERE $3 = 2 OR EXISTS (SELECT 1 FROM work_logs wl WHERE wl.assignment_id=a.id AND wl.status='approved' AND to_char(wl.work_date,'YYYY-MM')=ANY($2::text[]))
+                  OR (a.level::text IN ('master','phd') AND s.track='special')
 			  UNION ALL
 			    SELECT DISTINCT c.id, 'lecturer', u.id,
 			           COALESCE(NULLIF(u.title,''), '') ||
@@ -801,9 +893,9 @@ func (s *DocumentProgressService) ListChecklist(ctx context.Context, termID uuid
 			       ON sc.teaching_course_id = c.id
 			      AND sc.role = p.role
 			      AND sc.signer_id IS NOT DISTINCT FROM p.signer_id
-			      AND sc.fiscal_round = 2
+			      AND sc.fiscal_round = $3
 			ORDER BY c.code, CASE p.role WHEN 'ta' THEN 1 WHEN 'lecturer' THEN 2 ELSE 3 END,
-			         COALESCE(p.signer_name, '')`, termID, gregMonths)
+			         COALESCE(p.signer_name, '')`, termID, gregMonths, round)
 	default:
 		return nil, Invalid("รอบไม่ถูกต้อง")
 	}
@@ -914,7 +1006,7 @@ func (s *DocumentProgressService) ToggleSignature(
 	if !priv {
 		return ErrForbidden
 	}
-	if round != 1 && round != 2 {
+	if !ProgressScopeValid(round) {
 		return Invalid("รอบไม่ถูกต้อง")
 	}
 	if role != "ta" && role != "lecturer" && role != "certifier" {
@@ -932,6 +1024,26 @@ func (s *DocumentProgressService) ToggleSignature(
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id = $1`, tcID).Scan(&termID); err != nil {
 		return Invalid("ไม่พบรายวิชา")
+	}
+	if round > 2 {
+		items, e := s.ListChecklist(ctx, termID, round)
+		if e != nil {
+			return e
+		}
+		found := false
+		for _, it := range items {
+			if it.TeachingCourseID == tcID && it.Role == role && (it.SignerID == nil && signerID == nil || it.SignerID != nil && signerID != nil && *it.SignerID == *signerID) {
+				found = it.Exported
+				break
+			}
+		}
+		if !found {
+			return Invalid("ผู้ลงนามหรือรายวิชายังไม่มีเอกสารส่งออกของเดือนนี้")
+		}
+	}
+
+	if e := s.validateLegacyMutation(ctx, termID, round); e != nil {
+		return e
 	}
 	var signerName string
 	if signerID != nil {
@@ -981,7 +1093,7 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if !priv {
 		return 0, ErrForbidden
 	}
-	if round != 1 && round != 2 {
+	if !ProgressScopeValid(round) {
 		return 0, Invalid("รอบไม่ถูกต้อง")
 	}
 	if s.notify == nil {
@@ -1002,9 +1114,12 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if recent {
 		return 0, Invalid("ส่งแจ้งเตือนรอบนี้ไปแล้วภายใน 12 ชั่วโมงที่ผ่านมา กรุณารอก่อนส่งซ้ำ")
 	}
+	if round > 2 {
+		return s.remindMonthlyUnsigned(ctx, actor, termID, round)
+	}
 	var rows pgx.Rows
-	switch round {
-	case 1:
+	switch {
+	case round == 1:
 		// The submitter, not every co-teacher — see ListChecklist's own note.
 		rows, err = s.pool.Query(ctx, `
 			SELECT DISTINCT r.lecturer_id, tc.code
@@ -1018,10 +1133,10 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 			CROSS JOIN LATERAL (SELECT `+courseHasTA+` AS has_ta) x
 			WHERE tc.term_id = $1 AND x.has_ta AND sc.signed_at IS NULL
 			ORDER BY tc.code`, termID)
-	case 2:
+	case round >= 2:
 		var gregMonths []string
 		var exists bool
-		gregMonths, exists, err = s.roundMonths(ctx, termID, 2)
+		gregMonths, exists, err = s.roundMonths(ctx, termID, round)
 		if err != nil {
 			return 0, err
 		}
@@ -1036,11 +1151,11 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 			       ON sc.teaching_course_id = tc.id
 			      AND sc.role = 'lecturer'
 			      AND sc.signer_id = r.lecturer_id
-			      AND sc.fiscal_round = 2
+			      AND sc.fiscal_round = $3
 			CROSS JOIN LATERAL (SELECT `+courseHasTA+` AS has_ta) x
 			CROSS JOIN LATERAL (SELECT `+roundBillableSQL("$2")+` AS billable) y
 			WHERE tc.term_id = $1 AND x.has_ta AND y.billable AND sc.signed_at IS NULL
-			ORDER BY tc.code`, termID, gregMonths)
+			ORDER BY tc.code`, termID, gregMonths, round)
 	}
 	if err != nil {
 		return 0, err
@@ -1067,10 +1182,13 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 	if round == 2 {
 		first = "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนที่รอการลงนามของท่าน ในรายวิชา %s ซึ่งเป็นการเบิกจ่ายรอบที่ 2 ของปีงบประมาณใหม่"
 	}
+	if round > 2 {
+		first = "มีเอกสารเบิกจ่ายค่าตอบแทนผู้ช่วยสอนประจำเดือน " + thaiSelectedMonthsLabel([]string{scopeMonth(round)}) + " ที่รอการลงนามของท่าน ในรายวิชา %s"
+	}
 	for _, uid := range order {
 		body := fmt.Sprintf(first, strings.Join(byUser[uid], ", ")) +
 			"\n\n" + "ขอให้ท่านลงนามในเอกสารดังกล่าว เพื่อให้สามารถดำเนินการเบิกจ่ายในขั้นตอนต่อไปได้"
-		s.notify.SendAction(ctx, uid, fmt.Sprintf("เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม รอบที่ %d", round), body, "/document-progress")
+		s.notify.SendAction(ctx, uid, documentScopeTitle(round), body, "/document-progress")
 	}
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind",
 		Entity: "academic_term", EntityID: termID.String(), Note: fmt.Sprintf("round=%d", round),
@@ -1078,4 +1196,31 @@ func (s *DocumentProgressService) RemindUnsigned(ctx context.Context, actor, ter
 		return 0, err
 	}
 	return len(order), nil
+}
+
+func documentScopeTitle(scope int) string {
+	if scope > 2 {
+		return "เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม · " + thaiSelectedMonthsLabel([]string{scopeMonth(scope)})
+	}
+	return fmt.Sprintf("เอกสารเบิกจ่ายผู้ช่วยสอนรอการลงนาม รอบที่ %d", scope)
+}
+
+func (s *DocumentProgressService) remindMonthlyUnsigned(ctx context.Context, actor, termID uuid.UUID, scope int) (int, error) {
+	items, err := s.ListChecklist(ctx, termID, scope)
+	if err != nil {
+		return 0, err
+	}
+	byPerson := map[uuid.UUID][]string{}
+	for _, it := range items {
+		if it.Exported && it.Role == "lecturer" && it.SignerID != nil && it.SignedAt == nil {
+			byPerson[*it.SignerID] = append(byPerson[*it.SignerID], it.Code)
+		}
+	}
+	for id, codes := range byPerson {
+		s.notify.SendAction(ctx, id, documentScopeTitle(scope), "กรุณาลงนามเอกสารเบิกจ่ายประจำเดือน "+thaiSelectedMonthsLabel([]string{scopeMonth(scope)})+" รายวิชา "+strings.Join(codes, ", "), "/document-progress")
+	}
+	if err = s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "signature_checklist.remind", Entity: "academic_term", EntityID: termID.String(), Note: fmt.Sprintf("round=%d", scope), After: map[string]any{"month": scopeMonth(scope), "notified": len(byPerson)}}); err != nil {
+		return 0, err
+	}
+	return len(byPerson), nil
 }

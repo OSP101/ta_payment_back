@@ -179,6 +179,19 @@ func (s *ExportService) CourseExportBlockers(ctx context.Context, courseID uuid.
 		}
 	}
 
+	lumpBlockers, err := s.monthlyLumpPrerequisites(ctx, courseID, months)
+	if err != nil {
+		return nil, err
+	}
+	for i := range lumpBlockers {
+		b := lumpBlockers[i]
+		k := key{b.Kind, b.TAName}
+		if _, exists := agg[k]; !exists {
+			agg[k] = &b
+			order = append(order, k)
+		}
+	}
+
 	// Stage order, then name — staff read this list top-down as a work queue.
 	rank := map[string]int{"waiting_ta": 0, "waiting_lecturer": 1, "class_clash": 2, "not_appointed": 3, "profile": 4, "unreviewed": 5}
 	sort.SliceStable(order, func(i, j int) bool {

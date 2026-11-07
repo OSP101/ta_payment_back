@@ -181,11 +181,13 @@ func main() {
 	}
 
 	app := fiber.New(fiber.Config{
-		AppName:      "TA Payment API",
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		BodyLimit:    32 * 1024 * 1024,
-		ErrorHandler: handler.ErrorHandler,
+		AppName: "TA Payment API",
+		// Signed edit views accompany forms and multi-course approval batches.
+		ReadBufferSize: 32 * 1024,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   60 * time.Second,
+		BodyLimit:      32 * 1024 * 1024,
+		ErrorHandler:   handler.ErrorHandler,
 		// Without this, fasthttp falls back to ReadTimeout (30s) as the
 		// keep-alive idle timeout too (see its idleTimeout()) — too short
 		// against Next.js's rewrite proxy, which pools persistent connections
@@ -264,7 +266,8 @@ func main() {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.CORSOrigins,
 		AllowCredentials: true,
-		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
+		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Edit-Views,Idempotency-Key",
+		ExposeHeaders:    "X-Edit-Views,Content-Disposition",
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 	}))
 	// Second layer of CSRF defence, under the cookie's own SameSite=Lax — see

@@ -436,6 +436,28 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		return in.Assignments[order[x]].TAID.String() < in.Assignments[order[y]].TAID.String()
 	})
 
+	// Reserve the course capacity and every named TA before rechecking. This
+	// also covers the deferred branch, which does not call autoDecide yet.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text,149))`, in.TeachingCourseID.String()); err != nil {
+		return nil, err
+	}
+	for _, i := range order {
+		ta := in.Assignments[i].TAID
+		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, ta.String()); err != nil {
+			return nil, err
+		}
+	}
+	for _, i := range order {
+		ta := in.Assignments[i].TAID
+		var exists bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM ta_request_assignments a JOIN ta_requests r ON r.id=a.request_id WHERE a.ta_id=$1 AND r.teaching_course_id=$2 AND r.status IN ('submitted','approved') AND a.state<>'dropped')`, ta, in.TeachingCourseID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if exists {
+			return nil, Conflict(s.taName(ctx, ta) + " มีคำขอของวิชานี้อยู่แล้ว กรุณาโหลดรายชื่อปัจจุบันก่อนส่งใหม่ โดยรายการในชุดนี้ยังไม่ถูกบันทึก")
+		}
+	}
+
 	results := make([]CreateResult, len(in.Assignments))
 	notices := make([]map[uuid.UUID][]string, len(in.Assignments))
 	for _, i := range order {
@@ -2882,6 +2904,34 @@ func (s *TARequestService) EnsureAssignmentTAActive(ctx context.Context, logID, 
 	}
 	if !active {
 		return Conflict("บันทึกเวลาแทน TA คนนี้ไม่ได้ เนื่องจากบัญชีผู้ใช้ของ TA ถูกปิดใช้งานแล้ว")
+	}
+	return nil
+}
+
+// Lock a legacy multi-TA request in the same order as a new submission, before
+// any assignment changes. Timetable finalisers and section additions share it.
+func lockRequestTAs(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) error {
+	rows, err := tx.Query(ctx, `SELECT DISTINCT ta_id::text FROM ta_request_assignments WHERE request_id=$1 ORDER BY ta_id::text`, reqID)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }

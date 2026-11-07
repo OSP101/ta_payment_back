@@ -873,6 +873,23 @@ func (s *ExportService) BuildTransferCoverWorkbook(ctx context.Context, actor, t
 		return nil, nil, Invalid(err.Error())
 	}
 
+	if err := s.ValidatePayoutSelection(ctx, termID, months); err != nil {
+		return nil, nil, err
+	}
+	legacy, err := s.LegacyPayoutMonths(ctx, termID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(months) == 1 && !legacy[months[0]] {
+		var issued bool
+		if err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM monthly_payout_batches WHERE term_id=$1 AND year_month=$2)`, termID, months[0]).Scan(&issued); err != nil {
+			return nil, nil, err
+		}
+		if !issued {
+			return nil, nil, Invalid("ต้องออกชุดเบิกรวมประจำเดือนก่อนออกใบปะหน้าจ่ายตรง")
+		}
+	}
+
 	if err := assertOneFiscalYear(all, months); err != nil {
 		return nil, nil, err
 	}
@@ -1053,6 +1070,7 @@ type TransferCoverMonthStatus struct {
 	// Issued is true once any generation covered this month. Rows predating
 	// the months column covered the whole term, so they mark every month.
 	Issued bool `json:"issued"`
+	Legacy bool `json:"legacy,omitempty"`
 	// Ready is false while anything in the month is still waiting on a TA, a
 	// lecturer, or the finance step. The document is keyed straight into the
 	// university's ERP, so its figures have to be final — a month that is still
@@ -1171,12 +1189,35 @@ func (s *ExportService) TransferCoverCoverage(ctx context.Context, termID uuid.U
 	if err != nil {
 		return nil, err
 	}
+
+	legacy, err := s.LegacyPayoutMonths(ctx, termID)
+	if err != nil {
+		return nil, err
+	}
+	completed := map[string]bool{}
+	rows, e := s.pool.Query(ctx, `SELECT DISTINCT year_month FROM monthly_payout_batches WHERE term_id=$1`, termID)
+	if e != nil {
+		return nil, e
+	}
+	for rows.Next() {
+		var ym string
+		if e = rows.Scan(&ym); e != nil {
+			rows.Close()
+			return nil, e
+		}
+		completed[ym] = true
+	}
+	rows.Close()
+	if e = rows.Err(); e != nil {
+		return nil, e
+	}
 	out := &TransferCoverCoverage{Split: split, Months: make([]TransferCoverMonthStatus, 0, len(all))}
 	for _, m := range all {
-		ready := !notReady[m.YearMonth]
+		ready := !notReady[m.YearMonth] && (legacy[m.YearMonth] || completed[m.YearMonth])
 		out.Months = append(out.Months, TransferCoverMonthStatus{
 			TermMonth: m,
 			Issued:    issued[m.YearMonth],
+			Legacy:    legacy[m.YearMonth],
 			Ready:     &ready,
 		})
 	}

@@ -27,6 +27,7 @@ type tcFixture struct {
 	svc    *ExportService
 	docs   *DocsService
 	termID uuid.UUID
+	legacy bool
 	lectID uuid.UUID
 	// ym is "2569-MM" for the current calendar month — the same convention
 	// fixture_test.go's addSubmissionPeriod uses. Only the MM half is ever
@@ -172,6 +173,9 @@ func (f *tcFixture) ensurePeriod() uuid.UUID {
 		        VALUES ($1, $2, $3, '2026-12-31'::date, $4, '2026-06-01'::date, FALSE)`,
 			spID, f.termID, f.ym, "รอบ "+f.ym)
 	}
+	if f.legacy {
+		f.markLegacyMonth(f.ym)
+	}
 	return spID
 }
 
@@ -258,7 +262,7 @@ func openWorkbookBytes(t *testing.T, body []byte) *excelize.File {
 // track's own money — never merged into one row the way a single-course claim
 // would.
 func TestBuildTransferCoverSheets_DualTrackSplitsAcrossSheets(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	courseB, _, specB := f.insertCourse(tcCourseOpts{Code: "CP222", Curriculum: "CY", LectureHrs: 100})
 
@@ -303,7 +307,7 @@ func TestBuildTransferCoverSheets_DualTrackSplitsAcrossSheets(t *testing.T) {
 // never the raw, uncapped hourly total. A mutation that summed claimCostByTASlot
 // directly (skipping fundedShare) would pay 150 here instead of the true 70.
 func TestBuildTransferCoverSheets_UsesSettledShareNotRawTotal(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	// LectureHrs=7, students=30=baseline → weekly=7×1×1=7; monthly=7×10=70;
 	// term_months=4 → regular cap = 70×4 = 280... too big for a small demo,
 	// so months is overridden to 1 for THIS course's term via a dedicated term.
@@ -346,7 +350,7 @@ func TestBuildTransferCoverSheets_UsesSettledShareNotRawTotal(t *testing.T) {
 // rate table (lumpsum=1000, cap=12000) the flat amount is just 1000, not
 // 1000×4=4000 the way the old (buggy) formula computed it.
 func TestBuildTransferCoverSheets_GradSpecialLumpIsFlatNotMultipliedByMonths(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP888", Curriculum: "CY", LectureHrs: 100})
 
 	ta := f.newTA("นายบัณฑิต เรียนดี", "master")
@@ -372,7 +376,7 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsFlatNotMultipliedByMonths(t *
 // lump independently — there is no cross-course aggregate cap (a TA on 2
 // courses gets 2×lump, not a shared 12,000 split between them).
 func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	c1, _, spec1 := f.insertCourse(tcCourseOpts{Code: "CP888", Curriculum: "CY", LectureHrs: 100})
 	c2, _, spec2 := f.insertCourse(tcCourseOpts{Code: "CP889", Curriculum: "CY", LectureHrs: 100})
 
@@ -400,7 +404,7 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *tes
 // A row that nets to zero (the pool has nothing left after the committed lump)
 // must not appear at all — a 0.00 line is not something finance transfers.
 func TestBuildTransferCoverSheets_ZeroNetRowExcluded(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	f.termID = uuid.New()
 	f.exec(`INSERT INTO academic_terms (id, academic_year, semester, starts_on, ends_on, is_active, months)
 	        VALUES ($1, 2569, 2, '2026-06-01', '2026-10-31', FALSE, 1)`, f.termID)
@@ -429,7 +433,7 @@ func TestBuildTransferCoverSheets_ZeroNetRowExcluded(t *testing.T) {
 // rows, not a hardcoded figure — and the rendered cell values must match what
 // buildTransferCoverSheets computed.
 func TestBuildTransferCoverWorkbook_TotalIsARealFormula(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	// Named so alphabetical sort is unambiguous: ก precedes ย in Thai order,
 	// so ta1 must land on row 6 regardless of insertion order.
@@ -479,7 +483,7 @@ func TestBuildTransferCoverWorkbook_TotalIsARealFormula(t *testing.T) {
 // has no หมายเหตุ column, so the printed file carries five columns and this
 // reading lives only on the screen staff check before downloading.
 func TestTransferCoverPreview_SeniorityPopulated(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	newTA := f.newTA("กมล ใหม่เอี่ยม", "undergrad")
 	oldTA := f.newTA("ยุพา เก่าแก่", "undergrad")
@@ -511,7 +515,7 @@ func TestTransferCoverPreview_SeniorityPopulated(t *testing.T) {
 // The gate must be term-wide: one course whose claim documents have not been
 // issued blocks the whole document, even if every other course is done.
 func TestTermExportBlockers_RejectsWhenOneMonthIsNotExported(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	ta := f.newTA("นายค้าง ส่งออก", "undergrad")
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
@@ -551,7 +555,7 @@ func TestTermExportBlockers_RejectsWhenOneMonthIsNotExported(t *testing.T) {
 // 'exported' is the line that matters: the claim documents are issued, the
 // month is locked, and nothing on the cover can move any more.
 func TestTermExportBlockers_ExportedIsEnoughWithoutTheFinanceHandoff(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP222", Curriculum: "CY", LectureHrs: 100})
 	ta := f.newTA("นางสาวส่งออก แล้ว", "undergrad")
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
@@ -584,7 +588,7 @@ func TestTermExportBlockers_ExportedIsEnoughWithoutTheFinanceHandoff(t *testing.
 // Once every course reaches finance_sent, the gate opens and the same course
 // that blocked above must no longer appear.
 func TestTermExportBlockers_ClearsOnceFinanceSent(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	ta := f.newTA("นายจ่ายครบ แล้ว", "undergrad")
 	f.assignTA(ta, courseA, regA, "undergrad", []int{1})
@@ -604,7 +608,7 @@ func TestTermExportBlockers_ClearsOnceFinanceSent(t *testing.T) {
 // printCurriculumCode routing export_course_summary.go uses, exercised here
 // through transferCoverPrintCurricula's own call site.
 func TestBuildTransferCoverSheets_GraduateCourseRoutesToGradSheet(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{
 		Code: "CP398001", Curriculum: "AI", LectureHrs: 100, Level: "graduate",
 	})
@@ -638,7 +642,7 @@ func TestBuildTransferCoverSheets_GraduateCourseRoutesToGradSheet(t *testing.T) 
 // wrong level over half its rows — while the same TA was also billed on the
 // graduate document, making the course's paperwork claim them twice.
 func TestCollectCombinedBook_ExcludesGraduateTAsEntirely(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseID, regSec, specSec := f.insertCourse(tcCourseOpts{Code: "CP891", Curriculum: "CY", LectureHrs: 100})
 
 	ug := f.newTA("นายปริญญาตรี ทำงาน", "undergrad")
@@ -676,7 +680,7 @@ func TestCollectCombinedBook_ExcludesGraduateTAsEntirely(t *testing.T) {
 // undergrad book at all, and that is not an error — its whole claim lives on
 // the graduate documents.
 func TestBuildCombinedClaimWorkbook_NilForGraduateOnlyCourse(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseID, regSec, _ := f.insertCourse(tcCourseOpts{Code: "CP892", Curriculum: "CY", LectureHrs: 100})
 	ta := f.newTA("นายบัณฑิต ลงเวลา", "phd")
 	f.assignTA(ta, courseID, regSec, "phd", []int{10, 11})
@@ -689,4 +693,14 @@ func TestBuildCombinedClaimWorkbook_NilForGraduateOnlyCourse(t *testing.T) {
 	if book != nil {
 		t.Error("a graduate-only course produced an undergrad claim workbook")
 	}
+}
+
+// Historical fixtures explicitly model migration 0154's cutover snapshot.
+func newLegacyTCFixture(t *testing.T) *tcFixture { f := newTCFixture(t); f.legacy = true; return f }
+func (f *tcFixture) markLegacyMonth(period string) {
+	ym, e := gregorianYearMonth(period)
+	if e != nil {
+		f.t.Fatal(e)
+	}
+	f.exec(`INSERT INTO payout_legacy_months(term_id,year_month) VALUES($1,$2) ON CONFLICT DO NOTHING`, f.termID, ym)
 }

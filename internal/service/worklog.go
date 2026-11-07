@@ -4535,7 +4535,8 @@ type WorkLogWithTA struct {
 	// Widened on 03/08/2026 when the deadline stopped exempting staff: without
 	// it the editor kept offering a pencil on rows the server would refuse,
 	// which is the same trap the TA's submit button used to be.
-	Locked bool `json:"locked"`
+	Locked       bool `json:"locked"`
+	PeriodClosed bool `json:"period_closed"`
 }
 
 // StaffAssignment is one approved (TA × section) slot in a course, used by the
@@ -4565,7 +4566,7 @@ func (s *WorkLogService) StaffListByCourse(ctx context.Context, tcID uuid.UUID) 
 		       tc.code, sec.sec_no, sec.track, a.level,
 		       -- Exactly what assertWorklogWritable refuses, so the pencil the
 		       -- editor draws and the write the server accepts cannot disagree.
-		       `+unsubmittableMonthSQL("wl")+` AS locked
+		       `+financeLockedRowSQL("wl")+` AS locked, `+unsubmittableMonthSQL("wl")+` AS period_closed
 		FROM work_logs wl
 		JOIN ta_request_assignments a ON a.id = wl.assignment_id
 		JOIN users u ON u.id = a.ta_id
@@ -4584,7 +4585,7 @@ func (s *WorkLogService) StaffListByCourse(ctx context.Context, tcID uuid.UUID) 
 			&w.StartTime, &w.EndTime, &w.Hours, &w.Activity, &w.ParentKind,
 			&w.Room, &w.Note, &w.Status,
 			&w.TAID, &w.TAName, &w.CourseCode, &w.SectionNo, &w.Track, &w.Level,
-			&w.Locked); err != nil {
+			&w.Locked, &w.PeriodClosed); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
@@ -4683,11 +4684,12 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	// against the unlocked assignment while the UPDATE (matched by id) rewrote the
 	// locked row. Pin w.AssignmentID to the row's real owner up front.
 	var wasApproved bool
+	var originalDate string
 	if w.ID != uuid.Nil {
 		var realAssignment uuid.UUID
 		var status string
 		if err := s.pool.QueryRow(ctx,
-			`SELECT assignment_id, status::text FROM work_logs WHERE id=$1`, w.ID).Scan(&realAssignment, &status); err != nil {
+			`SELECT assignment_id, status::text,work_date::text FROM work_logs WHERE id=$1`, w.ID).Scan(&realAssignment, &status, &originalDate); err != nil {
 			return uuid.Nil, Invalid("ไม่พบรายการที่ต้องการแก้ไข")
 		}
 		w.AssignmentID = realAssignment
@@ -4713,12 +4715,27 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	}
 	// After authorization, so an outsider gets a plain 403 rather than being
 	// asked for a password.
-	if wasApproved {
+	closedCorrection := false
+	if privileged && w.ID != uuid.Nil {
+		closed, _, _, e := monthClosedForCourse(ctx, s.pool, ac.TeachingCourseID, w.WorkDate)
+		if e != nil {
+			return uuid.Nil, e
+		}
+		closedCorrection = closed
+		if originalDate != "" {
+			oldClosed, _, _, e := monthClosedForCourse(ctx, s.pool, ac.TeachingCourseID, originalDate)
+			if e != nil {
+				return uuid.Nil, e
+			}
+			closedCorrection = closedCorrection || oldClosed
+		}
+	}
+	if wasApproved || closedCorrection {
 		if err := s.checkApprovedEditStepUp(ctx, actor, stepUp); err != nil {
 			return uuid.Nil, err
 		}
 	}
-	if err := s.validateOnBehalfWrite(ctx, ac, w, onBehalfOpts{}); err != nil {
+	if err := s.validateOnBehalfWrite(ctx, ac, w, onBehalfOpts{staffCorrection: privileged && w.ID != uuid.Nil}); err != nil {
 		return uuid.Nil, err
 	}
 
@@ -4732,7 +4749,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 	// before-image is simply absent, which is the honest record.
 	if err := writeAuditedRow(ctx, s.pool, s.aud,
 		audit.Entry{ActorID: &actor, Action: auditEditAction(privileged), Entity: "work_log", EntityID: w.ID.String(),
-			Note: approvedEditNote(wasApproved, stepUp)},
+			Note: approvedEditNote(wasApproved || closedCorrection, stepUp)},
 		"work_logs", w.ID,
 		func(tx pgx.Tx) error {
 			if isNew {
@@ -4800,6 +4817,7 @@ func (s *WorkLogService) StaffUpsert(ctx context.Context, actor uuid.UUID, privi
 
 // onBehalfOpts tunes validateOnBehalfWrite for the lecturer's review path.
 type onBehalfOpts struct {
+	staffCorrection bool // staff may correct an existing closed-month entry, never submit late
 	// reviewOnly: the row is a submitted one under the lecturer's review, so
 	// the monthly deadline does not apply — only the export lock does.
 	reviewOnly bool
@@ -4875,7 +4893,7 @@ func (s *WorkLogService) validateOnBehalfWrite(ctx context.Context, ac *assignme
 	// work the TA sent in time, and routinely does so after the period has
 	// closed; only a month already exported or sent to finance is out of reach.
 	writable := assertWorklogWritable
-	if opt.reviewOnly {
+	if opt.reviewOnly || opt.staffCorrection {
 		writable = assertWorklogNotExported
 	}
 	if err := writable(ctx, s.pool, ac.TeachingCourseID, ac.TAID, w.WorkDate); err != nil {

@@ -763,26 +763,11 @@ func (h *TeachingHandler) RegEnrolment(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"job": job})
 }
 
-// StartRegEnrolment is POST /terms/:id/reg-enrolment {scope} — start fetching real
-// enrolment from reg.kku.ac.th, or get the fetch already running / a result
-// under ten minutes old. It only reads; staff apply the numbers through
-// BulkNumStudents.
+// StartRegEnrolment is temporarily suspended while the integration is rebuilt
+// for KKU REG's replacement website. Keep status/stop available for old clients.
 func (h *TeachingHandler) StartRegEnrolment(c *fiber.Ctx) error {
-	termID, err := uuid.Parse(c.Params("id"))
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
-	}
-	var body struct {
-		Scope string `json:"scope"` // requested (default) | all
-	}
-	if err := Bind(c, &body); err != nil {
-		return err
-	}
-	job, err := h.Svc.RegEnrolment.Start(c.Context(), UserID(c), termID, body.Scope)
-	if err != nil {
-		return err
-	}
-	return c.JSON(fiber.Map{"job": job})
+	return fiber.NewError(fiber.StatusServiceUnavailable,
+		"ปิดการดึงข้อมูลจาก KKU REG ชั่วคราว เนื่องจากระบบทะเบียนเปลี่ยนเว็บไซต์ อยู่ระหว่างพัฒนาใหม่ กรุณาวางข้อมูลจาก Excel แทน")
 }
 
 // StopRegEnrolment is DELETE /terms/:id/reg-enrolment — stop the running
@@ -1748,7 +1733,7 @@ func (h *DocsHandler) Download(c *fiber.Ctx) error {
 		return err
 	}
 	if deleted {
-		return fiber.NewError(fiber.StatusGone, "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน")
+		return fiber.NewError(fiber.StatusGone, "ไฟล์ถูกลบตามระยะเวลาเก็บรักษาที่กำหนดแล้ว")
 	}
 	rc, filename, mime, ownerID, err := h.Svc.Docs.OpenStored(c.Context(), id)
 	if err != nil {
@@ -2039,7 +2024,7 @@ func (h *DocsHandler) PreviewWatermarked(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "doc does not belong to user")
 	}
 	if meta.FileDeletedAt != nil {
-		return fiber.NewError(fiber.StatusGone, "ไฟล์ถูกลบตามนโยบายเก็บรักษา 7 วัน")
+		return fiber.NewError(fiber.StatusGone, "ไฟล์ถูกลบตามระยะเวลาเก็บรักษาที่กำหนดแล้ว")
 	}
 	rc, err := h.Svc.Docs.OpenByKey(meta.StorageKey)
 	if err != nil {
@@ -3448,29 +3433,57 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	var termID uuid.UUID
+	if err := h.Svc.Pool.QueryRow(c.Context(), `SELECT term_id FROM teaching_courses WHERE id=$1`, id).Scan(&termID); err != nil {
+		return err
+	}
+	legacy, err := h.Svc.Export.LegacyPayoutMonths(c.Context(), termID)
+	if err != nil {
+		return err
+	}
+	for _, ym := range months {
+		if !legacy[ym] {
+			return service.Invalid("กรุณาออกชุดเบิกรวมประจำเดือนที่หน้าตรวจและส่งออกเอกสาร")
+		}
+	}
+	body, name, err := h.issueCourseZip(c, id, months, nil, "")
+	if err != nil {
+		return err
+	}
+	c.Set("Content-Type", "application/zip")
+	c.Set("Content-Disposition", contentDisposition("attachment", name))
+	return c.Send(body)
+}
+
+// issueCourseZip is also used by the month pack, after every course passed
+// preflight. A retry reuses already locked course files rather than repricing.
+func (h *ExportHandler) issueCourseZip(c *fiber.Ctx, id uuid.UUID, months []string, prepared *service.CourseZip, preparedFP string) ([]byte, string, error) {
 	// A download of months that are already exported (and not sent back) is a
 	// re-download: hand back the exact ZIP finance received rather than a
 	// rebuild, which used to be refused with 409 once anything in the term had
 	// moved the live pricing. Audited like BatchDownload — it carries PII.
 	if arch, err := h.Svc.Export.ArchivedReissue(c.Context(), id, months); err != nil {
-		return err
+		return nil, "", err
 	} else if arch != nil {
 		actor := UserID(c)
 		if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.batch_download", Entity: "export_batch", EntityID: arch.Batch.BatchID.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")}); err != nil {
-			return err
+			return nil, "", err
 		}
-		c.Set("Content-Type", "application/zip")
-		c.Set("Content-Disposition", contentDisposition("attachment", arch.Batch.FileName))
-		return c.Send(arch.Body)
+		return arch.Body, arch.Batch.FileName, nil
 	}
-	builtFP, err := h.Svc.SubmissionPeriods.CourseWorklogFingerprint(c.Context(), id, months)
-	if err != nil {
-		return err
+	builtFP := preparedFP
+	var err error
+	if prepared == nil {
+		builtFP, err = h.Svc.SubmissionPeriods.CourseWorklogFingerprint(c.Context(), id, months)
+		if err != nil {
+			return nil, "", err
+		}
+		prepared, err = h.Svc.Export.BuildCourseZipPack(c.Context(), id, months)
+		if err != nil {
+			return nil, "", err
+		}
 	}
-	pack, err := h.Svc.Export.BuildCourseZipPack(c.Context(), id, months)
-	if err != nil {
-		return err
-	}
+	pack := prepared
 	body, name, taCount := pack.Body, pack.Name, pack.TACount
 	actor := UserID(c)
 	// Lock every fully-approved (TA × month) in the course BEFORE the file leaves
@@ -3483,7 +3496,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// The pack's per-(TA, month) figures are recorded with the lock, so the
 	// locked months are priced from what this file says from now on.
 	if _, err := h.Svc.SubmissionPeriods.MarkCourseExportedWithFigures(c.Context(), actor, id, months, builtFP, pack.Figures); err != nil {
-		return err
+		return nil, "", err
 	}
 	// The graduate-special lump each exported month carries is fixed from here
 	// on (grad_lump_ledger): a later month gaining weight must not shrink a
@@ -3491,7 +3504,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// It freezes the split THIS pack printed, and refuses (409, file not sent)
 	// if a concurrent export already froze different figures.
 	if err := h.Svc.Export.FreezeGradLumpSnapshot(c.Context(), actor, pack.GradLumps, months); err != nil {
-		return err
+		return nil, "", err
 	}
 	// Freeze section edits — this export is now the source of truth for the
 	// course's section list + student counts. Non-fatal if it fails; the numbers
@@ -3504,7 +3517,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// costs staff a retry; letting it through costs a PII disclosure nobody can
 	// account for afterwards.
 	if err := h.Svc.Auditor.Log(c.Context(), audit.Entry{ActorID: &actor, Action: "export.course", Entity: "teaching_course", EntityID: id.String(), IP: c.IP(), UserAgent: c.Get("User-Agent")}); err != nil {
-		return err
+		return nil, "", err
 	}
 
 	// Keep the actual bytes so staff can re-download this exact file later
@@ -3516,7 +3529,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	if key, _, serr := h.Svc.Storage.Save("export_batches", name, bytes.NewReader(body)); serr == nil {
 		filePath = key
 	} else {
-		log.Printf("export_batch: failed to persist zip for re-download (course %s): %v", id, serr)
+		return nil, "", serr
 	}
 	// Persist the batch so the dashboard can list history + budget snapshot.
 	// TotalBaht is the ACTUAL paid sum (Σ actual_paid after the pro-rata cap) so
@@ -3525,7 +3538,7 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 	// Best-effort — a DB write failure must NOT hide the (already-locked) zip.
 	// Read with the pack's lump split so the recorded total is the file's.
 	if prev, perr := h.Svc.Export.CoursePreview(service.WithGradLumpSnapshot(c.Context(), pack.GradLumps), id, months); perr == nil {
-		_, _ = h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
+		_, recordErr := h.Svc.ExportBatches.Record(c.Context(), actor, service.ExportBatch{
 			TeachingCourseID: id,
 			FilePath:         filePath,
 			FileName:         name,
@@ -3533,11 +3546,14 @@ func (h *ExportHandler) CourseZip(c *fiber.Ctx) error {
 			Months:           months,
 			TotalBaht:        prev.TotalActual,
 		})
+		if recordErr != nil {
+			return nil, "", recordErr
+		}
+	} else {
+		return nil, "", perr
 	}
 
-	c.Set("Content-Type", "application/zip")
-	c.Set("Content-Disposition", contentDisposition("attachment", name))
-	return c.Send(body)
+	return body, name, nil
 }
 
 // CoursesSummary powers the exports dashboard: budget/usage/pending months per

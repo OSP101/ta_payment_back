@@ -891,6 +891,13 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			return err
 		}
 		defer tx.Rollback(ctx)
+		var owner uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT user_id FROM ta_documents WHERE id=$1`, docID).Scan(&owner); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT user_id FROM ta_profiles WHERE user_id=$1 FOR UPDATE`, owner); err != nil {
+			return err
+		}
 		var rejUserID uuid.UUID
 		if err := tx.QueryRow(ctx,
 			`UPDATE ta_documents SET status=$1::doc_status, reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3
@@ -911,6 +918,9 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			rejUserID, reason, actor); err != nil {
 			return err
 		}
+		if err := pauseDocumentRetention(ctx, tx, rejUserID); err != nil {
+			return err
+		}
 		if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_doc.review", Entity: "ta_document",
 			EntityID: docID.String(), After: map[string]any{"status": status, "reason": reason}}); err != nil {
 			return err
@@ -926,8 +936,8 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 		return nil
 	}
 	// Approve. Three things happen together, so they share a transaction: the
-	// document flips, its 7-day retention clock starts, and — if this was the
-	// last of the three required documents — the profile itself is approved.
+	// document flips and — if this was the
+	// last required document — the profile is approved and all file clocks start.
 	//
 	// That last part used to be a separate click ("อนุมัติและดาวน์โหลดเอกสาร
 	// ทั้งหมด"). Approving all three documents and then not being approved was a
@@ -940,11 +950,20 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	}
 	defer tx.Rollback(ctx)
 
+	// Serialize approvals for this TA before touching any document so concurrent
+	// final approvals see each other's committed verdicts.
+	var owner uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT user_id FROM ta_documents WHERE id=$1`, docID).Scan(&owner); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT user_id FROM ta_profiles WHERE user_id=$1 FOR UPDATE`, owner); err != nil {
+		return err
+	}
+
 	var userID uuid.UUID
 	if err := tx.QueryRow(ctx, `
 		UPDATE ta_documents
-		   SET status='approved', reject_reason=NULL, reviewed_at=NOW(), reviewed_by=$1,
-		       expires_at=NOW() + INTERVAL '7 days'
+		   SET status='approved', reject_reason=NULL, reviewed_at=NOW(), reviewed_by=$1
 		 WHERE id=$2
 		 RETURNING user_id`,
 		actor, docID).Scan(&userID); err != nil {
@@ -1028,6 +1047,9 @@ func (s *DocsService) finalizeProfileIfComplete(
 		UPDATE ta_profiles
 		   SET status='approved', reject_reason=NULL, verified_at=NOW(), verified_by=$1
 		 WHERE user_id=$2`, actor, userID); err != nil {
+		return false, 0, err
+	}
+	if err := startDocumentRetention(ctx, tx, userID); err != nil {
 		return false, 0, err
 	}
 	// Freeze the submission snapshot for this round, exactly as the old
@@ -1209,6 +1231,10 @@ func ProfileDocsMissingSQL(userCol string) string {
 }
 
 func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingProfile, error) {
+	policy, err := s.DocumentPolicy(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// Every bucket except "incomplete" is about a profile that exists, so the
 	// base relation is users LEFT JOIN profiles and their p.status predicate
 	// excludes the profile-less rows on its own. "incomplete" is the reason for
@@ -1297,7 +1323,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 			&p.DownloadsUsed, &p.EverDownloaded, &p.DocsIn, &p.DocsNeeded, &p.Foreign); err != nil {
 			return nil, err
 		}
-		p.DownloadsLimit = maxDocDownloads
+		p.DownloadsLimit = policy.DownloadLimit
 		if completedAt != nil {
 			s := completedAt.Format(time.RFC3339)
 			p.SubmittedAt = &s

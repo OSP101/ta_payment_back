@@ -239,9 +239,17 @@ func (s *ExportService) CourseExportCoverage(ctx context.Context, courseID uuid.
 	if err != nil {
 		return nil, err
 	}
+	var termID uuid.UUID
+	if err = s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id=$1`, courseID).Scan(&termID); err != nil {
+		return nil, err
+	}
+	legacy, err := s.LegacyPayoutMonths(ctx, termID)
+	if err != nil {
+		return nil, err
+	}
 	out := &CourseExportCoverage{Split: split, Months: make([]TransferCoverMonthStatus, 0, len(all))}
 	for _, m := range all {
-		out.Months = append(out.Months, TransferCoverMonthStatus{TermMonth: m, Issued: issued[m.YearMonth]})
+		out.Months = append(out.Months, TransferCoverMonthStatus{TermMonth: m, Issued: issued[m.YearMonth], Legacy: legacy[m.YearMonth]})
 	}
 	return out, nil
 }

@@ -362,11 +362,28 @@ func (s *ExportService) archivedForSlice(ctx context.Context, courseID uuid.UUID
 	if err != nil {
 		return nil, err
 	}
-	if len(cells) == 0 {
-		return nil, nil
-	}
 	var lastLock time.Time
 	legacy := false
+	holders, err := gradSpecialHolderIDs(ctx, s.pool, courseID)
+	if err != nil {
+		return nil, err
+	}
+	if len(cells) == 0 && len(holders) == 0 {
+		return nil, nil
+	}
+	for _, ta := range holders {
+		var count int
+		var frozenAt *time.Time
+		if err = s.pool.QueryRow(ctx, `SELECT count(*),max(frozen_at) FROM grad_lump_ledger WHERE teaching_course_id=$1 AND ta_id=$2 AND year_month=ANY($3)`, courseID, ta, months).Scan(&count, &frozenAt); err != nil {
+			return nil, err
+		}
+		if count != len(months) {
+			return nil, nil
+		}
+		if frozenAt != nil && frozenAt.After(lastLock) {
+			lastLock = *frozenAt
+		}
+	}
 	for _, c := range cells {
 		if !c.locked() {
 			return nil, nil

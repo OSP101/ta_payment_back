@@ -20,6 +20,9 @@ func progressSvc(f *fixture) *DocumentProgressService {
 // any of the signature rules.
 func exportedTerm(f *fixture) {
 	f.exec(`UPDATE teaching_courses SET exported_at = now() WHERE term_id = $1`, f.TermID)
+	f.exec(`INSERT INTO payout_legacy_months(term_id,year_month) SELECT term_id,(left(year_month,4)::int-543+CASE WHEN right(year_month,2)::int<=5 THEN 1 ELSE 0 END)::text||'-'||right(year_month,2) FROM submission_periods WHERE term_id=$1 ON CONFLICT DO NOTHING`, f.TermID)
+	f.exec(`INSERT INTO export_batches(id,teaching_course_id,file_path,file_name,ta_count,total_baht,generated_by,months) SELECT gen_random_uuid(),$2,'legacy','legacy.zip',1,0,$3,array_agg(year_month) FROM payout_legacy_months WHERE term_id=$1`, f.TermID, f.CourseID, f.StaffID)
+
 }
 
 func TestSetStage_RefusesToSkipPastUnsignedTAs(t *testing.T) {

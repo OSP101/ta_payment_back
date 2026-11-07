@@ -15,7 +15,7 @@ import (
 
 // Both levels ready → one zip, two files inside, neither missing.
 func TestBuildTransferCoverBundle_BothLevelsReadyProducesTwoFiles(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP610", Curriculum: "CY", LectureHrs: 100})
 	ug := f.newTA("บันเดิล ปตรี", "undergrad")
 	f.assignTA(ug, courseA, regA, "undergrad", []int{1})
@@ -54,7 +54,7 @@ func TestBuildTransferCoverBundle_BothLevelsReadyProducesTwoFiles(t *testing.T) 
 // warning explaining the other is missing — never a hard failure, since that
 // would recreate exactly the coupling the level split was built to remove.
 func TestBuildTransferCoverBundle_OneLevelBlockedShipsTheOtherWithWarning(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP630", Curriculum: "CY", LectureHrs: 100})
 	ug := f.newTA("พร้อม ปตรี", "undergrad")
 	f.assignTA(ug, courseA, regA, "undergrad", []int{1})
@@ -90,7 +90,7 @@ func TestBuildTransferCoverBundle_OneLevelBlockedShipsTheOtherWithWarning(t *tes
 // Both levels blocked → nothing to ship, so the bundle must fail outright
 // rather than return an empty zip.
 func TestBuildTransferCoverBundle_BothLevelsBlockedFails(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	f.addPeriod(f.ym) // the gate needs a submission period to compare work_logs against
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP650", Curriculum: "CY", LectureHrs: 100})
 	ug := f.newTA("ค้าง ปตรี", "undergrad")

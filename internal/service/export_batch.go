@@ -50,23 +50,10 @@ func (s *ExportBatchService) Record(ctx context.Context, actor uuid.UUID, in Exp
 		audit.Entry{ActorID: &actor, Action: "export_batch.record",
 			Entity: "teaching_course", EntityID: in.TeachingCourseID.String(), After: in},
 		func(tx pgx.Tx) error {
-			if err := batchVersion(ctx, tx, &in); err != nil {
-				return err
+			recorded, err := s.RecordTx(ctx, tx, actor, in)
+			if err == nil {
+				in = *recorded
 			}
-			// generated_at is the DATABASE clock, like the exported_at of the
-			// lock this batch follows: the version and archive checks compare
-			// the two, and an app-side timestamp (second-truncated, possibly
-			// skewed) could read as older than the lock it came after.
-			err := tx.QueryRow(ctx, `
-				INSERT INTO export_batches
-				    (id, teaching_course_id, submission_period_id,
-				     file_path, file_name, ta_count, total_baht,
-				     generated_at, generated_by, months, version, previous_batch_id)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11)
-				RETURNING to_char(generated_at, 'YYYY-MM-DD"T"HH24:MI:SS.USTZH:TZM')`,
-				in.ID, in.TeachingCourseID, in.SubmissionPeriodID,
-				in.FilePath, in.FileName, in.TACount, in.TotalBaht,
-				in.GeneratedBy, in.Months, in.Version, in.PreviousBatchID).Scan(&in.GeneratedAt)
 			return err
 		}); err != nil {
 		return nil, err
@@ -635,4 +622,33 @@ func (s *ExportBatchService) roundStanding(
 		out[id] = st
 	}
 	return out, rows.Err()
+}
+
+// RecordTx persists one course archive as part of a combined monthly commit.
+func (s *ExportBatchService) RecordTx(ctx context.Context, tx pgx.Tx, actor uuid.UUID, in ExportBatch) (*ExportBatch, error) {
+	if in.ID == uuid.Nil {
+		in.ID = uuid.New()
+	}
+	in.GeneratedBy = actor
+	if err := batchVersion(ctx, tx, &in); err != nil {
+		return nil, err
+	}
+	// generated_at is the DATABASE clock, like the exported_at of the
+	// lock this batch follows: the version and archive checks compare
+	// the two, and an app-side timestamp (second-truncated, possibly
+	// skewed) could read as older than the lock it came after.
+	err := tx.QueryRow(ctx, `
+				INSERT INTO export_batches
+				    (id, teaching_course_id, submission_period_id,
+				     file_path, file_name, ta_count, total_baht,
+				     generated_at, generated_by, months, version, previous_batch_id)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8,$9,$10,$11)
+				RETURNING to_char(generated_at, 'YYYY-MM-DD"T"HH24:MI:SS.USTZH:TZM')`,
+		in.ID, in.TeachingCourseID, in.SubmissionPeriodID,
+		in.FilePath, in.FileName, in.TACount, in.TotalBaht,
+		in.GeneratedBy, in.Months, in.Version, in.PreviousBatchID).Scan(&in.GeneratedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &in, nil
 }

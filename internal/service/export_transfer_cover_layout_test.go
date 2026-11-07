@@ -38,7 +38,7 @@ func coverStyle(t *testing.T, wb *excelize.File, sheet, cell string) *excelize.S
 //	5 header · 6,7 data · 8 the closing ruled row · 9 total · 12–14 signature
 func coverFixture(t *testing.T) (*excelize.File, string) {
 	t.Helper()
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	f.assignTA(f.newTA("หนึ่ง ทดสอบ", "undergrad"), courseA, regA, "undergrad", []int{1})
 	f.assignTA(f.newTA("สอง ทดสอบ", "undergrad"), courseA, regA, "undergrad", []int{2})
@@ -200,7 +200,7 @@ func TestThaiSelectedMonthsLabel(t *testing.T) {
 // on its face — with the term carrying MORE months than the selection, which is
 // the only shape in which this can go wrong.
 func TestTransferCoverSheet_HeadingNamesTheSelectedMonthsOnly(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	f.assignTA(f.newTA("หนึ่ง ทดสอบ", "undergrad"), courseA, regA, "undergrad", []int{1})
 	f.markExported(courseA)
@@ -250,7 +250,7 @@ func TestTransferCoverSheet_HeadingNamesTheSelectedMonthsOnly(t *testing.T) {
 // nobody can scan for a person, on the page the finance office reads name by
 // name against a bank file.
 func TestTransferCoverSheet_NamesCarryThePrefixButSortByGivenName(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	// Given names in order ก, ข, ค — with prefixes that would reverse two of
 	// them if the prefix were part of the key (นางสาว sorts before นาย).

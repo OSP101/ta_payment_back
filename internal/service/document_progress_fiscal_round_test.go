@@ -36,7 +36,7 @@ func (f *tcFixture) recordExportBatch(courseID, generatedBy uuid.UUID, months []
 // ONE round, with no label, indistinguishable from the board before fiscal
 // rounds existed.
 func TestGetOverview_NonCrossingTermHasExactlyOneUnlabeledRound(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09"} {
 		f.addPeriod(ym)
 	}
@@ -56,7 +56,7 @@ func TestGetOverview_NonCrossingTermHasExactlyOneUnlabeledRound(t *testing.T) {
 	if r.Round != 1 {
 		t.Errorf("round = %d, want 1", r.Round)
 	}
-	if r.RoundLabel != "" {
+	if !r.Legacy {
 		t.Errorf("round_label = %q, want empty — a single-round term must show no round language", r.RoundLabel)
 	}
 }
@@ -66,7 +66,7 @@ func TestGetOverview_NonCrossingTermHasExactlyOneUnlabeledRound(t *testing.T) {
 // point of gating round 2 on actual content, per the 12/08/2026 decision that
 // an empty round should not exist rather than sit at 0/0 forever.
 func TestGetOverview_CrossingTermWithNoRound2ContentStaysOneRound(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -89,7 +89,7 @@ func TestGetOverview_CrossingTermWithNoRound2ContentStaysOneRound(t *testing.T) 
 // gets a genuine second round, independent of the first — different course
 // total, different export state, different label.
 func TestGetOverview_CrossingTermWithRound2ContentHasTwoIndependentRounds(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -154,7 +154,7 @@ func TestGetOverview_CrossingTermWithRound2ContentHasTwoIndependentRounds(t *tes
 // content — a course whose TA never worked past กันยายน has no round-2
 // document at all, and must not appear asking for a signature on one.
 func TestListChecklist_Round2OnlyIncludesCoursesWithRound2Content(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -202,7 +202,7 @@ func TestListChecklist_Round2OnlyIncludesCoursesWithRound2Content(t *testing.T) 
 // prevent (before it, there was only one signature_checklist row per
 // course-role-signer, so a second round had nowhere of its own to write).
 func TestToggleSignature_RoundsAreIndependentForTheSamePerson(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -255,7 +255,7 @@ func TestToggleSignature_RoundsAreIndependentForTheSamePerson(t *testing.T) {
 // with no round 2 must refuse SetStage(round=2) outright rather than silently
 // creating a document_progress row nobody will ever see on screen.
 func TestSetStage_RoundsAdvanceIndependently(t *testing.T) {
-	f := newTCFixture(t)
+	f := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07", "2569-08", "2569-09", "2569-10"} {
 		f.addPeriod(ym)
 	}
@@ -300,7 +300,7 @@ func TestSetStage_RoundsAdvanceIndependently(t *testing.T) {
 
 	// A term whose round 2 does not exist must refuse SetStage(round=2)
 	// outright — proven against a second, non-crossing fixture.
-	g := newTCFixture(t)
+	g := newLegacyTCFixture(t)
 	for _, ym := range []string{"2569-06", "2569-07"} {
 		g.addPeriod(ym)
 	}

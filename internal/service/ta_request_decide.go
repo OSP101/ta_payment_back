@@ -823,6 +823,9 @@ func (s *TARequestService) finalize(ctx context.Context, reqID, termID uuid.UUID
 		return nil
 	}
 
+	if err := lockRequestTAs(ctx, tx, reqID); err != nil {
+		return err
+	}
 	notices, err := s.applyClashOutcome(ctx, tx, reqID)
 	if err != nil {
 		return err
