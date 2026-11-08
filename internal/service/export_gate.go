@@ -227,9 +227,9 @@ func exportBlockedError(blockers []ExportBlocker) error {
 		case "not_exported":
 			lines = append(lines, fmt.Sprintf("%s ตรวจสอบแล้วแต่ยังไม่ได้ส่งออกใบเบิกจ่าย (%s)", name, months))
 		case "class_clash":
-			lines = append(lines, fmt.Sprintf("%s มีรายการที่อนุมัติแล้วตรงกับตารางเรียนปัจจุบันของ TA %d รายการ — ตีกลับหรือแก้ไขก่อน (%s)", name, b.Rows, months))
+			lines = append(lines, fmt.Sprintf("%s มีรายการที่อนุมัติแล้วตรงกับตารางเรียนปัจจุบันของ TA %d รายการ ตีกลับหรือแก้ไขก่อน (%s)", name, b.Rows, months))
 		case "not_appointed":
-			lines = append(lines, fmt.Sprintf("%s ยังไม่อยู่ในคำสั่งแต่งตั้ง — ออกคำสั่งรอบถัดไปก่อน (%s)", name, months))
+			lines = append(lines, fmt.Sprintf("%s ยังไม่อยู่ในคำสั่งแต่งตั้ง ออกคำสั่งรอบถัดไปก่อน (%s)", name, months))
 		case "profile":
 			lines = append(lines, fmt.Sprintf("%s เอกสาร TA ยังไม่พร้อม: %s", name, b.Issue))
 		default:

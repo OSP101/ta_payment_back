@@ -151,7 +151,7 @@ func (s *CourseService) DeleteScheduledPayRate(ctx context.Context, actor, id uu
 				return err
 			}
 			if exists {
-				return Conflict("อัตรานี้มีผลแล้ว ลบไม่ได้ — ถ้าต้องการเปลี่ยน ให้บันทึกเวอร์ชันใหม่")
+				return Conflict("อัตรานี้มีผลแล้ว ลบไม่ได้ ถ้าต้องการเปลี่ยน ให้บันทึกเวอร์ชันใหม่")
 			}
 			return ErrNotFound
 		}
@@ -181,12 +181,12 @@ func checkPayRateDate(ctx context.Context, tx pgx.Tx, effectiveFrom string) erro
 	}
 	if inForce == nil {
 		if future {
-			return Invalid("ยังไม่มีอัตราที่มีผลอยู่ — เวอร์ชันแรกต้องเริ่มใช้ไม่เกินวันนี้ ระบบจึงจะมีอัตราใช้คำนวณ")
+			return Invalid("ยังไม่มีอัตราที่มีผลอยู่ เวอร์ชันแรกต้องเริ่มใช้ไม่เกินวันนี้ ระบบจึงจะมีอัตราใช้คำนวณ")
 		}
 		return nil
 	}
 	if effectiveFrom < *inForce {
-		return Invalid("วันเริ่มใช้ต้องไม่ก่อน " + *inForce + " ซึ่งเป็นวันเริ่มใช้ของอัตราที่มีผลอยู่ — เวอร์ชันที่เริ่มก่อนหน้านั้นจะไม่ถูกใช้เลย")
+		return Invalid("วันเริ่มใช้ต้องไม่ก่อน " + *inForce + " ซึ่งเป็นวันเริ่มใช้ของอัตราที่มีผลอยู่ เวอร์ชันที่เริ่มก่อนหน้านั้นจะไม่ถูกใช้เลย")
 	}
 	return nil
 }

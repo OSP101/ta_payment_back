@@ -361,7 +361,7 @@ func (s *ExportService) FreezeGradLumpSnapshotTx(ctx context.Context, tx pgx.Tx,
 		sort.Strings(drift)
 		return Conflict(fmt.Sprintf(
 			"ยอดเหมาจ่ายบัณฑิตภาคพิเศษของเดือน %s ถูกกำหนดไว้แล้วจากการส่งออกอีกครั้งที่เกิดพร้อมกัน "+
-				"เอกสารชุดนี้จึงไม่ถูกส่งออก — กรุณากดดาวน์โหลดใหม่", strings.Join(uniqueStrings(drift), ", ")))
+				"เอกสารชุดนี้จึงไม่ถูกส่งออก กรุณากดดาวน์โหลดใหม่", strings.Join(uniqueStrings(drift), ", ")))
 	}
 	return nil
 }

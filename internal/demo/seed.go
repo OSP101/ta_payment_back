@@ -43,7 +43,7 @@ var demoAccounts = []DemoAccount{
 	{Email: "ta1@demo.local", Label: "ผู้ช่วยสอน (TA) 1", Roles: []string{"ta"}},
 	{Email: "ta2@demo.local", Label: "ผู้ช่วยสอน (TA) 2", Roles: []string{"ta"}},
 	{Email: "ta3@demo.local", Label: "ผู้ช่วยสอน (TA) 3", Roles: []string{"ta"}},
-	{Email: "ta4@demo.local", Label: "ผู้ช่วยสอน (TA) 4 — ยังไม่ถูกเรียกใช้งาน", Roles: []string{"ta"}},
+	{Email: "ta4@demo.local", Label: "ผู้ช่วยสอน (TA) 4 ยังไม่ถูกเรียกใช้งาน", Roles: []string{"ta"}},
 }
 
 // seedSlot bootstraps a freshly-truncated slot schema with just enough data

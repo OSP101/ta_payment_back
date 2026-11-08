@@ -122,7 +122,7 @@ func (s *WorkLogService) courseDateRange(ctx context.Context, tcID uuid.UUID) (s
 	return *st, *et, nil
 }
 
-var errCourseDatesUnset = Invalid("ยังไม่ได้กำหนดวันเริ่ม/วันสิ้นสุดของภาคการศึกษาหรือรายวิชา — เจ้าหน้าที่ต้องตั้งช่วงวันที่ก่อน จึงจะลงเวลาได้")
+var errCourseDatesUnset = Invalid("ยังไม่ได้กำหนดวันเริ่ม/วันสิ้นสุดของภาคการศึกษาหรือรายวิชา เจ้าหน้าที่ต้องตั้งช่วงวันที่ก่อน จึงจะลงเวลาได้")
 
 // courseDateRangeOpt is courseDateRange for readers that can show "not set"
 // instead of refusing (the TA planner). Nil means that bound has no date.
@@ -2961,7 +2961,7 @@ func (s *WorkLogService) recheckOwnClassClashForApproval(ctx context.Context, tx
 		if clash := findOwnClassClash(blocks, int(d.Weekday()), sm, em); clash != nil {
 			return Conflict(fmt.Sprintf(
 				"อนุมัติไม่ได้ รายการวันที่ %s เวลา %s–%s ตรงกับตารางเรียนของ TA: %s "+
-					"(ตารางเรียนเปลี่ยนไปหลังจากลงเวลา — ให้ตีกลับรายการนี้ให้ TA แก้ไข)",
+					"(ตารางเรียนเปลี่ยนไปหลังจากลงเวลา ให้ตีกลับรายการนี้ให้ TA แก้ไข)",
 				day, start, end, clash.describe()))
 		}
 	}

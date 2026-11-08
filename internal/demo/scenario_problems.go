@@ -39,12 +39,12 @@ import (
 // shows the consequence, not the other party's own page. See ScenarioEvent
 // .ActorRole's doc comment.
 var problemEvents = []ScenarioEvent{
-	{Key: "worklog_over_cap", Label: "TA ลงเวลาเกินเพดานชั่วโมงต่อวัน", Description: "ให้ TA วิชาที่ 1 บันทึกเวลา 9 ชม. ในวันเดียว (เกินเพดาน 7 ชม./วัน) — ต้องทำขั้นตอนที่ 5 ในเส้นทางหลักก่อน", RelatedPath: "/staff/payouts", ActorRole: "staff"},
-	{Key: "budget_over_cap", Label: "งบประมาณของรายวิชาเกินวงเงิน", Description: "สร้างวิชาจำลองที่มีนักศึกษาแค่ 1 คน (วงเงินตามสูตรจึงต่ำมาก) แล้วให้ TA ทำงานจริงจนเกินวงเงินนั้น — ไม่แก้ไขวิชาในเส้นทางหลัก แต่ทำให้ขั้นตอนที่ 12 (ปะหน้าจ่ายตรง) ติดชั่วคราวจนกว่าจะแก้ไขวิชาทดสอบนี้ให้จบ หรือกดรีเซ็ตห้องทดลอง — เพราะปะหน้าจ่ายตรงต้องรอทุกวิชาในภาคเรียนพร้อมกัน เหมือนของจริง", RelatedPath: "/staff/budget-summary", ActorRole: "staff"},
-	{Key: "worklog_reject", Label: "อาจารย์ตีกลับบันทึกเวลา", Description: "อาจารย์วิชาที่ 1 ตีกลับบันทึกเวลาของ TA กลับไปแก้ไข — ต้องทำขั้นตอนที่ 9 ในเส้นทางหลักก่อน (ถ้าอนุมัติไปแล้วจะดึงกลับมาให้ตีกลับเอง) แต่ถ้าส่งออกไฟล์/ส่งการเงินแล้ว (ขั้นตอนที่ 11) จะแก้ไขย้อนหลังไม่ได้ตามกติกาจริง", RelatedPath: "/staff/payouts", ActorRole: "staff"},
-	{Key: "submission_deadline_missed", Label: "TA ไม่ส่งเอกสารจนงวดปิด", Description: "จำลองเดือนก่อนหน้าที่ปิดรอบไปแล้ว แล้วให้ TA พยายามส่งเวลาย้อนหลัง — ระบบต้องปฏิเสธ ไม่มีการอนุโลม (มีผลข้างเคียงกับขั้นตอนที่ 12 เหมือนเคสงบเกินวงเงินด้านบน)", RelatedPath: "/staff/settings?tab=calendar", ActorRole: "staff"},
-	{Key: "docs_reject", Label: "เจ้าหน้าที่ตีกลับเอกสาร TA", Description: "เจ้าหน้าที่ตีกลับเอกสาร 1 ฉบับของ TA วิชาที่ 1 (เช่น ไฟล์ไม่ชัด) — ต้องทำขั้นตอนที่ 7 ในเส้นทางหลักก่อน (ถ้าอนุมัติไปแล้วจะดึงกลับมาให้ตีกลับเอง) TA ต้องอัปโหลดใหม่แล้วให้ทำขั้นตอนที่ 8 ซ้ำ", RelatedPath: "/staff/review", ActorRole: "staff"},
-	{Key: "staff_cannot_unlock", Label: "เจ้าหน้าที่ปลดล็อกวิชาที่ส่งออกแล้วไม่ได้", Description: "จำลองการเรียก API ปลดล็อกวิชาที่ 1 (ต้องทำขั้นตอนที่ 11 ก่อน) ด้วยสิทธิ์เจ้าหน้าที่ — ต้องถูกปฏิเสธ แล้วลองซ้ำด้วยสิทธิ์ผู้ดูแลระบบ — ต้องสำเร็จ", RelatedPath: "/staff/payouts", ActorRole: "staff"},
+	{Key: "worklog_over_cap", Label: "TA ลงเวลาเกินเพดานชั่วโมงต่อวัน", Description: "ให้ TA วิชาที่ 1 บันทึกเวลา 9 ชม. ในวันเดียว (เกินเพดาน 7 ชม./วัน) ต้องทำขั้นตอนที่ 5 ในเส้นทางหลักก่อน", RelatedPath: "/staff/payouts", ActorRole: "staff"},
+	{Key: "budget_over_cap", Label: "งบประมาณของรายวิชาเกินวงเงิน", Description: "สร้างวิชาจำลองที่มีนักศึกษาแค่ 1 คน (วงเงินตามสูตรจึงต่ำมาก) แล้วให้ TA ทำงานจริงจนเกินวงเงินนั้น ไม่แก้ไขวิชาในเส้นทางหลัก แต่ทำให้ขั้นตอนที่ 12 (ปะหน้าจ่ายตรง) ติดชั่วคราวจนกว่าจะแก้ไขวิชาทดสอบนี้ให้จบ หรือกดรีเซ็ตห้องทดลอง เพราะปะหน้าจ่ายตรงต้องรอทุกวิชาในภาคเรียนพร้อมกัน เหมือนของจริง", RelatedPath: "/staff/budget-summary", ActorRole: "staff"},
+	{Key: "worklog_reject", Label: "อาจารย์ตีกลับบันทึกเวลา", Description: "อาจารย์วิชาที่ 1 ตีกลับบันทึกเวลาของ TA กลับไปแก้ไข ต้องทำขั้นตอนที่ 9 ในเส้นทางหลักก่อน (ถ้าอนุมัติไปแล้วจะดึงกลับมาให้ตีกลับเอง) แต่ถ้าส่งออกไฟล์/ส่งการเงินแล้ว (ขั้นตอนที่ 11) จะแก้ไขย้อนหลังไม่ได้ตามกติกาจริง", RelatedPath: "/staff/payouts", ActorRole: "staff"},
+	{Key: "submission_deadline_missed", Label: "TA ไม่ส่งเอกสารจนงวดปิด", Description: "จำลองเดือนก่อนหน้าที่ปิดรอบไปแล้ว แล้วให้ TA พยายามส่งเวลาย้อนหลัง ระบบต้องปฏิเสธ ไม่มีการอนุโลม (มีผลข้างเคียงกับขั้นตอนที่ 12 เหมือนเคสงบเกินวงเงินด้านบน)", RelatedPath: "/staff/settings?tab=calendar", ActorRole: "staff"},
+	{Key: "docs_reject", Label: "เจ้าหน้าที่ตีกลับเอกสาร TA", Description: "เจ้าหน้าที่ตีกลับเอกสาร 1 ฉบับของ TA วิชาที่ 1 (เช่น ไฟล์ไม่ชัด) ต้องทำขั้นตอนที่ 7 ในเส้นทางหลักก่อน (ถ้าอนุมัติไปแล้วจะดึงกลับมาให้ตีกลับเอง) TA ต้องอัปโหลดใหม่แล้วให้ทำขั้นตอนที่ 8 ซ้ำ", RelatedPath: "/staff/review", ActorRole: "staff"},
+	{Key: "staff_cannot_unlock", Label: "เจ้าหน้าที่ปลดล็อกวิชาที่ส่งออกแล้วไม่ได้", Description: "จำลองการเรียก API ปลดล็อกวิชาที่ 1 (ต้องทำขั้นตอนที่ 11 ก่อน) ด้วยสิทธิ์เจ้าหน้าที่ ต้องถูกปฏิเสธ แล้วลองซ้ำด้วยสิทธิ์ผู้ดูแลระบบ ต้องสำเร็จ", RelatedPath: "/staff/payouts", ActorRole: "staff"},
 }
 
 // ProblemEvents lists every problem-case event, for the panel's second list.
@@ -103,7 +103,7 @@ func problemWorkLogOverCap(ctx context.Context, svc *service.Container) (string,
 		  AND NOT EXISTS (SELECT 1 FROM work_logs WHERE assignment_id = $1 AND work_date = d)
 		ORDER BY d LIMIT 1`, assignmentID,
 	).Scan(&workDate); err != nil {
-		return "", fmt.Errorf("demo: หาไม่พบวันว่างสำหรับทดลอง (%w) — ลองรีเซ็ตห้องทดลอง", err)
+		return "", fmt.Errorf("demo: หาไม่พบวันว่างสำหรับทดลอง (%w) ลองรีเซ็ตห้องทดลอง", err)
 	}
 
 	w := service.WorkLog{
@@ -116,7 +116,7 @@ func problemWorkLogOverCap(ctx context.Context, svc *service.Container) (string,
 	}
 	_, err = svc.WorkLog.Upsert(ctx, taID, w)
 	if err == nil {
-		return "", errors.New("demo: ระบบยอมรับบันทึกเวลาที่เกินเพดานโดยไม่ควร — นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง")
+		return "", errors.New("demo: ระบบยอมรับบันทึกเวลาที่เกินเพดานโดยไม่ควร นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง")
 	}
 	return fmt.Sprintf("ระบบปฏิเสธตามที่ควร: %s", errMessageText(err)), nil
 }
@@ -244,7 +244,7 @@ func provisionProblemCourse(
 		return uuid.Nil, uuid.Nil, fmt.Errorf("เสนอชื่อ TA 4 ให้วิชา %s: %w", code, err)
 	}
 	if res.Status != "approved" {
-		return uuid.Nil, uuid.Nil, fmt.Errorf("demo: คำขอ TA สำหรับวิชา %s ไม่ได้รับอนุมัติ (สถานะ %s) — รีเซ็ตห้องทดลองแล้วลองใหม่", code, res.Status)
+		return uuid.Nil, uuid.Nil, fmt.Errorf("demo: คำขอ TA สำหรับวิชา %s ไม่ได้รับอนุมัติ (สถานะ %s) รีเซ็ตห้องทดลองแล้วลองใหม่", code, res.Status)
 	}
 	assignmentID, err = assignmentIDFor(ctx, svc, code, taID)
 	return courseID, assignmentID, err
@@ -299,12 +299,12 @@ func problemBudgetOverCap(ctx context.Context, svc *service.Container) (string, 
 	}
 	if snap.OverBudget {
 		return fmt.Sprintf(
-			"เกินวงเงินจริง: วิชาทดสอบ (1 คน) ใช้ไปแล้ว %.0f บาท จากวงเงินตามสูตรที่คำนวณได้เพียง %.0f บาท (เกิน %.0f บาท) — เจ้าหน้าที่จะเห็นคำเตือนนี้ที่หน้า “สรุปงบและเบิกจ่ายจ่ายตรง”",
+			"เกินวงเงินจริง: วิชาทดสอบ (1 คน) ใช้ไปแล้ว %.0f บาท จากวงเงินตามสูตรที่คำนวณได้เพียง %.0f บาท (เกิน %.0f บาท) เจ้าหน้าที่จะเห็นคำเตือนนี้ที่หน้า “สรุปงบและเบิกจ่ายจ่ายตรง”",
 			snap.UsedBaht, snap.PerCourseMaxBaht, snap.UsedBaht-snap.PerCourseMaxBaht,
 		), nil
 	}
 	return fmt.Sprintf(
-		"วิชาทดสอบ (1 คน) ใช้ไป %.0f บาท จากวงเงิน %.0f บาท — ยังไม่เกิน คงเหลือ %.0f บาท (ลองกดซ้ำอีกครั้งหลังจากนี้ เผื่อชั่วโมงสะสมเพิ่ม)",
+		"วิชาทดสอบ (1 คน) ใช้ไป %.0f บาท จากวงเงิน %.0f บาท ยังไม่เกิน คงเหลือ %.0f บาท (ลองกดซ้ำอีกครั้งหลังจากนี้ เผื่อชั่วโมงสะสมเพิ่ม)",
 		snap.UsedBaht, snap.PerCourseMaxBaht, snap.RemainingBaht,
 	), nil
 }
@@ -352,7 +352,7 @@ func problemWorkLogReject(ctx context.Context, svc *service.Container) (string, 
 			assignmentID,
 		).Scan(&revertedID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return "", errors.New("demo: ไม่มีบันทึกเวลาของวิชาที่ 1 เลยให้ตีกลับ — ทำขั้นตอนที่ 9 ในเส้นทางหลักก่อน")
+				return "", errors.New("demo: ไม่มีบันทึกเวลาของวิชาที่ 1 เลยให้ตีกลับ ทำขั้นตอนที่ 9 ในเส้นทางหลักก่อน")
 			}
 			return "", err
 		}
@@ -361,13 +361,13 @@ func problemWorkLogReject(ctx context.Context, svc *service.Container) (string, 
 	if err := svc.WorkLog.Reject(ctx, lecturerID, assignmentID, "กรุณาตรวจสอบชั่วโมงให้ตรงกับตารางสอนอีกครั้ง (เหตุผลจำลอง)", "", false); err != nil {
 		if revertedID != uuid.Nil {
 			if _, undoErr := svc.Pool.Exec(ctx, `UPDATE work_logs SET status='approved' WHERE id=$1`, revertedID); undoErr != nil {
-				return "", fmt.Errorf("ตีกลับไม่สำเร็จ (%s) และคืนสถานะเดิมไม่สำเร็จซ้อน (%s) — ลองรีเซ็ตห้องทดลอง", errMessageText(err), undoErr)
+				return "", fmt.Errorf("ตีกลับไม่สำเร็จ (%s) และคืนสถานะเดิมไม่สำเร็จซ้อน (%s) ลองรีเซ็ตห้องทดลอง", errMessageText(err), undoErr)
 			}
-			return "", fmt.Errorf("%s — วิชาที่ 1 ถูกส่งออกไฟล์/ส่งการเงินไปแล้ว จึงแก้ไขย้อนหลังไม่ได้ตามกติกาจริง ลองรีเซ็ตห้องทดลองแล้วทำใหม่โดยไม่ต้องทำถึงขั้นตอนที่ 11 ก่อน", errMessageText(err))
+			return "", fmt.Errorf("%s วิชาที่ 1 ถูกส่งออกไฟล์/ส่งการเงินไปแล้ว จึงแก้ไขย้อนหลังไม่ได้ตามกติกาจริง ลองรีเซ็ตห้องทดลองแล้วทำใหม่โดยไม่ต้องทำถึงขั้นตอนที่ 11 ก่อน", errMessageText(err))
 		}
 		return "", err
 	}
-	return "อาจารย์ตีกลับบันทึกเวลาแล้ว 1 รายการ" + note + " — สถานะเปลี่ยนเป็น “ถูกตีกลับ” TA ต้องแก้ไขแล้วกดส่งอนุมัติใหม่ (ทำขั้นตอนที่ 9 ซ้ำได้ทันที เพราะ Submit ส่งรายการที่ถูกตีกลับซ้ำได้)", nil
+	return "อาจารย์ตีกลับบันทึกเวลาแล้ว 1 รายการ" + note + " สถานะเปลี่ยนเป็น “ถูกตีกลับ” TA ต้องแก้ไขแล้วกดส่งอนุมัติใหม่ (ทำขั้นตอนที่ 9 ซ้ำได้ทันที เพราะ Submit ส่งรายการที่ถูกตีกลับซ้ำได้)", nil
 }
 
 // ---- 4. TA misses the submission deadline ------------------------------
@@ -435,7 +435,7 @@ func problemDeadlineMissed(ctx context.Context, svc *service.Container) (string,
 			YearMonth:        ym,
 			StartsOn:         isoDate(monthStart),
 			DueDate:          isoDate(monthStart.AddDate(0, 0, 5)),
-			Label:            fmt.Sprintf("รอบส่งเดือน %s (จำลอง — ปิดแล้ว)", ym),
+			Label:            fmt.Sprintf("รอบส่งเดือน %s (จำลอง ปิดแล้ว)", ym),
 			RemindDaysBefore: 3,
 			IsClosed:         true,
 		}); err != nil {
@@ -445,7 +445,7 @@ func problemDeadlineMissed(ctx context.Context, svc *service.Container) (string,
 
 	err = svc.WorkLog.Submit(ctx, taID, assignmentID)
 	if err == nil {
-		return "", fmt.Errorf("demo: ระบบยอมให้ส่งย้อนหลังในงวดที่ปิดแล้วโดยไม่ควร — นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง (courseID=%s)", courseID)
+		return "", fmt.Errorf("demo: ระบบยอมให้ส่งย้อนหลังในงวดที่ปิดแล้วโดยไม่ควร นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง (courseID=%s)", courseID)
 	}
 	return fmt.Sprintf("ระบบปฏิเสธตามที่ควร: %s", errMessageText(err)), nil
 }
@@ -496,7 +496,7 @@ func problemDocsReject(ctx context.Context, svc *service.Container) (string, err
 			taID,
 		).Scan(&docID, &kind); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return "", errors.New("demo: TA วิชาที่ 1 ยังไม่มีเอกสารเลย — ทำขั้นตอนที่ 7 ในเส้นทางหลักก่อน")
+				return "", errors.New("demo: TA วิชาที่ 1 ยังไม่มีเอกสารเลย ทำขั้นตอนที่ 7 ในเส้นทางหลักก่อน")
 			}
 			return "", err
 		}
@@ -507,7 +507,7 @@ func problemDocsReject(ctx context.Context, svc *service.Container) (string, err
 	}); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("เจ้าหน้าที่ตีกลับเอกสาร %s ของ TA วิชาที่ 1 แล้ว%s — สถานะโปรไฟล์เปลี่ยนเป็น “ต้องแก้ไข” TA ต้องอัปโหลดใหม่ก่อนเจ้าหน้าที่จะอนุมัติซ้ำได้ (ทำขั้นตอนที่ 8 ซ้ำหลัง TA อัปโหลดแล้ว)", kindLabelDemo(kind), note), nil
+	return fmt.Sprintf("เจ้าหน้าที่ตีกลับเอกสาร %s ของ TA วิชาที่ 1 แล้ว%s สถานะโปรไฟล์เปลี่ยนเป็น “ต้องแก้ไข” TA ต้องอัปโหลดใหม่ก่อนเจ้าหน้าที่จะอนุมัติซ้ำได้ (ทำขั้นตอนที่ 8 ซ้ำหลัง TA อัปโหลดแล้ว)", kindLabelDemo(kind), note), nil
 }
 
 // kindLabelDemo mirrors service.kindLabel (unexported, ta_documents.kind →
@@ -562,12 +562,12 @@ func problemStaffCannotUnlock(ctx context.Context, svc *service.Container, app *
 		termID, courseSeeds[0].code,
 	).Scan(&courseID, &exported); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", errors.New("demo: ยังไม่ได้เปิดวิชาที่ 1 — ทำขั้นตอนที่ 2 ในเส้นทางหลักก่อน")
+			return "", errors.New("demo: ยังไม่ได้เปิดวิชาที่ 1 ทำขั้นตอนที่ 2 ในเส้นทางหลักก่อน")
 		}
 		return "", err
 	}
 	if !exported {
-		return "", errors.New("demo: วิชาที่ 1 ยังไม่ได้ส่งออกไฟล์ — ทำขั้นตอนที่ 11 ในเส้นทางหลักก่อน (ต้องมีอะไรให้ปลดล็อกก่อน)")
+		return "", errors.New("demo: วิชาที่ 1 ยังไม่ได้ส่งออกไฟล์ ทำขั้นตอนที่ 11 ในเส้นทางหลักก่อน (ต้องมีอะไรให้ปลดล็อกก่อน)")
 	}
 
 	staffID, err := userIDByEmail(ctx, svc, "staff@demo.local")
@@ -586,7 +586,7 @@ func problemStaffCannotUnlock(ctx context.Context, svc *service.Container, app *
 		return "", err
 	}
 	if staffStatus != http.StatusForbidden {
-		return "", fmt.Errorf("demo: คาดว่าเจ้าหน้าที่จะถูกปฏิเสธ (403) แต่ได้ %d แทน (%s) — นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง", staffStatus, staffBody)
+		return "", fmt.Errorf("demo: คาดว่าเจ้าหน้าที่จะถูกปฏิเสธ (403) แต่ได้ %d แทน (%s) นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง", staffStatus, staffBody)
 	}
 
 	adminStatus, adminBody, err := unlockAs(ctx, svc, app, tokens, path, adminID, []string{"admin", "staff"})
@@ -594,10 +594,10 @@ func problemStaffCannotUnlock(ctx context.Context, svc *service.Container, app *
 		return "", err
 	}
 	if adminStatus != http.StatusOK {
-		return "", fmt.Errorf("demo: คาดว่าผู้ดูแลระบบจะปลดล็อกสำเร็จ (200) แต่ได้ %d แทน (%s) — นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง", adminStatus, adminBody)
+		return "", fmt.Errorf("demo: คาดว่าผู้ดูแลระบบจะปลดล็อกสำเร็จ (200) แต่ได้ %d แทน (%s) นี่คือบั๊ก ไม่ใช่ผลลัพธ์ที่ถูกต้อง", adminStatus, adminBody)
 	}
 
-	return "เจ้าหน้าที่พยายามปลดล็อกวิชาที่ 1 — ถูกปฏิเสธ (403 ไม่มีสิทธิ์) ตามที่ควร แล้วผู้ดูแลระบบลองซ้ำ — สำเร็จ วิชาที่ 1 ถูกปลดล็อกจริงแล้ว (ต้องทำขั้นตอนที่ 11 ซ้ำถ้าต้องการส่งออกใหม่)", nil
+	return "เจ้าหน้าที่พยายามปลดล็อกวิชาที่ 1 ถูกปฏิเสธ (403 ไม่มีสิทธิ์) ตามที่ควร แล้วผู้ดูแลระบบลองซ้ำ สำเร็จ วิชาที่ 1 ถูกปลดล็อกจริงแล้ว (ต้องทำขั้นตอนที่ 11 ซ้ำถ้าต้องการส่งออกใหม่)", nil
 }
 
 // unlockAs mints a throwaway session+token for userID/roles, fires the

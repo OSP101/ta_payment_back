@@ -269,7 +269,7 @@ func taRequestSubSteps(ctx context.Context, svc *service.Container, termID uuid.
 		}
 		sub := SubStep{
 			Key:   cs.code,
-			Label: fmt.Sprintf("วิชา %s — อาจารย์ผู้สอน %d เสนอชื่อ TA", cs.code, i+1),
+			Label: fmt.Sprintf("วิชา %s อาจารย์ผู้สอน %d เสนอชื่อ TA", cs.code, i+1),
 			Done:  exists,
 			Actor: cs.lecturerEmail,
 		}
@@ -402,7 +402,7 @@ func courseSubSteps(ctx context.Context, svc *service.Container, termID uuid.UUI
 		).Scan(&exists); err != nil {
 			return nil, err
 		}
-		out[i] = SubStep{Key: cs.code, Label: fmt.Sprintf("รายวิชา %s — %s", cs.code, cs.nameTH), Done: exists}
+		out[i] = SubStep{Key: cs.code, Label: fmt.Sprintf("รายวิชา %s %s", cs.code, cs.nameTH), Done: exists}
 	}
 	return out, nil
 }
@@ -449,7 +449,7 @@ func staffReviewExportSubSteps(ctx context.Context, svc *service.Container, term
 		).Scan(&exported); err != nil {
 			return nil, err
 		}
-		out[i] = SubStep{Key: cs.code, Label: fmt.Sprintf("รายวิชา %s — %s", cs.code, cs.nameTH), Done: exported}
+		out[i] = SubStep{Key: cs.code, Label: fmt.Sprintf("รายวิชา %s %s", cs.code, cs.nameTH), Done: exported}
 	}
 	return out, nil
 }

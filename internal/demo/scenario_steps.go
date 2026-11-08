@@ -28,7 +28,7 @@ func activeTermID(ctx context.Context, svc *service.Container) (uuid.UUID, error
 	// no created_at column to order by anyway).
 	err := svc.Pool.QueryRow(ctx, `SELECT id FROM academic_terms WHERE is_active LIMIT 1`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, errors.New("demo: ยังไม่ได้สร้างปีการศึกษา/ภาคเรียน — กรุณาทำขั้นตอนที่ 1 ก่อน")
+		return uuid.Nil, errors.New("demo: ยังไม่ได้สร้างปีการศึกษา/ภาคเรียน กรุณาทำขั้นตอนที่ 1 ก่อน")
 	}
 	return id, err
 }
@@ -172,7 +172,7 @@ func stepCourses(ctx context.Context, svc *service.Container) (string, error) {
 	if created == 0 {
 		return "เปิดรายวิชาไว้ครบทั้ง 3 วิชาแล้ว ข้ามไปขั้นตอนถัดไปได้เลย", nil
 	}
-	return fmt.Sprintf("เปิดรายวิชาใหม่ %d วิชา (ข้ามที่มีอยู่แล้ว %d วิชา) — แต่ละวิชามีตารางบรรยายทุกวันจันทร์ 09:00-12:00 ตลอดเดือนนี้", created, skipped), nil
+	return fmt.Sprintf("เปิดรายวิชาใหม่ %d วิชา (ข้ามที่มีอยู่แล้ว %d วิชา) แต่ละวิชามีตารางบรรยายทุกวันจันทร์ 09:00-12:00 ตลอดเดือนนี้", created, skipped), nil
 }
 
 // ---- 3. Submission periods ---------------------------------------------
@@ -282,7 +282,7 @@ func stepTARequests(ctx context.Context, svc *service.Container) (string, error)
 		if err := svc.Pool.QueryRow(ctx,
 			`SELECT id FROM teaching_courses WHERE code=$1 AND term_id=$2`, cs.code, termID,
 		).Scan(&courseID); err != nil {
-			return "", fmt.Errorf("demo: วิชา %s ยังไม่ถูกสร้าง — ทำขั้นตอนที่ 2 ก่อน", cs.code)
+			return "", fmt.Errorf("demo: วิชา %s ยังไม่ถูกสร้าง ทำขั้นตอนที่ 2 ก่อน", cs.code)
 		}
 		var existingReq int
 		if err := svc.Pool.QueryRow(ctx,
@@ -342,7 +342,7 @@ func stepTARequests(ctx context.Context, svc *service.Container) (string, error)
 			notes = append(notes, fmt.Sprintf("%s: สถานะ %s", cs.code, res.Status))
 		}
 	}
-	msg := fmt.Sprintf("ยื่นคำขอ TA แล้ว — อนุมัติอัตโนมัติ %d วิชา, ปฏิเสธ %d วิชา, ข้ามที่มีอยู่แล้ว %d วิชา", approved, rejected, skipped)
+	msg := fmt.Sprintf("ยื่นคำขอ TA แล้ว อนุมัติอัตโนมัติ %d วิชา, ปฏิเสธ %d วิชา, ข้ามที่มีอยู่แล้ว %d วิชา", approved, rejected, skipped)
 	if len(notes) > 0 {
 		msg += " | " + strings.Join(notes, "; ")
 	}
@@ -362,7 +362,7 @@ func stepAppointmentOrder(ctx context.Context, svc *service.Container) (string, 
 	}
 	var signerID uuid.UUID
 	if err := svc.Pool.QueryRow(ctx, `SELECT id FROM admin_officers WHERE is_active LIMIT 1`).Scan(&signerID); err != nil {
-		return "", errors.New("demo: ยังไม่มีผู้ลงนามในระบบ (admin_officers ว่าง) — รีเซ็ตห้องทดลองแล้วลองใหม่")
+		return "", errors.New("demo: ยังไม่มีผู้ลงนามในระบบ (admin_officers ว่าง) รีเซ็ตห้องทดลองแล้วลองใหม่")
 	}
 	now := timeutil.Now()
 	in := service.AppointmentOrderInput{
@@ -379,7 +379,7 @@ func stepAppointmentOrder(ctx context.Context, svc *service.Container) (string, 
 		// than wrapping it, since either one IS the useful answer here.
 		return "", err
 	}
-	return fmt.Sprintf("ออกคำสั่งแต่งตั้งสำเร็จ (%s, %d KB) — ดูเอกสารจริงได้ที่หน้า “ใบแต่งตั้งคำสั่ง” ของเจ้าหน้าที่", name, len(body)/1024+1), nil
+	return fmt.Sprintf("ออกคำสั่งแต่งตั้งสำเร็จ (%s, %d KB) ดูเอกสารจริงได้ที่หน้า “ใบแต่งตั้งคำสั่ง” ของเจ้าหน้าที่", name, len(body)/1024+1), nil
 }
 
 // ---- 7. TA docs -----------------------------------------------------------
@@ -479,7 +479,7 @@ func stepDocsApprove(ctx context.Context, svc *service.Container) (string, error
 		var status string
 		if err := svc.Pool.QueryRow(ctx, `SELECT status::text FROM ta_profiles WHERE user_id=$1`, taID).Scan(&status); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return "", fmt.Errorf("demo: %s ยังไม่ได้ส่งเอกสาร — ทำขั้นตอนที่ 7 ก่อน", cs.taEmail)
+				return "", fmt.Errorf("demo: %s ยังไม่ได้ส่งเอกสาร ทำขั้นตอนที่ 7 ก่อน", cs.taEmail)
 			}
 			return "", err
 		}
@@ -495,7 +495,7 @@ func stepDocsApprove(ctx context.Context, svc *service.Container) (string, error
 	if approved == 0 {
 		return "อนุมัติเอกสารของ TA ทุกคนไว้แล้ว ข้ามไปขั้นตอนถัดไปได้เลย", nil
 	}
-	return fmt.Sprintf("อนุมัติเอกสารแล้ว %d คน (มีอยู่ก่อนแล้ว %d คน) — พร้อมสำหรับการเบิกจ่ายแล้ว", approved, skipped), nil
+	return fmt.Sprintf("อนุมัติเอกสารแล้ว %d คน (มีอยู่ก่อนแล้ว %d คน) พร้อมสำหรับการเบิกจ่ายแล้ว", approved, skipped), nil
 }
 
 // ---- 9. Worklog generate + submit -----------------------------------------
@@ -550,7 +550,7 @@ func assignmentIDFor(ctx context.Context, svc *service.Container, courseCode str
 		WHERE tc.code = $1 AND a.ta_id = $2 AND a.state <> 'dropped'
 		ORDER BY a.id LIMIT 1`, courseCode, taID).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, fmt.Errorf("demo: ยังไม่มีการแต่งตั้ง TA ในวิชา %s — ทำขั้นตอนที่ 5 ก่อน (อาจถูกปฏิเสธอัตโนมัติ ลองรีเซ็ตห้องทดลอง)", courseCode)
+		return uuid.Nil, fmt.Errorf("demo: ยังไม่มีการแต่งตั้ง TA ในวิชา %s ทำขั้นตอนที่ 5 ก่อน (อาจถูกปฏิเสธอัตโนมัติ ลองรีเซ็ตห้องทดลอง)", courseCode)
 	}
 	return id, err
 }
@@ -609,7 +609,7 @@ func stepStaffReviewExport(ctx context.Context, svc *service.Container) (string,
 	if err := svc.Pool.QueryRow(ctx,
 		`SELECT id FROM submission_periods WHERE term_id=$1 AND year_month=$2`, termID, ym,
 	).Scan(&periodID); err != nil {
-		return "", errors.New("demo: ยังไม่ได้เปิดรอบส่งของเดือนนี้ — ทำขั้นตอนที่ 3 ก่อน")
+		return "", errors.New("demo: ยังไม่ได้เปิดรอบส่งของเดือนนี้ ทำขั้นตอนที่ 3 ก่อน")
 	}
 
 	var reviewed, exported, financeSent int
@@ -719,5 +719,5 @@ func stepTransferCover(ctx context.Context, svc *service.Container) (string, err
 		// hasn't reached finance_sent yet — pass it through unchanged.
 		return "", err
 	}
-	return fmt.Sprintf("ออกเอกสารปะหน้าจ่ายตรงของเดือน %s แล้ว (%d ไฟล์, %d KB) — ขั้นตอนสุดท้ายของเส้นทางหลักเสร็จสมบูรณ์", ym, len(files), len(body)/1024+1), nil
+	return fmt.Sprintf("ออกเอกสารปะหน้าจ่ายตรงของเดือน %s แล้ว (%d ไฟล์, %d KB) ขั้นตอนสุดท้ายของเส้นทางหลักเสร็จสมบูรณ์", ym, len(files), len(body)/1024+1), nil
 }
