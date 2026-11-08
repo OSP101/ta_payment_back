@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -194,6 +195,21 @@ func (s *TDBMService) fetchExtraTeachings(ctx context.Context, academicYear, sem
 // written to tdbm_sync_log.
 // ---------------------------------------------------------------------------
 
+const tdbmSyncFailureMessage = "ซิงก์ข้อมูลจาก TDBM ไม่สำเร็จ กรุณาลองใหม่ภายหลังหรือติดต่อผู้ดูแลระบบ"
+
+// This exact application-generated warning contains only a count and dates.
+// Do not accept arbitrary Thai text: legacy rows can contain internal errors.
+var tdbmSyncBlockedPattern = regexp.MustCompile(`\Aข้ามวันหยุดจาก TDBM [0-9]+ วัน \([0-9]{4}-[0-9]{2}-[0-9]{2}(, [0-9]{4}-[0-9]{2}-[0-9]{2})*\) เพราะมีบันทึกเวลาคาบบรรยาย/ปฏิบัติการที่ส่งหรืออนุมัติแล้วในวันนั้น ให้อาจารย์ตีกลับรายการเหล่านั้นก่อน แล้วซิงก์อีกครั้ง\z`)
+
+// Only application-owned messages may leave the sync service. This
+// also protects historical log rows containing raw SQL, URLs or credentials.
+func publicTDBMSyncError(msg string) string {
+	if msg == "" || tdbmSyncBlockedPattern.MatchString(msg) {
+		return msg
+	}
+	return tdbmSyncFailureMessage
+}
+
 type TDBMSyncResult struct {
 	Resource     string `json:"resource"`
 	AcademicYear int    `json:"academic_year,omitempty"`
@@ -216,7 +232,11 @@ type TDBMSyncResult struct {
 func (s *TDBMService) logSync(ctx context.Context, resource, triggerKind string, year, semester int, started time.Time, r TDBMSyncResult, runErr error) {
 	errMsg := ""
 	if runErr != nil {
-		errMsg = runErr.Error()
+		log.Printf("tdbm: sync failed resource=%s trigger=%s err=%v", resource, triggerKind, runErr)
+		errMsg = publicTDBMSyncError(r.Error)
+		if errMsg == "" {
+			errMsg = tdbmSyncFailureMessage
+		}
 	}
 	var yearArg, semArg any
 	if year > 0 {
@@ -255,7 +275,7 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 	res := TDBMSyncResult{Resource: "holidays", AcademicYear: academicYear, Semester: semester}
 	rows, err := s.fetchHolidays(ctx, academicYear, semester)
 	if err != nil {
-		res.Error = err.Error()
+		res.Error = tdbmSyncFailureMessage
 		s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 		return res
 	}
@@ -292,14 +312,14 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 		var curDate *string
 		if err := s.pool.QueryRow(ctx,
 			`SELECT holiday_date::text FROM public_holidays WHERE tdbm_holiday_id = $1`, r.HolidayID).Scan(&curDate); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			res.Error = err.Error()
+			res.Error = tdbmSyncFailureMessage
 			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 			return res
 		}
 		newClosure := curDate == nil || *curDate != r.HDate
 		tx, err := s.pool.Begin(ctx)
 		if err != nil {
-			res.Error = err.Error()
+			res.Error = tdbmSyncFailureMessage
 			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 			return res
 		}
@@ -331,12 +351,12 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 				blocked = append(blocked, r.HDate)
 				continue
 			}
-			res.Error = err.Error()
+			res.Error = tdbmSyncFailureMessage
 			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 			return res
 		}
 		if err := tx.Commit(ctx); err != nil {
-			res.Error = err.Error()
+			res.Error = tdbmSyncFailureMessage
 			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 			return res
 		}
@@ -351,7 +371,7 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 	if len(blocked) > 0 {
 		warn := fmt.Errorf("ข้ามวันหยุดจาก TDBM %d วัน (%s) เพราะมีบันทึกเวลาคาบบรรยาย/ปฏิบัติการที่ส่งหรืออนุมัติแล้วในวันนั้น ให้อาจารย์ตีกลับรายการเหล่านั้นก่อน แล้วซิงก์อีกครั้ง",
 			len(blocked), strings.Join(blocked, ", "))
-		res.Error = warn.Error()
+		res.Error = publicTDBMSyncError(warn.Error())
 		s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, warn)
 		return res
 	}
@@ -368,7 +388,7 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 	res := TDBMSyncResult{Resource: "extra-teachings", AcademicYear: academicYear, Semester: semester}
 	rows, err := s.fetchExtraTeachings(ctx, academicYear, semester)
 	if err != nil {
-		res.Error = err.Error()
+		res.Error = tdbmSyncFailureMessage
 		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
 		return res
 	}
@@ -380,7 +400,7 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		res.Error = err.Error()
+		res.Error = tdbmSyncFailureMessage
 		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
 		return res
 	}
@@ -406,7 +426,7 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 			r.ExtraClassID, academicYear, semester, r.Title, r.ClassDate, r.StartTime, r.EndTime,
 			r.Duration, r.CourseCode, r.OwnerTeacherName, r.Section, r.SemesterType, r.OptStatus)
 		if err != nil {
-			res.Error = err.Error()
+			res.Error = tdbmSyncFailureMessage
 			s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
 			return res
 		}
@@ -415,7 +435,7 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		res.Error = err.Error()
+		res.Error = tdbmSyncFailureMessage
 		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
 		return res
 	}
@@ -1157,6 +1177,11 @@ func (s *TDBMService) RecentSyncLog(ctx context.Context, limit int) ([]TDBMSyncL
 		if err := rows.Scan(&e.ID, &e.Resource, &e.TriggerKind, &e.AcademicYear, &e.Semester,
 			&e.Fetched, &e.Inserted, &e.Updated, &e.Skipped, &e.Matched, &e.Error, &e.StartedAt, &finished); err != nil {
 			return nil, err
+		}
+		// Old rows may contain raw driver errors from before error sanitization.
+		if e.Error != nil {
+			msg := publicTDBMSyncError(*e.Error)
+			e.Error = &msg
 		}
 		e.FinishedAt = finished
 		out = append(out, e)

@@ -404,7 +404,7 @@ func (h *SubmissionPeriodHandler) StaffEditBatch(c *fiber.Ctx) error {
 		}
 		key, size, err := h.Svc.Storage.Save("worklog-edits", uuid.New().String()+ext, bytes.NewReader(buf))
 		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, err.Error())
+			return err
 		}
 		evidence = append(evidence, service.EditEvidence{
 			StorageKey: key, Filename: fh.Filename, Size: size, MIME: mime,

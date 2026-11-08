@@ -268,7 +268,7 @@ func (s *AnnounceService) SendTest(ctx context.Context, actor uuid.UUID, title, 
 	}
 	subject := "[ทดสอบ] " + announceSubject(category, title)
 	if err := s.notify.SendEmailOnly(ctx, actor, subject, truncateRunes(announceBodyPlain(body), 240), ""); err != nil {
-		return Invalid("ส่งอีเมลทดสอบไม่สำเร็จ: " + truncateRunes(err.Error(), 200))
+		return fmt.Errorf("send announcement test email: %w", err)
 	}
 	return nil
 }

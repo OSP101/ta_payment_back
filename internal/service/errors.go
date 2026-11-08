@@ -12,9 +12,9 @@ var (
 // UserError carries a message that is safe (and intended) to show to the end
 // user, together with the HTTP status it should map to. Service methods return
 // these for business-rule failures so the handler layer can surface the Thai
-// message without leaking internal errors. Plain errors.New/fmt.Errorf values
-// are also treated as user-facing 400s by the error handler, but UserError lets
-// callers pick a more specific status (409/403/…).
+// message without leaking internal errors. Use this type only for messages
+// written for users; never pass a raw internal error to these constructors.
+// Legacy unwrapped Thai errors also map to 400; wrapped internal causes do not.
 type UserError struct {
 	Status int
 	Msg    string

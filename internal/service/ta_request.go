@@ -2576,7 +2576,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		&d.IsLate, &d.TrimmedCount, &d.DroppedCount, &d.CanCancel, &d.SubmittedByName, &d.TANames, &d.BatchID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("ไม่พบคำขอนี้")
+			return nil, NotFound("ไม่พบคำขอนี้")
 		}
 		return nil, err
 	}

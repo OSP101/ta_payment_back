@@ -564,7 +564,7 @@ func (h *TeachingHandler) TimetableFormPDF(c *fiber.Ctx) error {
 	body, err := h.Svc.Teaching.BuildTimetableFormPDF(c.Context(), taID, termID, yearMonth)
 	if errors.Is(err, service.ErrNoFontDir) {
 		// A deployment gap, not a bad request: say so instead of 400/500.
-		return fiber.NewError(fiber.StatusServiceUnavailable, err.Error())
+		return fiber.NewError(fiber.StatusServiceUnavailable, "ไม่สามารถสร้าง PDF ได้ชั่วคราว กรุณาติดต่อเจ้าหน้าที่")
 	}
 	if err != nil {
 		return err
@@ -1009,7 +1009,7 @@ func (h *TeachingHandler) ReplaceSectionSchedules(c *fiber.Ctx) error {
 		if errors.Is(err, service.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบ section")
 		}
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"ok": true})
 }
@@ -1340,7 +1340,7 @@ func (h *TARequestHandler) Detail(c *fiber.Ctx) error {
 	}
 	out, err := h.Svc.TARequest.Detail(c.Context(), id)
 	if err != nil {
-		return fiber.NewError(fiber.StatusNotFound, err.Error())
+		return err
 	}
 	// Staff/admin can view anything; a lecturer, requests of a course they
 	// teach NOW. Keyed on teaching_lecturers, not ta_requests.lecturer_id: a
@@ -1713,7 +1713,7 @@ func (h *DocsHandler) CreditorFormPDF(c *fiber.Ctx) error {
 	body, name, err := h.Svc.Docs.BuildCreditorFormPDF(c.Context(), UserID(c), in,
 		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir, grid)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	c.Set("Content-Type", "application/pdf")
 	c.Set("Content-Disposition", contentDisposition("inline", name))
@@ -1734,7 +1734,7 @@ func (h *DocsHandler) ConfirmCreditorForm(c *fiber.Ctx) error {
 	id, err := h.Svc.Docs.AttachGeneratedCreditorForm(c.Context(), UserID(c), in,
 		h.Svc.Cfg.CreditorTemplatePath, h.Svc.Cfg.FontDir)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"id": id})
 }
@@ -2789,7 +2789,7 @@ func (h *AnnounceHandler) Upsert(c *fiber.Ctx) error {
 		if errors.Is(err, service.ErrNotFound) {
 			return fiber.NewError(fiber.StatusNotFound, "ไม่พบประกาศ")
 		}
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.JSON(fiber.Map{"id": id})
 }
@@ -2987,7 +2987,7 @@ func (h *AnnounceHandler) UploadBackground(c *fiber.Ctx) error {
 	}
 	key, _, err := h.Svc.Storage.Save("announcements", uuid.New().String()+ext, bytes.NewReader(buf))
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	b, err := h.Svc.Announce.AddBackground(c.Context(), UserID(c), c.FormValue("name"), key,
 		cfg.Width, cfg.Height, c.FormValue("text_tone"))
@@ -3143,7 +3143,7 @@ func (h *AnnounceHandler) UploadMedia(c *fiber.Ctx) error {
 
 	key, size, err := h.Svc.Storage.Save("announcements", uuid.New().String()+spec.Ext, bytes.NewReader(buf))
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"kind": spec.Kind, "storage_key": key, "size_bytes": size, "mime": mime,
@@ -3287,7 +3287,7 @@ func (h *AnnounceHandler) UploadImage(c *fiber.Ctx) error {
 	stored := uuid.New().String() + ext
 	key, size, err := h.Svc.Storage.Save("announcements", stored, bytes.NewReader(buf))
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"key":  key,

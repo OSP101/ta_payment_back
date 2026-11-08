@@ -347,6 +347,9 @@ func RequireApprovedTAProfile(pool *pgxpool.Pool) fiber.Handler {
 // generic 500.
 func ErrorHandler(c *fiber.Ctx, err error) error {
 	status, msg := errorResponse(err)
+	if panicked, _ := c.Locals(string(ctxPanicReported)).(bool); panicked {
+		status, msg = fiber.StatusInternalServerError, internalErrorMessage
+	}
 
 	// The two cases whose real detail must never reach the client are the two
 	// worth a log line. Both carry the request id, so the generic
@@ -367,6 +370,8 @@ func isDBError(err error) bool {
 	return errors.As(err, &pgErr)
 }
 
+const internalErrorMessage = "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
+
 // errorResponse maps an error to the status and the message the client gets.
 //
 // Split out of ErrorHandler so the access log can report the status a request
@@ -379,6 +384,9 @@ func errorResponse(err error) (int, string) {
 	// Explicit fiber errors (auth, bad body, etc.).
 	var fe *fiber.Error
 	if errors.As(err, &fe) {
+		if fe.Code >= 500 {
+			return fe.Code, internalErrorMessage
+		}
 		return fe.Code, fe.Message
 	}
 
@@ -424,21 +432,13 @@ func errorResponse(err error) (int, string) {
 		}
 	}
 
-	// Any remaining plain error MAY be a user-facing business message — services
-	// raise those via errors.New/fmt.Errorf with Thai text — but it may equally
-	// be an internal failure that never reached the typed branches above: a pgx
-	// row-scan error ("cannot scan NULL into *time.Time"), a JSON error, an
-	// io/context failure. Those carry no *PgError, so echoing every plain error
-	// verbatim published driver internals to the end user as if they were
-	// validation advice.
-	//
-	// The discriminator is the script: every message this product intends a user
-	// to read is written in Thai, and every runtime/driver error is ASCII. Errors
-	// with no Thai character are answered with a generic 500, so an unexpected
-	// internal fault degrades to "ระบบขัดข้อง" instead of leaking how the query
-	// is shaped.
-	if !containsThai(err.Error()) {
-		return fiber.StatusInternalServerError, "ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"
+	// Legacy business rules still return plain Thai errors. A wrapped error
+	// carries an internal cause (including PathError with a Thai filename),
+	// so language alone must never make that cause public. Typed UserError
+	// values above are the explicit opt-in for safe user-facing messages.
+	_, joined := err.(interface{ Unwrap() []error })
+	if errors.Unwrap(err) != nil || joined || !containsThai(err.Error()) {
+		return fiber.StatusInternalServerError, internalErrorMessage
 	}
 	return fiber.StatusBadRequest, err.Error()
 }

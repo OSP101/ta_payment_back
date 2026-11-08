@@ -2,12 +2,15 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"ta-payment-back/internal/service"
 )
@@ -66,5 +69,67 @@ func TestErrorHandler_DoesNotLeakInternalErrors(t *testing.T) {
 	if status, body := get("/typed"); status != fiber.StatusBadRequest ||
 		!strings.Contains(body, "จำนวนชั่วโมง") {
 		t.Errorf("UserError = %d %s, want 400 with its own message", status, body)
+	}
+}
+
+// Exercise the real HTTP error boundary: raw details must never occur in the
+// response even when an internal error contains Thai or a server status.
+func TestErrorHandler_HidesWrappedAndServerErrors(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"Thai wrapper", fmt.Errorf("อ่านข้อมูลไม่สำเร็จ: %w", errors.New("dial tcp 10.0.0.8:5432: refused")), 500},
+		{"Thai path", &os.PathError{Op: "open", Path: "/private/uploads/เอกสาร.pdf", Err: os.ErrPermission}, 500},
+		{"joined errors", errors.Join(errors.New("อ่านข้อมูลไม่สำเร็จ"), errors.New("private driver details")), 500},
+		{"explicit server error", fiber.NewError(503, "open /private/template.pdf: permission denied"), 503},
+		{"wrapped database error", fmt.Errorf("อ่านข้อมูลไม่สำเร็จ: %w", &pgconn.PgError{Code: "XX000", Message: "private schema details"}), 500},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := fiber.New(fiber.Config{ErrorHandler: ErrorHandler})
+			app.Get("/", func(c *fiber.Ctx) error { return tc.err })
+			res, err := app.Test(httptest.NewRequest("GET", "/", nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.StatusCode != tc.status || string(body) != `{"error":"ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"}` {
+				t.Fatalf("unsafe response: status=%d body=%s", res.StatusCode, body)
+			}
+		})
+	}
+}
+
+func TestErrorHandler_ThaiPanicIsInternal(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: ErrorHandler})
+	app.Use(Recover())
+	app.Get("/", func(c *fiber.Ctx) error {
+		panic("อ่านไฟล์ /private/เอกสาร.pdf ไม่สำเร็จ")
+	})
+	res, err := app.Test(httptest.NewRequest("GET", "/", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 500 || string(body) != `{"error":"ระบบขัดข้อง กรุณาลองใหม่ภายหลัง"}` {
+		t.Fatalf("panic details leaked: status=%d body=%s", res.StatusCode, body)
+	}
+}
+
+func TestErrorResponse_PreservesExplicitBusinessErrors(t *testing.T) {
+	business := service.Conflict("มีข้อมูลนี้อยู่แล้ว")
+	status, msg := errorResponse(fmt.Errorf("operation: %w", business))
+	if status != 409 || msg != business.Msg {
+		t.Fatalf("lost business error: %d %q", status, msg)
 	}
 }

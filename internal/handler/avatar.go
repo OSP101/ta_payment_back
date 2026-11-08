@@ -119,7 +119,7 @@ func (h *UserHandler) uploadAvatarFor(c *fiber.Ctx, id uuid.UUID) error {
 
 	key, _, err := h.Svc.Storage.Save("avatars", uuid.NewString()+".jpg", bytes.NewReader(jpg))
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		return err
 	}
 	url, replaced, err := h.Svc.Users.SetAvatar(c.Context(), UserID(c), id, key)
 	if err != nil {
