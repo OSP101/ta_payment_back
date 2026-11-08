@@ -375,7 +375,7 @@ func (s *DocsService) SweepZipTokens(now time.Time) {
 	})
 }
 
-// MintAllApprovedZipToken gates the bulk download behind the officer's password
+// MintAllApprovedZipToken gates the bulk download behind the officer's TOTP code
 // and resolves the documents of the TAs the caller names.
 //
 // userIDs is REQUIRED and comes from the review screen: the people the officer
@@ -401,10 +401,10 @@ func (s *DocsService) SweepZipTokens(now time.Time) {
 // each file but not the total.
 const maxBulkUserIDs = 50
 
-func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UUID, password string, userIDs []uuid.UUID) (string, int, error) {
-	password = strings.TrimSpace(password)
-	if password == "" {
-		return "", 0, Invalid("กรุณากรอกรหัสผ่านเพื่อยืนยันการดาวน์โหลด")
+func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UUID, code string, userIDs []uuid.UUID) (string, int, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return "", 0, Invalid("กรุณากรอกรหัส TOTP 6 หลักเพื่อยืนยันการดาวน์โหลด")
 	}
 	// No implicit "everyone": an empty list must not fall back to the whole
 	// database, which is exactly the behaviour being removed.
@@ -414,7 +414,7 @@ func (s *DocsService) MintAllApprovedZipToken(ctx context.Context, actor uuid.UU
 	if len(userIDs) > maxBulkUserIDs {
 		return "", 0, Invalid(fmt.Sprintf("เลือกได้ไม่เกิน %d คนต่อครั้ง กรุณาแบ่งดาวน์โหลดเป็นชุดย่อย", maxBulkUserIDs))
 	}
-	if err := s.verifyOfficerPassword(ctx, actor, password); err != nil {
+	if err := s.verifyOfficerTOTP(ctx, actor, code); err != nil {
 		return "", 0, err
 	}
 
@@ -497,31 +497,30 @@ func (s *DocsService) CountTAsInDocs(ctx context.Context, docIDs []uuid.UUID) in
 	return n
 }
 
-// verifyOfficerPassword re-authenticates the officer before a download that
+// verifyOfficerTOTP re-authenticates the officer before a download that
 // carries PII. Shared by the single-TA and the bulk paths so both are gated
 // identically — the bulk file is every approved TA's national ID and bank
 // account in one document, so it cannot be the laxer of the two.
 //
-// Timing is dominated by bcrypt, so no extra dummy compare is needed; an account
-// deactivated mid-session simply has no row to match.
-func (s *DocsService) verifyOfficerPassword(ctx context.Context, actor uuid.UUID, password string) error {
-	return VerifyUserPassword(ctx, s.pool, actor, password)
+// Disabled or deleted accounts are rejected by the shared TOTP verifier.
+func (s *DocsService) verifyOfficerTOTP(ctx context.Context, actor uuid.UUID, code string) error {
+	return s.mfa.VerifyStepUp(ctx, actor, code)
 }
 
 // MintZipToken lets the officer re-download the ZIP later from the approved
 // bucket. Fresh token every call; docs are the current non-superseded rows.
 // Returns 410-style error if the physical files have all been purged.
 //
-// Re-download requires the officer's password because the zip contains PII
+// Re-download requires the officer's TOTP code because the zip contains PII
 // (national ID, bank account). The initial post-approve download is a
 // separate path (token minted inline in ApproveAll) and doesn't ask again,
 // since the officer just proved presence by clicking approve.
-func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID, password string) (string, error) {
-	password = strings.TrimSpace(password)
-	if password == "" {
-		return "", Invalid("กรุณากรอกรหัสผ่านเพื่อยืนยันการดาวน์โหลด")
+func (s *DocsService) MintZipToken(ctx context.Context, actor, userID uuid.UUID, code string) (string, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return "", Invalid("กรุณากรอกรหัส TOTP 6 หลักเพื่อยืนยันการดาวน์โหลด")
 	}
-	if err := s.verifyOfficerPassword(ctx, actor, password); err != nil {
+	if err := s.verifyOfficerTOTP(ctx, actor, code); err != nil {
 		return "", err
 	}
 

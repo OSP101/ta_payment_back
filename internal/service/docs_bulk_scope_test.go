@@ -29,7 +29,7 @@ const bulkTestPassword = "officer-pw-12345"
 func scopeFixture(t *testing.T, n int) (*DocsService, uuid.UUID, []uuid.UUID) {
 	t.Helper()
 	pool := testutil.NewPool(t)
-	svc := &DocsService{pool: pool, aud: audit.New(pool)}
+	svc := &DocsService{pool: pool, aud: audit.New(pool), mfa: newTestMFAService(t, pool)}
 	ctx := context.Background()
 
 	hash, err := auth.HashPassword(bulkTestPassword)
@@ -44,6 +44,7 @@ func scopeFixture(t *testing.T, n int) (*DocsService, uuid.UUID, []uuid.UUID) {
 		t.Fatalf("insert officer: %v", err)
 	}
 
+	setTestTOTP(t, svc.mfa, officer)
 	tas := make([]uuid.UUID, 0, n)
 	for i := 0; i < n; i++ {
 		ta := uuid.New()
@@ -106,7 +107,7 @@ func TestMintAllApproved_OnlyIncludesTheRequestedTAs(t *testing.T) {
 	onScreen := tas[1]
 
 	token, count, err := svc.MintAllApprovedZipToken(
-		context.Background(), officer, bulkTestPassword, []uuid.UUID{onScreen})
+		context.Background(), officer, setTestTOTP(t, svc.mfa, officer), []uuid.UUID{onScreen})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -132,7 +133,7 @@ func TestMintAllApproved_IncludesEveryRequestedTA(t *testing.T) {
 	want := []uuid.UUID{tas[0], tas[2]}
 
 	token, count, err := svc.MintAllApprovedZipToken(
-		context.Background(), officer, bulkTestPassword, want)
+		context.Background(), officer, setTestTOTP(t, svc.mfa, officer), want)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -193,7 +194,7 @@ func TestMintAllApproved_RequestedButUnapprovedIsExcluded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	token, count, err := svc.MintAllApprovedZipToken(ctx, officer, bulkTestPassword, tas)
+	token, count, err := svc.MintAllApprovedZipToken(ctx, officer, setTestTOTP(t, svc.mfa, officer), tas)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -214,7 +215,7 @@ func TestMintAllApproved_NoneQualifyIsAnError(t *testing.T) {
 		`UPDATE ta_profiles SET status='needs_fix' WHERE user_id=$1`, tas[0]); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.MintAllApprovedZipToken(ctx, officer, bulkTestPassword, tas); err == nil {
+	if _, _, err := svc.MintAllApprovedZipToken(ctx, officer, setTestTOTP(t, svc.mfa, officer), tas); err == nil {
 		t.Fatal("a request resolving to no documents must be an error, not an empty bundle")
 	}
 }

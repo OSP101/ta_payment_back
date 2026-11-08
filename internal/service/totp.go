@@ -11,7 +11,6 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -189,29 +188,12 @@ func (s *MFAService) Enable(ctx context.Context, userID uuid.UUID, code string) 
 	return codes, nil
 }
 
-// Disable turns 2FA off and discards recovery codes. The caller (handler
-// layer) is responsible for re-authenticating the actor first via
-// VerifyUserPassword (password_gate.go) before calling this — Disable itself
-// only verifies the second factor, not the password, matching the "prove
-// both factors to remove either" posture other account-security actions use.
+// Disable verifies a fresh TOTP once, then clears the secret and recovery codes.
 func (s *MFAService) Disable(ctx context.Context, actor uuid.UUID, code string) error {
-	var secretEnc []byte
-	var enabledAt *time.Time
-	if err := s.pool.QueryRow(ctx,
-		`SELECT totp_secret_enc, totp_enabled_at FROM users WHERE id = $1`,
-		actor).Scan(&secretEnc, &enabledAt); err != nil {
+	if err := s.VerifyStepUp(ctx, actor, code); err != nil {
 		return err
 	}
-	if enabledAt == nil {
-		return ErrMFANotEnabled
-	}
-	ok, err := s.verifyLiveCode(ctx, actor, secretEnc, code)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return ErrMFAInvalidCode
-	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -237,8 +219,8 @@ func (s *MFAService) Disable(ctx context.Context, actor uuid.UUID, code string) 
 
 // AdminReset clears actorID's target's 2FA entirely — the account-recovery
 // path for a lost device, used when the target cannot produce a code
-// themselves. Callers MUST re-verify the ACTOR's own password first
-// (VerifyUserPassword) and keep privileged targets (admin/staff/executive)
+// themselves. Callers MUST re-verify the ACTOR's own TOTP first
+// (VerifyStepUp) and keep privileged targets (admin/staff/executive)
 // admin-only — see internal/handler/mfa.go. Staff may reset TA and lecturer
 // accounts, the same reach they already have for password reset; unrestricted
 // staff 2FA reset would chain into a one-click path to admin takeover.
@@ -367,8 +349,10 @@ func (s *MFAService) verifyLiveCode(ctx context.Context, userID uuid.UUID, secre
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE users SET totp_last_step = $2
-		WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)`,
-		userID, step)
+		WHERE id = $1 AND is_active AND deleted_at IS NULL
+          AND totp_enabled_at IS NOT NULL AND totp_secret_enc = $3
+          AND (totp_last_step IS NULL OR totp_last_step < $2)`,
+		userID, step, secretEnc)
 	if err != nil {
 		return false, err
 	}
@@ -424,8 +408,12 @@ func isNumericTOTP(code string) bool {
 	if len(code) != 6 {
 		return false
 	}
-	_, err := strconv.Atoi(code)
-	return err == nil
+	for _, digit := range code {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // recoveryCodeAlphabet excludes ambiguous characters (0/O, 1/I/L), same

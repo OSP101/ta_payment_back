@@ -705,12 +705,12 @@ func (h *EnrollmentHandler) RegenerateCreditorForm(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var in struct {
-		Password string `json:"password" validate:"required"`
+		Code string `json:"code" validate:"required"`
 	}
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
-	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, UserID(c), in.Password); err != nil {
+	if err := h.Svc.MFA.VerifyStepUp(c.Context(), UserID(c), in.Code); err != nil {
 		return err
 	}
 	body, name, err := h.Svc.Docs.RegenerateCreditorForm(c.Context(), UserID(c), id,
@@ -749,7 +749,19 @@ func (h *TeachingHandler) BulkNumStudents(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"items": items})
 }
 
+// Suspended for handover. Re-enable only together with the frontend gate in
+// app/staff/teaching/regSources.ts. Status/stop remain usable for old clients.
+const regEnrolmentEnabled = false
+
+func regEnrolmentSuspended() error {
+	return fiber.NewError(fiber.StatusServiceUnavailable,
+		"ปิดการดึงข้อมูลจาก REG ชั่วคราว กรุณานำเข้าหรือวางข้อมูลจาก Excel")
+}
+
 func (h *TeachingHandler) RegSources(c *fiber.Ctx) error {
+	if !regEnrolmentEnabled {
+		return regEnrolmentSuspended()
+	}
 	sources, err := h.Svc.RegEnrolment.Sources(c.Context(), UserID(c))
 	if err != nil {
 		return err
@@ -773,6 +785,9 @@ func (h *TeachingHandler) RegEnrolment(c *fiber.Ctx) error {
 
 // StartRegEnrolment starts a paced, read-only fetch for the selected term.
 func (h *TeachingHandler) StartRegEnrolment(c *fiber.Ctx) error {
+	if !regEnrolmentEnabled {
+		return regEnrolmentSuspended()
+	}
 	termID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
@@ -1623,7 +1638,7 @@ func (h *DocsHandler) RecordPdpaConsent(c *fiber.Ctx) error {
 }
 
 type revealCitizenIDReq struct {
-	Password string `json:"password" validate:"required"`
+	Code string `json:"code" validate:"required"`
 }
 
 // RevealCitizenID lets a TA see their own full citizen ID on /account/my-data
@@ -1638,7 +1653,7 @@ func (h *DocsHandler) RevealCitizenID(c *fiber.Ctx) error {
 		return err
 	}
 	uid := UserID(c)
-	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, uid, in.Password); err != nil {
+	if err := h.Svc.MFA.VerifyStepUp(c.Context(), uid, in.Code); err != nil {
 		return err
 	}
 	nationalID, err := h.Svc.Docs.RevealCitizenID(c.Context(), uid, uid, "self-service PDPA data access")
@@ -1925,14 +1940,14 @@ func (h *DocsHandler) RejectBatch(c *fiber.Ctx) error {
 // them. See MintAllApprovedZipToken for why there is no "everyone" default.
 func (h *DocsHandler) MintAllApprovedZipToken(c *fiber.Ctx) error {
 	var body struct {
-		Password string      `json:"password" validate:"required"`
-		UserIDs  []uuid.UUID `json:"user_ids" validate:"required,dive,required"`
+		Code    string      `json:"code" validate:"required"`
+		UserIDs []uuid.UUID `json:"user_ids" validate:"required,dive,required"`
 	}
 	if err := Bind(c, &body); err != nil {
 		return err
 	}
 	token, taCount, err := h.Svc.Docs.MintAllApprovedZipToken(
-		c.Context(), UserID(c), body.Password, body.UserIDs)
+		c.Context(), UserID(c), body.Code, body.UserIDs)
 	if err != nil {
 		return err
 	}
@@ -1978,12 +1993,12 @@ func (h *DocsHandler) MintZipToken(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		Password string `json:"password" validate:"required"`
+		Code string `json:"code" validate:"required"`
 	}
 	if err := Bind(c, &body); err != nil {
 		return err
 	}
-	token, err := h.Svc.Docs.MintZipToken(c.Context(), UserID(c), uid, body.Password)
+	token, err := h.Svc.Docs.MintZipToken(c.Context(), UserID(c), uid, body.Code)
 	if err != nil {
 		return err
 	}
@@ -2459,8 +2474,8 @@ func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
 	// only when the row being edited is already approved (the service decides).
 	var in struct {
 		service.WorkLog
-		Password string `json:"password"`
-		Reason   string `json:"reason"`
+		Code   string `json:"code"`
+		Reason string `json:"reason"`
 	}
 	if err := Bind(c, &in); err != nil {
 		return err
@@ -2473,7 +2488,7 @@ func (h *WorkLogHandler) StaffUpsert(c *fiber.Ctx) error {
 	// the service so the rule survives a future caller.
 	privileged := rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff)
 	id, err := h.Svc.WorkLog.StaffUpsert(c.Context(), UserID(c), privileged, in.WorkLog,
-		&service.EditStepUp{Password: in.Password, Reason: in.Reason})
+		&service.EditStepUp{Code: in.Code, Reason: in.Reason})
 	if err != nil {
 		return err
 	}

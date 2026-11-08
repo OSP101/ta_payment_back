@@ -40,7 +40,7 @@ func (f *fixture) batchInput(logID uuid.UUID, reason, password string) EditBatch
 		TAID:             f.TAID,
 		YearMonth:        day(10)[:7],
 		Reason:           reason,
-		Password:         password,
+		Code:             password,
 		Changes:          []EditChange{{WorkLogID: logID, Action: "update", After: w}},
 	}
 }
@@ -71,7 +71,7 @@ func TestEditBatch_RefusesEmptyOrShortReason(t *testing.T) {
 
 	for _, reason := range []string{"", "แก้", "ผิด"} {
 		if _, err := f.Svc.ApplyStaffEditBatch(f.ctx, f.StaffID,
-			f.batchInput(id, reason, fixturePassword)); err == nil {
+			f.batchInput(id, reason, setTestTOTP(t, f.Svc.mfa, f.StaffID))); err == nil {
 			t.Errorf("reason %q was accepted — it is sent verbatim to the lecturer and the "+
 				"TA, and a one-word reason explains nothing to either", reason)
 		}
@@ -107,7 +107,7 @@ func TestEditBatch_RefusesRowsFromAnotherCourse(t *testing.T) {
 	after := f.entry(day(11), "09:00", "10:00", 1)
 	after.ID = foreignID
 	after.AssignmentID = other
-	in := f.batchInput(foreignID, goodReason, fixturePassword)
+	in := f.batchInput(foreignID, goodReason, setTestTOTP(t, f.Svc.mfa, f.StaffID))
 	in.Changes = []EditChange{{WorkLogID: foreignID, Action: "update", After: after}}
 
 	if _, err := f.Svc.ApplyStaffEditBatch(f.ctx, f.StaffID, in); err == nil {
@@ -127,7 +127,7 @@ func TestEditBatch_RefusesRowsFromAnotherCourse(t *testing.T) {
 func TestEditBatch_AppliesAndRecordsWhatChanged(t *testing.T) {
 	f, id := batchFixture(t)
 
-	res, err := f.Svc.ApplyStaffEditBatch(f.ctx, f.StaffID, f.batchInput(id, goodReason, fixturePassword))
+	res, err := f.Svc.ApplyStaffEditBatch(f.ctx, f.StaffID, f.batchInput(id, goodReason, setTestTOTP(t, f.Svc.mfa, f.StaffID)))
 	if err != nil {
 		t.Fatalf("ApplyStaffEditBatch: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestEditBatch_AppliesAndRecordsWhatChanged(t *testing.T) {
 func TestEditBatch_DeleteIsRecordedToo(t *testing.T) {
 	f, id := batchFixture(t)
 
-	in := f.batchInput(id, goodReason, fixturePassword)
+	in := f.batchInput(id, goodReason, setTestTOTP(t, f.Svc.mfa, f.StaffID))
 	in.Changes = []EditChange{{WorkLogID: id, Action: "delete"}}
 	res, err := f.Svc.ApplyStaffEditBatch(f.ctx, f.StaffID, in)
 	if err != nil {
@@ -192,7 +192,7 @@ func TestEditBatch_DeleteIsRecordedToo(t *testing.T) {
 func TestEditBatch_NoRecordWhenEveryRowIsRefused(t *testing.T) {
 	f, id := batchFixture(t)
 
-	in := f.batchInput(id, goodReason, fixturePassword)
+	in := f.batchInput(id, goodReason, setTestTOTP(t, f.Svc.mfa, f.StaffID))
 	// 30 hours in a day breaks the daily cap, so StaffUpsert refuses it.
 	bad := f.entry(day(10), "09:00", "10:00", 30)
 	bad.ID = id

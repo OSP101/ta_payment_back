@@ -54,7 +54,7 @@ type EditBatchInput struct {
 	TAID             uuid.UUID
 	YearMonth        string // "2026-07" — Gregorian, matching work_logs.work_date
 	Reason           string
-	Password         string
+	Code             string
 	Changes          []EditChange
 	Evidence         []EditEvidence
 }
@@ -93,9 +93,8 @@ func (s *WorkLogService) ApplyStaffEditBatch(
 	if len(in.Evidence) > maxEvidenceFiles {
 		return nil, Invalid(fmt.Sprintf("แนบรูปได้ไม่เกิน %d รูป", maxEvidenceFiles))
 	}
-	// Password last among the cheap checks: no reason to spend a bcrypt compare
-	// on a request that was malformed anyway.
-	if err := VerifyUserPassword(ctx, s.pool, actor, in.Password); err != nil {
+	// Verify the TOTP after checking the request shape, before any changes.
+	if err := s.mfa.VerifyStepUp(ctx, actor, in.Code); err != nil {
 		return nil, err
 	}
 

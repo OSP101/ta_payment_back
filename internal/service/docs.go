@@ -29,6 +29,7 @@ import (
 )
 
 type DocsService struct {
+	mfa   *MFAService
 	pool  *pgxpool.Pool
 	aud   *audit.Auditor
 	store storage.Store

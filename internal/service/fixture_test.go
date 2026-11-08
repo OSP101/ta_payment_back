@@ -124,6 +124,7 @@ func newFixture(t *testing.T, opts fixtureOpts) *fixture {
 		AcademicYear: 2569,
 		Svc: &WorkLogService{
 			pool:   pool,
+			mfa:    newTestMFAService(t, pool),
 			aud:    audit.New(pool),
 			budget: &BudgetService{pool: pool},
 			notify: &NotifyService{pool: pool, mailer: mail.New(config.Config{})},
@@ -160,6 +161,8 @@ func newFixture(t *testing.T, opts fixtureOpts) *fixture {
 		        VALUES (gen_random_uuid(), $1, $2, 'ZZ000', 'วิชาของ TA เอง', '1',
 		                'lecture', 0, '07:00', '08:00')`, f.TAID, f.TermID)
 	}
+
+	setTestTOTP(t, f.Svc.mfa, f.StaffID)
 
 	return f
 }

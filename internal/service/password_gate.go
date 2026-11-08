@@ -75,7 +75,7 @@ func pwGateCheck(actor uuid.UUID) error {
 		// Round up: "รออีก 0 นาที" reads like a bug.
 		mins := int(remain/time.Minute) + 1
 		return &UserError{Status: 429, Msg: fmt.Sprintf(
-			"ยืนยันรหัสผ่านไม่ถูกต้องหลายครั้งเกินไป กรุณารออีก %d นาทีแล้วลองใหม่", mins)}
+			"ยืนยันรหัส TOTP ไม่ถูกต้องหลายครั้งเกินไป กรุณารออีก %d นาทีแล้วลองใหม่", mins)}
 	}
 	// The lockout has expired — the next window starts clean.
 	e.fails = 0

@@ -136,7 +136,7 @@ func TestPasswordGate_LockoutIsPerActor(t *testing.T) {
 // locked-out person to let themselves back in.
 
 func (f *fixture) users() *UserService {
-	return &UserService{pool: f.Pool, aud: audit.New(f.Pool)}
+	return &UserService{pool: f.Pool, aud: audit.New(f.Pool), mfa: f.Svc.mfa}
 }
 
 // lockOut burns through the limit so the actor is shut out.

@@ -74,6 +74,7 @@ type User struct {
 }
 
 type UserService struct {
+	mfa  *MFAService
 	pool *pgxpool.Pool
 	aud  *audit.Auditor
 	// notify mails sign-in details (SendCredentials). Set after construction
@@ -1062,7 +1063,7 @@ func (s *UserService) UpdatePassword(ctx context.Context, id uuid.UUID, newPassw
 // a system-generated temp password) and a voluntary change from Account
 // Settings:
 //   - A voluntary change (MustChangePassword == false) must supply and prove
-//     the current password, so a hijacked live session on an unattended
+//     a fresh TOTP code, so a hijacked live session on an unattended
 //     machine cannot silently take over the account.
 //   - Either way, the new password must not equal the current one — for a
 //     forced change this is what stops a TA from just keeping the temp
@@ -1072,7 +1073,7 @@ func (s *UserService) UpdatePassword(ctx context.Context, id uuid.UUID, newPassw
 //
 // ValidatePassword's fuller rule (length/case/digit/special/blocklist) is
 // enforced by UpdatePassword below, same as before this method existed.
-func (s *UserService) ChangePassword(ctx context.Context, userID uuid.UUID, currentPassword, newPassword string) error {
+func (s *UserService) ChangePassword(ctx context.Context, userID uuid.UUID, code, newPassword string) error {
 	u, err := s.Get(ctx, userID)
 	if err != nil {
 		return err
@@ -1081,23 +1082,8 @@ func (s *UserService) ChangePassword(ctx context.Context, userID uuid.UUID, curr
 	if err != nil {
 		return err
 	}
-	// No local password at all (an SSO account whose temporary password was
-	// retired on its KKU login): there is nothing to verify, the signed-in
-	// session is the proof, so setting a first password skips the check.
-	if !u.MustChangePassword && hash != "" {
-		if currentPassword == "" {
-			return Invalid("กรุณากรอกรหัสผ่านปัจจุบัน")
-		}
-		// Through the shared password gate, not a bare compare: a stolen
-		// session could otherwise guess the current password here without
-		// limit (only the global rate cap), side-stepping the lockout that
-		// guards 2FA disable, the ZIP download and approved-row edits — and a
-		// right guess sets a password the attacker knows.
-		if err := VerifyUserPassword(ctx, s.pool, userID, currentPassword); err != nil {
-			var ue *UserError
-			if errors.As(err, &ue) && ue.Msg == "รหัสผ่านไม่ถูกต้อง" {
-				return &UserError{Status: 401, Msg: "รหัสผ่านปัจจุบันไม่ถูกต้อง"}
-			}
+	if !u.MustChangePassword {
+		if err := s.mfa.VerifyStepUp(ctx, userID, code); err != nil {
 			return err
 		}
 	}

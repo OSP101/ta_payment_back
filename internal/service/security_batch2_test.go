@@ -276,8 +276,8 @@ func TestStaffUpsert_ApprovedRowRequiresStepUp(t *testing.T) {
 
 	for name, su := range map[string]*EditStepUp{
 		"no step-up":     nil,
-		"short reason":   {Password: fixturePassword, Reason: "สั้น"},
-		"wrong password": {Password: "not-the-password", Reason: good},
+		"short reason":   {Code: fixturePassword, Reason: "สั้น"},
+		"wrong password": {Code: "not-the-password", Reason: good},
 	} {
 		if _, err := f.Svc.StaffUpsert(f.ctx, f.StaffID, true, edit, su); err == nil {
 			t.Fatalf("%s: editing an approved row must be refused", name)
@@ -291,7 +291,7 @@ func TestStaffUpsert_ApprovedRowRequiresStepUp(t *testing.T) {
 		t.Fatalf("a refused edit changed the row: hours=%v", hours)
 	}
 
-	if _, err := f.Svc.StaffUpsert(f.ctx, f.StaffID, true, edit, &EditStepUp{Password: fixturePassword, Reason: good}); err != nil {
+	if _, err := f.Svc.StaffUpsert(f.ctx, f.StaffID, true, edit, &EditStepUp{Code: setTestTOTP(t, f.Svc.mfa, f.StaffID), Reason: good}); err != nil {
 		t.Fatalf("a correctly stepped-up edit must succeed: %v", err)
 	}
 	var status string

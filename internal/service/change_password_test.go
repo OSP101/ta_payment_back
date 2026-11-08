@@ -54,16 +54,16 @@ func (f *fixture) insertUserWithTempPassword(tempPw string) uuid.UUID {
 
 // --- voluntary change (Account Settings) ---
 
-func TestChangePassword_VoluntaryRequiresCurrentPassword(t *testing.T) {
+func TestChangePassword_VoluntaryRequiresTOTP(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	err := f.users().ChangePassword(f.ctx, f.StaffID, "", "Xk9#mQz2Lp")
 	ue, ok := err.(*UserError)
 	if !ok || ue.Status != 400 {
-		t.Fatalf("want 400 when current_password is missing for a voluntary change, got %#v", err)
+		t.Fatalf("want 400 when TOTP code is missing for a voluntary change, got %#v", err)
 	}
 }
 
-func TestChangePassword_VoluntaryRejectsWrongCurrentPassword(t *testing.T) {
+func TestChangePassword_VoluntaryRejectsWrongTOTP(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	err := f.users().ChangePassword(f.ctx, f.StaffID, "not-the-password", "Xk9#mQz2Lp")
 	ue, ok := err.(*UserError)
@@ -75,7 +75,7 @@ func TestChangePassword_VoluntaryRejectsWrongCurrentPassword(t *testing.T) {
 func TestChangePassword_VoluntarySuccessAppliesNewPassword(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	const newPw = "Xk9#mQz2Lp"
-	if err := f.users().ChangePassword(f.ctx, f.StaffID, fixturePassword, newPw); err != nil {
+	if err := f.users().ChangePassword(f.ctx, f.StaffID, setTestTOTP(t, f.Svc.mfa, f.StaffID), newPw); err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
 	t.Cleanup(func() { pwGateReset(f.StaffID) })
@@ -94,7 +94,7 @@ func TestChangePassword_RejectsReuseOfCurrentPasswordInVoluntaryFlow(t *testing.
 	// fixturePassword itself doesn't satisfy the new character rules, but the
 	// reuse check must fire before ValidatePassword's rules even run — a
 	// same-password "change" is a duplicate error, not a weak-password one.
-	err := f.users().ChangePassword(f.ctx, f.StaffID, fixturePassword, fixturePassword)
+	err := f.users().ChangePassword(f.ctx, f.StaffID, setTestTOTP(t, f.Svc.mfa, f.StaffID), fixturePassword)
 	ue, ok := err.(*UserError)
 	if !ok || ue.Status != 400 || !strings.Contains(ue.Msg, "ซ้ำ") {
 		t.Fatalf("want a 400 duplicate-password error, got %#v", err)
@@ -121,7 +121,7 @@ func TestChangePassword_ForcedFlowDoesNotRequireCurrentPassword(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	id := f.insertUserWithTempPassword("TempPw9!Zx")
 	if err := f.users().ChangePassword(f.ctx, id, "", "Xk9#mQz2Lp"); err != nil {
-		t.Fatalf("a forced first-login change should not require current_password: %v", err)
+		t.Fatalf("a forced first-login change should not require TOTP code: %v", err)
 	}
 }
 
@@ -145,7 +145,7 @@ func TestChangePassword_ForcedFlowSuccessClearsMustChangeFlag(t *testing.T) {
 func TestChangePassword_PropagatesValidatePasswordRule(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
 	// Passes length/upper/lower/digit but is missing a special character.
-	err := f.users().ChangePassword(f.ctx, f.StaffID, fixturePassword, "Abcdefgh1")
+	err := f.users().ChangePassword(f.ctx, f.StaffID, setTestTOTP(t, f.Svc.mfa, f.StaffID), "Abcdefgh1")
 	ue, ok := err.(*UserError)
 	if !ok || ue.Status != 400 || !strings.Contains(ue.Msg, "อักขระพิเศษ") {
 		t.Fatalf("expected the missing-special-char rule to surface, got %#v", err)

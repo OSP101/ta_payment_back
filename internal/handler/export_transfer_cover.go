@@ -5,19 +5,17 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-
-	"ta-payment-back/internal/service"
 )
 
 type transferCoverStepUpReq struct {
-	Password string `json:"password"`
+	Code string `json:"code"`
 }
 
-// transferCoverStepUp re-checks the caller's own password before any
+// transferCoverStepUp re-checks the caller's own TOTP before any
 // ปะหน้าจ่ายตรง file leaves the server. The file carries every TA's full
 // citizen ID (the PromptPay column), so a session left open on an office
 // machine must not be enough to walk away with it — the same step-up
-// RevealCitizenID asks of a TA viewing only their own number. The password
+// RevealCitizenID asks of a TA viewing only their own number. The code
 // travels in a POST body, never the query string, so it stays out of access
 // logs and browser history.
 func (h *ExportHandler) transferCoverStepUp(c *fiber.Ctx) error {
@@ -25,7 +23,7 @@ func (h *ExportHandler) transferCoverStepUp(c *fiber.Ctx) error {
 	if err := c.BodyParser(&in); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	return service.VerifyUserPassword(c.Context(), h.Svc.Pool, UserID(c), in.Password)
+	return h.Svc.MFA.VerifyStepUp(c.Context(), UserID(c), in.Code)
 }
 
 // monthsParam reads the ?months=2026-06,2026-07 selection shared by the

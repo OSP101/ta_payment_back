@@ -361,8 +361,8 @@ func (h *AuthHandler) DataExport(c *fiber.Ctx) error {
 }
 
 type changePwReq struct {
-	CurrentPassword string `json:"current_password"`
-	NewPassword     string `json:"new_password"`
+	Code        string `json:"code"`
+	NewPassword string `json:"new_password"`
 }
 
 func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
@@ -371,11 +371,11 @@ func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
 	uid := UserID(c)
-	// All the business rules (current-password requirement for a voluntary
+	// All the business rules (TOTP requirement for a voluntary
 	// change, reuse rejection, and the fuller ValidatePassword rule) live in
 	// UserService.ChangePassword so they're covered by service-level tests
 	// without needing an HTTP harness — see internal/service/user.go.
-	if err := h.Svc.Users.ChangePassword(c.Context(), uid, in.CurrentPassword, in.NewPassword); err != nil {
+	if err := h.Svc.Users.ChangePassword(c.Context(), uid, in.Code, in.NewPassword); err != nil {
 		return err
 	}
 	// A changed password invalidates whatever session(s) were issued under the

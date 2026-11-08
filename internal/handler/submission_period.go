@@ -340,7 +340,7 @@ func (h *SubmissionPeriodHandler) StaffEditBatch(c *fiber.Ctx) error {
 	var payload struct {
 		YearMonth string               `json:"year_month"`
 		Reason    string               `json:"reason"`
-		Password  string               `json:"password"`
+		Code      string               `json:"code"`
 		Changes   []service.EditChange `json:"changes"`
 	}
 	raw := c.FormValue("payload")
@@ -416,7 +416,7 @@ func (h *SubmissionPeriodHandler) StaffEditBatch(c *fiber.Ctx) error {
 		TAID:             taID,
 		YearMonth:        payload.YearMonth,
 		Reason:           payload.Reason,
-		Password:         payload.Password,
+		Code:             payload.Code,
 		Changes:          payload.Changes,
 		Evidence:         evidence,
 	})

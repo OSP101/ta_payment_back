@@ -2,9 +2,12 @@ package handler
 
 import (
 	"context"
+	"github.com/pquerna/otp/totp"
 	"net/http/httptest"
 	"strings"
+	"ta-payment-back/internal/pii"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -29,7 +32,11 @@ func TestAdminReset2FA_StaffLimitedToNonPrivilegedTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := service.NewContainer(pool, store, mail.New(config.Config{}), audit.New(pool), config.Config{}, nil, nil)
+	cipher, err := pii.New(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := service.NewContainer(pool, store, mail.New(config.Config{}), audit.New(pool), config.Config{}, nil, cipher)
 
 	const pw = "officer-test-password"
 	hash, err := auth.HashPassword(pw)
@@ -64,7 +71,22 @@ func TestAdminReset2FA_StaffLimitedToNonPrivilegedTargets(t *testing.T) {
 			c.Locals(string(CtxRoles), []string{role})
 			return c.Next()
 		}, h.AdminReset)
-		req := httptest.NewRequest("POST", "/users/"+target.String()+"/2fa/reset", strings.NewReader(`{"password":"`+pw+`"}`))
+		key, err := totp.Generate(totp.GenerateOpts{Issuer: "test", AccountName: "actor@test.local"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		secret, err := cipher.Seal(actor[:], []byte(key.Secret()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE users SET totp_secret_enc=$2, totp_enabled_at=NOW(), totp_last_step=NULL WHERE id=$1`, actor, secret); err != nil {
+			t.Fatal(err)
+		}
+		code, err := totp.GenerateCode(key.Secret(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest("POST", "/users/"+target.String()+"/2fa/reset", strings.NewReader(`{"code":"`+code+`"}`))
 		req.Header.Set("Content-Type", "application/json")
 		res, err := app.Test(req)
 		if err != nil {

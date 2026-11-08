@@ -588,6 +588,7 @@ func validateWorkLogEntry(
 }
 
 type WorkLogService struct {
+	mfa    *MFAService
 	pool   *pgxpool.Pool
 	aud    *audit.Auditor
 	budget *BudgetService
@@ -4655,7 +4656,7 @@ func auditDeleteAction(privileged bool) string {
 }
 
 // EditStepUp is what an edit to an ALREADY-APPROVED work log must carry: the
-// editor's password and a written reason, the same bar ApplyStaffEditBatch sets.
+// editor's TOTP code and a written reason, the same bar ApplyStaffEditBatch sets.
 //
 // An approved row's hours are live money — budget and export totals read them
 // directly — and approval is the lecturer's sign-off on them. Changing one
@@ -4664,10 +4665,10 @@ func auditDeleteAction(privileged bool) string {
 // it arrives by. Before this, PUT /staff/worklogs skipped all three while the
 // batch route enforced them, for the identical write.
 type EditStepUp struct {
-	Password string
-	Reason   string
+	Code   string
+	Reason string
 	// verified is set only inside this package, by ApplyStaffEditBatch after it
-	// has checked the password itself and before it sends its own notices. A
+	// has checked the TOTP itself and before it sends its own notices. A
 	// caller outside the package cannot set it, so it cannot skip the check.
 	verified bool
 }
@@ -4963,7 +4964,7 @@ func approvedEditNote(wasApproved bool, stepUp *EditStepUp) string {
 	return "แก้ไขรายการที่อนุมัติแล้ว เหตุผล: " + strings.TrimSpace(stepUp.Reason)
 }
 
-// checkApprovedEditStepUp enforces EditStepUp. Cheap checks first, bcrypt last,
+// checkApprovedEditStepUp enforces EditStepUp. Check the reason before TOTP,
 // matching ApplyStaffEditBatch.
 func (s *WorkLogService) checkApprovedEditStepUp(ctx context.Context, actor uuid.UUID, stepUp *EditStepUp) error {
 	if stepUp != nil && stepUp.verified {
@@ -4971,10 +4972,10 @@ func (s *WorkLogService) checkApprovedEditStepUp(ctx context.Context, actor uuid
 	}
 	if stepUp == nil || len([]rune(strings.TrimSpace(stepUp.Reason))) < editReasonMinLen {
 		return Invalid(fmt.Sprintf(
-			"รายการนี้อนุมัติแล้ว การแก้ไขต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร และยืนยันรหัสผ่าน เหตุผลจะถูกส่งให้อาจารย์ประจำวิชา",
+			"รายการนี้อนุมัติแล้ว การแก้ไขต้องระบุเหตุผลอย่างน้อย %d ตัวอักษร และยืนยันรหัส TOTP เหตุผลจะถูกส่งให้อาจารย์ประจำวิชา",
 			editReasonMinLen))
 	}
-	return VerifyUserPassword(ctx, s.pool, actor, stepUp.Password)
+	return s.mfa.VerifyStepUp(ctx, actor, stepUp.Code)
 }
 
 // Delete removes a single work_log entry owned by the calling TA. Draft and

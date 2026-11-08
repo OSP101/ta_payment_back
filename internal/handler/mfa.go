@@ -88,22 +88,16 @@ func (h *MFAHandler) Enable(c *fiber.Ctx) error {
 }
 
 type disable2FAReq struct {
-	Password string `json:"password" validate:"required"`
-	Code     string `json:"code" validate:"required"`
+	Code string `json:"code" validate:"required"`
 }
 
-// Disable turns 2FA off. Requires BOTH the account password (re-auth, same
-// gate every other sensitive account action uses) and a valid second-factor
-// code — proving both factors to remove either, not just one.
+// Disable turns 2FA off after one fresh TOTP verification inside the service.
 func (h *MFAHandler) Disable(c *fiber.Ctx) error {
 	var in disable2FAReq
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
 	uid := UserID(c)
-	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, uid, in.Password); err != nil {
-		return err
-	}
 	if err := h.Svc.MFA.Disable(c.Context(), uid, in.Code); err != nil {
 		return mfaEnrollError(err)
 	}
@@ -111,20 +105,17 @@ func (h *MFAHandler) Disable(c *fiber.Ctx) error {
 }
 
 type regenerateCodesReq struct {
-	Password string `json:"password" validate:"required"`
+	Code string `json:"code" validate:"required"`
 }
 
-// RegenerateRecoveryCodes replaces every existing recovery code. Password
-// only, no TOTP code required — this is the "I still have my authenticator
-// but I'm down to my last code" path, distinct from Disable/AdminReset which
-// remove 2FA entirely.
+// RegenerateRecoveryCodes requires a fresh TOTP before replacing recovery codes.
 func (h *MFAHandler) RegenerateRecoveryCodes(c *fiber.Ctx) error {
 	var in regenerateCodesReq
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
 	uid := UserID(c)
-	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, uid, in.Password); err != nil {
+	if err := h.Svc.MFA.VerifyStepUp(c.Context(), uid, in.Code); err != nil {
 		return err
 	}
 	codes, err := h.Svc.MFA.RegenerateRecoveryCodes(c.Context(), uid)
@@ -135,12 +126,12 @@ func (h *MFAHandler) RegenerateRecoveryCodes(c *fiber.Ctx) error {
 }
 
 type adminReset2FAReq struct {
-	Password string `json:"password" validate:"required"`
+	Code string `json:"code" validate:"required"`
 }
 
 // AdminReset clears a target user's 2FA entirely — the break-glass path for
 // "I lost my phone and my recovery codes". Admin-only (see router.go), and
-// requires the ACTING admin's own password before it will touch anyone
+// requires the ACTING officer's own TOTP code before it will touch anyone
 // else's account — see MFAService.AdminReset's own doc comment for why this
 // cannot be opened up to staff the way password reset already is.
 func (h *MFAHandler) AdminReset(c *fiber.Ctx) error {
@@ -166,7 +157,7 @@ func (h *MFAHandler) AdminReset(c *fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusForbidden, "รีเซ็ต 2FA ของบัญชีผู้ดูแล/เจ้าหน้าที่/ผู้บริหาร ต้องให้ผู้ดูแลระบบดำเนินการ")
 		}
 	}
-	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, actorID, in.Password); err != nil {
+	if err := h.Svc.MFA.VerifyStepUp(c.Context(), actorID, in.Code); err != nil {
 		return err
 	}
 	if err := h.Svc.MFA.AdminReset(c.Context(), actorID, targetID); err != nil {

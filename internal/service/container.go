@@ -96,6 +96,9 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Dashboard.appointments = c.Appointment
 	c.Holiday = &HolidayService{pool: pool, aud: auditor, notify: c.Notify}
 	c.MFA = &MFAService{pool: pool, aud: auditor, totp: totpCipher}
+	c.Users.mfa = c.MFA
+	c.Docs.mfa = c.MFA
+	c.WorkLog.mfa = c.MFA
 	c.SSO = &SSOService{users: c.Users, aud: auditor}
 	if cfg.SSOEnabled {
 		c.SSO.client = &ssonext.Client{

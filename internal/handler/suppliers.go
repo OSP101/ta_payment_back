@@ -3,8 +3,6 @@ package handler
 import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-
-	"ta-payment-back/internal/service"
 )
 
 // SuppliersPreview — GET /ta-review/suppliers?term=<id> — the term's new TAs
@@ -23,17 +21,17 @@ func (h *DocsHandler) SuppliersPreview(c *fiber.Ctx) error {
 }
 
 // SuppliersXLSX — POST /ta-review/suppliers.xlsx?term=<id> — the file itself.
-// It carries full citizen IDs and bank accounts, so the caller's own password
+// It carries full citizen IDs and bank accounts, so the caller's own TOTP code
 // is re-checked first, in the body (never the query string), exactly as the
 // transfer cover does.
 func (h *DocsHandler) SuppliersXLSX(c *fiber.Ctx) error {
 	var in struct {
-		Password string `json:"password"`
+		Code string `json:"code"`
 	}
 	if err := c.BodyParser(&in); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
-	if err := service.VerifyUserPassword(c.Context(), h.Svc.Pool, UserID(c), in.Password); err != nil {
+	if err := h.Svc.MFA.VerifyStepUp(c.Context(), UserID(c), in.Code); err != nil {
 		return err
 	}
 	termID, err := uuid.Parse(c.Query("term"))
