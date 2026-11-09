@@ -208,7 +208,13 @@ func (s *RegEnrolmentService) Start(ctx context.Context, actor, termID uuid.UUID
 	snap := s.snapshot(j)
 	s.mu.Unlock()
 
-	go s.run(termID, j, codes, year, semester)
+	if !backgroundJobs.start(func(parent context.Context) { s.run(parent, termID, j, codes, year, semester) }) {
+		s.mu.Lock()
+		delete(s.jobs,regJobKey{termID,source})
+		s.busy=false
+		s.mu.Unlock()
+		return nil,Conflict("ระบบกำลังประมวลผลงานเบื้องหลัง กรุณาลองใหม่ภายหลัง")
+	}
 	return snap, nil
 }
 
@@ -267,10 +273,10 @@ func (s *RegEnrolmentService) termCodes(ctx context.Context, termID uuid.UUID, s
 	return codes, skipped, groups, rows.Err()
 }
 
-func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []string, year, semester int) {
+func (s *RegEnrolmentService) run(parent context.Context, termID uuid.UUID, j *RegEnrolmentJob, codes []string, year, semester int) {
 	// Paced at ~1.25 s a request, a whole term of 150 codes is 3–6 minutes;
 	// the cap only stops a hung registrar from holding the single slot forever.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Minute)
 	defer cancel()
 	s.mu.Lock()
 	j.stop = cancel
@@ -281,7 +287,7 @@ func (s *RegEnrolmentService) run(termID uuid.UUID, j *RegEnrolmentJob, codes []
 	stopped := func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return j.stopping
+		return j.stopping || ctx.Err() != nil
 	}
 
 	source := j.Source

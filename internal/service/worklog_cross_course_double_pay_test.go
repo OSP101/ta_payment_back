@@ -1,11 +1,77 @@
 package service
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+func TestTriggerSerializesUncommittedCrossCourseApproval(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	other := f.secondCourseAssignment(fixtureOpts{})
+	ctx, cancel := context.WithTimeout(f.ctx, 8*time.Second)
+	defer cancel()
+	first, err := f.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Rollback(context.Background())
+	insert := `INSERT INTO work_logs (assignment_id, work_date, start_time, end_time, hours, activity, status)
+		VALUES ($1,$2::date,'09:00','12:00',3,'review','approved')`
+	if _, err := first.Exec(ctx, insert, f.AssignmentID, day(10)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	var pid int
+	if err := second.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := second.Exec(ctx, insert, other, day(10))
+		done <- err
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		_ = first.Rollback(context.Background())
+		<-done // never release a connection while its query is still running
+	}()
+	// Wait for the actual lock wait, rather than assuming a timed sleep proves
+	// the second SQL statement reached the trigger.
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("second approval did not wait for the uncommitted first approval: %v", err)
+		default:
+		}
+		var event string
+		if err := f.Pool.QueryRow(ctx, `SELECT COALESCE(wait_event,'') FROM pg_stat_activity WHERE pid=$1`, pid).Scan(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event == "advisory" {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10*time.Millisecond):
+		}
+	}
+	if err := first.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "ซ้อน") {
+		t.Fatalf("second approval must recheck committed overlap: %v", err)
+	}
+}
 
 // 01/10/2026 — double pay across two courses.
 //

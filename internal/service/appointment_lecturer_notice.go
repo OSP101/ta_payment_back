@@ -64,6 +64,7 @@ func (s *AppointmentOrderService) notifyLecturersAppointed(
 	}
 	att := []mail.Attachment{{Name: fileName, ContentType: docxContentType, Data: file}}
 	for _, n := range notices {
+		if ctx.Err() != nil { return }
 		title, body, layout := lecturerAppointContent(doc, round, n.courses)
 		layout.Attachments = att
 		s.notify.SendLaidOut(ctx, n.lecturerID, title, body, "/lecturer", false, layout)

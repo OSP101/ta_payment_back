@@ -46,7 +46,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"ta-payment-back/internal/config"
 	"ta-payment-back/internal/db"
 )
 
@@ -58,33 +57,11 @@ const adminURLEnv = "TEST_DATABASE_URL"
 // the PID it keeps concurrent `go test` invocations from colliding.
 var dbSeq atomic.Int64
 
-// adminURL resolves the connection string used to CREATE/DROP throwaway test
-// databases. TEST_DATABASE_URL (CI) wins outright; otherwise it is built from
-// DB_HOST/DB_PORT/DB_USER/DB_PASSWORD, loaded from the repo's own .env — the
-// same file `docker compose up` and the running server already use.
-//
-// This used to be a literal connection string with a real password baked into
-// this file. That value sat in git history (and on the private GitHub remote)
-// for weeks before anyone noticed, and every password rotation silently broke
-// it again until someone hardcoded the new one back in. Reading .env instead
-// means there is exactly one place the password lives, and it is the place
-// already excluded from git.
+// adminURL only uses an explicitly configured, isolated test server. Never load
+// application credentials: this harness creates and drops whole databases.
 func adminURL(t *testing.T) string {
 	t.Helper()
-	if v := os.Getenv(adminURLEnv); v != "" {
-		return v
-	}
-	config.LoadDotEnv(filepath.Join(repoRoot(t), ".env"))
-	user, pass, host, port := os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_HOST"), os.Getenv("DB_PORT")
-	if user == "" || host == "" || port == "" {
-		// No .env and no TEST_DATABASE_URL — NewPool's caller skips on the
-		// ensuing connection failure, same as it always has.
-		return ""
-	}
-	// The admin connection targets Postgres's own "postgres" maintenance
-	// database (needed to CREATE DATABASE), never DB_NAME — creating a
-	// sibling database requires connecting to some OTHER database first.
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/postgres?sslmode=disable", user, pass, host, port)
+	return os.Getenv(adminURLEnv)
 }
 
 // repoRoot locates the repository root from this source file's own path, the
@@ -133,19 +110,17 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 
 	url := adminURL(t)
 	if url == "" {
-		t.Skipf("no test database configured — set %s, or create a .env with "+
-			"DB_HOST/DB_PORT/DB_USER/DB_PASSWORD (see .env.example)", adminURLEnv)
+		t.Skipf("no isolated test database configured — set %s explicitly", adminURLEnv)
 	}
 	admin, err := pgxpool.New(ctx, url)
 	if err != nil {
-		t.Skipf("no test database configured (%s): %v", adminURLEnv, err)
+		t.Fatalf("invalid explicit test database configuration (%s)", adminURLEnv)
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if err := admin.Ping(pingCtx); err != nil {
 		admin.Close()
-		t.Skipf("test database unreachable at %s — start it with `docker compose up -d` "+
-			"or set %s (%v)", redact(url), adminURLEnv, err)
+		t.Fatalf("explicit test database unreachable (%s)", adminURLEnv)
 	}
 
 	tpl, err := ensureTemplate(ctx, admin, url, MigrationsDir(t))

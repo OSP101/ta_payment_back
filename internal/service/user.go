@@ -196,7 +196,14 @@ func (s *UserService) Create(ctx context.Context, actor uuid.UUID, in CreateUser
 			return nil, err
 		}
 	}
-	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: id.String(), After: in}); err != nil {
+	// Explicit allowlist: request DTOs can contain credentials, now or later.
+	created := map[string]any{
+		"email": in.Email, "title": in.Title,
+		"first_name": in.FirstName, "last_name": in.LastName,
+		"phone": in.Phone, "roles": in.Roles, "study_level": in.StudyLevel,
+		"study_year": in.StudyYear, "nationality": nationality,
+	}
+	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: id.String(), After: created}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -906,6 +913,12 @@ func (s *UserService) Update(ctx context.Context, actor, id uuid.UUID, in Update
 				`INSERT INTO user_roles (user_id, role) VALUES ($1, $2::role_code)`, id, r); err != nil {
 				return nil, err
 			}
+		}
+		// Commit the permission change and token invalidation together. Login
+		// locks the same user row before creating a session.
+		if _, err := tx.Exec(ctx, `UPDATE sessions SET revoked_at=NOW(), revoke_reason='roles_changed'
+			WHERE user_id=$1 AND revoked_at IS NULL`, id); err != nil {
+			return nil, err
 		}
 	}
 

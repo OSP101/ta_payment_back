@@ -105,6 +105,39 @@ func TestMediaIsPublic_CoversTheCoverImageToo(t *testing.T) {
 	}
 }
 
+func TestPrivateMediaRequiresLiveAnnouncementAndRecipient(t *testing.T) {
+	f := newAnnFixture(t)
+	staff := f.user("staff", "media-owner")
+	reader := f.user("ta", "recipient")
+	outsider := f.user("ta", "non-recipient")
+	key := "announcements/2026/08/06/private.jpg"
+	id, err := f.svc.Upsert(f.ctx, staff, UpsertInput{
+		Title: "Private", Body: "Test", Category: "info", Audience: []string{"ta"},
+		PublishedAt: past(), CoverImageKey: &key,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`DELETE FROM announcement_recipients WHERE announcement_id=$1 AND user_id=$2`, id, outsider)
+	check := func(actor uuid.UUID, object string, want bool) {
+		t.Helper()
+		got, err := f.svc.MediaVisibleTo(f.ctx, actor, object)
+		if err != nil || got != want {
+			t.Fatalf("media visibility=%v want %v: %v", got, want, err)
+		}
+	}
+	check(reader, key, true)
+	check(outsider, key, false)
+	check(staff, "announcements/unattached.jpg", true)
+	check(reader, "announcements/unattached.jpg", false)
+	check(staff, "announcements/../ta_docs/private.pdf", false)
+	if err := f.svc.Unpublish(f.ctx, staff, id); err != nil {
+		t.Fatal(err)
+	}
+	check(reader, key, false)
+	check(staff, key, true)
+}
+
 // Attachments are replaced wholesale and keep the composer's order, because a
 // gallery reads as a sequence.
 func TestSaveAttachments_ReplacesAndKeepsOrder(t *testing.T) {

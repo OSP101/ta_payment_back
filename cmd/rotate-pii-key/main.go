@@ -107,6 +107,13 @@ func main() {
 	}
 	defer pool.Close()
 
+	var outboxExists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('notification_outbox') IS NOT NULL`).Scan(&outboxExists); err != nil { log.Fatal("cannot inspect notification queue") }
+	if outboxExists {
+		var pending int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM notification_outbox WHERE payload_enc IS NOT NULL`).Scan(&pending); err != nil { log.Fatal("cannot inspect notification queue") }
+		if pending > 0 { log.Fatal("drain the notification outbox and stop API writers before PII key rotation") }
+	}
 	if *apply {
 		for _, col := range sealedColumns {
 			var maxVersion int

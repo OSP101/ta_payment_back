@@ -169,3 +169,27 @@ func (s *AnnounceService) MediaIsPublic(ctx context.Context, key string) (bool, 
 	}
 	return ok, nil
 }
+
+// MediaVisibleTo applies the announcement's recipient boundary to its bytes.
+// Staff may also preview newly uploaded files before attaching them to a draft.
+func (s *AnnounceService) MediaVisibleTo(ctx context.Context, actor uuid.UUID, key string) (bool, error) {
+	if key == "" || !strings.HasPrefix(key, "announcements/") || strings.Contains(key, "..") {
+		return false, nil
+	}
+	staff, err := isPrivileged(ctx, s.pool, actor)
+	if err != nil || staff {
+		return staff, err
+	}
+	var visible bool
+	err = s.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM announcements a
+		WHERE a.published_at IS NOT NULL AND a.published_at <= NOW()
+		AND (a.expires_at IS NULL OR a.expires_at > NOW())
+		AND EXISTS (SELECT 1 FROM announcement_recipients r
+			WHERE r.announcement_id=a.id AND r.user_id=$2)
+		AND (a.cover_image_key=$1 OR EXISTS (
+			SELECT 1 FROM announcement_attachments t
+			WHERE t.announcement_id=a.id AND t.storage_key=$1))
+	)`, key, actor).Scan(&visible)
+	return visible, err
+}

@@ -137,6 +137,13 @@ func AccessLog() fiber.Handler {
 			"status", status,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"ip", c.IP(),
+			// Keep the transport peer separate from the resolved client. These
+			// diagnose a missing/mismatched proxy trust rule without retaining
+			// raw (potentially forged or sensitive) forwarding header values.
+			"peer_ip", c.Context().RemoteIP().String(),
+			"proxy_trusted", c.IsProxyTrusted(),
+			"proxy_header_enabled", c.App().Config().ProxyHeader != "",
+			"forwarded_for_present", c.Get(fiber.HeaderXForwardedFor) != "",
 			"bytes", len(c.Response().Body()),
 		}
 		if uid := UserID(c); uid != uuid.Nil {

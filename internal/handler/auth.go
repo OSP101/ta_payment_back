@@ -92,6 +92,17 @@ func (h *AuthHandler) LoginTwoFactor(c *fiber.Ctx) error {
 // it's on) and returns the same {"user": ...} body either path used to
 // return directly.
 func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User, viaSSO bool) error {
+	// Create the session before reading token roles. If a role edit committed
+	// while login was waiting on the account lock, use its new roles; if it
+	// commits after this point, it atomically revokes this session.
+	sessionID, err := h.Svc.Sessions.CreateAndSupersede(c.Context(), u.ID, h.Svc.Cfg.JWTLifetime, c.IP(), c.Get("User-Agent"))
+	if err != nil {
+		return err
+	}
+	u, err = h.Svc.Users.Get(c.Context(), u.ID)
+	if err != nil {
+		return err
+	}
 	// The synthetic executive role rides in the TOKEN only, not in u.Roles:
 	// RequireRole reads roles from JWT claims, so leaving it out here made the
 	// analytics endpoints 403 for a flagged lecturer. u.Roles itself stays the
@@ -101,14 +112,8 @@ func (h *AuthHandler) finishLogin(c *fiber.Ctx, u *service.User, viaSSO bool) er
 	if u.IsExecutive {
 		tokenRoles = append(append([]string{}, u.Roles...), rbac.RoleExecutive)
 	}
-	// Single-device login: this also revokes every other session this user
-	// currently holds (reason "superseded"), so whatever device was signed in
-	// before is rejected on its very next request — see SessionService and
-	// AccountGuard.
-	sessionID, err := h.Svc.Sessions.CreateAndSupersede(c.Context(), u.ID, h.Svc.Cfg.JWTLifetime, c.IP(), c.Get("User-Agent"))
-	if err != nil {
-		return err
-	}
+	// The session above supersedes previous logins; AccountGuard checks it on
+	// every protected request, including tokens issued concurrently with a role edit.
 	tok, err := h.Tokens.Issue(u.ID, tokenRoles, sessionID, h.Svc.Cfg.JWTLifetime)
 	if err != nil {
 		return err

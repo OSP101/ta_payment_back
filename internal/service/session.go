@@ -38,6 +38,14 @@ func (s *SessionService) CreateAndSupersede(ctx context.Context, userID uuid.UUI
 	}
 	defer tx.Rollback(ctx)
 
+	// Serialize even the FIRST two logins, when there is no session row to
+	// lock yet. Role changes lock this same account before revoking sessions.
+	var accountID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM users
+		WHERE id=$1 AND is_active AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&accountID); err != nil {
+		return uuid.Nil, err
+	}
+
 	if _, err := tx.Exec(ctx,
 		`UPDATE sessions SET revoked_at = NOW(), revoke_reason = 'superseded'
 		 WHERE user_id = $1 AND revoked_at IS NULL`, userID); err != nil {

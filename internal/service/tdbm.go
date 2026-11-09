@@ -1121,18 +1121,23 @@ func (s *TDBMService) TriggerAsync(triggerKind string) {
 	s.syncing = true
 	s.syncMu.Unlock()
 
-	go func() {
+	if !backgroundJobs.start(func(parent context.Context) {
 		defer func() {
 			s.syncMu.Lock()
 			s.syncing = false
 			s.syncMu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 		defer cancel()
 		if _, err := s.SyncAll(ctx, triggerKind); err != nil {
 			log.Printf("tdbm: async sync (%s) err=%v", triggerKind, err)
 		}
-	}()
+	}) {
+		s.syncMu.Lock()
+		s.syncing = false
+		s.syncMu.Unlock()
+		log.Printf("tdbm: background worker capacity unavailable")
+	}
 }
 
 // RecentSyncLog returns the most recent sync log rows, newest first, for the

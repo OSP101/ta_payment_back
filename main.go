@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"log"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -121,8 +123,12 @@ func main() {
 	if migrationDir == "" {
 		migrationDir = "./migrations"
 	}
-	if err := db.Migrate(ctx, pool, migrationDir); err != nil {
-		log.Fatalf("migrate: %v", err)
+	if cfg.AutoMigrate {
+		if err := db.Migrate(ctx, pool, migrationDir); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+	} else if err := db.CheckMigrations(ctx, pool, migrationDir); err != nil {
+		log.Fatalf("schema readiness: %v", err)
 	}
 
 	var encKey []byte
@@ -161,6 +167,10 @@ func main() {
 	totpCipher, err := pii.New(totpKey)
 	if err != nil {
 		log.Fatalf("pii (totp): %v", err)
+	}
+
+	if cfg.AppEnv == "production" && (bytes.Equal(piiKey, totpKey) || bytes.Equal(piiKey, encKey) || bytes.Equal(totpKey, encKey)) {
+		log.Fatal("PII, TOTP and document encryption keys must be distinct in production")
 	}
 
 	mailer := mail.New(cfg)
@@ -224,6 +234,12 @@ func main() {
 		// absent or not an IP falls back to the real socket address instead of
 		// being passed through.
 		EnableIPValidation: true,
+	})
+	var requests sync.WaitGroup
+	app.Use(func(c *fiber.Ctx) error {
+		requests.Add(1)
+		defer requests.Done()
+		return c.Next()
 	})
 	app.Use(handler.Recover())
 	// Order matters. RequestID is first so that everything below it — including
@@ -324,8 +340,10 @@ func main() {
 	// slot is migrated and mounted here, up front, rather than lazily on
 	// someone's first visit.
 	if cfg.DemoMode {
-		if err := db.EnsureDatabase(ctx, cfg.DemoDatabaseURL); err != nil {
-			log.Fatalf("demo: provisioning database: %v", err)
+		if cfg.AutoMigrate {
+			if err := db.EnsureDatabase(ctx, cfg.DemoDatabaseURL); err != nil {
+				log.Fatalf("demo: provisioning database: %v", err)
+			}
 		}
 		demoPool, err := db.Connect(ctx, cfg.DemoDatabaseURL)
 		if err != nil {
@@ -339,6 +357,7 @@ func main() {
 		// to touch it, before any slot has run 0001_init to install it.
 		// Idempotent and per-DATABASE (not per-schema), so every later
 		// per-slot 0001_init run just sees it already there and skips it.
+		if cfg.AutoMigrate {
 		for _, ext := range []string{"pgcrypto", "citext"} {
 			if _, err := demoPool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "`+ext+`"`); err != nil {
 				log.Fatalf("demo: enabling %s: %v", ext, err)
@@ -352,10 +371,14 @@ func main() {
 		if err := db.Migrate(ctx, demoPool, filepath.Join(migrationDir, "demo_registry")); err != nil {
 			log.Fatalf("demo: migrating registry: %v", err)
 		}
+		} else if err := db.CheckMigrations(ctx, demoPool, filepath.Join(migrationDir, "demo_registry")); err != nil {
+			log.Fatalf("demo registry readiness: %v", err)
+		}
 		mgr, err := demo.Bootstrap(ctx, demoPool, cfg, piiCipher, totpCipher, encKey, migrationDir)
 		if err != nil {
 			log.Fatalf("demo: %v", err)
 		}
+		defer mgr.Close()
 		demo.Mount(app, mgr)
 		// Who is ALLOWED into the sandbox is managed from the real app
 		// (/staff/settings), not from inside it — see MountAdmin's own doc
@@ -382,15 +405,22 @@ func main() {
 	// Lazy fanout on GET /announcements handles the common case; this loop
 	// covers windows where no one is reading, so a scheduled 08:00 post
 	// still lands in inboxes if the office opens at 08:15.
-	go services.Announce.RunScheduler(ctx)
+	var workers sync.WaitGroup
+	startWorker := func(run func(context.Context)) {
+		workers.Add(1)
+		go func() { defer workers.Done(); run(ctx) }()
+	}
+	startWorker(services.Announce.RunScheduler)
 
 	// Retention sweep: delete on-disk blobs 7 days after approval and mark
 	// file_deleted_at on the row for audit. See docs_review.go.
-	go services.Docs.RunRetention(ctx)
+	startWorker(services.Docs.RunRetention)
+	startWorker(services.RunOperationalMetrics)
+	if cfg.AsyncNotifications { startWorker(services.Notify.RunOutbox) }
 
 	// Monthly submission-period scheduler: hourly reminders + daily auto-close.
 	// Runs in-process; extract to cmd/scheduler if the reminder volume grows.
-	scheduler.New(services).Start(ctx)
+	startWorker(scheduler.New(services).Run)
 
 	// Finalise any TA request whose TAs have all filed their timetables while
 	// the server was down. The fast path is the trigger on the TA's own save
@@ -407,5 +437,14 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	log.Println("shutting down...")
-	_ = app.ShutdownWithTimeout(10 * time.Second)
+	signal.Stop(sig)
+	// Stop accepting work, drain requests, then stop/join workers before any
+	// deferred database pool close. SMTP has a bounded transport deadline.
+	if err := app.ShutdownWithTimeout(30 * time.Second); err != nil {
+		log.Printf("HTTP drain deadline reached: %v", err)
+	}
+	cancel()
+	requests.Wait()
+	service.ShutdownBackgroundJobs()
+	workers.Wait()
 }

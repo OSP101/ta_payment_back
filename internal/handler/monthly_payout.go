@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"log"
 	"strings"
 	"time"
 
@@ -132,6 +133,17 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 		total float64
 	}
 	packs := []coursePack{}
+	var createdKeys []string
+	commitAttempted := false
+	defer func() {
+		// A failed COMMIT can be ambiguous (e.g. lost network acknowledgement).
+		// Keep those artifacts for reconciliation; never delete a potentially
+		// committed financial archive on a client/connection error.
+		if commitAttempted { return }
+		for _, key := range createdKeys {
+			if err := h.Svc.Storage.Delete(key); err != nil { log.Printf("uncommitted payout artifact cleanup failed") }
+		}
+	}()
 	// Preflight every course before the first lock. A pending lecturer, profile,
 	// appointment, or staff review on any course blocks the combined month.
 	blockers := []service.ExportBlocker{}
@@ -163,7 +175,7 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	var buf bytes.Buffer
+	var buf payoutArchiveBuffer
 	zw := zip.NewWriter(&buf)
 	var total float64
 	for _, id := range ids {
@@ -196,6 +208,7 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 			if e != nil {
 				return e
 			}
+			createdKeys = append(createdKeys,cp.path)
 		}
 		w, e := zw.Create(id.String() + "/" + cp.name)
 		if e != nil {
@@ -204,6 +217,8 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 		if _, e = w.Write(cp.body); e != nil {
 			return e
 		}
+		cp.body = nil
+		if cp.pack != nil { cp.pack.Body = nil }
 		total += cp.total
 		packs = append(packs, cp)
 	}
@@ -224,6 +239,7 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	createdKeys = append(createdKeys,path)
 	tx, err := h.Svc.Pool.Begin(c.Context())
 	if err != nil {
 		return err
@@ -290,6 +306,7 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 	if err = h.Svc.Auditor.LogTx(c.Context(), tx, audit.Entry{ActorID: &actor, Action: "export.month", Entity: "academic_term", EntityID: termID.String(), After: map[string]any{"month": ym, "version": version, "total_baht": total, "course_ids": ids}}); err != nil {
 		return err
 	}
+	commitAttempted = true
 	if err = tx.Commit(c.Context()); err != nil {
 		return err
 	}
@@ -303,4 +320,12 @@ func (h *ExportHandler) MonthlyPayoutZip(c *fiber.Ctx) error {
 	c.Set("Content-Type", "application/zip")
 	c.Set("Content-Disposition", contentDisposition("attachment", name))
 	return c.Send(buf.Bytes())
+}
+
+// Combined archives are buffered for encryption/storage. Bound that buffer;
+// never release a partial archive or financial transaction on overflow.
+type payoutArchiveBuffer struct { bytes.Buffer }
+func (b *payoutArchiveBuffer) Write(p []byte) (int,error) {
+	if b.Len()+len(p)>64*1024*1024 { return 0,fiber.NewError(413,"ชุดเอกสารมีขนาดใหญ่เกินไป กรุณาติดต่อผู้ดูแลระบบ") }
+	return b.Buffer.Write(p)
 }

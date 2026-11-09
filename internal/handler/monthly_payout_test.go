@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"net/http/httptest"
 	"testing"
 
@@ -212,6 +215,18 @@ func TestMonthlyPayoutReprintsGraduateOnlyArchive(t *testing.T) {
 	orderID := uuid.New()
 	exec(`INSERT INTO appointment_orders(id,term_id,round_no,order_no,order_date,effective_date,ta_count) VALUES($1,$2,1,'TEST-1','2569-06-01','2569-06-01',1)`, orderID, term)
 	exec(`INSERT INTO appointment_order_items(id,appointment_order_id,teaching_course_id,ta_id) VALUES(gen_random_uuid(),$1,$2,$3)`, orderID, course, ta)
+	countArtifacts := func() int {
+		count := 0
+		err := filepath.WalkDir(store.Path("export_batches"),func(_ string,d fs.DirEntry,err error) error {
+			if errors.Is(err,os.ErrNotExist) { return nil }
+			if err != nil { return err }
+			if !d.IsDir() { count++ }
+			return nil
+		})
+		if err != nil { t.Fatal(err) }
+		return count
+	}
+	beforeArtifacts := countArtifacts()
 	svc.Storage = monthlyFailingStore{Store: store}
 	failed, e := app.Test(httptest.NewRequest("POST", julyURL, nil), -1)
 	if e != nil {
@@ -222,6 +237,7 @@ func TestMonthlyPayoutReprintsGraduateOnlyArchive(t *testing.T) {
 	if failed.StatusCode != 500 {
 		t.Fatalf("storage-failure status=%d body=%s", failed.StatusCode, failedBody)
 	}
+	if countArtifacts()!=beforeArtifacts { t.Fatal("failed payout left orphaned course archives") }
 	var julyLocked int
 	if e = pool.QueryRow(ctx, `SELECT count(*) FROM grad_lump_ledger WHERE teaching_course_id=$1 AND year_month='2026-07'`, course).Scan(&julyLocked); e != nil {
 		t.Fatal(e)
@@ -274,7 +290,7 @@ func TestMonthlyPayoutReprintsGraduateOnlyArchive(t *testing.T) {
 }
 
 // Fault injection only affects the combined file. Prepared per-course files
-// may exist, but no money or batch marker may commit when this save fails.
+// must be cleaned up, and no money or batch marker may commit on failure.
 type monthlyFailingStore struct{ storage.Store }
 
 func (s monthlyFailingStore) Save(kind, name string, r io.Reader) (string, int64, error) {

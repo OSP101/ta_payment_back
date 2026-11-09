@@ -2,6 +2,10 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -12,8 +16,10 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 20
-	cfg.MinConns = 2
+	if !strings.Contains(url, "pool_max_conns=") { cfg.MaxConns = 20 }
+	if !strings.Contains(url, "pool_min_conns=") { cfg.MinConns = 2 }
+	// URL pool parameters are honored; environment overrides are explicit.
+	if err := configurePool(cfg); err != nil { return nil, err }
 	cfg.MaxConnLifetime = 30 * time.Minute
 
 	// Pin every session to Thailand civil time so CURRENT_DATE agrees with the
@@ -44,4 +50,21 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	return pool, nil
+}
+
+// configurePool rejects malformed capacity settings instead of quietly running
+// with a different connection budget. PgBouncer is not required.
+func configurePool(cfg *pgxpool.Config) error {
+	for _, setting := range []struct { name string; dst *int32 }{
+		{"DB_POOL_MAX_CONNS", &cfg.MaxConns},
+		{"DB_POOL_MIN_CONNS", &cfg.MinConns},
+	} {
+		if raw := os.Getenv(setting.name); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 0 || n > 200 { return fmt.Errorf("invalid %s", setting.name) }
+			*setting.dst = int32(n)
+		}
+	}
+	if cfg.MaxConns < 1 || cfg.MinConns > cfg.MaxConns { return fmt.Errorf("invalid database pool capacity") }
+	return nil
 }

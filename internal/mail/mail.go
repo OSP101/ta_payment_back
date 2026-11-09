@@ -82,7 +82,7 @@ func (m *Mailer) Send(to, subject, html string) error {
 
 func (m *Mailer) SendMessage(msg Message) error {
 	if m.cfg.SMTPHost == "" {
-		log.Printf("[mail-disabled] to=%s subject=%s", msg.To, msg.Subject)
+		log.Printf("[mail-disabled] delivery skipped")
 		return nil
 	}
 	to := stripCRLF(strings.TrimSpace(msg.To))

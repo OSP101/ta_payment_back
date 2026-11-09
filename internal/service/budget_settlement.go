@@ -1536,6 +1536,8 @@ func (c taSlotCost) gradLevel() bool {
 func (s *ExportService) claimCostByTASlot(
 	ctx context.Context, courseID uuid.UUID, pr PayRate, sittingsCTE string,
 ) ([]taSlotCost, error) {
+	cacheKey := ledgerCacheKey{s.pool, courseID, pr, sittingsCTE}
+	if cached, ok := cachedLedger(ctx, cacheKey); ok { return cached, nil }
 	rows, err := s.pool.Query(ctx, `WITH`+sittingsCTE+`,`+b2OverlapCTE(b2StatusFilter(sittingsCTE))+`,
 	sit AS (
 	    SELECT ta_id, work_date, start_time, end_time,
@@ -1608,7 +1610,9 @@ func (s *ExportService) claimCostByTASlot(
 	rows.Close()
 	// An exported month is priced from what its document said, not from the
 	// rate in force (export_month_ledger.go).
-	return s.frozenCostsFor(ctx, courseID, out)
+	costs, err := s.frozenCostsFor(ctx, courseID, out)
+	if err == nil { cacheLedger(ctx, cacheKey, costs) }
+	return costs, err
 }
 
 // slotLedger groups per-TA คาบ costs into the course-wide slots the cutoff

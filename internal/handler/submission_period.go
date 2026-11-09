@@ -519,7 +519,7 @@ func (h *SubmissionPeriodHandler) ServeEditFile(c *fiber.Ctx) error {
 	default:
 		c.Set("Content-Type", "application/octet-stream")
 	}
-	c.Set("Cache-Control", "private, max-age=3600")
+	c.Set("Cache-Control", "private, no-store")
 	c.Set("X-Content-Type-Options", "nosniff")
 	return c.Send(body)
 }

@@ -133,16 +133,25 @@ func Bootstrap(ctx context.Context, mainPool *pgxpool.Pool, cfg config.Config, p
 		// controls (never from request input), so interpolating it into DDL
 		// here carries no injection surface — there is nothing a caller
 		// could supply that reaches this string.
-		if _, err := mainPool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schemaName)); err != nil {
-			return nil, fmt.Errorf("demo: creating schema %s: %w", schemaName, err)
+		if cfg.AutoMigrate {
+			if _, err := mainPool.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schemaName)); err != nil {
+				return nil, fmt.Errorf("demo: creating schema %s: %w", schemaName, err)
+			}
 		}
 
 		slotPool, err := openSlotPool(ctx, cfg.DemoDatabaseURL, schemaName)
 		if err != nil {
 			return nil, fmt.Errorf("demo: connecting slot %d: %w", i, err)
 		}
-		if err := db.Migrate(ctx, slotPool, migrationsDir); err != nil {
-			return nil, fmt.Errorf("demo: migrating slot %d: %w", i, err)
+		var schemaErr error
+		if cfg.AutoMigrate {
+			schemaErr = db.Migrate(ctx, slotPool, migrationsDir)
+		} else {
+			schemaErr = db.CheckMigrations(ctx, slotPool, migrationsDir)
+		}
+		if schemaErr != nil {
+			slotPool.Close()
+			return nil, fmt.Errorf("demo: schema readiness slot %d: %w", i, schemaErr)
 		}
 
 		slotCfg := cfg
@@ -160,6 +169,7 @@ func Bootstrap(ctx context.Context, mainPool *pgxpool.Pool, cfg config.Config, p
 		// can see what WOULD have been sent) is phase 2 work; the log line
 		// is the phase 0 substitute.
 		slotCfg.SMTPHost = ""
+		slotCfg.AsyncNotifications = false
 		mailer := mail.New(slotCfg)
 
 		store, err := storage.NewLocalWithKey(filepath.Join(cfg.UploadDir, "demo", schemaName), encKey)
@@ -569,4 +579,10 @@ func pgxIdentifier(schema, table string) string {
 
 func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
+}
+
+// Close is called after the HTTP server drains. It does not close the registry
+// pool (owned by main), and never drops schemas or demo data.
+func (m *Manager) Close() {
+	for _, slot := range m.slots { slot.Pool.Close() }
 }

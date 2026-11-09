@@ -178,7 +178,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// every route it guards is already authenticated, so — unlike
 	// loginLimiter — this one has a real per-visitor identity to key on and
 	// does not inherit the trusted-proxy caveat at all.
-	heavyLimiter := limiter.New(limiter.Config{
+	heavyLimiter := heavyAdmission(limiter.New(limiter.Config{
 		Max:        15,
 		Expiration: time.Minute,
 		KeyGenerator: func(c *fiber.Ctx) string {
@@ -189,7 +189,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 				"error": "ทำรายการนี้บ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่",
 			})
 		},
-	})
+	}))
 
 	authed.Get("/me", editGuard, authH.Me)
 	authed.Get("/me/data-export", editGuard, authH.DataExport)
@@ -500,6 +500,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// Several assignments, one transaction — a TA on two sections is approved
 	// wholly or not at all. Not under /assignments/:id because the batch is the
 	// unit here, not any one assignment.
+	authed.Get("/worklog/read-batch", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, wl.ReadBatch)
 	authed.Post("/worklog/approve-batch", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, wl.ApproveBatch)
 	authed.Post("/assignments/:id/worklog/reject", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, wl.Reject)
 	// Lecturer corrections during review: fix or cut a submitted sitting with a
@@ -684,7 +685,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// reason + password + up to three evidence images, notifying the TA AND the
 	// lecturer whose approval is being overridden.
 	authed.Post("/submission-periods/courses/:tcId/tas/:taId/worklog-batch",
-		adminOrStaff, editGuard, spH.StaffEditBatch)
+		adminOrStaff, heavyLimiter, editGuard, spH.StaffEditBatch)
 	authed.Get("/submission-periods/courses/:tcId/tas/:taId/worklog-batches",
 		staffOrLecturer, editGuard, spH.StaffEditHistory)
 	authed.Get("/worklog-edit-files/*", staffOrLecturer, editGuard, spH.ServeEditFile)

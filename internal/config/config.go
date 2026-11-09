@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -13,10 +14,8 @@ import (
 )
 
 // LoadDotEnv reads a KEY=VALUE file and populates os.Environ for keys not
-// already set. Silently no-ops if the file doesn't exist. Exported so tools
-// outside this package (internal/testutil, in particular) can point a test
-// database connection at the same .env a developer already has, instead of
-// keeping a second, easily-stale copy of the same credentials in Go source.
+// already set. Silently no-ops if the file does not exist. Database tests
+// deliberately do not call this: they require an explicit TEST_DATABASE_URL.
 func LoadDotEnv(path string) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -68,6 +67,9 @@ func stripInlineComment(v string) string {
 type Config struct {
 	Port        string
 	DatabaseURL string
+	// AutoMigrate is disabled in the hardened stack: a separate owner job runs DDL.
+	AutoMigrate bool
+	AsyncNotifications bool
 	JWTSecret   string
 	JWTIssuer   string
 	JWTLifetime time.Duration
@@ -274,6 +276,8 @@ func Load() (Config, error) {
 	c := Config{
 		Port:        env("PORT", "8080"),
 		DatabaseURL: resolveDatabaseURL(),
+		AutoMigrate: envBool("AUTO_MIGRATE", true),
+		AsyncNotifications: envBool("ASYNC_NOTIFICATIONS", false),
 		JWTSecret:   env("JWT_SECRET", ""),
 		JWTIssuer:   env("JWT_ISSUER", "ta-payment"),
 		CORSOrigins: env("CORS_ORIGINS", "http://localhost:3000"),
@@ -398,6 +402,22 @@ func Load() (Config, error) {
 	// A scanner deployment can't be assumed for every dev machine, but
 	// production must never silently accept unscanned uploads — see
 	// internal/service.scanUpload and docker-compose.yml's clamav service.
+	if c.AppEnv == "production" {
+		for _, origins := range []string{c.AppBaseURL, c.CORSOrigins} {
+			for _, origin := range strings.Split(origins, ",") {
+				u, err := url.Parse(strings.TrimSpace(origin))
+				if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+					return c, fmt.Errorf("production application/CORS origins must be explicit HTTPS origins")
+				}
+			}
+		}
+	}
+	if c.AppEnv == "production" && len(c.JWTSecret) < 32 {
+		return c, fmt.Errorf("JWT_SECRET must contain at least 32 characters when APP_ENV=production")
+	}
+	if c.AppEnv == "production" && c.TADocsEncKey == "" {
+		return c, fmt.Errorf("TA_DOCS_ENC_KEY is required when APP_ENV=production")
+	}
 	if c.AppEnv == "production" && c.ClamAVAddr == "" {
 		return c, fmt.Errorf("CLAMAV_ADDR is required when APP_ENV=production")
 	}
@@ -488,8 +508,14 @@ func resolveDatabaseURL() string {
 	name := env("DB_NAME", "")
 	port := env("DB_PORT", "5432")
 	if host != "" && user != "" && name != "" {
-		return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-			user, pass, host, port, name)
+		u := &url.URL{Scheme: "postgres", User: url.UserPassword(user, pass), Host: net.JoinHostPort(host, port), Path: "/" + name}
+		q := u.Query()
+		q.Set("sslmode", env("DB_SSLMODE", "disable"))
+		if cert := env("DB_SSLROOTCERT", ""); cert != "" {
+			q.Set("sslrootcert", cert)
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
 	}
 	return "postgres://tapay:tapay@localhost:5432/tapay?sslmode=disable"
 }

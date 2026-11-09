@@ -3,7 +3,9 @@
 # Built by deploy/docker-compose.yml with context = this directory.
 # Cache mounts keep the module download and build cache across rebuilds, so a
 # redeploy after a small code change compiles in seconds instead of minutes.
-FROM golang:1.26-alpine AS build
+ARG GO_IMAGE=golang:1.26-alpine
+ARG RUNTIME_IMAGE=alpine:3.20
+FROM ${GO_IMAGE} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -11,14 +13,16 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/api ./ && \
-    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/seed ./cmd/seed
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/seed ./cmd/seed && \
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/migrate ./cmd/migrate
 
-FROM alpine:3.20
+FROM ${RUNTIME_IMAGE}
 RUN apk add --no-cache ca-certificates tzdata
 ENV TZ=Asia/Bangkok
 WORKDIR /app
 COPY --from=build /out/api /app/api
 COPY --from=build /out/seed /app/seed
+COPY --from=build /out/migrate /app/migrate
 COPY migrations /app/migrations
 COPY assets /app/assets
 # UPLOAD_DIR in compose points here; the named volume inherits this ownership

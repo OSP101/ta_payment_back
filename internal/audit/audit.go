@@ -2,7 +2,6 @@ package audit
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -79,7 +78,7 @@ func write(ctx context.Context, q execer, e Entry) error {
 	var before, after []byte
 	if e.Before != nil {
 		var err error
-		if before, err = json.Marshal(e.Before); err != nil {
+		if before, err = marshalAuditValue(e.Before); err != nil {
 			// Marshalling used to be `_`-ignored, which turned an unencodable
 			// value into a NULL `before` column — an audit row that looks
 			// complete and has quietly lost the thing it was recording.
@@ -88,7 +87,7 @@ func write(ctx context.Context, q execer, e Entry) error {
 	}
 	if e.After != nil {
 		var err error
-		if after, err = json.Marshal(e.After); err != nil {
+		if after, err = marshalAuditValue(e.After); err != nil {
 			return fmt.Errorf("audit %s: encode after: %w", e.Action, err)
 		}
 	}

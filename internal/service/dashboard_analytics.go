@@ -130,6 +130,7 @@ type TermAnalytics struct {
 // Analytics builds the executive view for one term (nil = active/newest, same
 // resolution as Executive). Read-only.
 func (s *DashboardService) Analytics(ctx context.Context, termID *uuid.UUID, budget *BudgetService, export *ExportService) (*TermAnalytics, error) {
+	ctx = withDashboardCache(ctx)
 	out := &TermAnalytics{ElapsedPct: -1, NearCapRatio: NearCapRatio}
 
 	var (

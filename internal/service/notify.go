@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgconn"
+	"ta-payment-back/internal/pii"
 
 	"ta-payment-back/internal/mail"
 )
@@ -14,6 +17,7 @@ import (
 type NotifyService struct {
 	pool   *pgxpool.Pool
 	mailer *mail.Mailer
+	queueCipher *pii.Cipher
 	// baseURL is the first address of config.AppBaseURL. Links are stored as in-app paths
 	// ("/lecturer"), which the bell resolves against the current origin; a mail
 	// client has no origin, so the e-mail copy needs the absolute URL.
@@ -64,6 +68,16 @@ func (s *NotifyService) SendLaidOut(ctx context.Context, userID uuid.UUID, title
 }
 
 func (s *NotifyService) deliver(ctx context.Context, userID uuid.UUID, title, body, link, closing string, layout MailLayout) {
+	if s.queueCipher != nil {
+		if err := s.enqueue(ctx, userID, title, body, link, closing, layout); err != nil {
+			if errors.Is(err, errNoticeTooLarge) {
+				_ = s.deliverChecked(ctx, userID, title, body, link, closing, layout, true)
+				return
+			}
+			log.Printf("notify enqueue failed")
+		}
+		return
+	}
 	// Failures are logged where they happen; ordinary notices are best-effort.
 	_ = s.deliverChecked(ctx, userID, title, body, link, closing, layout, true)
 }
@@ -108,6 +122,14 @@ func (s *NotifyService) deliverChecked(ctx context.Context, userID uuid.UUID, ti
 
 func (s *NotifyService) writeInApp(ctx context.Context, userID uuid.UUID, title, body string, linkArg any) error {
 
+	return writeInAppWith(ctx, s.pool, userID, title, body, linkArg)
+}
+
+type notificationExec interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func writeInAppWith(ctx context.Context, q notificationExec, userID uuid.UUID, title, body string, linkArg any) error {
 	// in-app row — the source of truth for the bell/inbox.
 	//
 	// An UNREAD notice with the same title and link is REFRESHED rather than
@@ -118,7 +140,7 @@ func (s *NotifyService) writeInApp(ctx context.Context, userID uuid.UUID, title,
 	// TA actually reads, carrying the newest reason and moving back to the top.
 	//
 	// Only while unread: once they have seen it, a later notice is news again.
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := q.Exec(ctx, `
 		UPDATE notifications
 		SET body = $3, link = $4, created_at = NOW()
 		WHERE user_id = $1 AND channel = 'in_app' AND read_at IS NULL
@@ -129,7 +151,7 @@ func (s *NotifyService) writeInApp(ctx context.Context, userID uuid.UUID, title,
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := s.pool.Exec(ctx,
+		if _, err := q.Exec(ctx,
 			`INSERT INTO notifications (id, user_id, channel, title, body, link)
 			 VALUES (gen_random_uuid(), $1, 'in_app', $2, $3, $4)`,
 			userID, title, body, linkArg); err != nil {
@@ -149,7 +171,7 @@ func (s *NotifyService) sendEmail(ctx context.Context, userID uuid.UUID, title, 
 		       COALESCE(u.first_name, ''), COALESCE(u.last_name, '')
 		  FROM users u
 		  LEFT JOIN ta_profiles tp ON tp.user_id = u.id
-		 WHERE u.id = $1`, userID).Scan(&email, &prefix, &first, &last); err != nil {
+		 WHERE u.id = $1 AND u.deleted_at IS NULL AND u.is_active`, userID).Scan(&email, &prefix, &first, &last); err != nil {
 		return err
 	}
 	// Manual links are in-app paths too; the mail client needs them absolute.

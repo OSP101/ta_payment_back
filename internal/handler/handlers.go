@@ -109,16 +109,7 @@ func (h *UserHandler) Update(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	// A role edit changes what the target's EXISTING token is allowed to do —
-	// roles ride in the JWT claims (see Login), so the already-issued token
-	// keeps the old roles until it expires unless the session behind it is
-	// revoked. Only when roles were actually part of this request: this
-	// handler also carries profile-field edits that have no such stake.
-	if in.Roles != nil {
-		if err := h.Svc.Sessions.RevokeAllForUser(c.Context(), id, "roles_changed"); err != nil {
-			return err
-		}
-	}
+	// Users.Update revokes sessions in the role-update transaction.
 	return c.JSON(u)
 }
 
@@ -3154,7 +3145,21 @@ func (h *AnnounceHandler) UploadMedia(c *fiber.Ctx) error {
 
 // ServeMedia streams an attachment to a signed-in reader.
 func (h *AnnounceHandler) ServeMedia(c *fiber.Ctx) error {
+	if err := h.authorizeMedia(c, c.Params("*")); err != nil {
+		return err
+	}
 	return serveAnnounceMedia(c, h.Svc, c.Params("*"), false)
+}
+
+func (h *AnnounceHandler) authorizeMedia(c *fiber.Ctx, key string) error {
+	visible, err := h.Svc.Announce.MediaVisibleTo(c.Context(), UserID(c), key)
+	if err != nil {
+		return err
+	}
+	if !visible {
+		return fiber.NewError(fiber.StatusNotFound, "ไม่พบไฟล์")
+	}
+	return nil
 }
 
 // ServePublicMedia streams an attachment to anyone, but only when the
@@ -3301,6 +3306,9 @@ func (h *AnnounceHandler) UploadImage(c *fiber.Ctx) error {
 // per announcement is stable enough that a small cache saves round trips.
 func (h *AnnounceHandler) ServeImage(c *fiber.Ctx) error {
 	key := c.Params("*")
+	if err := h.authorizeMedia(c, key); err != nil {
+		return err
+	}
 	if key == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "key required")
 	}
@@ -3320,7 +3328,11 @@ func (h *AnnounceHandler) ServeImage(c *fiber.Ctx) error {
 	}
 	// Content-Type from stored extension. Strip the encryption suffix.
 	k := strings.TrimSuffix(key, ".enc")
-	switch strings.ToLower(k[strings.LastIndex(k, "."):]) {
+	ext := ""
+	if dot := strings.LastIndex(k, "."); dot >= 0 {
+		ext = strings.ToLower(k[dot:])
+	}
+	switch ext {
 	case ".jpg", ".jpeg":
 		c.Set("Content-Type", "image/jpeg")
 	case ".png":

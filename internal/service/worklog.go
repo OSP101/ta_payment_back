@@ -4067,6 +4067,14 @@ func (s *WorkLogService) ApproveMany(ctx context.Context, actor uuid.UUID, assig
 	}
 	defer tx.Rollback(ctx)
 
+	tas := make([]uuid.UUID, 0, len(ids))
+	for _, id := range ids {
+		tas = append(tas, ctxs[id].TAID)
+	}
+	if err := lockApprovalTAs(ctx, tx, tas); err != nil {
+		return err
+	}
+
 	// Serialize on every course involved, so two reviewers cannot both push the
 	// same course over budget. Sorted to give every caller the same lock order
 	// and rule out a deadlock between two overlapping batches.
@@ -4179,6 +4187,10 @@ func (s *WorkLogService) Approve(ctx context.Context, actor, assignmentID uuid.U
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	if err := lockApprovalTAs(ctx, tx, []uuid.UUID{ac.TAID}); err != nil {
+		return err
+	}
 
 	// The before-image is the set of rows this statement is about to move —
 	// same pattern as ApproveMany/Reject, and needed for the same reason: the

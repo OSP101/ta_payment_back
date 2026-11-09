@@ -65,6 +65,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	// IP); e-mail links take the first, as the SSO redirect does. The whole
 	// list used to be prepended, giving "http://a,http://b/ta" links.
 	c.Notify = &NotifyService{pool: pool, mailer: mailer, baseURL: config.PrimaryBaseURL(cfg.AppBaseURL)}
+	if cfg.AsyncNotifications { c.Notify.queueCipher = piiCipher }
 	c.Users.notify = c.Notify
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}
 	c.Budget = &BudgetService{pool: pool}

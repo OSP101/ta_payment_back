@@ -21,6 +21,8 @@ import (
 // Every authenticated API route passes through this guard AFTER its role
 // checks. Versions are maintained by database triggers, not by the browser.
 // No request payload, password, national ID or response body is retained.
+var editConnections = make(chan struct{}, 8)
+
 func ConcurrentEdits(pool *pgxpool.Pool, secret string) fiber.Handler {
 	if secret == "" {
 		secret = "test-only-edit-snapshots"
@@ -53,7 +55,16 @@ func ConcurrentEdits(pool *pgxpool.Pool, secret string) fiber.Handler {
 		}
 		// A separate session avoids exhausting the service pool: handlers acquire
 		// their own connections while this session holds the advisory lock.
-		conn, err := pgx.ConnectConfig(c.Context(), pool.Config().ConnConfig.Copy())
+		select {
+		case editConnections <- struct{}{}:
+			defer func() { <-editConnections }()
+		default:
+			c.Set("Retry-After", "2")
+			return fiber.NewError(fiber.StatusServiceUnavailable, "ระบบกำลังประมวลผล กรุณาลองใหม่สักครู่")
+		}
+		connectCtx, connectCancel := context.WithTimeout(c.Context(), 5*time.Second)
+		conn, err := pgx.ConnectConfig(connectCtx, pool.Config().ConnConfig.Copy())
+		connectCancel()
 		if err != nil {
 			return err
 		}
@@ -466,7 +477,7 @@ func editScopes(c *fiber.Ctx, pool *pgxpool.Pool) (string, []string) {
 	read := []string{scope}
 	// Aggregate review screens read course data across a term; the token is
 	// checked against the individual course's transaction when it is edited.
-	if c.Method() == fiber.MethodGet && (root == "submission-periods" || root == "ta-requests" || root == "exports" || root == "document-progress" || root == "terms" || root == "staff") {
+	if c.Method() == fiber.MethodGet && (root == "worklog" || root == "submission-periods" || root == "ta-requests" || root == "exports" || root == "document-progress" || root == "terms" || root == "staff") {
 		read = append(read, "course:*")
 	}
 	if c.Method() == fiber.MethodGet && (root == "ta-request" || root == "submission-periods") {

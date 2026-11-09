@@ -30,6 +30,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 	go s.loop(ctx)
 }
 
+// Run blocks until cancellation. Main joins it before closing its DB pool.
+func (s *Scheduler) Run(ctx context.Context) { s.loop(ctx) }
+
 // loop fires every hour: sweep due-window reminders, once-daily auto-close.
 // A short 5s startup jitter prevents thundering-herd on cold-start.
 func (s *Scheduler) loop(ctx context.Context) {

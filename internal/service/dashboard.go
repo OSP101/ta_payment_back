@@ -239,22 +239,42 @@ func (s *DashboardService) TaOverview(ctx context.Context, taID uuid.UUID, enrol
 		default:
 			r.Stage = "draft"
 		}
-		if r.Level == "master" || r.Level == "phd" {
-			_ = s.pool.QueryRow(ctx, `
-				SELECT COALESCE(MAX(LEAST(pay_rates.graduate_special_lumpsum, pay_rates.grad_special_term_cap)), 0)
-				  FROM ta_request_assignments a
-				  JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
-				  JOIN sections sec  ON sec.id = a.section_id AND sec.track = 'special'
-				  CROSS JOIN `+payRatesInForce+`
-				 WHERE a.ta_id = $1 AND sec.teaching_course_id = $2
-				   AND a.level::text IN ('master','phd') AND a.state <> 'dropped'`, taID, r.TeachingCourseID).Scan(&r.LumpsumBaht)
-		}
+
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	rows.Close()
+
+	// Fetch graduate special amounts for all visible courses in one query,
+	// after releasing the parent result set (also works with a one-conn pool).
+	var graduateIDs []uuid.UUID
+	for _, c := range out { if c.Level == "master" || c.Level == "phd" { graduateIDs = append(graduateIDs, c.TeachingCourseID) } }
+	if len(graduateIDs) > 0 {
+		lumps, err := s.pool.Query(ctx, `
+		    SELECT sec.teaching_course_id,
+		           COALESCE(MAX(LEAST(pay_rates.graduate_special_lumpsum, pay_rates.grad_special_term_cap)),0)
+		    FROM ta_request_assignments a
+		    JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
+		    JOIN sections sec ON sec.id=a.section_id AND sec.track='special'
+		    CROSS JOIN `+payRatesInForce+`
+		    WHERE a.ta_id=$1 AND sec.teaching_course_id=ANY($2::uuid[])
+		      AND a.level::text IN ('master','phd') AND a.state<>'dropped'
+		    GROUP BY sec.teaching_course_id`, taID, graduateIDs)
+		if err != nil { return nil, err }
+		amounts := map[uuid.UUID]float64{}
+		for lumps.Next() {
+			var id uuid.UUID; var amount float64
+			if err := lumps.Scan(&id, &amount); err != nil { lumps.Close(); return nil, err }
+			amounts[id] = amount
+		}
+		lumps.Close()
+		if err := lumps.Err(); err != nil { return nil, err }
+		for i := range out {
+			if out[i].Level == "master" || out[i].Level == "phd" { out[i].LumpsumBaht = amounts[out[i].TeachingCourseID] }
+		}
+	}
 
 	// Price the approved work with the claim's own ledger, as budget.go does
 	// for the lecturer card. The sitting sums above are kept only as a

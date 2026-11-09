@@ -54,11 +54,11 @@ func (t *TokenService) Issue(userID uuid.UUID, roles []string, sessionID uuid.UU
 
 func (t *TokenService) Parse(raw string) (*Claims, error) {
 	tok, err := jwt.ParseWithClaims(raw, &Claims{}, func(tk *jwt.Token) (interface{}, error) {
-		if _, ok := tk.Method.(*jwt.SigningMethodHMAC); !ok {
+		if tk.Method != jwt.SigningMethodHS256 {
 			return nil, errors.New("unexpected signing method")
 		}
 		return t.secret, nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(t.issuer), jwt.WithExpirationRequired())
 	if err != nil {
 		return nil, err
 	}

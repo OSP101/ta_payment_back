@@ -251,11 +251,16 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	// SMTP exchange per lecturer would hold the download for minutes, and the
 	// round is already recorded, so nothing here can change what staff got.
 	if s.notify != nil {
-		go func() {
-			bg, cancel := context.WithTimeout(context.Background(), lecturerNoticeTimeout)
+		notify := func(parent context.Context) {
+			bg, cancel := context.WithTimeout(parent, lecturerNoticeTimeout)
 			defer cancel()
 			s.notifyLecturersAppointed(bg, in.TermID, round, pairs, doc, docxBytes, name)
-		}()
+		}
+		if !backgroundJobs.start(notify) {
+			// Preserve delivery on saturation, bounded by this authenticated
+			// request's heavy-operation slot instead of spawning another worker.
+			notify(ctx)
+		}
 	}
 	return docxBytes, name, nil
 }

@@ -255,6 +255,9 @@ func (s *DataDeletionService) ReviewDeletion(ctx context.Context, actor, request
 		WHERE id = $1`, userID); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `DELETE FROM notification_outbox WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM mfa_recovery_codes WHERE user_id = $1`, userID); err != nil {
 		return err
 	}
