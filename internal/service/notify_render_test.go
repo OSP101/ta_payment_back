@@ -103,7 +103,7 @@ func TestMailCopyright(t *testing.T) {
 	defer func(f func() time.Time) { mailNow = f }(mailNow)
 	mailNow = func() time.Time { return time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC) }
 	m := mailContent{Title: "t", Body: "b", Recipient: "คุณก ข", Closing: closingInform}
-	en := "© 2026 College of Computing, Khon Kaen University. All rights reserved."
+	en := "© 2026 College of Computing, Khon Kaen University. All rights reserved. Powered by ITII Development Team"
 	for name, out := range map[string]string{"html": renderMailHTML(m), "text": renderMailText(m)} {
 		if !strings.Contains(out, en) {
 			t.Errorf("%s missing the copyright line", name)

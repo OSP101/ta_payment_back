@@ -335,9 +335,8 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE users SET student_id = $2, phone = $3, updated_at = NOW() WHERE id = $1`,
-		userID, sid, phone); err != nil {
+	// Match Upload's lock order, including when the profile does not exist yet.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, userID.String()); err != nil {
 		return err
 	}
 
@@ -347,7 +346,7 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 	var prevStatus string
 	var prevRound int
 	err = tx.QueryRow(ctx,
-		`SELECT status::text, current_round FROM ta_profiles WHERE user_id = $1`, userID,
+		`SELECT status::text, current_round FROM ta_profiles WHERE user_id = $1 FOR UPDATE`, userID,
 	).Scan(&prevStatus, &prevRound)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -360,6 +359,23 @@ func (s *DocsService) UpsertProfile(ctx context.Context, userID uuid.UUID, in TA
 		// A UserError, not a bare error: this is an expected refusal the TA should
 		// read, and a bare error surfaced as a 500 with English text.
 		return Conflict("โปรไฟล์ได้รับการอนุมัติแล้ว หากต้องการแก้ไข กรุณาติดต่อเจ้าหน้าที่เพื่อเปิดแก้ไข")
+	}
+
+	// These fields produce the creditor form: accepting a correction to an
+	// unrelated attachment must not allow changes behind its approved PDF.
+	var creditorStatus string
+	err = tx.QueryRow(ctx, `SELECT status::text FROM ta_documents
+		WHERE user_id=$1 AND kind='creditor_form' AND superseded_at IS NULL FOR UPDATE`, userID).Scan(&creditorStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if creditorStatus == "approved" {
+		return Conflict("แบบแจ้งเจ้าหนี้ได้รับการอนุมัติแล้ว หากต้องการแก้ไขข้อมูลส่วนตัว บัญชี หรือลายเซ็น กรุณาติดต่อเจ้าหน้าที่เพื่อตีกลับเอกสารนี้ก่อน")
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE users SET student_id = $2, phone = $3, updated_at = NOW() WHERE id = $1`,
+		userID, sid, phone); err != nil {
+		return err
 	}
 
 	// Keep ta_enrollments (migration 0094) in sync with this self-service
@@ -686,34 +702,68 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 		return uuid.Nil, Invalid("ไฟล์ PDF นี้เสียหาย ตั้งรหัสผ่านไว้ หรือเปิดอ่านไม่ได้ กรุณาบันทึกหรือส่งออกเป็น PDF ใหม่ (ไม่ตั้งรหัสผ่าน) แล้วอัปโหลดอีกครั้ง")
 	}
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Serialize uploads even before a profile/current document exists. The
+	// profile lock is shared with staff approval/rejection transactions.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, userID.String()); err != nil {
+		return uuid.Nil, err
+	}
+	var profileStatus string
+	err = tx.QueryRow(ctx, `SELECT status::text FROM ta_profiles WHERE user_id=$1 FOR UPDATE`, userID).Scan(&profileStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, err
+	}
+	if profileStatus == "approved" {
+		return uuid.Nil, Conflict("โปรไฟล์ได้รับการอนุมัติแล้ว หากต้องการแก้ไขเอกสาร กรุณาติดต่อเจ้าหน้าที่เพื่อเปิดแก้ไข")
+	}
+
+	var prevID uuid.UUID
+	var prevRound int
+	var prevStatus, prevKey string
+	err = tx.QueryRow(ctx, `
+		SELECT id, round, status::text, storage_key FROM ta_documents
+		WHERE user_id = $1 AND kind = $2 AND superseded_at IS NULL FOR UPDATE`,
+		userID, kind,
+	).Scan(&prevID, &prevRound, &prevStatus, &prevKey)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		prevRound = 0
+	case err != nil:
+		return uuid.Nil, err
+	}
+	if prevStatus == "approved" {
+		return uuid.Nil, Conflict("เอกสารนี้ได้รับการอนุมัติแล้ว หากต้องการแก้ไข กรุณาติดต่อเจ้าหน้าที่เพื่อตีกลับเอกสาร")
+	}
+	// A retry of a pending upload is the same submission, including when the
+	// file was renamed. Rejected documents may be deliberately resubmitted.
+	if prevStatus == "submitted" {
+		previous, err := s.store.Open(prevKey)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		old, readErr := io.ReadAll(io.LimitReader(previous, maxDocBytes+1))
+		closeErr := previous.Close()
+		if readErr != nil {
+			return uuid.Nil, readErr
+		}
+		if closeErr != nil {
+			return uuid.Nil, closeErr
+		}
+		if bytes.Equal(old, buf) {
+			return prevID, nil
+		}
+	}
+
 	key, savedSize, err := s.store.Save("ta_docs", filename, bytes.NewReader(buf))
 	if err != nil {
 		return uuid.Nil, err
 	}
 	size = savedSize
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		_ = s.store.Delete(key)
-		return uuid.Nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	// Find current round (if any) for this (user, kind).
-	var prevID uuid.UUID
-	var prevRound int
-	err = tx.QueryRow(ctx, `
-		SELECT id, round FROM ta_documents
-		WHERE user_id = $1 AND kind = $2 AND superseded_at IS NULL`,
-		userID, kind,
-	).Scan(&prevID, &prevRound)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		prevRound = 0
-	case err != nil:
-		_ = s.store.Delete(key)
-		return uuid.Nil, err
-	}
 
 	newRound := 1
 	if prevRound > 0 {
@@ -846,25 +896,15 @@ func (s *DocsService) OpenStored(ctx context.Context, id uuid.UUID) (rc io.ReadC
 	return rc, filename, mime, ownerID, err
 }
 
-func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approve bool, reason string) error {
-	reason = strings.TrimSpace(reason)
-	// Every refusal below is something an officer can trigger from the UI (a
-	// whitespace-only reason, an old tab after the TA re-uploaded), so each is
-	// a Thai UserError — the English errors.New these used to be reached the
-	// officer as a bare "ระบบขัดข้อง" 500.
-	if !approve && reason == "" {
-		return Invalid("กรุณาระบุเหตุผลที่ตีกลับเอกสาร")
-	}
-	status := "approved"
-	if !approve {
-		status = "rejected"
-	}
+// assertReviewableDocument must run after taking the owner's profile lock.
+// An officer's stale tab must never approve/reject a superseded revision.
+func assertReviewableDocument(ctx context.Context, tx pgx.Tx, docID uuid.UUID, approve bool) error {
 	// Guard: cannot review a superseded doc — that would silently rewrite
 	// history and break the audit trail.
 	var superseded bool
 	var curStatus string
-	err := s.pool.QueryRow(ctx,
-		`SELECT superseded_at IS NOT NULL, status::text FROM ta_documents WHERE id = $1`, docID,
+	err := tx.QueryRow(ctx,
+		`SELECT superseded_at IS NOT NULL, status::text FROM ta_documents WHERE id = $1 FOR UPDATE`, docID,
 	).Scan(&superseded, &curStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return NotFound("ไม่พบเอกสารนี้ อาจถูกลบไปแล้ว กรุณารีเฟรชหน้า")
@@ -882,6 +922,23 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 		return Conflict("เอกสารนี้ถูกตีกลับแล้ว ต้องรอให้ TA อัปโหลดฉบับใหม่ก่อนจึงจะอนุมัติได้")
 	}
 
+	return nil
+}
+
+func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approve bool, reason string) error {
+	reason = strings.TrimSpace(reason)
+	// Every refusal below is something an officer can trigger from the UI (a
+	// whitespace-only reason, an old tab after the TA re-uploaded), so each is
+	// a Thai UserError — the English errors.New these used to be reached the
+	// officer as a bare "ระบบขัดข้อง" 500.
+	if !approve && reason == "" {
+		return Invalid("กรุณาระบุเหตุผลที่ตีกลับเอกสาร")
+	}
+	status := "approved"
+	if !approve {
+		status = "rejected"
+	}
+
 	if !approve {
 		// A transaction for a single UPDATE, so the rejection and the record of
 		// it land together — the approve branch below already works that way,
@@ -894,9 +951,15 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 		defer tx.Rollback(ctx)
 		var owner uuid.UUID
 		if err := tx.QueryRow(ctx, `SELECT user_id FROM ta_documents WHERE id=$1`, docID).Scan(&owner); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return NotFound("ไม่พบเอกสารนี้ อาจถูกลบไปแล้ว กรุณารีเฟรชหน้า")
+			}
 			return err
 		}
 		if _, err := tx.Exec(ctx, `SELECT user_id FROM ta_profiles WHERE user_id=$1 FOR UPDATE`, owner); err != nil {
+			return err
+		}
+		if err := assertReviewableDocument(ctx, tx, docID, approve); err != nil {
 			return err
 		}
 		var rejUserID uuid.UUID
@@ -955,9 +1018,15 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 	// final approvals see each other's committed verdicts.
 	var owner uuid.UUID
 	if err := tx.QueryRow(ctx, `SELECT user_id FROM ta_documents WHERE id=$1`, docID).Scan(&owner); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return NotFound("ไม่พบเอกสารนี้ อาจถูกลบไปแล้ว กรุณารีเฟรชหน้า")
+		}
 		return err
 	}
 	if _, err := tx.Exec(ctx, `SELECT user_id FROM ta_profiles WHERE user_id=$1 FOR UPDATE`, owner); err != nil {
+		return err
+	}
+	if err := assertReviewableDocument(ctx, tx, docID, approve); err != nil {
 		return err
 	}
 
@@ -1156,13 +1225,15 @@ func (s *DocsService) ReviewProfile(ctx context.Context, actor, userID uuid.UUID
 //	"approved"             → approved, most recently verified first
 //	"rejected"             → rejected, most recently verified first
 type PendingProfile struct {
-	UserID      uuid.UUID `json:"user_id"`
-	FullName    string    `json:"full_name"`
-	Email       string    `json:"email"`
-	Status      string    `json:"status"`
-	Round       int       `json:"round"`
-	SubmittedAt *string   `json:"submitted_at,omitempty"`
-	VerifiedAt  *string   `json:"verified_at,omitempty"`
+	// RevisionPending distinguishes corrected documents awaiting staff from first submissions.
+	RevisionPending bool      `json:"revision_pending"`
+	UserID          uuid.UUID `json:"user_id"`
+	FullName        string    `json:"full_name"`
+	Email           string    `json:"email"`
+	Status          string    `json:"status"`
+	Round           int       `json:"round"`
+	SubmittedAt     *string   `json:"submitted_at,omitempty"`
+	VerifiedAt      *string   `json:"verified_at,omitempty"`
 	// EarliestExpiresAt is the soonest expires_at among the TA's current
 	// approved required docs. Only meaningful for the approved bucket —
 	// null in pending/rejected. The FE uses it to show "จะลบใน N วัน".
@@ -1287,7 +1358,26 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		       COALESCE(p.current_round, 1), p.completed_at, p.verified_at,
 		       d.earliest_expires_at, COALESCE(d.all_deleted, FALSE),
 		       COALESCE(dl.used, 0), COALESCE(dl.ever, FALSE), `+docsIn+`,
-		       COALESCE(`+docsNeeded+`, 0), u.nationality = 'foreign'
+		       COALESCE(`+docsNeeded+`, 0), u.nationality = 'foreign',
+		       COALESCE(p.status IN ('submitted','needs_fix'), FALSE)
+		       AND NOT EXISTS (
+		           SELECT 1 FROM ta_documents current_doc
+		           WHERE current_doc.user_id = u.id AND current_doc.superseded_at IS NULL
+		             AND current_doc.kind = ANY(ta_required_doc_kinds(u.id))
+		             AND current_doc.status IN ('rejected','needs_fix')
+		       )
+		       AND EXISTS (
+		           SELECT 1 FROM ta_documents corrected
+		           WHERE corrected.user_id = u.id AND corrected.superseded_at IS NULL
+		             AND corrected.kind = ANY(ta_required_doc_kinds(u.id))
+		             AND corrected.status = 'submitted'
+		             AND EXISTS (
+		                 SELECT 1 FROM ta_documents previous
+		                 WHERE previous.user_id = corrected.user_id AND previous.kind = corrected.kind
+		                   AND previous.superseded_at IS NOT NULL AND previous.round < corrected.round
+		                   AND previous.status IN ('rejected','needs_fix')
+		             )
+		       )
 		FROM users u
 		LEFT JOIN ta_profiles p ON p.user_id = u.id
 		LEFT JOIN LATERAL (
@@ -1321,7 +1411,7 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		var completedAt, verifiedAt, earliestExp *time.Time
 		if err := rows.Scan(&p.UserID, &p.FullName, &p.Email, &p.Status, &p.Round,
 			&completedAt, &verifiedAt, &earliestExp, &p.AllFilesDeleted,
-			&p.DownloadsUsed, &p.EverDownloaded, &p.DocsIn, &p.DocsNeeded, &p.Foreign); err != nil {
+			&p.DownloadsUsed, &p.EverDownloaded, &p.DocsIn, &p.DocsNeeded, &p.Foreign, &p.RevisionPending); err != nil {
 			return nil, err
 		}
 		p.DownloadsLimit = policy.DownloadLimit

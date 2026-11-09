@@ -284,3 +284,56 @@ func TestListReview_SupersededDocumentDoesNotCount(t *testing.T) {
 		t.Errorf("docs_in = %d, want 2", p.DocsIn)
 	}
 }
+
+func TestListReview_RevisionPending(t *testing.T) {
+	svc := completenessSvc(t)
+	ctx := context.Background()
+	ta := docReviewFixture(t, svc.pool, "แก้ไขเอกสาร", requiredDocKinds...)
+	assertPending := func(want bool) {
+		t.Helper()
+		row, ok := listIDs(t, svc, "pending")[ta]
+		if !ok || row.RevisionPending != want {
+			t.Fatalf("review row present=%v revision_pending=%v, want %v", ok, row.RevisionPending, want)
+		}
+	}
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := svc.pool.Exec(ctx, sql, ta); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertPending(false) // First submission.
+	exec(`UPDATE ta_profiles SET status='needs_fix' WHERE user_id=$1`)
+	exec(`UPDATE ta_documents SET status='rejected' WHERE user_id=$1 AND kind IN ('national_id','bank_book')`)
+	assertPending(false) // Still waiting for the TA.
+	replace := func(kind string) {
+		t.Helper()
+		if _, err := svc.pool.Exec(ctx, `
+			WITH old AS (
+			    UPDATE ta_documents SET superseded_at=NOW()
+			    WHERE user_id=$1 AND kind=$2 AND superseded_at IS NULL RETURNING *
+			)
+			INSERT INTO ta_documents (id,user_id,kind,filename,mime,size_bytes,storage_key,status,round)
+			SELECT $3,user_id,kind,filename,mime,size_bytes,storage_key,'submitted',round+1 FROM old`,
+			ta, kind, uuid.New()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replace("national_id")
+	assertPending(false) // A second rejected file still needs fixing.
+	replace("bank_book")
+	assertPending(true) // All requested corrections are back, profile still needs_fix.
+	exec(`UPDATE ta_profiles SET status='submitted' WHERE user_id=$1`)
+	assertPending(true) // Saving the profile must not lose the revision label.
+	exec(`UPDATE ta_documents SET status='approved' WHERE user_id=$1 AND kind='national_id' AND superseded_at IS NULL`)
+	assertPending(true) // Remains until the last corrected document is reviewed.
+	exec(`UPDATE ta_documents SET status='rejected' WHERE user_id=$1 AND kind='bank_book' AND superseded_at IS NULL`)
+	assertPending(false) // Another rejection returns the work to the TA.
+	replace("bank_book")
+	assertPending(true)
+	exec(`UPDATE ta_documents SET status='approved' WHERE user_id=$1 AND superseded_at IS NULL`)
+	exec(`UPDATE ta_profiles SET status='approved' WHERE user_id=$1`)
+	if row := listIDs(t, svc, "approved")[ta]; row.RevisionPending {
+		t.Fatal("approved documents must not show awaiting revision review")
+	}
+}

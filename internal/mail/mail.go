@@ -139,7 +139,12 @@ func buildMessage(from string, msg Message, now time.Time) ([]byte, error) {
 	// Q-encode the subject: it doubles as the CRLF guard (encoded form has no
 	// raw newlines) and fixes Thai subjects, which are naked UTF-8 on a header
 	// line without it — some receivers render that as mojibake.
-	subject := mime.QEncoding.Encode("utf-8", stripCRLF(msg.Subject))
+	subjectText := strings.TrimSpace(stripCRLF(msg.Subject))
+	const subjectPrefix = "[COCO TAS]"
+	if subjectText != subjectPrefix && !strings.HasPrefix(subjectText, subjectPrefix+" ") {
+		subjectText = strings.TrimSpace(subjectPrefix + " " + subjectText)
+	}
+	subject := mime.QEncoding.Encode("utf-8", subjectText)
 
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "From: %s\r\nTo: %s\r\nSubject: %s\r\n", from, to, subject)

@@ -51,7 +51,7 @@ func TestBuildMessage_Structure(t *testing.T) {
 		t.Errorf("Date=%q Message-ID=%q", m.Header.Get("Date"), m.Header.Get("Message-ID"))
 	}
 	dec := new(mime.WordDecoder)
-	if s, _ := dec.DecodeHeader(m.Header.Get("Subject")); s != "แจ้งผลการพิจารณา" {
+	if s, _ := dec.DecodeHeader(m.Header.Get("Subject")); s != "[COCO TAS] แจ้งผลการพิจารณา" {
 		t.Errorf("subject decodes to %q", s)
 	}
 	types := partTypes(t, m.Header.Get("Content-Type"), m.Body)
@@ -64,6 +64,36 @@ func TestBuildMessage_Structure(t *testing.T) {
 	m, _ = netmail.ReadMessage(bytes.NewReader(raw))
 	if got := partTypes(t, m.Header.Get("Content-Type"), m.Body); strings.Join(got, ",") != "text/html" {
 		t.Errorf("logo attached although unreferenced: %v", got)
+	}
+}
+
+func TestBuildMessage_SubjectPrefix(t *testing.T) {
+	cases := []struct{ subject, want string }{
+		{"ผลการตรวจเอกสาร ผ่าน 2 รายการ ต้องแก้ไข 1 รายการ", "[COCO TAS] ผลการตรวจเอกสาร ผ่าน 2 รายการ ต้องแก้ไข 1 รายการ"},
+		{"[COCO TAS] แจ้งเตือน", "[COCO TAS] แจ้งเตือน"},
+		{"  แจ้งเตือน  ", "[COCO TAS] แจ้งเตือน"},
+		{"", "[COCO TAS]"},
+		{"[COCO TAS]", "[COCO TAS]"},
+		{"แจ้งเตือน\r\nBcc: attacker@example.test", "[COCO TAS] แจ้งเตือน Bcc: attacker@example.test"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.subject, func(t *testing.T) {
+			raw, err := buildMessage("no-reply@example.test", Message{To: "a@example.test", Subject: tc.subject, HTML: "<p>x</p>"}, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := netmail.ReadMessage(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := new(mime.WordDecoder).DecodeHeader(msg.Header.Get("Subject"))
+			if err != nil || got != tc.want {
+				t.Fatalf("subject = %q, err = %v; want %q", got, err, tc.want)
+			}
+			if got := msg.Header.Get("Bcc"); got != "" {
+				t.Fatalf("unexpected Bcc header: %q", got)
+			}
+		})
 	}
 }
 
