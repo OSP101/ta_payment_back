@@ -24,7 +24,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -760,18 +762,60 @@ func (s *ExportService) fillClaimSignatures(ctx context.Context, f *excelize.Fil
 			if j == 0 {
 				prefix, size = "อาจารย์ประจำวิชา ", 14.0
 			}
-			cell := fmt.Sprintf("%s%d", col, 23+j)
-			f.SetCellValue(tt, cell, prefix+course.code+" "+course.nameTH)
 			style, err := courseLine(size, colors[course.code])
 			if err != nil {
 				return err
 			}
-			if err := f.SetCellStyle(tt, cell, cell, style); err != nil {
+			if err := setTimetableCourseLine(f, tt, col, 23+j, prefix+course.code+" "+course.nameTH, size, style); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// Each lecturer owns nine columns. The template merges the first course row,
+// but not every subsequent row; wrapped text in a lone cell is clipped in Excel.
+func setTimetableCourseLine(f *excelize.File, sheet, col string, row int, text string, size float64, style int) error {
+	firstCol, err := excelize.ColumnNameToNumber(col)
+	if err != nil {
+		return err
+	}
+	lastCol, err := excelize.ColumnNumberToName(firstCol + 8)
+	if err != nil {
+		return err
+	}
+	start, end := fmt.Sprintf("%s%d", col, row), fmt.Sprintf("%s%d", lastCol, row)
+	if err := f.MergeCell(sheet, start, end); err != nil {
+		return err
+	}
+	if err := f.SetCellValue(sheet, start, text); err != nil {
+		return err
+	}
+	if err := f.SetCellStyle(sheet, start, end, style); err != nil {
+		return err
+	}
+	// Excel does not autofit merged cells. Estimate conservatively in points,
+	// reserving room for word wrapping and font substitution by other viewers.
+	width := 0.0
+	for c := firstCol; c <= firstCol+8; c++ {
+		name, _ := excelize.ColumnNumberToName(c)
+		w, err := f.GetColWidth(sheet, name)
+		if err != nil {
+			return err
+		}
+		width += w * 7 * 0.75
+	}
+	capacity := math.Max(1, width/(size*0.7)-12)
+	lines := 0.0
+	for _, line := range strings.Split(text, "\n") {
+		lines += math.Max(1, math.Ceil(float64(len([]rune(line)))/capacity))
+	}
+	height, err := f.GetRowHeight(sheet, row)
+	if err != nil {
+		return err
+	}
+	return f.SetRowHeight(sheet, row, math.Max(height, lines*size*1.5+6))
 }
 
 func thinBorder() []excelize.Border {
