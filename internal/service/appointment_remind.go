@@ -11,11 +11,8 @@ import (
 	"ta-payment-back/internal/audit"
 )
 
-// appointment_remind.go is the "เตือน" button on the ใบแต่งตั้ง TA page. A TA
-// request is decided only once every TA on it has entered a class timetable
-// for the term; until then the course is held out of the appointment order.
-// Staff used to chase those TAs by hand. This sends each one a notice naming
-// the courses waiting on them and linking to the timetable page.
+// Staff can remind waiting TAs from appointments or the request approvals
+// list. A submitted request waits for that TA's class timetable for the term.
 
 // timetableRemindGap is the least time between two reminders to one TA for
 // one term, so repeated clicks cannot flood an inbox.
@@ -40,6 +37,19 @@ type waitingCourse struct{ code, name, lecturer string }
 // Anyone named who is not actually holding anything up is skipped, not
 // reminded: a notice telling someone to do what they already did is noise.
 func (s *AppointmentOrderService) RemindTimetable(ctx context.Context, actor, termID uuid.UUID, taIDs []uuid.UUID) (*RemindTimetableResult, error) {
+	return s.remindTimetable(ctx, actor, termID, taIDs, nil)
+}
+
+// RemindRequestTimetables limits the reminder to the requests visible in the
+// approvals list. An empty selection must never expand to the whole term.
+func (s *AppointmentOrderService) RemindRequestTimetables(ctx context.Context, actor, termID uuid.UUID, requestIDs []uuid.UUID) (*RemindTimetableResult, error) {
+	if len(requestIDs) == 0 {
+		return &RemindTimetableResult{Sent: []string{}, Skipped: []RemindSkipped{}}, nil
+	}
+	return s.remindTimetable(ctx, actor, termID, nil, requestIDs)
+}
+
+func (s *AppointmentOrderService) remindTimetable(ctx context.Context, actor, termID uuid.UUID, taIDs, requestIDs []uuid.UUID) (*RemindTimetableResult, error) {
 	if s.notify == nil {
 		return nil, fmt.Errorf("notify service not configured")
 	}
@@ -55,8 +65,7 @@ func (s *AppointmentOrderService) RemindTimetable(ctx context.Context, actor, te
 		       tc.code, tc.name_th,
 		       COALESCE((SELECT `+personNameSQL+` FROM users u
 		                 LEFT JOIN ta_profiles tp ON tp.user_id = u.id
-		                 WHERE u.id = r.lecturer_id), ''),
-		       (SELECT MAX(tr.sent_at) FROM timetable_reminders tr WHERE tr.ta_id = a.ta_id AND tr.term_id = $1)
+		                 WHERE u.id = r.lecturer_id), '')
 		FROM ta_requests r
 		JOIN teaching_courses tc ON tc.id = r.teaching_course_id AND tc.term_id = $1
 		JOIN ta_request_assignments a ON a.request_id = r.id AND a.state <> 'dropped'
@@ -65,15 +74,15 @@ func (s *AppointmentOrderService) RemindTimetable(ctx context.Context, actor, te
 		WHERE r.status = 'submitted'
 		  AND NOT EXISTS (SELECT 1 FROM ta_class_schedules cs WHERE cs.user_id = a.ta_id AND cs.term_id = $1)
 		  AND ($2::uuid[] IS NULL OR a.ta_id = ANY($2))
-		ORDER BY 2, 3`, termID, nilIfEmpty(taIDs))
+		  AND ($3::uuid[] IS NULL OR r.id = ANY($3))
+		  AND u.is_active AND u.deleted_at IS NULL
+		ORDER BY 2, 3`, termID, nilIfEmpty(taIDs), nilIfEmpty(requestIDs))
 	if err != nil {
 		return nil, err
 	}
 	type waiting struct {
-		name     string
-		last     *time.Time
-		courses  []waitingCourse
-		reminded bool
+		name    string
+		courses []waitingCourse
 	}
 	byTA := map[uuid.UUID]*waiting{}
 	var order []uuid.UUID
@@ -81,15 +90,14 @@ func (s *AppointmentOrderService) RemindTimetable(ctx context.Context, actor, te
 		var (
 			id                       uuid.UUID
 			name, code, cname, lectr string
-			last                     *time.Time
 		)
-		if err := rows.Scan(&id, &name, &code, &cname, &lectr, &last); err != nil {
+		if err := rows.Scan(&id, &name, &code, &cname, &lectr); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		w, ok := byTA[id]
 		if !ok {
-			w = &waiting{name: name, last: last}
+			w = &waiting{name: name}
 			byTA[id] = w
 			order = append(order, id)
 		}
@@ -113,22 +121,51 @@ func (s *AppointmentOrderService) RemindTimetable(ctx context.Context, actor, te
 		}
 	}
 
-	now := time.Now()
 	for _, id := range order {
 		w := byTA[id]
-		if w.last != nil && now.Sub(*w.last) < timetableRemindGap {
+		// Share the cooldown across both pages and concurrent staff clicks.
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return res, err
+		}
+		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "timetable-reminder:"+termID.String()+":"+id.String()); err != nil {
+			tx.Rollback(ctx)
+			return res, err
+		}
+		var last *time.Time
+		err = tx.QueryRow(ctx, `SELECT MAX(sent_at) FROM timetable_reminders WHERE ta_id=$1 AND term_id=$2`, id, termID).Scan(&last)
+		if err != nil {
+			tx.Rollback(ctx)
+			return res, err
+		}
+		if last != nil && time.Since(*last) < timetableRemindGap {
+			tx.Rollback(ctx)
 			res.Skipped = append(res.Skipped, RemindSkipped{w.name,
-				"เตือนไปแล้วเมื่อ " + thaiLongDateTime(*w.last) + " เตือนซ้ำได้หลังผ่านไป 24 ชั่วโมง"})
+				"เตือนไปแล้วเมื่อ " + thaiLongDateTime(*last) + " เตือนซ้ำได้หลังผ่านไป 24 ชั่วโมง"})
 			continue
 		}
-		if _, err := s.pool.Exec(ctx,
+		if _, err = tx.Exec(ctx,
 			`INSERT INTO timetable_reminders (ta_id, term_id, sent_by) VALUES ($1, $2, $3)`,
 			id, termID, actor); err != nil {
+			tx.Rollback(ctx)
 			return res, err
 		}
 		title, body, layout := timetableReminderContent(term, w.courses)
-		s.notify.SendLaidOut(ctx, id, title, body, "/ta/schedule", true, layout)
+		// Checked delivery lets staff retry an SMTP failure immediately; never
+		// consume the 24-hour cooldown or report a failed email as sent.
+		if err = s.notify.SendLaidOutEmailOnly(ctx, id, title, body, "/ta/schedule", true, layout); err != nil {
+			tx.Rollback(ctx)
+			res.Skipped = append(res.Skipped, RemindSkipped{w.name, "ส่งอีเมลไม่สำเร็จ กรุณาลองใหม่"})
+			continue
+		}
 		res.Sent = append(res.Sent, w.name)
+		if err = writeInAppWith(ctx, tx, id, plainPunct(title), plainPunct(body), "/ta/schedule"); err != nil {
+			tx.Rollback(ctx)
+			return res, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return res, err
+		}
 	}
 
 	if err := s.aud.Log(ctx, audit.Entry{ActorID: &actor, Action: "appointment.remind_timetable",

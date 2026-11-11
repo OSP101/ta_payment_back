@@ -2,6 +2,9 @@ package service
 
 import (
 	"strings"
+	"sync"
+	"ta-payment-back/internal/config"
+	"ta-payment-back/internal/mail"
 	"testing"
 
 	"github.com/google/uuid"
@@ -103,5 +106,92 @@ func TestRemindTimetable_OnlyWaitingTAs_OncePerDay(t *testing.T) {
 	_ = f.Pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM audit_logs WHERE action = 'appointment.remind_timetable'`).Scan(&audited)
 	if audited != 2 {
 		t.Errorf("audit rows = %d, want 2", audited)
+	}
+}
+
+func TestRemindRequestTimetables_RestrictsRecipientsAndEmptySelection(t *testing.T) {
+	f, svc, _ := remindFixture(t)
+	other := f.insertUser("ta", "unselected-waiting")
+	var otherRequest uuid.UUID
+	if err := f.Pool.QueryRow(f.ctx, `INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, status, reimburse_scope)
+ SELECT gen_random_uuid(), teaching_course_id, lecturer_id, status, reimburse_scope FROM ta_requests WHERE id=$1 RETURNING id`, f.RequestID).Scan(&otherRequest); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`INSERT INTO ta_request_assignments (id,request_id,section_id,ta_id,level) VALUES (gen_random_uuid(),$1,$2,$3,'undergrad')`, otherRequest, f.SectionID, other)
+	for _, ids := range [][]uuid.UUID{nil, {}, {uuid.New()}} {
+		res, err := svc.RemindRequestTimetables(f.ctx, f.StaffID, f.TermID, ids)
+		if err != nil || len(res.Sent) != 0 {
+			t.Fatalf("empty/unmatched selection: %+v %v", res, err)
+		}
+	}
+	res, err := svc.RemindRequestTimetables(f.ctx, f.StaffID, f.TermID, []uuid.UUID{f.RequestID})
+	if err != nil || len(res.Sent) != 1 {
+		t.Fatalf("selected reminder: %+v %v", res, err)
+	}
+	var n int
+	if err := f.Pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM notifications WHERE user_id=$1`, other).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("TA outside selected requests received %d notifications", n)
+	}
+	// Both pages share the same cooldown.
+	res, err = svc.RemindTimetable(f.ctx, f.StaffID, f.TermID, []uuid.UUID{f.TAID})
+	if err != nil || len(res.Sent) != 0 || len(res.Skipped) != 1 {
+		t.Fatalf("shared cooldown: %+v %v", res, err)
+	}
+	f.exec(`UPDATE ta_requests SET status='cancelled' WHERE id=$1`, otherRequest)
+	res, err = svc.RemindRequestTimetables(f.ctx, f.StaffID, f.TermID, []uuid.UUID{otherRequest})
+	if err != nil || len(res.Sent) != 0 {
+		t.Fatalf("cancelled request: %+v %v", res, err)
+	}
+}
+
+func TestRemindRequestTimetables_EmailFailureCanRetry(t *testing.T) {
+	f, svc, _ := remindFixture(t)
+	original := svc.notify.mailer
+	svc.notify.mailer = mail.New(config.Config{SMTPHost: "127.0.0.1", SMTPPort: 1, MailFrom: "noreply@example.test"})
+	res, err := svc.RemindRequestTimetables(f.ctx, f.StaffID, f.TermID, []uuid.UUID{f.RequestID})
+	if err != nil || len(res.Sent) != 0 || len(res.Skipped) != 1 {
+		t.Fatalf("failed delivery: %+v %v", res, err)
+	}
+	var n int
+	if err = f.Pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM timetable_reminders WHERE ta_id=$1`, f.TAID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("failed mail consumed cooldown: %d", n)
+	}
+	svc.notify.mailer = original
+	res, err = svc.RemindRequestTimetables(f.ctx, f.StaffID, f.TermID, []uuid.UUID{f.RequestID})
+	if err != nil || len(res.Sent) != 1 {
+		t.Fatalf("retry after failure: %+v %v", res, err)
+	}
+}
+
+func TestRemindRequestTimetables_ConcurrentClicksSendOnce(t *testing.T) {
+	f, svc, _ := remindFixture(t)
+	var wg sync.WaitGroup
+	sent := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := svc.RemindRequestTimetables(f.ctx, f.StaffID, f.TermID, []uuid.UUID{f.RequestID})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			sent <- len(res.Sent)
+		}()
+	}
+	wg.Wait()
+	close(sent)
+	total := 0
+	for n := range sent {
+		total += n
+	}
+	if total != 1 {
+		t.Fatalf("sent %d reminders for concurrent clicks", total)
 	}
 }

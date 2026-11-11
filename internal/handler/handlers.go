@@ -3837,13 +3837,20 @@ func (h *ExportHandler) AppointmentPreview(c *fiber.Ctx) error {
 // a course out of the appointment order. ta_ids empty means all of them.
 func (h *ExportHandler) AppointmentRemindTimetable(c *fiber.Ctx) error {
 	var in struct {
-		TermID uuid.UUID   `json:"term_id" validate:"required"`
-		TAIDs  []uuid.UUID `json:"ta_ids" validate:"max=200"`
+		TermID     uuid.UUID   `json:"term_id" validate:"required"`
+		TAIDs      []uuid.UUID `json:"ta_ids" validate:"max=200"`
+		RequestIDs []uuid.UUID `json:"request_ids" validate:"max=200"`
 	}
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
-	out, err := h.Svc.Appointment.RemindTimetable(c.Context(), UserID(c), in.TermID, in.TAIDs)
+	var out *service.RemindTimetableResult
+	var err error
+	if in.RequestIDs != nil {
+		out, err = h.Svc.Appointment.RemindRequestTimetables(c.Context(), UserID(c), in.TermID, in.RequestIDs)
+	} else {
+		out, err = h.Svc.Appointment.RemindTimetable(c.Context(), UserID(c), in.TermID, in.TAIDs)
+	}
 	if err != nil {
 		return err
 	}
