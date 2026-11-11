@@ -219,13 +219,16 @@ func derefStr(p *string) string {
 // mergeSection is the shape both merge paths (typed form, registrar file)
 // reduce their sections to before mergeCodeTx writes them.
 type mergeSection struct {
-	secNo       string
-	track       string
-	room        *string
-	numStudents int
-	curriculum  *string
-	schedules   []parsedSchedule
-	exams       []ExamSchedule
+	regReserved      string
+	regPending       bool
+	regPendingReason string
+	secNo            string
+	track            string
+	room             *string
+	numStudents      int
+	curriculum       *string
+	schedules        []parsedSchedule
+	exams            []ExamSchedule
 }
 
 // mergeCodeTx does the writes: records the alternate code, adds any lecturers
@@ -296,10 +299,10 @@ func (s *TeachingService) mergeCodeTx(ctx context.Context, tx pgx.Tx, termID, ta
 		}
 		secID := uuid.New()
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students, curriculum, course_code)
-			 VALUES ($1,$2,$3,$4::section_track,$5,$6,$7,$8)`,
+			`INSERT INTO sections (id, teaching_course_id, sec_no, track, room, num_students, curriculum, course_code,reg_reserved_for,reg_pending_schedule,reg_pending_reason)
+			 VALUES ($1,$2,$3,$4::section_track,$5,$6,$7,$8,$9,$10,$11)`,
 			secID, targetID, altSecNo(code, sec.secNo), sec.track, sec.room, sec.numStudents,
-			sec.curriculum, code); err != nil {
+			sec.curriculum, code, sec.regReserved, sec.regPending, sec.regPendingReason); err != nil {
 			return err
 		}
 		for _, sch := range sec.schedules {

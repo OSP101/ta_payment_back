@@ -215,7 +215,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		SELECT EXISTS(
 			SELECT 1 FROM sections sx
 			WHERE sx.teaching_course_id = $1
-			  AND NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id = sx.id))
+			  AND (sx.reg_pending_schedule OR NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id = sx.id)))
 	`, in.TeachingCourseID).Scan(&missingSchedule); err != nil {
 		return nil, err
 	}

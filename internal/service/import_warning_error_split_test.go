@@ -53,14 +53,14 @@ func TestCommitImport_RealFileSeparatesWarningsFromErrors(t *testing.T) {
 	if len(res.CreatedIDs) != 127 {
 		t.Errorf("created = %d, want 127", len(res.CreatedIDs))
 	}
-	if res.ErrorCount != 8 {
-		t.Errorf("ErrorCount = %d, want 8 (genuine unreadable-day rows) — got: %v", res.ErrorCount, res.Errors)
+	if res.ErrorCount != 6 {
+		t.Errorf("ErrorCount = %d, want 6 (blank-day rows; S is now a supported Saturday alias) — got: %v", res.ErrorCount, res.Errors)
 	}
 	if res.WarningCount != 57 {
 		t.Errorf("WarningCount = %d, want 57 (no-schedule courses) — got: %v", res.WarningCount, res.Warnings)
 	}
-	if res.WarningCount+res.ErrorCount != 65 {
-		t.Errorf("WarningCount+ErrorCount = %d, want 65 (matches the pre-split total, nothing lost)",
+	if res.WarningCount+res.ErrorCount != 63 {
+		t.Errorf("WarningCount+ErrorCount = %d, want 63 (two former S errors are now imported schedules)",
 			res.WarningCount+res.ErrorCount)
 	}
 	if len(res.Warnings) != res.WarningCount {

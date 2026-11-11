@@ -24,10 +24,10 @@ import (
 // same course could therefore be written through one door with numbers another
 // door refused. They are ceilings against typos, not policy.
 const (
-	// maxStudentsPerSection / maxStudentsPerCourse: the largest real section in
-	// the registrar file is 150; an extra zero is the typo these catch.
+	// Sections remain bounded against typos. REG general-education courses
+	// legitimately aggregate thousands of seats (CP001001: 7,543 in 2/2569).
 	maxStudentsPerSection = 3000
-	maxStudentsPerCourse  = 3000
+	maxStudentsPerCourse  = 100000
 	maxCourseCredits      = 30
 	// maxWeeklyHours is 60, not 30: the registrar's own file carries
 	// "6 (0-36-18)" and "9 (0-36-18)" (graduate project/thesis courses), so a

@@ -1146,62 +1146,42 @@ func (h *TeachingHandler) ImportExcel(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	// Reject anything that isn't actually an .xlsx before it reaches excelize —
-	// added 15/09/2026 (TOR §3.3 ข.3-4). Until then a bad upload (.xls, .csv,
-	// a renamed .txt, a truncated file) surfaced excelize's own error verbatim
-	// — "zip: not a valid zip file" — which is neither Thai nor actionable.
-	// .xlsx IS a zip container, so checking both the extension and the zip
-	// magic bytes catches a wrong-format file before spending any work on it;
-	// a merely CORRUPT .xlsx still reaches the clearer message wrapped around
-	// excelize.OpenReader in parseNormalizedSheet/pickImportSheet.
+	// REG exports are either legacy BIFF8/OLE2 or modern OOXML/ZIP.
+	// Require both a supported extension and its matching container signature;
+	// each reader then validates workbook contents and returns a Thai error.
 	const maxImportBytes = 20 << 20 // 20 MB — registrar files run a few hundred KB
-	if !strings.HasSuffix(strings.ToLower(fh.Filename), ".xlsx") || !bytes.HasPrefix(body, []byte("PK\x03\x04")) {
+	if !((strings.HasSuffix(strings.ToLower(fh.Filename), ".xlsx") && bytes.HasPrefix(body, []byte("PK\x03\x04"))) || (strings.HasSuffix(strings.ToLower(fh.Filename), ".xls") && service.IsLegacyREGWorkbook(body))) {
 		return fiber.NewError(fiber.StatusUnprocessableEntity,
-			"รองรับเฉพาะไฟล์ Excel (.xlsx) จากงานทะเบียนเท่านั้น")
+			"รองรับไฟล์ REG แบบ .xls หรือ .xlsx ที่เป็นไฟล์ Excel จริงเท่านั้น")
 	}
 	if len(body) > maxImportBytes {
 		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ไฟล์ใหญ่เกิน 20 MB")
 	}
+	var review *service.REGReview
+	if raw := c.FormValue("review"); raw != "" {
+		if len(raw) > 10<<20 {
+			return fiber.NewError(fiber.StatusRequestEntityTooLarge, "ข้อมูลตรวจสอบใหญ่เกินไป")
+		}
+		review = &service.REGReview{}
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(review); err != nil {
+			return fiber.NewError(fiber.StatusUnprocessableEntity, "ข้อมูลตรวจสอบไม่ถูกต้อง")
+		}
+	}
 	// Preview path: staff uploads to see per-course preview (new / existing /
 	// missing_catalog / unmatched_officer) without touching the DB.
 	if c.Query("dry_run") == "1" {
-		preview, err := h.Svc.Teaching.PreviewImport(c.Context(), UserID(c), termID, fh.Filename, body)
+		preview, err := h.Svc.Teaching.PreviewREGReview(c.Context(), UserID(c), termID, fh.Filename, body, review)
 		if err != nil {
 			return err
 		}
 		return c.JSON(preview)
 	}
-	// Commit path: skip_codes is a comma-separated list of course codes the
-	// staff has explicitly opted out of (e.g. unmatched-officer courses they
-	// chose to skip rather than proceed unassigned).
-	var skipCodes []string
-	if raw := c.FormValue("skip_codes"); raw != "" {
-		for _, part := range strings.Split(raw, ",") {
-			if p := strings.TrimSpace(part); p != "" {
-				skipCodes = append(skipCodes, p)
-			}
-		}
+	if review == nil {
+		return fiber.NewError(fiber.StatusUnprocessableEntity, "กรุณาตรวจสอบและยืนยันข้อมูล REG ก่อนบันทึก")
 	}
-	// merges: JSON [{"primary":"CP353301","codes":["SC313302"]}] — staff's
-	// answers to the preview's same-name groups.
-	var merges []service.ImportMerge
-	if raw := c.FormValue("merges"); raw != "" {
-		if err := json.Unmarshal([]byte(raw), &merges); err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "ข้อมูลการรวมรายวิชาไม่ถูกต้อง")
-		}
-	}
-	// proceed_codes: unmatched-officer courses staff chose to create with no
-	// lecturer. Unmatched courses NOT listed are skipped, matching what the
-	// preview told staff ("ต้องตัดสินใจ").
-	var proceedCodes []string
-	if raw := c.FormValue("proceed_codes"); raw != "" {
-		for _, part := range strings.Split(raw, ",") {
-			if p := strings.TrimSpace(part); p != "" {
-				proceedCodes = append(proceedCodes, p)
-			}
-		}
-	}
-	res, err := h.Svc.Teaching.CommitImport(c.Context(), UserID(c), termID, fh.Filename, body, skipCodes, merges, proceedCodes...)
+	res, err := h.Svc.Teaching.CommitREGReview(c.Context(), UserID(c), termID, fh.Filename, body, review)
 	if err != nil {
 		return err
 	}

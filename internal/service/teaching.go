@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -94,12 +95,15 @@ type TeachingCourse struct {
 }
 
 type Section struct {
-	ID               uuid.UUID `json:"id"`
-	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
-	SecNo            string    `json:"sec_no"`
-	Track            string    `json:"track"`
-	Room             *string   `json:"room,omitempty"`
-	NumStudents      int       `json:"num_students"`
+	REGReservedFor     string    `json:"reg_reserved_for"`
+	REGPendingSchedule bool      `json:"reg_pending_schedule"`
+	REGPendingReason   string    `json:"reg_pending_reason"`
+	ID                 uuid.UUID `json:"id"`
+	TeachingCourseID   uuid.UUID `json:"teaching_course_id"`
+	SecNo              string    `json:"sec_no"`
+	Track              string    `json:"track"`
+	Room               *string   `json:"room,omitempty"`
+	NumStudents        int       `json:"num_students"`
 	// Programme group served (CS/IT/GIS/AI/CY, OTHER = another faculty),
 	// derived from the import file's ReservedFor; nil = not yet known.
 	Curriculum *string `json:"curriculum,omitempty"`
@@ -513,8 +517,8 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 		        -- เดียวกันแล้วเห็นสถานะไม่ตรงกับหน้ารายการ
 		        EXISTS (SELECT 1 FROM sections sx
 		                 WHERE sx.teaching_course_id = tc.id
-		                   AND NOT EXISTS (SELECT 1 FROM section_schedules sch
-		                                    WHERE sch.section_id = sx.id))
+		                   AND (sx.reg_pending_schedule OR NOT EXISTS (SELECT 1 FROM section_schedules sch
+		                                    WHERE sch.section_id = sx.id)))
 		 FROM teaching_courses tc
 		 JOIN academic_terms  at ON at.id = tc.term_id
 		 WHERE tc.id = $1`, id).Scan(&tc.ID, &tc.TermID, &tc.Code, &tc.AltCodes, &tc.NameTH, &tc.NameEN, &tc.Level,
@@ -528,7 +532,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	}
 	// Sections
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, sec_no, track::text, room, num_students, curriculum, course_code,
+		`SELECT reg_reserved_for,reg_pending_schedule,reg_pending_reason,id, sec_no, track::text, room, num_students, curriculum, course_code,
 		        TO_CHAR(schedule_set_by_lecturer_at,'YYYY-MM-DD"T"HH24:MI:SSTZH:TZM')
 		   FROM sections WHERE teaching_course_id=$1 ORDER BY sec_no`, id)
 	if err != nil {
@@ -536,7 +540,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	}
 	for rows.Next() {
 		var sec Section
-		if err := rows.Scan(&sec.ID, &sec.SecNo, &sec.Track, &sec.Room, &sec.NumStudents,
+		if err := rows.Scan(&sec.REGReservedFor, &sec.REGPendingSchedule, &sec.REGPendingReason, &sec.ID, &sec.SecNo, &sec.Track, &sec.Room, &sec.NumStudents,
 			&sec.Curriculum, &sec.CourseCode, &sec.ScheduleSetByLecturerAt); err != nil {
 			rows.Close()
 			return nil, err
@@ -594,7 +598,7 @@ func (s *TeachingService) Get(ctx context.Context, id uuid.UUID) (*TeachingCours
 	// someone fills the timetable in. Derived here (sections are already
 	// loaded) so Get and List agree on the flag.
 	for i := range tc.Sections {
-		if len(tc.Sections[i].Schedules) == 0 {
+		if len(tc.Sections[i].Schedules) == 0 || tc.Sections[i].REGPendingSchedule {
 			tc.HasMissingSchedule = true
 			break
 		}
@@ -691,7 +695,7 @@ func (s *TeachingService) List(ctx context.Context, termID *uuid.UUID, lecturerI
 	             (tc.num_students_special > 0 OR tc.num_students_special_entered),
 	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS has_special,
 	             EXISTS(SELECT 1 FROM sections sx WHERE sx.teaching_course_id=tc.id
-	                    AND NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id=sx.id)) AS has_missing_schedule,
+	                    AND (sx.reg_pending_schedule OR NOT EXISTS(SELECT 1 FROM section_schedules ss WHERE ss.section_id=sx.id))) AS has_missing_schedule,
 	             (SELECT COUNT(*) FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='regular') AS n_sec_regular,
 	             (SELECT COUNT(*) FROM sections sx WHERE sx.teaching_course_id=tc.id AND sx.track='special') AS n_sec_special,
 	             -- With the ตำแหน่งทางวิชาการ, matching the payout list and the
@@ -1877,6 +1881,10 @@ func (s *TeachingService) replaceSectionSchedules(ctx context.Context, actor, tc
 		Entity: "section", EntityID: sectionID.String(), After: schedules}); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `UPDATE sections SET reg_pending_schedule=false, reg_pending_reason='' WHERE id=$1`, sectionID); err != nil {
+		return err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
@@ -2850,6 +2858,7 @@ type ImportPreviewCourse struct {
 }
 
 type ImportPreview struct {
+	Review        *REGReview            `json:"review,omitempty"`
 	Filename      string                `json:"filename"`
 	Courses       []ImportPreviewCourse `json:"courses"`
 	NewCount      int                   `json:"new_count"`
@@ -2875,15 +2884,26 @@ type parsedSchedule struct {
 }
 
 type parsedSection struct {
-	secNo       string
-	track       string
-	room        string
-	numStudents int
-	curriculum  string // "" = ReservedFor carried no programme token
-	schedules   []parsedSchedule
+	reviewSchedules []REGSchedule
+	originalRows    [][]string
+	sourceRow       int
+	reserved        string
+	rawCells        []string
+	rawDays         string
+	rawTimes        string
+	secNo           string
+	track           string
+	room            string
+	numStudents     int
+	curriculum      string // "" = ReservedFor carried no programme token
+	schedules       []parsedSchedule
 }
 
 type parsedCourse struct {
+	sourceHeaders   []string
+	requiresReview  bool
+	prerequisite    string
+	rawCells        []string
 	code            string
 	name            string // Thai name (falls back to the English name / code)
 	nameEN          string
@@ -2946,7 +2966,7 @@ func dowFromAbbrev(s string) (int, bool) {
 		return 4, true
 	case "F":
 		return 5, true
-	case "SA":
+	case "SA", "S":
 		return 6, true
 	}
 	return 0, false
@@ -3051,7 +3071,7 @@ func pickImportSheet(f *excelize.File) (name string, raw bool, err error) {
 	}
 	// 2. Raw registrar export (multi-line cells, header rows + section rows).
 	for _, s := range sheets {
-		if s == "sysTitle" || headerHas(s, "COURSECODE1") {
+		if strings.EqualFold(s, "sysTitle") || headerHas(s, "COURSECODE1") {
 			return s, true, nil
 		}
 	}
@@ -3141,6 +3161,8 @@ func curriculumFromReserved(reserved string) string {
 		return "AI"
 	case "CY":
 		return "CY"
+	case "ITII":
+		return "IT"
 	}
 	// An SC/CP token we don't recognise is still a college code — a new
 	// programme would land here. OTHER would silently file it under another
@@ -3181,6 +3203,13 @@ var importUnzipLimits = excelize.Options{
 }
 
 func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []string, errs []string, err error) {
+	if IsLegacyREGWorkbook(body) {
+		rows, e := readLegacyREGRows(body)
+		if e != nil {
+			return nil, nil, nil, e
+		}
+		return parseRawRows(rows)
+	}
 	f, err := excelize.OpenReader(bytes.NewReader(body), importUnzipLimits)
 	if err != nil {
 		// The handler already rejects a non-.xlsx upload by extension + magic
@@ -3244,14 +3273,15 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 			name := get(row, "coursename")
 			credits, lec, lab, self, unitOK := parseUnit(get(row, "unit"))
 			course = &parsedCourse{
-				code:            code,
-				name:            name,
-				nameEN:          name,
-				level:           courseLevelFromReserved(get(row, "reservedfor")),
-				credits:         credits,
-				lectureHrs:      lec,
-				labHrs:          lab,
-				selfHrs:         self,
+				code:       code,
+				name:       name,
+				nameEN:     name,
+				level:      courseLevelFromReserved(get(row, "reservedfor")),
+				credits:    credits,
+				lectureHrs: lec,
+				labHrs:     lab,
+				selfHrs:    self,
+				rawCells:   append([]string{}, row...), sourceHeaders: append([]string{}, rows[0]...),
 				unitRaw:         get(row, "unit"),
 				unitOK:          unitOK,
 				firstRow:        r + 1,
@@ -3289,10 +3319,11 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 			secNo = "0"
 		}
 
-		sec, ok := course.sections[secNo]
+		trackKey := sectionImportKey(secNo, regTrack(get(row, "reservedfor")))
+		sec, ok := course.sections[trackKey]
 		if !ok {
 			track := "regular"
-			if strings.Contains(get(row, "reservedfor"), "โครงการพิเศษ") {
+			if regTrack(get(row, "reservedfor")) == "special" {
 				track = "special"
 			}
 			seatsRaw := get(row, "totalseats")
@@ -3304,13 +3335,47 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): จำนวนที่นั่ง '%s' อ่านไม่ได้ นำเข้าเป็น 0 คน กรุณากรอกจำนวนนักศึกษาภายหลัง", r+1, code, secNo, seatsRaw))
 			}
 			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats,
-				curriculum: curriculumFromReserved(get(row, "reservedfor"))}
-			course.sections[secNo] = sec
-			course.sectionsInOrder = append(course.sectionsInOrder, secNo)
+				curriculum: curriculumFromReserved(get(row, "reservedfor")), sourceRow: r + 1, reserved: get(row, "reservedfor")}
+			course.sections[trackKey] = sec
+			course.sectionsInOrder = append(course.sectionsInOrder, trackKey)
 		}
 
 		kindRaw := strings.ToLower(get(row, "sessiontype"))
 		timeRaw := get(row, "time")
+		// Keep every flattened source row for the reviewed path, including
+		// meetings that the legacy parser below cannot schedule yet.
+		sec.originalRows = append(sec.originalRows, append([]string{}, row...))
+		if sec.reviewSchedules == nil {
+			sec.reviewSchedules = []REGSchedule{}
+		}
+		rawMeeting := strings.TrimSpace(timeRaw + " " + kindRaw + " " + get(row, "room"))
+		if sec.rawCells == nil {
+			sec.rawCells = []string{code, get(row, "coursename"), get(row, "unit"), get(row, "prerequisite"), rawSection, get(row, "reservedfor"), get(row, "totalseats"), get(row, "day"), rawMeeting, get(row, "midtermexamdate"), get(row, "midtermexamtime"), get(row, "finalexamdate"), get(row, "finalexamtime"), get(row, "officer")}
+		} else {
+			sec.rawCells[7] += "\n" + get(row, "day")
+			sec.rawCells[8] += "\n" + rawMeeting
+		}
+		sec.rawDays = sec.rawCells[7]
+		sec.rawTimes = sec.rawCells[8]
+		if kindRaw != "" || timeRaw != "" {
+			kind := kindRaw
+			if kind == "lec" {
+				kind = "lecture"
+			}
+			start, end, _ := parseTimeRange(timeRaw)
+			day, known := dowFromAbbrev(get(row, "day"))
+			if !known {
+				day = -1
+			}
+			slot := REGSchedule{Day: day, Start: start, End: end, Kind: kind, Room: get(row, "room"), Raw: rawMeeting, Pending: !known || start == "" || end == ""}
+			if strings.EqualFold(get(row, "day"), "MW") {
+				slot.Day = 1
+				slot.Pending = start == "" || end == ""
+				sec.reviewSchedules = append(sec.reviewSchedules, slot)
+				slot.Day = 3
+			}
+			sec.reviewSchedules = append(sec.reviewSchedules, slot)
+		}
 		var kind string
 		switch kindRaw {
 		case "lec", "lecture":
@@ -3398,10 +3463,13 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 	for r := 0; r < len(rows); r++ {
 		row := rows[r]
 		codeRaw := cell(row, 0)
-		if strings.EqualFold(codeRaw, "COURSECODE1") {
+		if strings.EqualFold(codeRaw, "COURSECODE1") || codeRaw == "รหัสวิชา" {
 			continue // header row
 		}
 		if codeRaw != "" {
+			if !courseCodeRe.MatchString(strings.ToUpper(codeRaw)) {
+				return nil, nil, nil, Invalid(fmt.Sprintf("แถว %d: รหัสวิชา %q ไม่ถูกต้อง", r+1, codeRaw))
+			}
 			// Course header row.
 			code := strings.ToUpper(codeRaw)
 			c, ok := byCode[code]
@@ -3410,6 +3478,7 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 				credits, lec, lab, self, unitOK := parseUnit(cell(row, 2))
 				c = &parsedCourse{
 					code: code, name: name, nameEN: name, level: "undergrad",
+					requiresReview: true, prerequisite: cell(row, 3), rawCells: append([]string(nil), row...),
 					credits: credits, lectureHrs: lec, labHrs: lab, selfHrs: self,
 					unitRaw: cell(row, 2), unitOK: unitOK, firstRow: r + 1,
 					sections:        map[string]*parsedSection{},
@@ -3418,13 +3487,24 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 				byCode[code] = c
 				order = append(order, code)
 			}
+			if ok && (c.unitRaw != cell(row, 2) || normalizeCourseName(c.name) != normalizeCourseName(cell(row, 1))) {
+				return nil, nil, nil, Invalid(fmt.Sprintf("แถว %d: รหัส %s ซ้ำแต่ชื่อหรือหน่วยกิตต่างกัน กรุณาตรวจไฟล์ต้นฉบับ", r+1, code))
+			}
 			cur = c
+			if cell(row, 4) == "" {
+				continue
+			}
+		}
+		// A section without a preceding course must never disappear silently.
+		rawSection := cell(row, 4)
+		if rawSection == "" {
+			if cell(row, 7) != "" || cell(row, 8) != "" {
+				return nil, nil, nil, Invalid(fmt.Sprintf("แถว %d: มีตารางเรียนแต่ไม่ระบุ Section กรุณาตรวจรูปแบบไฟล์ REG", r+1))
+			}
 			continue
 		}
-		// Section row.
-		rawSection := cell(row, 4)
-		if rawSection == "" || cur == nil {
-			continue
+		if cur == nil {
+			return nil, nil, nil, Invalid(fmt.Sprintf("แถว %d: Section ไม่มีรหัสวิชาก่อนหน้า", r+1))
 		}
 		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.ToUpper(rawSection), "SEC"))
 		secNo := strings.TrimLeft(trimmed, "0")
@@ -3435,15 +3515,29 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 		if cur.level == "undergrad" && courseLevelFromReserved(reserved) == "graduate" {
 			cur.level = "graduate"
 		}
-		if cur.officerRaw == "" {
-			if o := cell(row, 13); o != "" {
-				cur.officerRaw = o
+		if o := cell(row, 13); o != "" {
+			seen := map[string]bool{}
+			for _, name := range strings.Fields(cur.officerRaw) {
+				seen[name] = true
+			}
+			for _, name := range strings.Fields(o) {
+				if !seen[name] {
+					if cur.officerRaw != "" {
+						cur.officerRaw += " "
+					}
+					cur.officerRaw += name
+					seen[name] = true
+				}
 			}
 		}
-		sec, ok := cur.sections[secNo]
+		key := sectionImportKey(secNo, regTrack(reserved))
+		if _, exists := cur.sections[key]; exists {
+			key = fmt.Sprintf("%s|row%d", key, r+1)
+		}
+		sec, ok := cur.sections[key]
 		if !ok {
 			track := "regular"
-			if strings.Contains(reserved, "โครงการพิเศษ") {
+			if regTrack(reserved) == "special" {
 				track = "special"
 			}
 			seatsRaw := cell(row, 6)
@@ -3452,9 +3546,9 @@ func parseRawRows(rows [][]string) (courses []*parsedCourse, warnings []string, 
 				warnings = append(warnings, fmt.Sprintf("แถว %d (%s SEC %s): จำนวนที่นั่ง '%s' อ่านไม่ได้ นำเข้าเป็น 0 คน กรุณากรอกจำนวนนักศึกษาภายหลัง", r+1, cur.code, secNo, seatsRaw))
 			}
 			sec = &parsedSection{secNo: secNo, track: track, numStudents: seats,
-				curriculum: curriculumFromReserved(reserved)}
-			cur.sections[secNo] = sec
-			cur.sectionsInOrder = append(cur.sectionsInOrder, secNo)
+				curriculum: curriculumFromReserved(reserved), sourceRow: r + 1, reserved: reserved, rawCells: append([]string(nil), row...), rawDays: cell(row, 7), rawTimes: cell(row, 8)}
+			cur.sections[key] = sec
+			cur.sectionsInOrder = append(cur.sectionsInOrder, key)
 		}
 		// Meetings: Day (col H) and "time kind room" (col I) are multi-line,
 		// aligned line-by-line. Blank/WBA time → section with no schedule.
@@ -3809,6 +3903,11 @@ func (s *TeachingService) CommitImport(ctx context.Context, actor uuid.UUID, ter
 		s.recordFailedImport(ctx, actor, termID, filename, fileSHA256, started, errImportNoCourses)
 		return nil, errImportNoCourses
 	}
+	for _, c := range courses {
+		if c.requiresReview {
+			return nil, Invalid("กรุณาตรวจสอบและยืนยันข้อมูล REG ก่อนบันทึก")
+		}
+	}
 	res := &ImportResult{
 		Warnings: warnings, WarningCount: len(warnings),
 		Errors: parseErrs, ErrorCount: len(parseErrs),
@@ -4068,6 +4167,7 @@ type ScheduleImportSummary struct {
 // fetched separately from the list (ListImportHistory) since these can run
 // to hundreds of lines for a large registrar file.
 type ScheduleImportDetail struct {
+	ReviewData json.RawMessage `json:"review_data,omitempty"`
 	ScheduleImportSummary
 	CreatedCodes []string `json:"created_codes"`
 	SkippedCodes []string `json:"skipped_codes"`
@@ -4143,7 +4243,7 @@ func (s *TeachingService) GetImportHistoryDetail(ctx context.Context, actor, id 
 		       si.created_count, si.skipped_count, si.merged_count, si.warning_count, si.error_count,
 		       si.fatal_error, TO_CHAR(si.started_at,'YYYY-MM-DD"T"HH24:MI:SS'),
 		       TO_CHAR(si.at,'YYYY-MM-DD"T"HH24:MI:SS'),
-		       si.created_codes, si.skipped_codes, si.merged_codes, si.warnings, si.errors
+		       si.created_codes, si.skipped_codes, si.merged_codes, si.warnings, si.errors,si.review_data
 		  FROM schedule_imports si
 		  LEFT JOIN users u ON u.id = si.imported_by
 		 WHERE si.id = $1`, id).Scan(
@@ -4151,7 +4251,7 @@ func (s *TeachingService) GetImportHistoryDetail(ctx context.Context, actor, id 
 		&d.Filename, &d.FileSHA256, &d.RowCount,
 		&d.CreatedCount, &d.SkippedCount, &d.MergedCount, &d.WarningCount, &d.ErrorCount,
 		&d.FatalError, &startedAt, &d.At,
-		&d.CreatedCodes, &d.SkippedCodes, &d.MergedCodes, &d.Warnings, &d.Errors)
+		&d.CreatedCodes, &d.SkippedCodes, &d.MergedCodes, &d.Warnings, &d.Errors, &d.ReviewData)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -4184,8 +4284,8 @@ func (s *TeachingService) commitOneCourse(ctx context.Context, actor, termID uui
 			}
 			if _, err := s.pool.Exec(ctx,
 				`UPDATE sections SET curriculum = $1
-				  WHERE teaching_course_id = $2 AND sec_no = $3 AND curriculum IS NULL`,
-				sec.curriculum, existing, sec.secNo); err != nil {
+				  WHERE teaching_course_id = $2 AND sec_no = $3 AND track = $4::section_track AND curriculum IS NULL`,
+				sec.curriculum, existing, sec.secNo, sec.track); err != nil {
 				return uuid.Nil, err
 			}
 		}

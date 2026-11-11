@@ -46,11 +46,15 @@ func newImportApp(t *testing.T, actor uuid.UUID) *fiber.App {
 	return app
 }
 
-func postImport(t *testing.T, app *fiber.App, filename string, body []byte, dryRun bool) int {
+func postImport(t *testing.T, app *fiber.App, filename string, body []byte, dryRun bool, termIDs ...uuid.UUID) int {
 	t.Helper()
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-	if err := w.WriteField("term_id", uuid.New().String()); err != nil {
+	termID := uuid.New()
+	if len(termIDs) > 0 {
+		termID = termIDs[0]
+	}
+	if err := w.WriteField("term_id", termID.String()); err != nil {
 		t.Fatal(err)
 	}
 	part, err := w.CreateFormFile("file", filename)
@@ -134,7 +138,11 @@ func TestImportExcel_ValidXlsxPassesFileTypeGate(t *testing.T) {
 	}, th.ImportExcel)
 
 	xlsx := buildMinimalNormalizedXlsx(t)
-	status := postImport(t, app, "รายวิชาที่เปิดสอน.xlsx", xlsx, true)
+	termID := uuid.New()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO academic_terms(id,academic_year,semester) VALUES($1,2569,2)`, termID); err != nil {
+		t.Fatal(err)
+	}
+	status := postImport(t, app, "รายวิชาที่เปิดสอน.xlsx", xlsx, true, termID)
 	if status == fiber.StatusUnprocessableEntity || status == fiber.StatusRequestEntityTooLarge {
 		t.Fatalf("a valid .xlsx was rejected by the file-type gate: status %d", status)
 	}
@@ -168,4 +176,18 @@ func buildMinimalNormalizedXlsx(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+func TestImportExcel_RejectsDisguisedLegacyFile(t *testing.T) {
+	app := newImportApp(t, uuid.New())
+	if status := postImport(t, app, "reg.xls", []byte("PK\x03\x04not a BIFF file"), true); status != fiber.StatusUnprocessableEntity {
+		t.Fatalf("status=%d", status)
+	}
+}
+
+func TestImportExcel_RequiresReviewBeforeAnyCommit(t *testing.T) {
+	app := newImportApp(t, uuid.New())
+	if status := postImport(t, app, "reg.xlsx", buildMinimalNormalizedXlsx(t), false); status != fiber.StatusUnprocessableEntity {
+		t.Fatalf("unreviewed commit status=%d", status)
+	}
 }

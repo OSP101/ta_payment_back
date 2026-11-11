@@ -47,14 +47,16 @@ func TestCreateCourse_RefusesImplausibleNumbers(t *testing.T) {
 		}
 	}
 	bad := map[string]func(in *CreateTeachingCourseInput){
-		"negative section":   func(in *CreateTeachingCourseInput) { in.Sections[0].NumStudents = -50 },
-		"2,000,000 students": func(in *CreateTeachingCourseInput) { in.Sections[0].NumStudents = 2000000 },
-		"2,000,000 hours":    func(in *CreateTeachingCourseInput) { in.LectureHrs = 2000000 },
-		"course over 3000":   func(in *CreateTeachingCourseInput) { in.NumStudents = 3001 },
-		"credits 99":         func(in *CreateTeachingCourseInput) { in.Credits = 99 },
-		"3 (9-9-9)":          func(in *CreateTeachingCourseInput) { in.LectureHrs, in.LabHrs, in.SelfHrs = 9, 9, 9 },
-		"sections sum to 3002": func(in *CreateTeachingCourseInput) {
-			in.Sections = append(in.Sections, CourseSectionInput{SecNo: "2", Track: "regular", NumStudents: 2962})
+		"negative section":    func(in *CreateTeachingCourseInput) { in.Sections[0].NumStudents = -50 },
+		"2,000,000 students":  func(in *CreateTeachingCourseInput) { in.Sections[0].NumStudents = 2000000 },
+		"2,000,000 hours":     func(in *CreateTeachingCourseInput) { in.LectureHrs = 2000000 },
+		"course over ceiling": func(in *CreateTeachingCourseInput) { in.NumStudents = maxStudentsPerCourse + 1 },
+		"credits 99":          func(in *CreateTeachingCourseInput) { in.Credits = 99 },
+		"3 (9-9-9)":           func(in *CreateTeachingCourseInput) { in.LectureHrs, in.LabHrs, in.SelfHrs = 9, 9, 9 },
+		"sections exceed course ceiling": func(in *CreateTeachingCourseInput) {
+			for i := 0; i < 34; i++ {
+				in.Sections = append(in.Sections, CourseSectionInput{SecNo: strconv.Itoa(i + 2), Track: "regular", NumStudents: 3000})
+			}
 		},
 		"reversed dates": func(in *CreateTeachingCourseInput) {
 			in.StartsOn, in.EndsOn = strp(day(20)), strp(day(3))
@@ -94,8 +96,8 @@ func TestSectionAndHeadcountEdits_ShareTheCeilings(t *testing.T) {
 		UpdateSectionInput{NumStudents: intp(3001)}), 400, "3000")
 	_, err := svc.AddSection(f.ctx, f.StaffID, f.CourseID, AddSectionInput{SecNo: "9", Track: "regular", NumStudents: -1})
 	wantRuleErr(t, err, 400, "ติดลบ")
-	// Per course, not per track: 2000 + 2000 is over.
-	wantRuleErr(t, svc.SetNumStudents(f.ctx, f.StaffID, f.CourseID, -1, 2000, 2000, true), 400, "3000")
+	// Per course, not per track: two individually valid counts exceed the total ceiling.
+	wantRuleErr(t, svc.SetNumStudents(f.ctx, f.StaffID, f.CourseID, -1, 60000, 60000, true), 400, "100000")
 	wantRuleErr(t, svc.SetNumStudents(f.ctx, f.StaffID, f.CourseID, -1, -5, -1, true), 400, "ติดลบ")
 	// /info: same notation rule as Create.
 	wantRuleErr(t, svc.UpdateCourseInfo(f.ctx, f.StaffID, f.CourseID,
