@@ -14,8 +14,9 @@ as well. File extension and container signature must agree. Limit: 20 MB.
    same dry-run endpoint. Course identities and source-section identities cannot
    disappear; exclusion requires an explicit skip reason. Source evidence is
    always reconstructed from the uploaded file.
-3. Correct all errors and explicitly acknowledge warning IDs. Revalidate after
-   any edit or acknowledgement. The server returns `ready` and `validation_hash`.
+3. Correct all errors and explicitly acknowledge warning IDs. The UI revalidates
+   automatically after an editing pause; manual retry remains available. The
+   server returns `ready` and `validation_hash`.
 4. Submit the same file and review with `confirmed: true` to the commit endpoint.
    The server regenerates validation and compares the hash, including the term,
    file, values, acknowledgements and existing-course snapshot. Frontend readiness
@@ -28,6 +29,31 @@ Existing courses default to skip and are not overwritten. Reimport after a lost
 response therefore cannot silently duplicate a successful batch. A deliberate
 merge into an existing course respects its export lock. A new merged course must
 use the newest code era as its base so the correct timetable/credits survive.
+
+## Staff assistance and batch edits
+
+Previews expose stable issue `kind` values and source-derived
+`unmatched_officer_names`. The UI explains possible spelling differences,
+missing/inactive lecturer accounts and ambiguous names; it does not infer a
+specific cause from a failed match. Staff can search by full name/email, open
+user management separately and refresh active candidates without losing edits.
+A complete exact unique match to active lecturer accounts, with the source's
+primary-owner order unchanged, is marked `lecturer_match_verified` and produces
+no `lecturer_match` warning. This is recomputed on every preview and commit,
+never trusted from client metadata. Partial/ambiguous matches, unnamed extra
+teachers (e.g. “และคณะ”), and manual changes to the matched account/order still
+require review. No heuristic percentage is presented as certainty.
+An empty lecturer picker is local draft state, never an empty UUID in a request.
+
+Batch tools are limited to explicitly selected, currently visible, included new
+courses. They preview old/new values before applying curricula, tracks, study
+levels or lecturer additions. Existing courses and skipped courses are excluded.
+Curriculum updates default to filling invalid/missing classifications only;
+lecturer additions retain existing teachers unless explicit primary promotion
+is selected. Batch acknowledgement selects warning categories from a fresh
+validated review. Errors, unresolved REG names and unassigned-lecturer warnings
+cannot be acknowledged in bulk. Every batch invalidates final confirmation and
+requires server revalidation; it does not write to the database.
 
 ## Source semantics
 

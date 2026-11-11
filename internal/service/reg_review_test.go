@@ -39,6 +39,9 @@ func TestREGSourceTracksAndMultiline(t *testing.T) {
 	}
 	validateREGReview(r)
 	for _, i := range r.Issues {
+		if i.Kind == "" {
+			t.Fatal("review issue missing category for scoped bulk confirmation")
+		}
 		if i.Severity == "error" {
 			t.Fatalf("unexpected validation: %+v", i)
 		}

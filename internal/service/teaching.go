@@ -2884,6 +2884,9 @@ type parsedSchedule struct {
 }
 
 type parsedSection struct {
+	sourceRows      []REGSourceRow
+	studentCountRaw string
+	capacityRaw     string
 	reviewSchedules []REGSchedule
 	originalRows    [][]string
 	sourceRow       int
@@ -2900,6 +2903,7 @@ type parsedSection struct {
 }
 
 type parsedCourse struct {
+	sourceFormat    string
 	sourceHeaders   []string
 	requiresReview  bool
 	prerequisite    string
@@ -3075,7 +3079,14 @@ func pickImportSheet(f *excelize.File) (name string, raw bool, err error) {
 			return s, true, nil
 		}
 	}
-	// 3. Fall back to the last sheet; guess raw vs flat from its header.
+	for _, s := range sheets {
+		if rows, e := f.GetRows(s); e == nil {
+			if _, _, ok := programmeHeader(rows); ok {
+				return s, false, nil
+			}
+		}
+	}
+	// Fall back to the last sheet; guess raw vs flat from its header.
 	last := sheets[len(sheets)-1]
 	return last, headerHas(last, "COURSECODE1"), nil
 }
@@ -3236,6 +3247,9 @@ func parseNormalizedSheet(body []byte) (courses []*parsedCourse, warnings []stri
 	}
 	// Raw registrar export (multi-line cells, header + section rows) is flattened
 	// by parseRawRows into the same []*parsedCourse the Normalized branch builds.
+	if header, columns, ok := programmeHeader(rows); ok {
+		return parseProgrammeSheet(f, sheet, rows, header, columns)
+	}
 	if raw {
 		return parseRawRows(rows)
 	}

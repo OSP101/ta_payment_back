@@ -32,39 +32,50 @@ type REGLecturer struct {
 }
 type REGIssue struct {
 	ID        string `json:"id"`
+	Kind      string `json:"kind"`
 	Severity  string `json:"severity"`
 	Code      string `json:"code"`
 	SectionID string `json:"section_id,omitempty"`
 	Message   string `json:"message"`
 }
 type REGCourse struct {
-	SourceCells      []string     `json:"source_cells"`
-	Code             string       `json:"code"`
-	Name             string       `json:"name"`
-	Unit             string       `json:"unit"`
-	Level            string       `json:"level"`
-	SourceRow        int          `json:"source_row"`
-	OfficerRaw       string       `json:"officer_raw"`
-	LecturerIDs      []uuid.UUID  `json:"lecturer_ids"`
-	UnassignedReason string       `json:"unassigned_reason"`
-	Skip             bool         `json:"skip"`
-	SkipReason       string       `json:"skip_reason"`
-	ExistingID       string       `json:"existing_id"`
-	ExistingVersion  string       `json:"existing_version"`
-	MergeInto        string       `json:"merge_into"`
-	Sections         []REGSection `json:"sections"`
+	SourceFormat          string       `json:"source_format,omitempty"`
+	SourceHeaders         []string     `json:"source_headers,omitempty"`
+	SourceCells           []string     `json:"source_cells"`
+	Code                  string       `json:"code"`
+	Name                  string       `json:"name"`
+	Unit                  string       `json:"unit"`
+	Level                 string       `json:"level"`
+	SourceRow             int          `json:"source_row"`
+	OfficerRaw            string       `json:"officer_raw"`
+	UnmatchedOfficerNames []string     `json:"unmatched_officer_names"`
+	LecturerMatchVerified bool         `json:"lecturer_match_verified"`
+	LecturerIDs           []uuid.UUID  `json:"lecturer_ids"`
+	UnassignedReason      string       `json:"unassigned_reason"`
+	Skip                  bool         `json:"skip"`
+	SkipReason            string       `json:"skip_reason"`
+	ExistingID            string       `json:"existing_id"`
+	ExistingVersion       string       `json:"existing_version"`
+	MergeInto             string       `json:"merge_into"`
+	Sections              []REGSection `json:"sections"`
 }
 type REGSection struct {
-	SourceCells   []string      `json:"source_cells"`
-	ID            string        `json:"id"`
-	SourceRow     int           `json:"source_row"`
-	SecNo         string        `json:"sec_no"`
-	Track         string        `json:"track"`
-	ReservedFor   string        `json:"reserved_for"`
-	Curriculum    string        `json:"curriculum"`
-	Students      *int          `json:"students"`
-	PendingReason string        `json:"pending_reason"`
-	Schedules     []REGSchedule `json:"schedules"`
+	SourceCapacity *int           `json:"source_capacity,omitempty"`
+	SourceRows     []REGSourceRow `json:"source_rows,omitempty"`
+	SourceCells    []string       `json:"source_cells"`
+	ID             string         `json:"id"`
+	SourceRow      int            `json:"source_row"`
+	SecNo          string         `json:"sec_no"`
+	Track          string         `json:"track"`
+	ReservedFor    string         `json:"reserved_for"`
+	Curriculum     string         `json:"curriculum"`
+	Students       *int           `json:"students"`
+	PendingReason  string         `json:"pending_reason"`
+	Schedules      []REGSchedule  `json:"schedules"`
+}
+type REGSourceRow struct {
+	Row   int      `json:"row"`
+	Cells []string `json:"cells"`
 }
 type REGSchedule struct {
 	Day     int    `json:"day"`
@@ -82,16 +93,25 @@ func newREGReview(courses []*parsedCourse, body []byte) *REGReview {
 	r := &REGReview{FileSHA256: regFileHash(body), Courses: []REGCourse{}, Acknowledged: []string{}, Issues: []REGIssue{}, Lecturers: []REGLecturer{}}
 	for _, c := range courses {
 		v := REGCourse{SourceCells: append([]string{}, c.rawCells...), Code: c.code, Name: c.name, Unit: c.unitRaw, Level: c.level, SourceRow: c.firstRow, OfficerRaw: c.officerRaw, LecturerIDs: []uuid.UUID{}, Sections: []REGSection{}}
+		v.SourceFormat, v.SourceHeaders = c.sourceFormat, c.sourceHeaders
 		for _, key := range c.sectionsInOrder {
 			s := c.sections[key]
 			n := s.numStudents
 			sec := REGSection{SourceCells: append([]string{}, s.rawCells...), ID: fmt.Sprintf("%s:%d:%s", c.code, s.sourceRow, key), SourceRow: s.sourceRow, SecNo: s.secNo, Track: s.track, ReservedFor: s.reserved, Curriculum: s.curriculum, Students: &n, Schedules: []REGSchedule{}}
-			if len(s.rawCells) > 6 {
+			sec.SourceRows = s.sourceRows
+			if c.sourceFormat == "programme" {
+				if capacity, err := strconv.Atoi(s.capacityRaw); err == nil {
+					sec.SourceCapacity = &capacity
+				}
+				if _, err := strconv.Atoi(s.studentCountRaw); err != nil {
+					sec.Students = nil
+				}
+			} else if len(s.rawCells) > 6 {
 				if _, err := strconv.Atoi(strings.TrimSpace(s.rawCells[6])); err != nil {
 					sec.Students = nil
 				}
 			}
-			if len(s.rawCells) > 6 && strings.TrimSpace(s.rawCells[6]) == "" {
+			if c.sourceFormat != "programme" && len(s.rawCells) > 6 && strings.TrimSpace(s.rawCells[6]) == "" {
 				sec.Students = nil
 			}
 			if s.reviewSchedules != nil {
@@ -161,6 +181,7 @@ func bindREGReview(source, input *REGReview) error {
 		c.Name = strings.TrimSpace(c.Name)
 		c.MergeInto = strings.ToUpper(strings.TrimSpace(c.MergeInto))
 		c.SourceCells = original.SourceCells
+		c.SourceFormat, c.SourceHeaders = original.SourceFormat, original.SourceHeaders
 		c.SourceRow = original.SourceRow
 		c.OfficerRaw = original.OfficerRaw
 		for j, s := range original.Sections {
@@ -185,6 +206,8 @@ func bindREGReview(source, input *REGReview) error {
 				sch.Kind = strings.ToLower(strings.TrimSpace(sch.Kind))
 			}
 			c.Sections[j].SourceCells = s.SourceCells
+			c.Sections[j].SourceRows = s.SourceRows
+			c.Sections[j].SourceCapacity = s.SourceCapacity
 			c.Sections[j].SourceRow = s.SourceRow
 			c.Sections[j].ReservedFor = s.ReservedFor
 			if len(c.Sections[j].Schedules) > 200 {
@@ -198,12 +221,43 @@ func bindREGReview(source, input *REGReview) error {
 func regIssue(r *REGReview, code, section, kind, severity, message string, facts any) {
 	b, _ := json.Marshal(facts)
 	h := sha256.Sum256(append([]byte(code+section+kind+message), b...))
-	r.Issues = append(r.Issues, REGIssue{ID: hex.EncodeToString(h[:12]), Severity: severity, Code: code, SectionID: section, Message: message})
+	r.Issues = append(r.Issues, REGIssue{ID: hex.EncodeToString(h[:12]), Kind: kind, Severity: severity, Code: code, SectionID: section, Message: message})
 }
 
 // Validation always runs server-side, including on commit. Warnings can be
 // acknowledged; invalid values cannot be waived by ticking a checkbox.
 func validateREGReview(r *REGReview) {
+	validateREGReviewWithTrustedMatches(r, nil)
+}
+
+// Trust comes only from a fresh source lookup, never from a client flag or
+// similarity score. Keep the order: the first lecturer is the primary owner.
+func sameREGOrderedLecturers(a, b []uuid.UUID) bool {
+	if len(a) == 0 || len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func trustedREGSourceLecturers(raw string, matched []uuid.UUID, unmatched []string) bool {
+	if len(matched) == 0 || len(unmatched) != 0 {
+		return false
+	}
+	for _, token := range strings.Fields(raw) {
+		// These placeholders stand for additional unnamed teachers.
+		if token == "และคณะ" || token == "อจ.พิเศษ" {
+			return false
+		}
+	}
+	return len(officerTokens(raw)) > 0
+}
+
+func validateREGReviewWithTrustedMatches(r *REGReview, trusted map[string][]uuid.UUID) {
 	r.Issues = []REGIssue{}
 	r.Ready = true
 	names := map[string][]string{}
@@ -211,6 +265,10 @@ func validateREGReview(r *REGReview) {
 		names[normalizeCourseName(c.Name)] = append(names[normalizeCourseName(c.Name)], c.Code)
 	}
 	for _, c := range r.Courses {
+		countLabel := "จำนวนรับ"
+		if c.SourceFormat == "programme" {
+			countLabel = "จำนวนผู้ลงทะเบียน"
+		}
 		issue := func(kind, severity, message string, facts any) {
 			regIssue(r, c.Code, "", kind, severity, message, facts)
 		}
@@ -251,7 +309,7 @@ func validateREGReview(r *REGReview) {
 		if len(c.Sections) == 0 {
 			issue("section", "error", "รายวิชาต้องมีอย่างน้อยหนึ่ง Section", nil)
 		}
-		if len(c.LecturerIDs) > 0 {
+		if len(c.LecturerIDs) > 0 && !sameREGOrderedLecturers(c.LecturerIDs, trusted[c.Code]) {
 			issue("lecturer_match", "warning", "ตรวจรายชื่ออาจารย์ที่จับคู่กับข้อความจาก REG และผู้รับผิดชอบหลัก", c.LecturerIDs)
 		}
 		if related := names[normalizeCourseName(c.Name)]; len(related) > 1 {
@@ -278,14 +336,14 @@ func validateREGReview(r *REGReview) {
 				warn("track", "error", "กรุณาเลือกภาคปกติหรือภาคพิเศษ", sec.Track)
 			}
 			if sec.Students == nil {
-				warn("students", "error", "จำนวนรับยังว่าง กรุณากรอกจำนวนที่ถูกต้อง", nil)
+				warn("students", "error", countLabel+"ยังว่าง กรุณากรอกจำนวนที่ถูกต้อง", nil)
 			} else {
 				if e := validateSectionStudents(*sec.Students, "Section"); e != nil {
 					warn("students", "error", e.Error(), sec.Students)
 				}
 				total += *sec.Students
 				if *sec.Students == 0 {
-					warn("zero", "warning", "จำนวนรับเป็น 0 คน กรุณายืนยัน", 0)
+					warn("zero", "warning", countLabel+"เป็น 0 คน กรุณายืนยัน", 0)
 				}
 			}
 			if !validSectionCurricula[sec.Curriculum] {
@@ -356,9 +414,9 @@ func validateREGReview(r *REGReview) {
 			}
 		}
 		if total > 100000 {
-			issue("total", "error", "จำนวนรับรวมเกิน 100,000 คน กรุณาตรวจตัวเลข", total)
+			issue("total", "error", countLabel+"รวมเกิน 100,000 คน กรุณาตรวจตัวเลข", total)
 		} else if total > 3000 {
-			issue("total", "warning", fmt.Sprintf("จำนวนรับรวม %d คน สูงกว่า 3,000 คน กรุณายืนยันรายวิชาขนาดใหญ่", total), total)
+			issue("total", "warning", fmt.Sprintf("%sรวม %d คน สูงกว่า 3,000 คน กรุณายืนยันรายวิชาขนาดใหญ่", countLabel, total), total)
 		}
 	}
 	acks := map[string]bool{}
@@ -432,6 +490,7 @@ func (s *TeachingService) prepareREGReview(ctx context.Context, term uuid.UUID, 
 		return nil, nil, err
 	}
 	unmatchedByCode := map[string][]string{}
+	trustedLecturers := map[string][]uuid.UUID{}
 	for i := range r.Courses {
 		c := &r.Courses[i]
 		var id, version string
@@ -447,11 +506,19 @@ func (s *TeachingService) prepareREGReview(ctx context.Context, term uuid.UUID, 
 				c.SkipReason = "มีรายวิชาในระบบแล้ว เก็บข้อมูลเดิม"
 			}
 		}
-		matched, unmatched, e := s.matchOfficers(ctx, officerTokens(c.OfficerRaw))
+		var matched []uuid.UUID
+		var unmatched []string
+		var e error
+		if c.SourceFormat == "programme" {
+			matched, unmatched = matchProgrammeOfficers(c.OfficerRaw, r.Lecturers)
+		} else {
+			matched, unmatched, e = s.matchOfficers(ctx, officerTokens(c.OfficerRaw))
+		}
 		if e != nil {
 			return nil, nil, e
 		}
 		unmatchedByCode[c.Code] = unmatched
+		c.UnmatchedOfficerNames = unmatched
 		if input == nil {
 			c.LecturerIDs = matched
 			if id != "" {
@@ -459,8 +526,12 @@ func (s *TeachingService) prepareREGReview(ctx context.Context, term uuid.UUID, 
 				c.SkipReason = "มีรายวิชาในระบบแล้ว เก็บข้อมูลเดิม"
 			}
 		}
+		c.LecturerMatchVerified = trustedREGSourceLecturers(c.OfficerRaw, matched, unmatched) && sameREGOrderedLecturers(c.LecturerIDs, matched)
+		if c.LecturerMatchVerified {
+			trustedLecturers[c.Code] = matched
+		}
 	}
-	validateREGReview(r)
+	validateREGReviewWithTrustedMatches(r, trustedLecturers)
 	for i, c := range r.Courses {
 		if c.Skip {
 			continue
@@ -477,7 +548,7 @@ func (s *TeachingService) prepareREGReview(ctx context.Context, term uuid.UUID, 
 			if strings.Contains(raw.rawDays, "MW") || strings.Contains("\n"+raw.rawDays+"\n", "\nS\n") {
 				regIssue(r, c.Code, sec.ID, "day_alias", "warning", fmt.Sprintf("แถว %d: แปล MW เป็นจันทร์และพุธ และ S เป็นเสาร์ กรุณาตรวจวันเรียน", sec.SourceRow), sec.Schedules)
 			}
-			if len(splitLines(raw.rawDays)) != len(splitLines(raw.rawTimes)) && strings.TrimSpace(raw.rawTimes) != "" {
+			if c.SourceFormat != "programme" && len(splitLines(raw.rawDays)) != len(splitLines(raw.rawTimes)) && strings.TrimSpace(raw.rawTimes) != "" {
 				regIssue(r, c.Code, sec.ID, "alignment", "warning", fmt.Sprintf("แถว %d: จำนวนบรรทัดวันกับเวลาใน REG ไม่เท่ากัน ตรวจคาบที่แก้ไขทุกบรรทัด", sec.SourceRow), sec.Schedules)
 			}
 			before, _ := json.Marshal(original.Sections[j])
