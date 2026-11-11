@@ -37,7 +37,8 @@ for person in data["people"]:
         excluded.append({"student_id": person["student_id"], "reasons": reasons})
     else:
         ready.append({"student_id": person["student_id"], "email": email, "title": title,
-                      "first_name": parts[0], "last_name": parts[1], "study_level": levels[0]})
+                      "first_name": parts[0], "last_name": parts[1], "study_level": levels[0],
+                      "ta_seniority": "returning", "history_source": "TA ระบบเดิม ภาคต้น ปีการศึกษา 2569"})
 emails = Counter(r["email"] for r in ready)
 if any(n > 1 for n in emails.values()):
     raise ValueError("Duplicate ready email; resolve before import")

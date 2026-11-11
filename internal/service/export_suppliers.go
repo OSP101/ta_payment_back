@@ -66,14 +66,11 @@ type SupplierCandidate struct {
 
 func (c SupplierCandidate) ready() bool { return c.Missing == "" }
 
-// SupplierCandidates lists the TAs who are new in termID: at least one approved
-// request (assignment not dropped) in this term and none in any earlier term.
-// A staff "returning" override (users.ta_seniority_override) wins, for people
-// whose TA history predates this system.
+// SupplierCandidates requires an approved assignment in termID and the same
+// "new" classification used by badges and the finance documents.
 func (s *DocsService) SupplierCandidates(ctx context.Context, termID uuid.UUID) ([]SupplierCandidate, error) {
 	rows, err := s.pool.Query(ctx, `
-		WITH t AS (SELECT academic_year, semester FROM academic_terms WHERE id = $1),
-		appointed AS (
+		WITH appointed AS (
 			SELECT a.ta_id, at.academic_year, at.semester, tc.term_id
 			  FROM ta_request_assignments a
 			  JOIN ta_requests r       ON r.id = a.request_id
@@ -87,11 +84,7 @@ func (s *DocsService) SupplierCandidates(ctx context.Context, termID uuid.UUID) 
 		  FROM users u
 		  LEFT JOIN ta_profiles p ON p.user_id = u.id
 		 WHERE u.id IN (SELECT ta_id FROM appointed WHERE term_id = $1)
-		   AND NOT EXISTS (
-		         SELECT 1 FROM appointed e, t
-		          WHERE e.ta_id = u.id
-		            AND (e.academic_year, e.semester) < (t.academic_year, t.semester))
-		   AND u.ta_seniority_override IS DISTINCT FROM 'returning'
+		   AND `+taSenioritySQL("u.id", "$1::uuid")+`='new'
 		   AND u.deleted_at IS NULL
 		 ORDER BY u.first_name, u.last_name`, termID)
 	if err != nil {

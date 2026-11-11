@@ -28,12 +28,14 @@ func NewTAAccountBatch(pool *pgxpool.Pool, cfg config.Config) *TAAccountBatch {
 }
 
 type TAAccountInput struct {
-	StudentID  string `json:"student_id"`
-	Email      string `json:"email"`
-	Title      string `json:"title"`
-	FirstName  string `json:"first_name"`
-	LastName   string `json:"last_name"`
-	StudyLevel string `json:"study_level"`
+	StudentID     string `json:"student_id"`
+	Email         string `json:"email"`
+	Title         string `json:"title"`
+	FirstName     string `json:"first_name"`
+	LastName      string `json:"last_name"`
+	StudyLevel    string `json:"study_level"`
+	Seniority     string `json:"ta_seniority,omitempty"`
+	HistorySource string `json:"history_source,omitempty"`
 }
 
 // These records must only be persisted in an encrypted manifest, never logs.
@@ -62,6 +64,9 @@ func validateTAAccountInputs(in []TAAccountInput) error {
 	}
 	ids, emails := map[string]bool{}, map[string]bool{}
 	for i, r := range in {
+		if r.Seniority != "" && (r.Seniority != "returning" || strings.TrimSpace(r.HistorySource) == "" || len([]rune(r.HistorySource)) > 200) {
+			return fmt.Errorf("invalid legacy TA history at row %d", i+1)
+		}
 		a, err := netmail.ParseAddress(r.Email)
 		if !studentIDPattern(r.StudentID) || err != nil || a.Address != r.Email || strings.TrimSpace(r.FirstName) == "" || strings.TrimSpace(r.LastName) == "" || len([]rune(r.FirstName)) > 100 || len([]rune(r.LastName)) > 100 || !validAccountLevel(r.StudyLevel) {
 			return fmt.Errorf("invalid account input at row %d", i+1)
@@ -160,7 +165,7 @@ func (s *TAAccountBatch) Import(ctx context.Context, actor uuid.UUID, batch stri
 		if err != nil {
 			return nil, err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO users(id,email,title,first_name,last_name,study_level,student_id,password_hash,must_change_password,is_active,profile_completed) VALUES($1,$2,NULLIF($3,''),$4,$5,$6::study_level,$7,$8,TRUE,TRUE,FALSE)`, rec.UserID, r.Email, r.Title, r.FirstName, r.LastName, r.StudyLevel, r.StudentID, hash)
+		_, err = tx.Exec(ctx, `INSERT INTO users(id,email,title,first_name,last_name,study_level,student_id,password_hash,must_change_password,is_active,profile_completed,ta_seniority_override) VALUES($1,$2,NULLIF($3,''),$4,$5,$6::study_level,$7,$8,TRUE,TRUE,FALSE,NULLIF($9,''))`, rec.UserID, r.Email, r.Title, r.FirstName, r.LastName, r.StudyLevel, r.StudentID, hash, r.Seniority)
 		if err != nil {
 			return nil, err
 		}
@@ -170,7 +175,7 @@ func (s *TAAccountBatch) Import(ctx context.Context, actor uuid.UUID, batch stri
 		if _, err = tx.Exec(ctx, `INSERT INTO ta_enrollments(user_id,student_id,study_level,created_by,note) VALUES($1,$2,$3::study_level,$4,$5)`, rec.UserID, r.StudentID, r.StudyLevel, actor, "account import "+batch); err != nil {
 			return nil, err
 		}
-		if err = s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: rec.UserID.String(), After: map[string]any{"email": r.Email, "student_id": r.StudentID, "roles": []string{"ta"}, "batch": batch}, Note: "account-only import; no mail"}); err != nil {
+		if err = s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: rec.UserID.String(), After: map[string]any{"email": r.Email, "student_id": r.StudentID, "roles": []string{"ta"}, "batch": batch, "ta_seniority": r.Seniority, "history_source": r.HistorySource}, Note: "account-only import; no mail"}); err != nil {
 			return nil, err
 		}
 		rec.Status = "pending"

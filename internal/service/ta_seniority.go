@@ -19,27 +19,30 @@ import (
 // TASeniority answers ใหม่/เก่า for userID as of termID.
 // ta_seniority_override wins outright — the escape hatch for anyone whose
 // real TA history predates this system, where ta_first_term_id cannot be
-// trusted at all. Failing that, NULL ta_first_term_id (nobody has stamped it
-// yet) defaults to "returning": it is far more often someone who predates the
-// system than someone appointed for the very first time in this exact call,
-// and RecordTAFirstTermIfUnset is what actually establishes the "new" answer
-// going forward once it runs.
+// trusted at all. Otherwise use the first-term stamp, falling back to the
+// earliest approved assignment when a stamp is missing. If neither exists,
+// history is unknown and defaults to returning.
 func (s *UserService) TASeniority(ctx context.Context, userID, termID uuid.UUID) (string, error) {
-	var override *string
-	var firstTermID *uuid.UUID
-	err := s.pool.QueryRow(ctx,
-		`SELECT ta_seniority_override, ta_first_term_id FROM users WHERE id = $1`,
-		userID).Scan(&override, &firstTermID)
-	if err != nil {
-		return "", err
-	}
-	if override != nil {
-		return *override, nil
-	}
-	if firstTermID != nil && *firstTermID == termID {
-		return "new", nil
-	}
-	return "returning", nil
+	var result string
+	err := s.pool.QueryRow(ctx, `SELECT `+taSenioritySQL("$1::uuid", "$2::uuid"), userID, termID).Scan(&result)
+	return result, err
+}
+
+// taSenioritySQL is shared by badges, exports and ERP candidates. Expressions
+// are internal SQL identifiers/placeholders, never user input. Explicit history
+// wins, followed by the first-term stamp and the earliest approved non-dropped
+// assignment. Unknown history stays returning.
+func taSenioritySQL(userExpr, termExpr string) string {
+	return `(SELECT COALESCE(seniority_user.ta_seniority_override,
+	  CASE WHEN COALESCE(seniority_user.ta_first_term_id, (
+	    SELECT tc.term_id FROM ta_request_assignments a
+	    JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
+	    JOIN teaching_courses tc ON tc.id=r.teaching_course_id
+	    JOIN academic_terms term ON term.id=tc.term_id
+	    WHERE a.ta_id=seniority_user.id AND a.state<>'dropped'
+	    ORDER BY term.academic_year, term.semester, tc.term_id LIMIT 1
+	  )) = ` + termExpr + ` THEN 'new' ELSE 'returning' END)
+	  FROM users seniority_user WHERE seniority_user.id=` + userExpr + `)`
 }
 
 // RecordTAFirstTermIfUnset stamps ta_first_term_id the first time a TA's

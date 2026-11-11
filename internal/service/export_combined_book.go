@@ -1655,12 +1655,10 @@ func (s *ExportService) BuildTimetableWorkbook(ctx context.Context, taID, termID
 	f.SetCellValue(tt, "I3", fullName)
 	f.SetCellValue(tt, "O3", studentID)
 	var returning bool
-	_ = s.pool.QueryRow(ctx, `SELECT EXISTS (
-	    SELECT 1 FROM ta_request_assignments a
-	    JOIN ta_requests r ON r.id=a.request_id AND r.status='approved'
-	    JOIN teaching_courses tc ON tc.id=r.teaching_course_id
-	    WHERE a.ta_id=$1 AND tc.term_id <> $2 AND a.state <> 'dropped')`,
-		taID, termID).Scan(&returning)
+	if err := s.pool.QueryRow(ctx, `SELECT (`+taSenioritySQL("$1::uuid", "$2::uuid")+`='returning')`,
+		taID, termID).Scan(&returning); err != nil {
+		return nil, err
+	}
 	if returning {
 		f.SetCellValue(tt, "AA1", "TA เดิม")
 	}

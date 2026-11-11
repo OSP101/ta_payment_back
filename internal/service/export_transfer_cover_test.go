@@ -487,6 +487,7 @@ func TestTransferCoverPreview_SeniorityPopulated(t *testing.T) {
 	courseA, regA, _ := f.insertCourse(tcCourseOpts{Code: "CP111", Curriculum: "CY", LectureHrs: 100})
 	newTA := f.newTA("กมล ใหม่เอี่ยม", "undergrad")
 	oldTA := f.newTA("ยุพา เก่าแก่", "undergrad")
+	f.exec(`UPDATE users SET ta_seniority_override='returning' WHERE id=$1`, oldTA)
 	f.exec(`UPDATE users SET ta_first_term_id = $2 WHERE id = $1`, newTA, f.termID)
 	f.assignTA(newTA, courseA, regA, "undergrad", []int{1})
 	f.assignTA(oldTA, courseA, regA, "undergrad", []int{2})
@@ -507,7 +508,7 @@ func TestTransferCoverPreview_SeniorityPopulated(t *testing.T) {
 			got["กมล ใหม่เอี่ยม ทดสอบ"], got)
 	}
 	if got["ยุพา เก่าแก่ ทดสอบ"] != "เก่า" {
-		t.Errorf("a TA with no ta_first_term_id stamp reads %q, want เก่า (all: %v)",
+		t.Errorf("a TA with explicit legacy history reads %q, want เก่า (all: %v)",
 			got["ยุพา เก่าแก่ ทดสอบ"], got)
 	}
 }

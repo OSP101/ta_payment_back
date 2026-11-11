@@ -38,8 +38,8 @@ func main() {
 	}
 }
 func run() error {
-	mode := flag.String("mode", "import", "import or send")
-	input := flag.String("input", "", "ready account JSON file (import only)")
+	mode := flag.String("mode", "import", "import, mark-returning, or send")
+	input := flag.String("input", "", "ready account JSON file (import and mark-returning)")
 	path := flag.String("manifest", "data/account-imports/legacy-ta-20261111.enc", "encrypted credentials and delivery ledger")
 	batch := flag.String("batch", "legacy-ta-20261111", "batch name")
 	actorEmail := flag.String("actor-email", "", "active admin/staff email; optional when exactly one active admin exists")
@@ -49,7 +49,7 @@ func run() error {
 	limit := flag.Int("limit", 0, "maximum messages to send; 0 means all pending")
 	report := flag.String("report", "", "optional account status JSON report (never includes passwords)")
 	flag.Parse()
-	if (*mode != "import" && *mode != "send") || (*mode == "import" && *send) || (*mode == "send" && *apply) || *limit < 0 {
+	if (*mode != "import" && *mode != "send" && *mode != "mark-returning") || (*mode != "send" && *send) || (*mode == "send" && *apply) || *limit < 0 {
 		return errors.New("invalid mode or flags")
 	}
 	cfg, err := config.Load()
@@ -76,6 +76,26 @@ func run() error {
 	actor, err := svc.ResolveActor(ctx, *actorEmail)
 	if err != nil {
 		return err
+	}
+	if *mode == "mark-returning" {
+		in, err := readInputs(*input)
+		if err != nil {
+			return err
+		}
+		records, err := svc.MarkReturning(ctx, actor, *batch, in, *apply)
+		if err != nil {
+			return err
+		}
+		printCounts(records)
+		if err = writeReport(*report, records); err != nil {
+			return err
+		}
+		if *apply {
+			fmt.Println("TA history updated. No passwords changed; no requests created; NO EMAIL SENT.")
+		} else {
+			fmt.Println("PREVIEW: TA history unchanged; no email sent")
+		}
+		return nil
 	}
 	if *mode == "import" && !*apply {
 		in, err := readInputs(*input)
@@ -272,6 +292,9 @@ func printCounts(records []service.TAAccountRecord) {
 		counts[r.Status]++
 	}
 	fmt.Printf("total=%d ready=%d created_pending=%d existing=%d conflict=%d\n", len(records), counts["ready"], counts["pending"], counts["existing"], counts["conflict"])
+	if counts["ready_returning"]+counts["marked_returning"]+counts["already_returning"]+counts["not_found"] > 0 {
+		fmt.Printf("ready_returning=%d marked_returning=%d already_returning=%d not_found=%d\n", counts["ready_returning"], counts["marked_returning"], counts["already_returning"], counts["not_found"])
+	}
 }
 
 func writeReport(path string, records []service.TAAccountRecord) error {

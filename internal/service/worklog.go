@@ -4563,8 +4563,7 @@ type StaffAssignment struct {
 	SectionNo    string    `json:"section_no"`
 	Track        string    `json:"track"`
 	Level        string    `json:"level"`
-	// IsReturning is true when the TA held an approved assignment in an earlier
-	// academic term — the "เก่า/ใหม่" badge, same rule as the export coversheet.
+	// IsReturning uses the shared seniority rule, including legacy overrides.
 	IsReturning bool `json:"is_returning"`
 }
 
@@ -4612,18 +4611,7 @@ func (s *WorkLogService) StaffListAssignments(ctx context.Context, tcID uuid.UUI
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.id, a.ta_id, u.first_name || ' ' || u.last_name,
 		       COALESCE(a.student_id_snapshot, u.student_id, ''), sec.sec_no, sec.track::text, a.level::text,
-		       EXISTS(
-		         SELECT 1 FROM ta_request_assignments pa
-		         JOIN ta_requests pr ON pr.id = pa.request_id AND pr.status = 'approved'
-		         JOIN sections psec ON psec.id = pa.section_id
-		         JOIN teaching_courses ptc ON ptc.id = psec.teaching_course_id
-		         JOIN academic_terms pt ON pt.id = ptc.term_id
-		         JOIN teaching_courses ctc ON ctc.id = $1
-		         JOIN academic_terms cur ON cur.id = ctc.term_id
-		         WHERE pa.ta_id = a.ta_id
-		           AND (pt.academic_year < cur.academic_year
-		                OR (pt.academic_year = cur.academic_year AND pt.semester < cur.semester))
-		       ) AS is_returning
+		       (`+taSenioritySQL("u.id", "(SELECT term_id FROM teaching_courses WHERE id=$1)")+`='returning') AS is_returning
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		JOIN users u ON u.id = a.ta_id

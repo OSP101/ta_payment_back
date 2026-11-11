@@ -30,6 +30,17 @@ go run ./cmd/ta-accounts -mode import \
 
 ## วันประชุม
 
+ก่อนวันประชุม สำหรับบัญชีที่นำเข้าด้วยเครื่องมือรุ่นเดิม ให้ปรับสถานะประวัติด้วยโหมด `mark-returning` หลังเตรียมไฟล์ input รุ่นที่มี `ta_seniority: returning` และ `history_source` แล้ว:
+
+```bash
+go run ./cmd/ta-accounts -mode mark-returning \
+  -input data/account-imports/legacy-ta-20261111-ready.json
+go run ./cmd/ta-accounts -mode mark-returning \
+  -input data/account-imports/legacy-ta-20261111-ready.json -apply
+```
+
+หากมี admin หลายคน ให้เพิ่ม `-actor-email` เช่นเดียวกับโหมดนำเข้า การปรับประวัติตรวจทั้งรหัสนักศึกษาและอีเมล พร้อมบันทึก audit ไม่เปลี่ยนรหัสผ่าน ไม่สร้างคำขอ และไม่แตะไฟล์สถานะการส่ง บัญชีใหม่ที่นำเข้าพร้อมประวัติ `returning` จะเป็น TA เก่าตั้งแต่สร้างบัญชี ทุกหน้าจอและเอกสารใช้กติกาจาก `ta_seniority.go` ร่วมกัน
+
 1. เปิดฐานข้อมูลและตรวจการตั้งค่า SMTP ของระบบ
 2. ตั้ง `APP_BASE_URL` เป็น URL ที่นักศึกษาเปิดได้จริง เช่น URL ของระบบที่ใช้ในวันประชุม ปัจจุบันการตั้งค่าในเครื่องมี `localhost` เป็นค่าแรก จึงต้องเปลี่ยนหรือกำหนดผ่าน environment ก่อนส่ง ห้ามใช้ URL ตัวอย่างแทน URL จริง
 3. ตรวจรายการก่อน แล้วจึงรันส่ง:
