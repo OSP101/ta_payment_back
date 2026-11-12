@@ -4293,3 +4293,19 @@ func (h *TDBMHandler) ExtraTeachings(c *fiber.Ctx) error {
 	}
 	return c.JSON(out)
 }
+
+func (h *TeachingHandler) MergeExistingCourse(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return fiber.ErrBadRequest
+	}
+	var in service.ExistingMergeInput
+	if err = Bind(c, &in); err != nil {
+		return err
+	}
+	result, err := h.Svc.Teaching.ExistingCourseMerge(c.Context(), UserID(c), id, in, c.Query("commit") == "1")
+	if err != nil {
+		return err
+	}
+	return c.JSON(result)
+}

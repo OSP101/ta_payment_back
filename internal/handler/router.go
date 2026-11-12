@@ -359,6 +359,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// Course identity — the registrar file arrives with typos, and rebuilding a
 	// course to fix one meant re-entering every section and schedule by hand.
 	authed.Patch("/teaching-courses/:id/info", adminOrStaff, editGuard, th.UpdateCourseInfo)
+	authed.Post("/teaching-courses/:id/merge-existing", adminOrStaff, editGuard, th.MergeExistingCourse)
 	authed.Post("/teaching-courses/:id/merge-code", adminOrStaff, editGuard, th.MergeCourseCode)
 	authed.Post("/teaching-courses/:id/sections", adminOrStaff, editGuard, th.AddSection)
 	authed.Patch("/teaching-courses/:id/sections/:sectionId", adminOrStaff, editGuard, th.UpdateSection)
