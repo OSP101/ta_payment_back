@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"ta-payment-back/internal/telemetry"
 )
 
 type Entry struct {
@@ -69,7 +70,11 @@ func (a *Auditor) LogTx(ctx context.Context, tx pgx.Tx, e Entry) error {
 	return write(ctx, tx, e)
 }
 
-func write(ctx context.Context, q execer, e Entry) error {
+func write(ctx context.Context, q execer, e Entry) (result error) {
+	// Keep the original context for audit identity; the trace bridge is only
+	// for diagnostics, not the authoritative actor/session fields.
+	_, finish := telemetry.StartOperation(ctx, "audit.write")
+	defer func() { finish(result) }()
 	// Anything the caller did not set is taken from the request on the context.
 	// This is what gives every one of the 122 call sites an IP, a role, a
 	// session and a request id without any of them asking for one.

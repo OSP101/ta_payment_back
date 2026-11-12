@@ -1,6 +1,28 @@
 package errtrack
 
-import "testing"
+import (
+	"encoding/json"
+	"github.com/getsentry/sentry-go"
+	"strings"
+	"testing"
+)
+
+func TestScrubRemovesPrivateURLsFingerprintsAndLocals(t *testing.T) {
+	event := &sentry.Event{
+		Message:     "GET https://app.test/api/public/private-link?code=private-query",
+		Fingerprint: []string{"person@example.test"},
+		Exception:   []sentry.Exception{{Value: "Bearer private-token", Stacktrace: &sentry.Stacktrace{Frames: []sentry.Frame{{Vars: map[string]interface{}{"form": "private-form"}}}}}},
+	}
+	data, err := json.Marshal(scrub(event, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"private-link", "private-query", "person@example.test", "private-token", "private-form"} {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("event leaked %s", secret)
+		}
+	}
+}
 
 func TestMaskDigits(t *testing.T) {
 	for in, want := range map[string]string{

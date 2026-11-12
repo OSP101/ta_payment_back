@@ -7,16 +7,16 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"ta-payment-back/internal/pii"
 
 	"ta-payment-back/internal/mail"
 )
 
 type NotifyService struct {
-	pool   *pgxpool.Pool
-	mailer *mail.Mailer
+	pool        *pgxpool.Pool
+	mailer      *mail.Mailer
 	queueCipher *pii.Cipher
 	// baseURL is the first address of config.AppBaseURL. Links are stored as in-app paths
 	// ("/lecturer"), which the bell resolves against the current origin; a mail
@@ -181,7 +181,7 @@ func (s *NotifyService) sendEmail(ctx context.Context, userID uuid.UUID, title, 
 		Recipient: recipientName(prefix, first, last), Closing: closing,
 		Layout: layout, Contact: loadMailContact(ctx, s.pool),
 	}
-	if err := s.mailer.SendMessage(mail.Message{
+	if err := s.mailer.SendMessageContext(ctx, mail.Message{
 		To: email, Subject: title, HTML: renderMailHTML(m), Text: renderMailText(m),
 		Attachments: layout.Attachments,
 	}); err != nil {

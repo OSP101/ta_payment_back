@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"ta-payment-back/internal/telemetry"
 	"time"
 )
 
@@ -42,7 +43,7 @@ func NewAPI(base string) *APIClient {
 	if base == "" {
 		base = DefaultAPIBase
 	}
-	return &APIClient{Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: 20 * time.Second}, Gap: time.Second, Jitter: 500 * time.Millisecond, MaxBackoff: time.Minute}
+	return &APIClient{Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Transport: telemetry.HTTPTransport{Integration: "reg-api"}, Timeout: 20 * time.Second}, Gap: time.Second, Jitter: 500 * time.Millisecond, MaxBackoff: time.Minute}
 }
 
 // apiInt accepts JSON's 31 and 31.0 without rounding identifiers or counts.

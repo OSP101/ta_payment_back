@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
+	"ta-payment-back/internal/telemetry"
 )
 
 // Options configures Init. Empty DSN disables reporting.
@@ -87,8 +88,10 @@ func Flush(timeout time.Duration) {
 // handler package fills it in; this package never sees a fiber.Ctx, so it
 // cannot accidentally copy more than these fields.
 type Request struct {
-	ID     string // X-Request-Id, also on the access log and audit rows
-	Method string
+	TraceID       string
+	EdgeRequestID string
+	ID            string // X-Request-Id, also on the access log and audit rows
+	Method        string
 	// Route is the matched pattern (/api/v1/claims/:id), never the concrete
 	// path: a path can carry a share-link token (/p/progress/<token>), and
 	// the pattern is what groups the same bug across different records.
@@ -106,7 +109,7 @@ func CaptureError(err error, r Request) string {
 	}
 	hub := sentry.CurrentHub().Clone()
 	hub.ConfigureScope(func(s *sentry.Scope) { applyRequest(s, r) })
-	hub.Scope().SetFingerprint([]string{r.Method, r.Route, normalize(err.Error())})
+	hub.Scope().SetFingerprint([]string{r.Method, r.Route, normalize(telemetry.ScrubText(err.Error()))})
 	if id := hub.CaptureException(err); id != nil {
 		return string(*id)
 	}
@@ -133,6 +136,12 @@ func CapturePanic(recovered any, r Request) string {
 }
 
 func applyRequest(s *sentry.Scope, r Request) {
+	if r.TraceID != "" {
+		s.SetTag("trace_id", r.TraceID)
+	}
+	if r.EdgeRequestID != "" {
+		s.SetTag("edge_request_id", r.EdgeRequestID)
+	}
 	s.SetTag("request_id", r.ID)
 	s.SetTag("route", r.Route)
 	s.SetTag("method", r.Method)
@@ -222,9 +231,19 @@ func normalize(msg string) string {
 // mistake) cannot start shipping request contents.
 func scrub(e *sentry.Event, _ *sentry.EventHint) *sentry.Event {
 	e.Request = nil
-	e.Message = maskDigits(e.Message)
+	e.Attachments = nil
+	e.Breadcrumbs = nil
+	e.Message = telemetry.ScrubText(maskDigits(e.Message))
 	for i := range e.Exception {
-		e.Exception[i].Value = maskDigits(e.Exception[i].Value)
+		e.Exception[i].Value = telemetry.ScrubText(maskDigits(e.Exception[i].Value))
+		if stack := e.Exception[i].Stacktrace; stack != nil {
+			for j := range stack.Frames {
+				stack.Frames[j].Vars = nil
+			}
+		}
+	}
+	for i := range e.Fingerprint {
+		e.Fingerprint[i] = telemetry.ScrubText(e.Fingerprint[i])
 	}
 	e.User.Email = ""
 	e.User.Username = ""

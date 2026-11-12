@@ -1,8 +1,12 @@
 package mail
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"log"
 	"net"
 	"net/smtp"
@@ -172,7 +176,17 @@ func (m *Mailer) openWithFallback(trace traceFn) (*smtp.Client, bool, error) {
 
 // deliver sends one prepared message to one recipient.
 func (m *Mailer) deliver(to string, raw []byte) error {
-	c, _, err := m.openWithFallback(nil)
+	return m.deliverContext(context.Background(), to, raw)
+}
+
+func (m *Mailer) deliverContext(ctx context.Context, to string, raw []byte) error {
+	c, _, err := m.openWithFallback(func(key, _ string, started time.Time, err error, skip bool, _ string) {
+		_, span := otel.Tracer("ta-payment/smtp").Start(ctx, "smtp."+key, trace.WithTimestamp(started), trace.WithSpanKind(trace.SpanKindClient))
+		if err != nil {
+			span.SetStatus(codes.Error, "SMTP step failed")
+		}
+		span.End()
+	})
 	if err != nil {
 		return err
 	}

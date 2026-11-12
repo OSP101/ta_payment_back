@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"ta-payment-back/internal/telemetry"
 	"time"
 )
 
@@ -149,7 +150,7 @@ func (c *Client) http() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return &http.Client{Timeout: 10 * time.Second}
+	return &http.Client{Transport: telemetry.HTTPTransport{Integration: "sso"}, Timeout: 10 * time.Second}
 }
 
 // LoginURL is where the browser is sent to start a login.

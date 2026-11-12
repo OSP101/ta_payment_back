@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"ta-payment-back/internal/telemetry"
 	"time"
 
 	"golang.org/x/text/encoding/charmap"
@@ -62,7 +63,7 @@ func New(base string) *Client {
 	}
 	return &Client{
 		Base:       strings.TrimRight(base, "/"),
-		HTTP:       &http.Client{Timeout: 20 * time.Second},
+		HTTP:       &http.Client{Transport: telemetry.HTTPTransport{Integration: "reg-legacy"}, Timeout: 20 * time.Second},
 		Gap:        time.Second,
 		Jitter:     500 * time.Millisecond,
 		MaxBackoff: time.Minute,

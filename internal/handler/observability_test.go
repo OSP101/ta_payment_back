@@ -1,14 +1,89 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"log/slog"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
 
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"ta-payment-back/internal/rbac"
 	"ta-payment-back/internal/service"
+	"ta-payment-back/internal/telemetry"
 )
+
+func TestPanicIsLoggedMeasuredAndTracedAs500(t *testing.T) {
+	var logs bytes.Buffer
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(&logs, nil))))
+	defer slog.SetDefault(oldLogger)
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	defer provider.Shutdown(context.Background())
+	oldProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	defer otel.SetTracerProvider(oldProvider)
+	app := fiber.New(fiber.Config{ErrorHandler: ErrorHandler})
+	app.Use(RequestID(), AccessLog(), Recover())
+	app.Get("/panic-test", func(c *fiber.Ctx) error {
+		if !trace.SpanContextFromContext(telemetry.Parent(c.Context())).IsValid() {
+			t.Error("DB/service context lost request trace")
+		}
+		panic("ยอดผิดพลาด 1100000000001")
+	})
+	r := httptest.NewRequest("GET", "/panic-test?password=do-not-log", nil)
+	r.Header.Set("X-Request-Id", "forged")
+	response, err := app.Test(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 500 || response.Header.Get("X-Request-Id") == "forged" || response.Header.Get("X-Trace-Id") == "" {
+		t.Fatalf("missing authoritative reference/status: %v", response)
+	}
+	text := logs.String()
+	if !strings.Contains(text, `"msg":"http_request"`) || !strings.Contains(text, `"status":500`) || strings.Contains(text, "1100000000001") || strings.Contains(text, "do-not-log") {
+		t.Fatalf("incomplete or unsafe panic log: %s", text)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "GET /panic-test" {
+		t.Fatalf("panic trace missing: %#v", spans)
+	}
+	metrics, err := telemetry.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, family := range metrics {
+		if family.GetName() == "ta_http_requests_total" {
+			for _, metric := range family.Metric {
+				route, status := "", ""
+				for _, label := range metric.Label {
+					if label.GetName() == "route" {
+						route = label.GetValue()
+					}
+					if label.GetName() == "status" {
+						status = label.GetValue()
+					}
+				}
+				if route == "/panic-test" && status == "500" && metric.Counter.GetValue() >= 1 {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("panic missing from 5xx metrics")
+	}
+}
 
 // The access log's severity is the first filter of any incident, so the status
 // it records has to be the one the client was actually told.

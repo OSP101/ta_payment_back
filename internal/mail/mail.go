@@ -2,6 +2,7 @@ package mail
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/x509"
 	_ "embed"
@@ -14,6 +15,7 @@ import (
 	netmail "net/mail"
 	"net/textproto"
 	"strings"
+	"ta-payment-back/internal/telemetry"
 	"time"
 
 	"ta-payment-back/internal/config"
@@ -81,7 +83,14 @@ func (m *Mailer) Send(to, subject, html string) error {
 }
 
 func (m *Mailer) SendMessage(msg Message) error {
+	return m.SendMessageContext(context.Background(), msg)
+}
+
+func (m *Mailer) SendMessageContext(ctx context.Context, msg Message) (result error) {
+	ctx, finish := telemetry.StartOperation(ctx, "mail.send")
+	defer func() { finish(result) }()
 	if m.cfg.SMTPHost == "" {
+		telemetry.Operations.WithLabelValues("mail.skipped", "disabled").Inc()
 		log.Printf("[mail-disabled] delivery skipped")
 		return nil
 	}
@@ -90,7 +99,7 @@ func (m *Mailer) SendMessage(msg Message) error {
 	if err != nil {
 		return err
 	}
-	return m.deliver(to, raw)
+	return m.deliverContext(ctx, to, raw)
 }
 
 // envelopeFrom is the bare sender address for MAIL FROM. MailFrom may be

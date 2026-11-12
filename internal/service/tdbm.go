@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"ta-payment-back/internal/telemetry"
 	"time"
 
 	"github.com/google/uuid"
@@ -151,7 +152,7 @@ func (s *TDBMService) fetchJSON(ctx context.Context, path string, out any) error
 	req.Header.Set("User-Agent", tdbmUserAgent)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Transport: telemetry.HTTPTransport{Integration: "tdbm"}}).Do(req)
 	if err != nil {
 		return &UserError{Status: 502, Msg: "ไม่สามารถติดต่อ TDBM API ได้ (network / timeout)"}
 	}

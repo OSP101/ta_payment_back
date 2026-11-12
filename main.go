@@ -8,8 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"syscall"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -30,6 +30,7 @@ import (
 	"ta-payment-back/internal/scheduler"
 	"ta-payment-back/internal/service"
 	"ta-payment-back/internal/storage"
+	"ta-payment-back/internal/telemetry"
 )
 
 // proxyHeader decides whether c.IP() reads X-Forwarded-For at all.
@@ -61,7 +62,7 @@ func initLogging(env string) {
 	if env == "production" {
 		h = slog.NewJSONHandler(os.Stdout, opts)
 	}
-	logger := slog.New(h)
+	logger := slog.New(telemetry.NewLogHandler(h)).With("service", "ta-payment-api", "environment", env, "release", os.Getenv("SENTRY_RELEASE"))
 	slog.SetDefault(logger)
 	// The standard log package still has ~100 call sites in this codebase and
 	// third-party libraries write to it too. Routing it through slog means one
@@ -112,12 +113,22 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if shutdown, err := telemetry.Start(ctx, cfg.AppEnv, cfg.SentryRelease); err != nil {
+		slog.Error("telemetry_start_failed", "error", err)
+	} else {
+		defer func() {
+			flush, done := context.WithTimeout(context.Background(), 5*time.Second)
+			defer done()
+			_ = shutdown(flush)
+		}()
+	}
 
 	pool, err := db.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("db: %v", err)
 	}
 	defer pool.Close()
+	telemetry.ObservePool(pool)
 
 	migrationDir := os.Getenv("MIGRATIONS_DIR")
 	if migrationDir == "" {
@@ -241,12 +252,13 @@ func main() {
 		defer requests.Done()
 		return c.Next()
 	})
-	app.Use(handler.Recover())
 	// Order matters. RequestID is first so that everything below it — including
 	// a panic recovered above, and the access log's own line — can name the
 	// request. AccessLog wraps the rest so its duration covers the real work.
 	app.Use(handler.RequestID())
 	app.Use(handler.AccessLog())
+	// Recovery must be INSIDE the logger/trace so panics return through both.
+	app.Use(handler.Recover())
 	app.Use(handler.TranslateErrors())
 	app.Use(handler.TranslateFields())
 	app.Use(helmet.New(helmet.Config{
@@ -283,7 +295,7 @@ func main() {
 		AllowOrigins:     cfg.CORSOrigins,
 		AllowCredentials: true,
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization,X-Edit-Views,Idempotency-Key",
-		ExposeHeaders:    "X-Edit-Views,Content-Disposition",
+		ExposeHeaders:    "X-Edit-Views,Content-Disposition,X-Request-Id,X-Trace-Id,X-Edge-Request-Id",
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 	}))
 	// Second layer of CSRF defence, under the cookie's own SameSite=Lax — see
@@ -358,19 +370,19 @@ func main() {
 		// Idempotent and per-DATABASE (not per-schema), so every later
 		// per-slot 0001_init run just sees it already there and skips it.
 		if cfg.AutoMigrate {
-		for _, ext := range []string{"pgcrypto", "citext"} {
-			if _, err := demoPool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "`+ext+`"`); err != nil {
-				log.Fatalf("demo: enabling %s: %v", ext, err)
+			for _, ext := range []string{"pgcrypto", "citext"} {
+				if _, err := demoPool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS "`+ext+`"`); err != nil {
+					log.Fatalf("demo: enabling %s: %v", ext, err)
+				}
 			}
-		}
-		// The registry (demo_workspaces, demo_authorized_testers) — its own
-		// small migration set, applied only here, never against the real
-		// migrationDir/production pool. See migrations/demo_registry's own
-		// doc comment for why this is a separate directory rather than just
-		// more files in migrationDir.
-		if err := db.Migrate(ctx, demoPool, filepath.Join(migrationDir, "demo_registry")); err != nil {
-			log.Fatalf("demo: migrating registry: %v", err)
-		}
+			// The registry (demo_workspaces, demo_authorized_testers) — its own
+			// small migration set, applied only here, never against the real
+			// migrationDir/production pool. See migrations/demo_registry's own
+			// doc comment for why this is a separate directory rather than just
+			// more files in migrationDir.
+			if err := db.Migrate(ctx, demoPool, filepath.Join(migrationDir, "demo_registry")); err != nil {
+				log.Fatalf("demo: migrating registry: %v", err)
+			}
 		} else if err := db.CheckMigrations(ctx, demoPool, filepath.Join(migrationDir, "demo_registry")); err != nil {
 			log.Fatalf("demo registry readiness: %v", err)
 		}
@@ -416,7 +428,9 @@ func main() {
 	// file_deleted_at on the row for audit. See docs_review.go.
 	startWorker(services.Docs.RunRetention)
 	startWorker(services.RunOperationalMetrics)
-	if cfg.AsyncNotifications { startWorker(services.Notify.RunOutbox) }
+	if cfg.AsyncNotifications {
+		startWorker(services.Notify.RunOutbox)
+	}
 
 	// Monthly submission-period scheduler: hourly reminders + daily auto-close.
 	// Runs in-process; extract to cmd/scheduler if the reminder volume grows.

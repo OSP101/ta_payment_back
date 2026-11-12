@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"ta-payment-back/internal/errtrack"
+	"ta-payment-back/internal/telemetry"
 )
 
 // ctxPanicReported marks a request whose panic Recover() already sent to
@@ -49,9 +50,13 @@ func errtrackRequest(c *fiber.Ctx, status int) errtrack.Request {
 	r := errtrack.Request{
 		ID:       ReqID(c).String(),
 		Method:   c.Method(),
-		Route:    c.Route().Path,
+		Route:    diagnosticRoute(c),
 		Status:   status,
 		UserRole: actingRole(Roles(c)),
+	}
+	r.TraceID, _ = telemetry.TraceIDs(c.Context())
+	if edgeIDPattern.MatchString(c.Get("X-Edge-Request-Id")) {
+		r.EdgeRequestID = c.Get("X-Edge-Request-Id")
 	}
 	if id := UserID(c); id != uuid.Nil {
 		r.UserID = id.String()

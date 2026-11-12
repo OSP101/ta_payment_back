@@ -9,14 +9,23 @@
 package handler
 
 import (
+	"context"
 	"log/slog"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/rbac"
+	"ta-payment-back/internal/telemetry"
 )
 
 // HeaderRequestID is echoed on every response. It is the one string a user can
@@ -26,6 +35,24 @@ const HeaderRequestID = "X-Request-Id"
 
 // ctxRequestID is where the id lives for the duration of the request.
 const ctxRequestID ctxKey = "request_id"
+
+var edgeIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
+
+// Unmatched and demo workspace paths must not create unbounded metric labels
+// or retain bearer links in diagnostics.
+func diagnosticRoute(c *fiber.Ctx) string {
+	route := c.Route().Path
+	if route == "" || route == "/" && c.Path() != "/" {
+		return "unmatched"
+	}
+	if len(route) > 256 {
+		return "unmatched"
+	}
+	if strings.HasPrefix(route, "/api/demo/w/") {
+		return "/api/demo/workspace"
+	}
+	return route
+}
 
 // RequestID mints an id for every request and returns it to the client.
 //
@@ -107,6 +134,22 @@ func actingRole(roles []string) string {
 func AccessLog() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		start := time.Now()
+		// Start a new authoritative server trace; inbound browser trace IDs are
+		// not trusted as audit identity. The edge ID is only a diagnostic link.
+		ctx := telemetry.WithRequest(context.Background(), ReqID(c).String())
+		ctx, span := otel.Tracer("ta-payment/http").Start(ctx, "http request", trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+		c.SetUserContext(ctx)
+		c.Locals(telemetry.ContextKey, ctx)
+		if tid, _ := telemetry.TraceIDs(ctx); tid != "" {
+			c.Set("X-Trace-Id", tid)
+		}
+		edgeID := c.Get("X-Edge-Request-Id")
+		if !edgeIDPattern.MatchString(edgeID) {
+			edgeID = ""
+		}
+		telemetry.HTTPActive.Inc()
+		defer telemetry.HTTPActive.Dec()
 		err := c.Next()
 
 		// NOT c.Response().StatusCode(). Fiber runs ErrorHandler outside the
@@ -117,6 +160,26 @@ func AccessLog() fiber.Handler {
 		status := c.Response().StatusCode()
 		if err != nil {
 			status, _ = errorResponse(err)
+		}
+		if panicked, _ := c.Locals(string(ctxPanicReported)).(bool); panicked {
+			status = 500
+		}
+		route := diagnosticRoute(c)
+		method := c.Method()
+		switch method {
+		case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS":
+		default:
+			method = "OTHER"
+		}
+		telemetry.HTTPRequests.WithLabelValues(method, route, strconv.Itoa(status)).Inc()
+		telemetry.HTTPDuration.WithLabelValues(method, route).Observe(time.Since(start).Seconds())
+		span.SetName(method + " " + route)
+		span.SetAttributes(attribute.String("http.request.method", method), attribute.String("http.route", route), attribute.Int("http.response.status_code", status), attribute.String("request_id", ReqID(c).String()))
+		if edgeID != "" {
+			span.SetAttributes(attribute.String("edge_request_id", edgeID))
+		}
+		if status >= 500 {
+			span.SetStatus(codes.Error, "request failed")
 		}
 
 		// Level by outcome, so `level=ERROR` alone is a useful filter: 5xx is
@@ -133,7 +196,8 @@ func AccessLog() fiber.Handler {
 		attrs := []any{
 			"request_id", ReqID(c).String(),
 			"method", c.Method(),
-			"route", c.Route().Path,
+			"route", route,
+			"edge_request_id", edgeID,
 			"status", status,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"ip", c.IP(),

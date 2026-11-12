@@ -15,7 +15,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/api ./ && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/seed ./cmd/seed && \
     CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/migrate ./cmd/migrate && \
-    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/ta-accounts ./cmd/ta-accounts
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/ta-accounts ./cmd/ta-accounts && \
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/alert-mailer ./cmd/alert-mailer
 
 FROM ${RUNTIME_IMAGE}
 RUN apk add --no-cache ca-certificates tzdata
@@ -25,6 +26,7 @@ COPY --from=build /out/api /app/api
 COPY --from=build /out/seed /app/seed
 COPY --from=build /out/migrate /app/migrate
 COPY --from=build /out/ta-accounts /app/ta-accounts
+COPY --from=build /out/alert-mailer /app/alert-mailer
 COPY migrations /app/migrations
 COPY assets /app/assets
 # UPLOAD_DIR in compose points here; the named volume inherits this ownership

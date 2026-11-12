@@ -10,10 +10,12 @@ package scheduler
 import (
 	"context"
 	"log"
+	"log/slog"
 	"time"
 
 	"ta-payment-back/internal/handler"
 	"ta-payment-back/internal/service"
+	"ta-payment-back/internal/telemetry"
 )
 
 type Scheduler struct {
@@ -84,13 +86,22 @@ func (s *Scheduler) shouldRunDaily(ctx context.Context) bool {
 			SELECT 1 FROM scheduler_daily_close_state WHERE last_run_at::date = CURRENT_DATE
 		)`).Scan(&upToDate)
 	if err != nil {
-		log.Printf("scheduler: shouldRunDaily check failed, skipping this hour: %v", err)
+		telemetry.Operations.WithLabelValues("scheduler.daily_check", "error").Inc()
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "daily_check", "error", err)
 		return false
 	}
 	return !upToDate
 }
 
 func (s *Scheduler) tick(ctx context.Context) {
+	ctx, finish := telemetry.StartOperation(ctx, "scheduler.hourly")
+	var runErr error
+	defer func() {
+		finish(runErr)
+		if runErr == nil {
+			telemetry.JobLastSuccess.WithLabelValues("hourly").SetToCurrentTime()
+		}
+	}()
 	// Drop expired read-audit throttle keys. Cheap and unconditional: the map
 	// holds one key per (viewer, audited screen, subject) seen in the last
 	// hour, and without a sweep a long-lived process keeps every one of them
@@ -108,7 +119,8 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// not daily — a scrub failure left sitting is exactly the state a PDPA
 	// erasure guarantee is not supposed to have.
 	if n, err := s.svc.DataDeletion.SweepPendingScrubs(ctx); err != nil {
-		log.Printf("scheduler: sweep_pending_scrubs err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "sweep_pending_scrubs", "error", err)
 	} else if n > 0 {
 		log.Printf("scheduler: completed %d pending PDPA scrub(s)", n)
 	}
@@ -129,7 +141,8 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// Runs before the reminder sweep because a request finalised here may
 	// change who is due to submit work logs this month.
 	if n, err := s.svc.TARequest.SweepPendingRequests(ctx); err != nil {
-		log.Printf("scheduler: ta_request_sweep err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "ta_request_sweep", "error", err)
 	} else if n > 0 {
 		log.Printf("scheduler: finalised %d pending TA request(s)", n)
 	}
@@ -139,14 +152,16 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// course attached late, or a window that opens in the future, is picked
 	// up without anyone pressing anything. See ta_request_notice.go.
 	if n, err := s.svc.TARequest.SweepWindowNotices(ctx); err != nil {
-		log.Printf("scheduler: ta_window_notice err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "ta_window_notice", "error", err)
 	} else if n > 0 {
 		log.Printf("scheduler: sent %d TA request window notice(s)", n)
 	}
 
 	n, err := s.svc.SubmissionPeriods.SweepReminders(ctx)
 	if err != nil {
-		log.Printf("scheduler: sweep_reminders err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "sweep_reminders", "error", err)
 		return
 	}
 	if n > 0 {
@@ -160,18 +175,28 @@ func (s *Scheduler) tick(ctx context.Context) {
 	// Hourly bounds how stale we can get without one; SyncAll itself already
 	// no-ops cleanly when no term is active.
 	if _, err := s.svc.TDBM.SyncAll(ctx, "scheduler"); err != nil {
-		log.Printf("scheduler: tdbm_sync err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "tdbm_sync", "error", err)
 	}
 }
 
 func (s *Scheduler) dailyClose(ctx context.Context) {
+	ctx, finish := telemetry.StartOperation(ctx, "scheduler.daily")
+	var runErr error
+	defer func() {
+		finish(runErr)
+		if runErr == nil {
+			telemetry.JobLastSuccess.WithLabelValues("daily").SetToCurrentTime()
+		}
+	}()
 	// Age audit rows out at five years, archiving each batch to the document
 	// store and verifying it before anything is deleted. Daily and batched: a
 	// table that has never been purged catches up over several nights rather
 	// than trying to move years of rows in one pass, and nothing is waiting on
 	// it. An error here deletes nothing — see PurgeExpiredAudit's ordering.
 	if r, err := s.svc.Audit.PurgeExpiredAudit(ctx, s.svc.Auditor); err != nil {
-		log.Printf("scheduler: audit_purge err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "audit_purge", "error", err)
 	} else if r.Deleted > 0 {
 		log.Printf("scheduler: archived and purged %d audit row(s) up to %s (sha256 %s)",
 			r.Deleted, r.CoversTo.Format("2006-01-02"), r.SHA256[:12])
@@ -179,7 +204,8 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 
 	n, err := s.svc.SubmissionPeriods.AutoCloseExpired(ctx)
 	if err != nil {
-		log.Printf("scheduler: auto_close err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "auto_close", "error", err)
 	} else if n > 0 {
 		log.Printf("scheduler: auto-closed %d expired periods", n)
 	}
@@ -189,7 +215,8 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 	// nothing reads a session after it is a week past revoked/expired, so
 	// there is no freshness requirement pushing this onto the hourly tick.
 	if n, err := s.svc.Sessions.Cleanup(ctx); err != nil {
-		log.Printf("scheduler: session_cleanup err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "session_cleanup", "error", err)
 	} else if n > 0 {
 		log.Printf("scheduler: cleaned up %d expired session(s)", n)
 	}
@@ -198,7 +225,8 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 	// individually but unbounded over time — every step-1 login for a 2FA
 	// account writes one, whether or not step 2 ever completes.
 	if n, err := s.svc.MFA.CleanupChallenges(ctx); err != nil {
-		log.Printf("scheduler: mfa_challenge_cleanup err=%v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "mfa_challenge_cleanup", "error", err)
 	} else if n > 0 {
 		log.Printf("scheduler: cleaned up %d expired mfa challenge(s)", n)
 	}
@@ -212,6 +240,7 @@ func (s *Scheduler) dailyClose(ctx context.Context) {
 	if _, err := s.svc.Pool.Exec(ctx, `
 		INSERT INTO scheduler_daily_close_state (id, last_run_at) VALUES (TRUE, NOW())
 		ON CONFLICT (id) DO UPDATE SET last_run_at = NOW()`); err != nil {
-		log.Printf("scheduler: recording dailyClose run failed: %v", err)
+		runErr = err
+		slog.ErrorContext(ctx, "scheduler_step_failed", "step", "record_daily_run", "error", err)
 	}
 }
