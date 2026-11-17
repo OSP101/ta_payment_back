@@ -154,3 +154,35 @@ func TestRoleAndStatusCompose(t *testing.T) {
 		}
 	}
 }
+
+// A name search must reach lecturers beyond the initial page, match the full
+// name, and exclude inactive accounts and people with only other roles.
+func TestLecturerFullNameSearchBeyondFirstPage(t *testing.T) {
+	svc, ctx := newListSvc(t, 90)
+	if _, err := svc.pool.Exec(ctx, `INSERT INTO user_roles (user_id, role)
+   SELECT id, 'lecturer'::role_code FROM users WHERE first_name <> 'p089'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.pool.Exec(ctx, `INSERT INTO user_roles (user_id, role)
+   SELECT id, 'staff'::role_code FROM users WHERE first_name = 'p089'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		search string
+		want   int
+	}{
+		{"p088 ทดสอบ", 1}, {"p087 ทดสอบ", 0}, {"p089 ทดสอบ", 0},
+	} {
+		t.Run(tc.search, func(t *testing.T) {
+			items, total, err := svc.List(ctx, UserListFilter{
+				Role: "lecturer", Status: "active", Search: tc.search, Limit: 50,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if total != tc.want || len(items) != tc.want {
+				t.Fatalf("search %q: want %d lecturers, got total=%d items=%d", tc.search, tc.want, total, len(items))
+			}
+		})
+	}
+}

@@ -559,7 +559,7 @@ func (s *UserService) List(ctx context.Context, f UserListFilter) ([]User, int, 
 		i++
 	}
 	if f.Search != "" {
-		where += " AND (u.email ILIKE $" + itoa(i) + " OR u.first_name ILIKE $" + itoa(i) + " OR u.last_name ILIKE $" + itoa(i) + " OR COALESCE(u.student_id,'') ILIKE $" + itoa(i) + ")"
+		where += " AND (u.email ILIKE $" + itoa(i) + " OR u.first_name ILIKE $" + itoa(i) + " OR u.last_name ILIKE $" + itoa(i) + " OR (u.first_name || ' ' || u.last_name) ILIKE $" + itoa(i) + " OR COALESCE(u.student_id,'') ILIKE $" + itoa(i) + ")"
 		args = append(args, "%"+f.Search+"%")
 		i++
 	}
