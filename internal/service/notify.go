@@ -181,6 +181,12 @@ func (s *NotifyService) sendEmail(ctx context.Context, userID uuid.UUID, title, 
 		Recipient: recipientName(prefix, first, last), Closing: closing,
 		Layout: layout, Contact: loadMailContact(ctx, s.pool),
 	}
+	meta := mail.DeliveryMetaFrom(ctx)
+	meta.UserID, meta.Name = userID.String(), strings.TrimSpace(first+" "+last)
+	if meta.Source == "direct" {
+		meta.Source = "notification"
+	}
+	ctx = mail.WithDeliveryMeta(ctx, meta)
 	if err := s.mailer.SendMessageContext(ctx, mail.Message{
 		To: email, Subject: title, HTML: renderMailHTML(m), Text: renderMailText(m),
 		Attachments: layout.Attachments,

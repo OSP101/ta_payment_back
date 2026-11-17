@@ -87,6 +87,9 @@ func (s *MailSettingsService) SendTest(ctx context.Context, actor uuid.UUID, to 
 		return nil, Invalid("รูปแบบอีเมลผู้รับไม่ถูกต้อง")
 	}
 	if s.mailer == nil || !s.mailer.Info().Enabled {
+		if s.mailer != nil {
+			_ = s.mailer.SendMessageContext(mail.WithDeliveryMeta(ctx, mail.DeliveryMeta{Source: "test"}), mail.Message{To: addr.Address, Subject: "ทดสอบการส่งอีเมลจากระบบ COCO TAS"})
+		}
 		return &TestSendResult{To: addr.Address, Disabled: true,
 			Error: "ยังไม่ได้กำหนด SMTP_HOST ระบบจึงไม่ส่งอีเมล"}, nil
 	}
@@ -108,7 +111,7 @@ func (s *MailSettingsService) SendTest(ctx context.Context, actor uuid.UUID, to 
 		Contact:   loadMailContact(ctx, s.pool),
 	}
 	t0 := time.Now()
-	err = s.mailer.SendMessage(mail.Message{
+	err = s.mailer.SendMessageContext(mail.WithDeliveryMeta(ctx, mail.DeliveryMeta{Source: "test"}), mail.Message{
 		To: addr.Address, Subject: m.Title, HTML: renderMailHTML(m), Text: renderMailText(m),
 	})
 	res := &TestSendResult{To: addr.Address, Sent: err == nil, Millis: time.Since(t0).Milliseconds()}

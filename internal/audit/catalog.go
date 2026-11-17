@@ -281,12 +281,19 @@ var catalog = map[string]ActionInfo{
 	"audit_log.export":              sensitive("ส่งออกบันทึกการใช้งานเป็นไฟล์"),
 
 	// ── Settings and housekeeping ───────────────────────────────────────────
-	"document_policy.update": warn("แก้ไขอายุเก็บไฟล์และจำนวนดาวน์โหลดเอกสาร", CatSystem),
-	"mail_settings.update":   warn("แก้ไขการตั้งค่าอีเมลของระบบ", CatSystem),
-	"mail.check":             ok("ทดสอบการเชื่อมต่อเซิร์ฟเวอร์อีเมล", CatSystem),
-	"mail.test_send":         ok("ส่งอีเมลทดสอบ", CatSystem),
-	"system.db_restore":      danger("กู้คืนฐานข้อมูลจากไฟล์สำรอง", CatSystem),
-	"audit_log.purge":        system(ok("ย้ายบันทึกที่พ้นอายุเก็บ 5 ปีเข้าคลังถาวร", CatSystem)),
+	"document_policy.update":  warn("แก้ไขอายุเก็บไฟล์และจำนวนดาวน์โหลดเอกสาร", CatSystem),
+	"mail_settings.update":    warn("แก้ไขการตั้งค่าอีเมลของระบบ", CatSystem),
+	"mail.delivery.queued":    system(ok("นำอีเมลเข้าคิวรอส่ง", CatComms)),
+	"mail.delivery.started":   system(ok("เริ่มประมวลผลการส่งอีเมล", CatComms)),
+	"mail.delivery.accepted":  system(ok("เซิร์ฟเวอร์ SMTP รับอีเมลแล้ว", CatComms)),
+	"mail.delivery.skipped":   system(failed("ข้ามการส่งอีเมลเพราะปิด SMTP", CatComms)),
+	"mail.delivery.failed":    system(failed("ส่งอีเมลผ่าน SMTP ไม่สำเร็จ", CatComms)),
+	"mail.delivery.retry":     system(warn("รอลองส่งอีเมลจากคิวอีกครั้ง", CatComms)),
+	"mail.delivery.exhausted": system(failed("หยุดส่งอีเมลจากคิวหลังลองครบ 5 ครั้ง", CatComms)),
+	"mail.check":              ok("ทดสอบการเชื่อมต่อเซิร์ฟเวอร์อีเมล", CatSystem),
+	"mail.test_send":          ok("ส่งอีเมลทดสอบ", CatSystem),
+	"system.db_restore":       danger("กู้คืนฐานข้อมูลจากไฟล์สำรอง", CatSystem),
+	"audit_log.purge":         system(ok("ย้ายบันทึกที่พ้นอายุเก็บ 5 ปีเข้าคลังถาวร", CatSystem)),
 }
 
 // families describe an action that has no entry of its own, from its prefix,

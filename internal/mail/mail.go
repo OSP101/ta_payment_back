@@ -18,6 +18,7 @@ import (
 	"ta-payment-back/internal/telemetry"
 	"time"
 
+	"github.com/google/uuid"
 	"ta-payment-back/internal/config"
 )
 
@@ -42,6 +43,7 @@ type Mailer struct {
 	// rootCAs overrides the system roots; nil in production. Tests set it to
 	// trust their own fake relay's certificate.
 	rootCAs *x509.CertPool
+	observe func(context.Context, DeliveryEvent)
 }
 
 func New(cfg config.Config) *Mailer { return &Mailer{cfg: cfg} }
@@ -88,6 +90,28 @@ func (m *Mailer) SendMessage(msg Message) error {
 
 func (m *Mailer) SendMessageContext(ctx context.Context, msg Message) (result error) {
 	ctx, finish := telemetry.StartOperation(ctx, "mail.send")
+	event := DeliveryEvent{DeliveryMeta: DeliveryMetaFrom(ctx), ID: uuid.NewString(), To: stripCRLF(strings.TrimSpace(msg.To)), Subject: stripCRLF(msg.Subject), From: m.envelopeFrom(), StartedAt: time.Now(), Status: "started"}
+	if m.observe != nil {
+		m.observe(ctx, event)
+	}
+	defer func() {
+		now := time.Now()
+		event.FinishedAt = &now
+		event.Millis = now.Sub(event.StartedAt).Milliseconds()
+		event.Status = "accepted"
+		if m.cfg.SMTPHost == "" {
+			event.Status = "skipped"
+		} else if result != nil {
+			event.Status = "failed"
+			event.Error = Explain(result)
+			if m.cfg.SMTPPass != "" {
+				event.Error = strings.ReplaceAll(event.Error, m.cfg.SMTPPass, "[redacted]")
+			}
+		}
+		if m.observe != nil {
+			m.observe(ctx, event)
+		}
+	}()
 	defer func() { finish(result) }()
 	if m.cfg.SMTPHost == "" {
 		telemetry.Operations.WithLabelValues("mail.skipped", "disabled").Inc()

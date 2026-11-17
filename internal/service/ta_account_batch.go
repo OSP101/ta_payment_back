@@ -26,7 +26,9 @@ type TAAccountBatch struct {
 
 func NewTAAccountBatch(pool *pgxpool.Pool, cfg config.Config) *TAAccountBatch {
 	aud := audit.New(pool)
-	return &TAAccountBatch{pool: pool, aud: aud, users: &UserService{pool: pool, aud: aud, notify: &NotifyService{pool: pool, mailer: mail.New(cfg), baseURL: config.PrimaryBaseURL(cfg.AppBaseURL)}}}
+	mailer := mail.New(cfg)
+	observeMailDelivery(mailer, aud)
+	return &TAAccountBatch{pool: pool, aud: aud, users: &UserService{pool: pool, aud: aud, notify: &NotifyService{pool: pool, mailer: mailer, baseURL: config.PrimaryBaseURL(cfg.AppBaseURL)}}}
 }
 
 type TAAccountInput struct {

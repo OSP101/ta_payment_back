@@ -92,6 +92,7 @@ type AuditQuery struct {
 	Action    string
 	Entity    string
 	EntityID  string
+	MailJobID string
 	IP        string
 	RequestID *uuid.UUID
 	SessionID *uuid.UUID
@@ -254,6 +255,9 @@ func (s *AuditService) auditWhere(ctx context.Context, q *AuditQuery) (string, [
 	}
 	if q.Entity != "" {
 		add("a.entity = $%d", q.Entity)
+	}
+	if q.MailJobID != "" {
+		add("a.entity = 'mail_delivery' AND a.after->>'job_id' = $%d", q.MailJobID)
 	}
 	if q.EntityID != "" {
 		add("a.entity_id = $%d", q.EntityID)

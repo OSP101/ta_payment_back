@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"ta-payment-back/internal/audit"
+	"ta-payment-back/internal/mail"
 )
 
 // Only best-effort notices use this queue. Checked delivery / credential mail
@@ -17,30 +19,56 @@ import (
 var errNoticeTooLarge = errors.New("notification exceeds queue limit")
 
 type queuedNotice struct {
-	Title string
-	Body string
-	Link string
+	Title   string
+	Body    string
+	Link    string
 	Closing string
-	Layout MailLayout
+	Layout  MailLayout
 }
 
 func (s *NotifyService) enqueue(ctx context.Context, user uuid.UUID, title, body, link, closing string, layout MailLayout) error {
 	title, body = plainPunct(title), plainPunct(body)
 	id := uuid.New()
 	raw, err := json.Marshal(queuedNotice{title, body, link, closing, layout})
-	if err != nil { return err }
-	if len(raw) > 2*1024*1024 { return errNoticeTooLarge }
+	if err != nil {
+		return err
+	}
+	if len(raw) > 2*1024*1024 {
+		return errNoticeTooLarge
+	}
 	payload, err := s.queueCipher.Seal([]byte("notification-outbox:"+id.String()), raw)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	tx, err := s.pool.Begin(ctx)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer tx.Rollback(ctx)
 	// Match user deletion's row lock; never enqueue after the deletion commits.
 	var active bool
-	if err := tx.QueryRow(ctx, `SELECT deleted_at IS NULL AND is_active FROM users WHERE id=$1 FOR UPDATE`, user).Scan(&active); err != nil { return err }
-	if !active { return fmt.Errorf("notification recipient unavailable") }
-	if err := writeInAppWith(ctx, tx, user, title, body, nilStr(&link)); err != nil { return err }
-	if _, err := tx.Exec(ctx, `INSERT INTO notification_outbox(id,user_id,payload_enc) VALUES($1,$2,$3)`, id, user, payload); err != nil { return err }
+	if err := tx.QueryRow(ctx, `SELECT deleted_at IS NULL AND is_active FROM users WHERE id=$1 FOR UPDATE`, user).Scan(&active); err != nil {
+		return err
+	}
+	if !active {
+		return fmt.Errorf("notification recipient unavailable")
+	}
+	if err := writeInAppWith(ctx, tx, user, title, body, nilStr(&link)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO notification_outbox(id,user_id,payload_enc) VALUES($1,$2,$3)`, id, user, payload); err != nil {
+		return err
+	}
+	// Store routing metadata in the same transaction as the queued notice.
+	var email, name string
+	if err := tx.QueryRow(ctx, `SELECT email, trim(coalesce(first_name,'') || ' ' || coalesce(last_name,'')) FROM users WHERE id=$1`, user).Scan(&email, &name); err != nil {
+		return err
+	}
+	if err := audit.New(s.pool).LogTx(ctx, tx, audit.Entry{Action: "mail.delivery.queued", Entity: "mail_delivery", EntityID: id.String(),
+		Note:  email + " | " + name + " | " + title + " | " + id.String(),
+		After: map[string]any{"to": email, "recipient_name": name, "recipient_id": user.String(), "subject": title, "source": "outbox", "job_id": id.String(), "status": "queued"}}); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -49,13 +77,16 @@ func (s *NotifyService) enqueue(ctx context.Context, user uuid.UUID, title, body
 // Delivery is at-least-once: an SMTP acceptance followed by a process failure
 // can cause a duplicate notice. This worker NEVER approves or sends payments.
 func (s *NotifyService) RunOutbox(ctx context.Context) {
-	if s.queueCipher == nil { return }
+	if s.queueCipher == nil {
+		return
+	}
 	ticks := 0
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done(): return
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			ticks++
 			if ticks%3600 == 0 {
@@ -63,7 +94,9 @@ func (s *NotifyService) RunOutbox(ctx context.Context) {
 				_, _ = s.pool.Exec(gcCtx, `WITH expired AS (SELECT id FROM notification_outbox WHERE state IN ('sent','failed') AND finished_at<now()-interval '30 days' LIMIT 500) DELETE FROM notification_outbox q USING expired e WHERE q.id=e.id`)
 				cancel()
 			}
-			if err := s.processNotice(ctx); err != nil && ctx.Err() == nil { slog.Error("notification worker failed") }
+			if err := s.processNotice(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("notification worker failed")
+			}
 		}
 	}
 }
@@ -82,26 +115,54 @@ func (s *NotifyService) processNotice(ctx context.Context) error {
 	    lease_token=$1, attempts=LEAST(attempts+1,5)
 	  FROM due WHERE q.id=due.id
 	  RETURNING q.id,q.user_id,q.payload_enc,q.attempts`, lease).Scan(&id, &user, &payload, &attempts)
-	if errors.Is(err, pgx.ErrNoRows) { return nil }
-	if err != nil { return err }
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	ctx = mail.WithDeliveryMeta(ctx, mail.DeliveryMeta{Source: "outbox", JobID: id.String(), Attempt: attempts, UserID: user.String()})
 	raw, deliveryErr := s.queueCipher.Open([]byte("notification-outbox:"+id.String()), payload)
 	var n queuedNotice
-	if deliveryErr == nil { deliveryErr = json.Unmarshal(raw, &n) }
-	if deliveryErr == nil { deliveryErr = s.sendEmail(ctx, user, n.Title, n.Body, n.Link, nilStr(&n.Link), n.Closing, n.Layout) }
+	if deliveryErr == nil {
+		deliveryErr = json.Unmarshal(raw, &n)
+	}
+	if deliveryErr == nil {
+		deliveryErr = s.sendEmail(ctx, user, n.Title, n.Body, n.Link, nilStr(&n.Link), n.Closing, n.Layout)
+	}
 	// Finalize even during shutdown, otherwise a delivered notice is retried.
 	finishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	state := "sent"
 	if deliveryErr != nil {
 		state = "pending"
-		if attempts >= 5 { state = "failed" }
+		if attempts >= 5 {
+			state = "failed"
+		}
 		slog.Warn("notification delivery retry", "job_id", id, "attempt", attempts)
 	}
-	_, err = s.pool.Exec(finishCtx, `UPDATE notification_outbox
+	var retryAt time.Time
+	err = s.pool.QueryRow(finishCtx, `UPDATE notification_outbox
 	    SET state=$3, lease_token=NULL, lease_until=NULL,
 	        available_at=now()+($4::int*interval '1 minute'),
 	        payload_enc=CASE WHEN $3 IN ('sent','failed') THEN NULL ELSE payload_enc END,
 	        finished_at=CASE WHEN $3 IN ('sent','failed') THEN now() ELSE NULL END
-	    WHERE id=$1 AND lease_token=$2`, id, lease, state, attempts*attempts)
+	    WHERE id=$1 AND lease_token=$2 RETURNING available_at`, id, lease, state, attempts*attempts).Scan(&retryAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err == nil && deliveryErr != nil {
+		var to, name string
+		_ = s.pool.QueryRow(finishCtx, `SELECT email, trim(coalesce(first_name,'') || ' ' || coalesce(last_name,'')) FROM users WHERE id=$1`, user).Scan(&to, &name)
+		action := "mail.delivery.retry"
+		if state == "failed" {
+			action = "mail.delivery.exhausted"
+		}
+		recordMailEvent(finishCtx, audit.New(s.pool), action, id.String(), map[string]any{
+			"to": to, "recipient_name": name, "recipient_id": user.String(), "subject": n.Title, "source": "outbox", "job_id": id.String(), "attempt": attempts,
+			"status": state, "retry_at": retryAt,
+			"error": "การส่งหรือการอ่านข้อมูลในคิวไม่สำเร็จ", // Deliberately exclude decrypted payloads and raw crypto errors.
+		}, to+" | "+name+" | "+n.Title+" | "+id.String()+" | "+user.String())
+	}
 	return err
 }

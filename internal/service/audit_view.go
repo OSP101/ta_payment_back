@@ -94,6 +94,13 @@ func decorate(r *AuditRow) {
 
 	before, after := jsonObject(r.Before), jsonObject(r.After)
 	r.Changes = auditChanges(before, after)
+	if r.Entity == "mail_delivery" {
+		if name, ok := after["recipient_name"].(string); ok && name != "" {
+			r.SubjectName = name
+		} else if to, ok := after["to"].(string); ok {
+			r.SubjectName = to
+		}
+	}
 	if r.SubjectName == "" {
 		// The thing the row was about no longer exists (or never had a name the
 		// resolver knows). The row's own images are the last place its name is
@@ -143,6 +150,11 @@ func jsonObject(raw json.RawMessage) map[string]any {
 // before/after images. A key with no entry is shown as itself — still
 // readable by an administrator, and a visible prompt to add it here.
 var auditFieldLabels = map[string]string{
+	"to": "อีเมลผู้รับ", "subject": "หัวข้ออีเมล", "from": "อีเมลผู้ส่ง",
+	"recipient_id": "บัญชีผู้รับ", "recipient_name": "ชื่อผู้รับ",
+	"job_id": "เลขคิว", "attempt": "ครั้งที่ลองส่ง", "delivery_id": "เลขการส่ง",
+	"started_at": "เริ่มส่งเมื่อ", "finished_at": "ส่งเสร็จเมื่อ", "duration_ms": "เวลาที่ใช้ (มิลลิวินาที)",
+	"retry_at": "กำหนดลองส่งอีกครั้ง", "error": "ปัญหาที่พบ",
 	"hours": "ชั่วโมง", "status": "สถานะ", "activity": "กิจกรรม", "work_date": "วันที่ทำงาน",
 	"start_time": "เวลาเริ่ม", "end_time": "เวลาสิ้นสุด", "room": "ห้อง", "note": "หมายเหตุ",
 	"count": "จำนวนรายการ", "rows": "รายการ", "reason": "เหตุผล", "reject_reason": "เหตุผลที่ตีกลับ",

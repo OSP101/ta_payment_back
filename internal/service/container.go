@@ -56,6 +56,7 @@ type Container struct {
 }
 
 func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, auditor *audit.Auditor, cfg config.Config, piiCipher *pii.Cipher, totpCipher *pii.Cipher) *Container {
+	observeMailDelivery(mailer, auditor)
 	c := &Container{Pool: pool, Storage: store, Mailer: mailer, Auditor: auditor, Cfg: cfg}
 	c.Sessions = &SessionService{pool: pool}
 	c.Audit = &AuditService{pool: pool, store: store}
@@ -65,7 +66,9 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	// IP); e-mail links take the first, as the SSO redirect does. The whole
 	// list used to be prepended, giving "http://a,http://b/ta" links.
 	c.Notify = &NotifyService{pool: pool, mailer: mailer, baseURL: config.PrimaryBaseURL(cfg.AppBaseURL)}
-	if cfg.AsyncNotifications { c.Notify.queueCipher = piiCipher }
+	if cfg.AsyncNotifications {
+		c.Notify.queueCipher = piiCipher
+	}
 	c.Users.notify = c.Notify
 	c.Teaching = &TeachingService{pool: pool, aud: auditor, notify: c.Notify, fontDir: cfg.FontDir}
 	c.Budget = &BudgetService{pool: pool}

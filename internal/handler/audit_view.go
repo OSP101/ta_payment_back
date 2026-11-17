@@ -23,16 +23,17 @@ import (
 // exactly that.
 func auditQueryFrom(c *fiber.Ctx) (service.AuditQuery, error) {
 	q := service.AuditQuery{
-		Role:     c.Query("role"),
-		Action:   c.Query("action"),
-		Entity:   c.Query("entity"),
-		EntityID: c.Query("entity_id"),
-		IP:       c.Query("ip"),
-		Category: c.Query("category"),
-		Severity: c.Query("severity"),
-		Outcome:  c.Query("outcome"),
-		Q:        strings.TrimSpace(c.Query("q")),
-		Fold:     c.Query("fold") == "1",
+		Role:      c.Query("role"),
+		Action:    c.Query("action"),
+		Entity:    c.Query("entity"),
+		EntityID:  c.Query("entity_id"),
+		MailJobID: c.Query("mail_job_id"),
+		IP:        c.Query("ip"),
+		Category:  c.Query("category"),
+		Severity:  c.Query("severity"),
+		Outcome:   c.Query("outcome"),
+		Q:         strings.TrimSpace(c.Query("q")),
+		Fold:      c.Query("fold") == "1",
 	}
 	var err error
 	if q.From, err = optTime(c.Query("from")); err != nil {
