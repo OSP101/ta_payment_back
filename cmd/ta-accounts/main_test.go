@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,6 +48,27 @@ func TestManifestEncryptsPasswordsAndKeepsDeliveryState(t *testing.T) {
 	loaded, err = loadManifest(path, c)
 	if err != nil || loaded.Records[0].Password != "" || loaded.Records[0].Status != "sent" {
 		t.Fatal("delivery ledger did not survive save")
+	}
+}
+
+func TestStudentInputRequiresProgrammeAndActiveState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "students.json")
+	in := []service.TAAccountInput{{StudentID: "693380001-1", Email: "synthetic@example.invalid", FirstName: "Synthetic", LastName: "Student", StudyLevel: "undergrad"}}
+	raw, _ := json.Marshal(in)
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readInputs(path, true); err == nil {
+		t.Fatal("accepted incomplete student metadata")
+	}
+	in[0].Department = "Computer Science (SC-CS)"
+	active := false
+	in[0].IsActive = &active
+	raw, _ = json.Marshal(in)
+	os.WriteFile(path, raw, 0600)
+	got, err := readInputs(path, true)
+	if err != nil || got[0].IsActive == nil || *got[0].IsActive {
+		t.Fatal("lost explicit inactive state")
 	}
 }
 

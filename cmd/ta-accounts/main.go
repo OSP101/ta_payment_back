@@ -48,6 +48,7 @@ func run() error {
 	only := flag.String("only", "", "only this student ID in send mode")
 	limit := flag.Int("limit", 0, "maximum messages to send; 0 means all pending")
 	report := flag.String("report", "", "optional account status JSON report (never includes passwords)")
+	studentInput := flag.Bool("student-input", false, "require programme and an explicit active state on every student row")
 	flag.Parse()
 	if (*mode != "import" && *mode != "send" && *mode != "mark-returning") || (*mode != "send" && *send) || (*mode == "send" && *apply) || *limit < 0 {
 		return errors.New("invalid mode or flags")
@@ -73,12 +74,17 @@ func run() error {
 	target := endpoint.Host + "/" + database
 	fmt.Printf("database=%s mode=%s\n", target, *mode)
 	svc := service.NewTAAccountBatch(pool, cfg)
+	svc.Progress = func(done, total int) {
+		if done == 0 || done%100 == 0 || done == total {
+			fmt.Printf("temporary passwords prepared: %d/%d (no email sent)\n", done, total)
+		}
+	}
 	actor, err := svc.ResolveActor(ctx, *actorEmail)
 	if err != nil {
 		return err
 	}
 	if *mode == "mark-returning" {
-		in, err := readInputs(*input)
+		in, err := readInputs(*input, *studentInput)
 		if err != nil {
 			return err
 		}
@@ -98,7 +104,7 @@ func run() error {
 		return nil
 	}
 	if *mode == "import" && !*apply {
-		in, err := readInputs(*input)
+		in, err := readInputs(*input, *studentInput)
 		if err != nil {
 			return err
 		}
@@ -136,7 +142,7 @@ func run() error {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		in, err := readInputs(*input)
+		in, err := readInputs(*input, *studentInput)
 		if err != nil {
 			return err
 		}
@@ -229,7 +235,7 @@ func run() error {
 	}
 	return nil
 }
-func readInputs(path string) ([]service.TAAccountInput, error) {
+func readInputs(path string, requireStudentFields ...bool) ([]service.TAAccountInput, error) {
 	if path == "" {
 		return nil, errors.New("-input is required")
 	}
@@ -239,6 +245,13 @@ func readInputs(path string) ([]service.TAAccountInput, error) {
 	}
 	var in []service.TAAccountInput
 	err = json.Unmarshal(data, &in)
+	if err == nil && len(requireStudentFields) > 0 && requireStudentFields[0] {
+		for i, r := range in {
+			if strings.TrimSpace(r.Department) == "" || r.IsActive == nil {
+				return nil, fmt.Errorf("student input row %d requires department and explicit is_active", i+1)
+			}
+		}
+	}
 	return in, err
 }
 func saveManifest(path string, c *pii.Cipher, m manifest) error {
@@ -292,6 +305,9 @@ func printCounts(records []service.TAAccountRecord) {
 		counts[r.Status]++
 	}
 	fmt.Printf("total=%d ready=%d created_pending=%d existing=%d conflict=%d\n", len(records), counts["ready"], counts["pending"], counts["existing"], counts["conflict"])
+	if counts["created_inactive"] > 0 {
+		fmt.Printf("created_inactive=%d\n", counts["created_inactive"])
+	}
 	if counts["ready_returning"]+counts["marked_returning"]+counts["already_returning"]+counts["not_found"] > 0 {
 		fmt.Printf("ready_returning=%d marked_returning=%d already_returning=%d not_found=%d\n", counts["ready_returning"], counts["marked_returning"], counts["already_returning"], counts["not_found"])
 	}

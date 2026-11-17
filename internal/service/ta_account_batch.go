@@ -20,6 +20,8 @@ type TAAccountBatch struct {
 	pool  *pgxpool.Pool
 	aud   *audit.Auditor
 	users *UserService
+	// Progress reports password preparation counts only; it never receives PII.
+	Progress func(completed, total int)
 }
 
 func NewTAAccountBatch(pool *pgxpool.Pool, cfg config.Config) *TAAccountBatch {
@@ -36,7 +38,11 @@ type TAAccountInput struct {
 	StudyLevel    string `json:"study_level"`
 	Seniority     string `json:"ta_seniority,omitempty"`
 	HistorySource string `json:"history_source,omitempty"`
+	Department    string `json:"department,omitempty"`
+	IsActive      *bool  `json:"is_active,omitempty"`
 }
+
+func (r TAAccountInput) active() bool { return r.IsActive == nil || *r.IsActive }
 
 // These records must only be persisted in an encrypted manifest, never logs.
 type TAAccountRecord struct {
@@ -96,6 +102,16 @@ func (s *TAAccountBatch) Import(ctx context.Context, actor uuid.UUID, batch stri
 	if apply && checkpoint == nil {
 		return nil, errors.New("encrypted checkpoint is required")
 	}
+	// bcrypt is deliberately completed before acquiring the users write lock.
+	// Recheck every identity under the lock before using a prepared credential.
+	prepared := map[string]preparedAccountPassword{}
+	if apply {
+		var err error
+		prepared, err = s.prepareAccountPasswords(ctx, actor, batch, in)
+		if err != nil {
+			return nil, err
+		}
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -146,8 +162,10 @@ func (s *TAAccountBatch) Import(ctx context.Context, actor uuid.UUID, batch stri
 				rec.Detail = "matching account is inactive"
 			case !isTA:
 				rec.Detail = "matching account does not have TA role"
+			case active != r.active():
+				rec.Detail = "matching account has another active state"
 			}
-			if count == 1 && strings.EqualFold(email, r.Email) && strings.ReplaceAll(sid, "-", "") == strings.ReplaceAll(r.StudentID, "-", "") && active && isTA {
+			if count == 1 && strings.EqualFold(email, r.Email) && strings.ReplaceAll(sid, "-", "") == strings.ReplaceAll(r.StudentID, "-", "") && active == r.active() && isTA {
 				rec.Status = "existing"
 				rec.UserID = id
 				rec.Detail = "unchanged"
@@ -159,13 +177,16 @@ func (s *TAAccountBatch) Import(ctx context.Context, actor uuid.UUID, batch stri
 			result = append(result, rec)
 			continue
 		}
-		rec.UserID = uuid.New()
-		rec.Password = generateTempPassword(18)
-		hash, err := auth.HashPassword(rec.Password)
-		if err != nil {
-			return nil, err
+		credential, ok := prepared[r.StudentID]
+		if !ok {
+			rec.Status = "conflict"
+			rec.Detail = "identity changed during password preparation; review before retry"
+			result = append(result, rec)
+			continue
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO users(id,email,title,first_name,last_name,study_level,student_id,password_hash,must_change_password,is_active,profile_completed,ta_seniority_override) VALUES($1,$2,NULLIF($3,''),$4,$5,$6::study_level,$7,$8,TRUE,TRUE,FALSE,NULLIF($9,''))`, rec.UserID, r.Email, r.Title, r.FirstName, r.LastName, r.StudyLevel, r.StudentID, hash, r.Seniority)
+		rec.UserID = uuid.New()
+		rec.Password = credential.password
+		_, err = tx.Exec(ctx, `INSERT INTO users(id,email,title,first_name,last_name,study_level,student_id,password_hash,must_change_password,is_active,profile_completed,ta_seniority_override,department) VALUES($1,$2,NULLIF($3,''),$4,$5,$6::study_level,$7,$8,TRUE,$10,FALSE,NULLIF($9,''),NULLIF($11,''))`, rec.UserID, r.Email, r.Title, r.FirstName, r.LastName, r.StudyLevel, r.StudentID, credential.hash, r.Seniority, r.active(), r.Department)
 		if err != nil {
 			return nil, err
 		}
@@ -175,10 +196,14 @@ func (s *TAAccountBatch) Import(ctx context.Context, actor uuid.UUID, batch stri
 		if _, err = tx.Exec(ctx, `INSERT INTO ta_enrollments(user_id,student_id,study_level,created_by,note) VALUES($1,$2,$3::study_level,$4,$5)`, rec.UserID, r.StudentID, r.StudyLevel, actor, "account import "+batch); err != nil {
 			return nil, err
 		}
-		if err = s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: rec.UserID.String(), After: map[string]any{"email": r.Email, "student_id": r.StudentID, "roles": []string{"ta"}, "batch": batch, "ta_seniority": r.Seniority, "history_source": r.HistorySource}, Note: "account-only import; no mail"}); err != nil {
+		if err = s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "user.create", Entity: "user", EntityID: rec.UserID.String(), After: map[string]any{"email": r.Email, "student_id": r.StudentID, "roles": []string{"ta"}, "batch": batch, "ta_seniority": r.Seniority, "history_source": r.HistorySource, "department": r.Department, "is_active": r.active()}, Note: "account-only import; no mail"}); err != nil {
 			return nil, err
 		}
 		rec.Status = "pending"
+		if !r.active() {
+			rec.Status = "created_inactive"
+			rec.Password = ""
+		}
 		result = append(result, rec)
 	}
 	if !apply {

@@ -81,3 +81,60 @@ func TestTAAccountBatchAtomicCreateAndNoRequestsOrMail(t *testing.T) {
 		t.Fatal("accepted used temporary password")
 	}
 }
+
+func TestTAAccountBatchStudentProgramInactiveStateAndPasswordPreparation(t *testing.T) {
+	f := newFixture(t, fixtureOpts{})
+	svc := NewTAAccountBatch(f.Pool, config.Config{})
+	input := accountBatchInput()
+	input[0].Department = "Computer Science (SC-CS)"
+	inactive := input[0]
+	inactive.StudentID = "693380998-2"
+	inactive.Email = "inactive-synthetic@example.invalid"
+	active := false
+	inactive.IsActive = &active
+	input = append(input, inactive)
+	// Another connection can update users while bcrypt is prepared; the import
+	// must not hold its users write lock during that CPU-heavy phase.
+	called := false
+	svc.Progress = func(done, total int) {
+		if done == 0 {
+			called = true
+			conn, err := f.Pool.Acquire(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Release()
+			if _, err := conn.Exec(f.ctx, `SET lock_timeout='500ms'`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Exec(f.ctx, `UPDATE users SET updated_at=updated_at WHERE id=$1`, f.StaffID); err != nil {
+				t.Fatalf("password preparation held users write lock: %v", err)
+			}
+		}
+	}
+	result, err := svc.Import(f.ctx, f.StaffID, "all-students", input, true, func([]TAAccountRecord) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called || len(result) != 2 || result[0].Status != "pending" || result[1].Status != "created_inactive" || result[1].Password != "" {
+		t.Fatal("wrong credential/active state")
+	}
+	for i, r := range result {
+		var department string
+		var isActive bool
+		var override *string
+		if err = f.Pool.QueryRow(f.ctx, `SELECT department,is_active,ta_seniority_override FROM users WHERE id=$1`, r.UserID).Scan(&department, &isActive, &override); err != nil {
+			t.Fatal(err)
+		}
+		if department != input[i].Department || isActive != input[i].active() || override != nil {
+			t.Fatal("student program/state lost, or all students marked old")
+		}
+	}
+	if err = svc.ValidateCredential(f.ctx, result[1]); err == nil {
+		t.Fatal("inactive student can receive credentials")
+	}
+	again, err := svc.Import(f.ctx, f.StaffID, "all-students", input, false, nil)
+	if err != nil || again[0].Status != "existing" || again[1].Status != "existing" {
+		t.Fatalf("repeat preview: %v", err)
+	}
+}
