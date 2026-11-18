@@ -725,6 +725,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Post("/tdbm/sync-now", adminOrStaff, editGuard, tdbmH.SyncNow)
 	authed.Get("/tdbm/sync-log", adminOrStaff, editGuard, tdbmH.SyncLog)
 	authed.Get("/tdbm/extra-teachings", adminOrStaff, editGuard, tdbmH.ExtraTeachings)
+	authed.Post("/tdbm/match-makeups", adminOrStaff, editGuard, tdbmH.MatchMakeups)
 
 	// Audit log (admin)
 	audH := &AuditHandler{Svc: svc}

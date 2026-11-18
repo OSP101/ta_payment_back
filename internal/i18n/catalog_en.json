@@ -2088,5 +2088,15 @@
  "เวลาที่ใช้ (มิลลิวินาที)": "Duration (milliseconds)",
  "กำหนดลองส่งอีกครั้ง": "Next retry at",
  "ปัญหาที่พบ": "Error",
- "เริ่มประมวลผลการส่งอีเมล": "Started processing an email delivery"
+ "เริ่มประมวลผลการส่งอีเมล": "Started processing an email delivery",
+ "เลือกคาบที่ต้องการจับคู่ 1–100 รายการ และระบุภาคเรียน": "Select 1–100 sessions to match and specify the academic term",
+ "รายการจับคู่ไม่ถูกต้องหรือเลือกรายการ TDBM ซ้ำ": "Invalid match selections or duplicate TDBM entries",
+ "ไม่พบรายการหรือยังไม่ได้จับคู่กลุ่มเรียน กรุณาโหลดข้อมูลใหม่": "Entry not found or section not matched. Reload the data.",
+ "รายการถูกจับคู่หรือยกเลิกแล้ว กรุณาโหลดข้อมูลใหม่": "An entry has already been matched or cancelled. Reload the data.",
+ "คาบวันหยุดเดิมไม่ว่าง ไม่มีในตารางเรียน ถูกล็อก หรือมีชั่วโมงที่ส่งแล้ว กรุณาโหลดข้อมูลใหม่": "An original session is unavailable, absent from the timetable, locked, or has submitted hours. Reload the data.",
+ "รายการ TDBM ไม่มีช่วงเวลาสอนที่ถูกต้อง กรุณาตรวจสอบต้นทาง": "The TDBM entry has invalid teaching times. Check the source.",
+ "มีผู้จับคู่คาบนี้แล้ว กรุณาโหลดข้อมูลใหม่": "This session has already been matched. Reload the data.",
+ "เจ้าหน้าที่จับคู่คาบชดเชยจาก TDBM": "Staff matched make-up sessions from TDBM",
+ "นำเข้าประวัติการเป็น TA": "Imported prior TA history",
+ "รวมรายวิชาที่มีอยู่แล้ว": "Merged existing courses"
 }

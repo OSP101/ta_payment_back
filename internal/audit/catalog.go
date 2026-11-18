@@ -114,6 +114,7 @@ var catalog = map[string]ActionInfo{
 		Severity: SevDanger, Outcome: OutcomeDenied, Known: true},
 
 	// ── Accounts, roles, credentials ────────────────────────────────────────
+	"user.ta_history.import":        ok("นำเข้าประวัติการเป็น TA", CatAccount),
 	"user.create":                   ok("สร้างบัญชีผู้ใช้", CatAccount),
 	"user.update":                   warn("แก้ไขข้อมูลบัญชีหรือสิทธิ์", CatAccount),
 	"user.activate":                 ok("เปิดใช้งานบัญชี", CatAccount),
@@ -165,6 +166,7 @@ var catalog = map[string]ActionInfo{
 	"makeup.delete":              ok("ลบคาบชดเชย", CatHours),
 	"makeup.waive":               ok("ยกเว้นคาบชดเชย", CatHours),
 	"makeup.unwaive":             warn("ยกเลิกการยกเว้นคาบชดเชย", CatHours),
+	"makeup.match_from_tdbm":     ok("เจ้าหน้าที่จับคู่คาบชดเชยจาก TDBM", CatHours),
 	"makeup.auto_fill_from_tdbm": system(ok("เติมคาบชดเชยอัตโนมัติจากตารางสอนชดเชย (TDBM)", CatHours)),
 
 	// ── Payment paperwork ───────────────────────────────────────────────────
@@ -219,6 +221,7 @@ var catalog = map[string]ActionInfo{
 	"teaching_course.update_settings":   ok("แก้ไขการตั้งค่ารายวิชา", CatCourse),
 	"teaching_course.num_students":      ok("แก้จำนวนนักศึกษาของรายวิชา", CatCourse),
 	"teaching_course.lecturers.replace": ok("เปลี่ยนอาจารย์ผู้สอนของรายวิชา", CatCourse),
+	"teaching_course.merge_existing":    warn("รวมรายวิชาที่มีอยู่แล้ว", CatCourse),
 	"teaching_course.merge_code":        ok("รวมรหัสวิชาที่สอนร่วมกัน", CatCourse),
 	"teaching_course.fold_section":      warn("รวม section ของรหัสที่รวมไว้เข้ากับ section ที่เรียนด้วยกัน", CatCourse),
 	"teaching_course.delete":            warn("ลบรายวิชา", CatCourse),

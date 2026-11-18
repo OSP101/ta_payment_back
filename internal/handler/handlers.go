@@ -4309,3 +4309,16 @@ func (h *TeachingHandler) MergeExistingCourse(c *fiber.Ctx) error {
 	}
 	return c.JSON(result)
 }
+
+// MatchMakeups files the explicitly reviewed original sittings atomically.
+func (h *TDBMHandler) MatchMakeups(c *fiber.Ctx) error {
+	var in service.TDBMMatchInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	count, err := h.Svc.TDBM.MatchMakeups(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"matched": count})
+}

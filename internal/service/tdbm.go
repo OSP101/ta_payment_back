@@ -698,57 +698,11 @@ func entryDurationMins(c tdbmCandidate) int {
 	return et - st
 }
 
-// AutoFillMakeupSchedules pairs each section's still-unresolved holiday
-// periods against that section's still-unapplied TDBM submissions and writes
-// makeup_schedules directly (bypassing AddMakeup's validation on purpose —
-// see the package doc comment's DESIGN DECISION). Returns how many rows it
-// created, for the caller's log line.
-//
-// THE CORE PROBLEM: TDBM's /extra-teachings no longer says which holiday a
-// submission replaces (dropped along with teacher_id/holiday_id/class_id when
-// course_code arrived — see migration 0116). All it gives per section is a
-// proposed makeup date/time. So this can only INFER the pairing:
-//
-//  1. Group a section's unresolved (holiday_date, kind) rows by date, in
-//     date order — each group is "what this ONE holiday still needs" (one or
-//     two periods; a section normally teaches at most lecture+lab per day).
-//  2. Group that section's unapplied TDBM rows by class_date, in date order —
-//     lecturers who file a makeup normally file the lecture+lab pair for one
-//     holiday under the same target class_date, so this is the TDBM-side
-//     analogue of a "holiday group".
-//  3. First, pair any TDBM group whose class_date is EXACTLY one of the
-//     section's still-open holiday dates straight to that holiday — this
-//     covers lecturers who hold the makeup class ON the holiday itself
-//     (a normal thing to do: the holiday is exactly when the room/slot is
-//     free) and is a hard fact, not a guess, so it always wins.
-//  4. Whatever holidays and TDBM groups are left after step 3, pair group i
-//     with group i, in date order — the oldest still-open holiday gets the
-//     oldest still-unapplied TDBM submission for that section.
-//
-// SAFETY RAILS, because #4 is a real guess that a lecturer filing out of
-// chronological order would break (step 3 needs no such rail — an exact
-// date match is certain):
-//   - A pair is used ONLY when both groups have exactly the same number of
-//     entries (both 1, or both 2) — a count mismatch means the guess has
-//     nothing solid to anchor on, so that pair is skipped and logged rather
-//     than forced. It stays "ยังไม่ได้กำหนดวันชดเชย" until either side's
-//     count changes (a later sync, or a manual entry) makes it resolvable.
-//   - Within a matched pair of size 2, kind is assigned by matching duration
-//     against each kind's OWN scheduled duration when they differ; when they
-//     are equal (as they often are — two 2-hour blocks), earliest scheduled
-//     kind is paired with the earliest TDBM start_time. Still a guess, which
-//     is why every auto-filled row's note names the exact extra_class_id it
-//     came from — traceable and correctable by hand if the guess was wrong.
-//   - ON CONFLICT DO NOTHING on the insert, and applied_makeup_id (migration
-//     0118) marks a TDBM row consumed the moment it succeeds, so re-running
-//     this on every sync can only fill NEW gaps, never re-pair or duplicate
-//     an already-resolved one.
-//   - Only pulls candidates with opt_status <> 'C' (cancelled/rejected) —
-//     P/D/A all count, per this project's standing policy of using a
-//     submission as soon as it exists rather than waiting for full approval.
-//   - Skips any course already exported (assertNotExported's own column) —
-//     that term's payout is locked; a new makeup there could not change
-//     anything a TA can still log against.
+// AutoFillMakeupSchedules only fills a section with one unresolved holiday
+// group and one TDBM date group. Multiple dates have no authoritative link in
+// the upstream feed: leave them for staff review instead of pairing by date
+// order (or assuming a makeup on a holiday replaces that same holiday).
+// Previously applied links are preserved for review, never silently rewritten.
 func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear, semester int) (int, error) {
 	// A twin of an already-filed sitting (the same makeup filed under the
 	// course's other code — see loadTDBMCandidates) points at that makeup
@@ -805,50 +759,16 @@ func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear,
 	for sectionID, groups := range bySectionHolidays {
 		clusters := bySectionClusters[sectionID]
 
-		// Step 3: exact class_date == holiday_date matches first — certain,
-		// not a guess, so they're pulled out before the chronological
-		// fallback below ever sees them.
-		var remainingGroups []holidayGroup
-		usedClusterIdx := map[int]bool{}
-		for _, g := range groups {
-			matched := false
-			for ci, cl := range clusters {
-				if usedClusterIdx[ci] || cl.classDate != g.date {
-					continue
-				}
-				usedClusterIdx[ci] = true
-				matched = true
-				filled += s.pairAndApply(ctx, sectionID, g, cl)
-				break
-			}
-			if !matched {
-				remainingGroups = append(remainingGroups, g)
-			}
+		if len(groups) != 1 || len(clusters) != 1 {
+			continue
 		}
-		var remainingClusters []tdbmCluster
-		for ci, cl := range clusters {
-			if !usedClusterIdx[ci] {
-				remainingClusters = append(remainingClusters, cl)
-			}
-		}
-
-		// Step 4: whatever is left, pair chronologically by index as before.
-		n := len(remainingGroups)
-		if len(remainingClusters) < n {
-			n = len(remainingClusters)
-		}
-		for i := 0; i < n; i++ {
-			g, cl := remainingGroups[i], remainingClusters[i]
-			filled += s.pairAndApply(ctx, sectionID, g, cl)
-		}
+		filled += s.pairAndApply(ctx, sectionID, groups[0], clusters[0])
 	}
 	return filled, nil
 }
 
-// pairAndApply applies one matched (holidayGroup, cluster) pair — shared by
-// AutoFillMakeupSchedules' exact-date-match pass and its chronological
-// fallback pass. Returns how many rows it created (0 or 1 on a count
-// mismatch or insert error, both already logged).
+// pairAndApply applies the only remaining holiday/date group pair.
+// A count mismatch remains available for explicit per-period staff review.
 func (s *TDBMService) pairAndApply(ctx context.Context, sectionID uuid.UUID, g holidayGroup, cl tdbmCluster) int {
 	if len(g.kinds) != len(cl.entries) {
 		log.Printf("tdbm: auto-fill skip section=%s holiday=%s — %d period(s) needed vs %d TDBM entr(y/ies) on %s (count mismatch, left for manual entry)",
@@ -897,88 +817,48 @@ func (s *TDBMService) pairAndApply(ctx context.Context, sectionID uuid.UUID, g h
 	return filled
 }
 
-// applyOneMakeup inserts one makeup_schedules row from one TDBM candidate
-// (with the cancelled sitting's drafts cleared in the same transaction) and
-// then marks that candidate consumed, non-transactionally (a crash between
-// the two leaves the makeup filed and the TDBM row eligible to be picked up
-// again — resolveSectionMatches + this function's ON CONFLICT DO NOTHING mean
-// the retry is a safe no-op, not a duplicate). Returns 1 on a genuine new
-// insert, 0 if the slot was already filled by something else (a manual entry,
-// or a previous run that didn't get to mark this row applied).
+// applyOneMakeup shares the section lock and transactional writer with staff
+// review. Re-check consumed rows and sitting status after acquiring the lock.
 func (s *TDBMService) applyOneMakeup(ctx context.Context, sectionID uuid.UUID, kindNeeded unresolvedPeriod, entry tdbmCandidate) (int, error) {
-	// Same sitting rules as TeachingService.AddMakeup, now that TDBM is the
-	// only source of makeups besides the lecturer. If the original sitting
-	// already has sent/approved hours the class evidently ran, and a makeup on
-	// top would pay the period twice: leave it for the lecturer to sort out.
-	var taughtRows int
-	if err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		  FROM work_logs wl
-		  JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		 WHERE a.section_id = $1 AND wl.work_date = $2::date AND wl.activity = $3
-		   AND wl.status IN ('submitted','approved')`,
-		sectionID, kindNeeded.HolidayDate, kindNeeded.Kind).Scan(&taughtRows); err != nil {
-		return 0, err
-	}
-	if taughtRows > 0 {
-		log.Printf("tdbm: auto-fill skip section=%s date=%s kind=%s — %d sent/approved row(s) on the original sitting",
-			sectionID, kindNeeded.HolidayDate, kindNeeded.Kind, taughtRows)
-		return 0, nil
-	}
-	makeupID := uuid.New()
-	note := fmt.Sprintf("นำเข้าอัตโนมัติจาก TDBM (extra_class_id=%d)", entry.ExtraClassID)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO makeup_schedules (id, section_id, original_date, makeup_date, start_time, end_time, note, kind)
-		VALUES ($1,$2,$3::date,$4::date,$5,$6,$7,$8)
-		ON CONFLICT (section_id, original_date, kind) DO NOTHING`,
-		makeupID, sectionID, kindNeeded.HolidayDate, entry.ClassDate, entry.StartTime, entry.EndTime, note, kindNeeded.Kind)
-	if err != nil {
+	var locked uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM sections WHERE id = $1 FOR UPDATE`, sectionID).Scan(&locked); err != nil {
 		return 0, err
 	}
-	if tag.RowsAffected() == 0 {
+	var taught bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM work_logs wl
+ JOIN ta_request_assignments a ON a.id = wl.assignment_id
+ WHERE a.section_id = $1 AND wl.work_date = $2::date AND wl.activity = $3
+ AND wl.status IN ('submitted','approved'))`, sectionID, kindNeeded.HolidayDate, kindNeeded.Kind).Scan(&taught); err != nil {
+		return 0, err
+	}
+	if taught {
 		return 0, nil
 	}
-	// Unsent drafts of the cancelled sitting would ride along into the next
-	// submit next to the makeup — the same cleanup AddMakeup does.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM work_logs wl
-		 USING ta_request_assignments a
-		 WHERE a.id = wl.assignment_id
-		   AND a.section_id = $1 AND wl.work_date = $2::date
-		   AND wl.activity = $3 AND wl.status = 'draft'`,
-		sectionID, kindNeeded.HolidayDate, kindNeeded.Kind); err != nil {
+	// A sync may have cancelled or re-matched the entry since candidates loaded.
+	var stale bool
+	if err := tx.QueryRow(ctx, `SELECT (opt_status = 'C' OR applied_makeup_id IS NOT NULL
+ OR section_id IS DISTINCT FROM $2 OR class_date IS DISTINCT FROM $3::date
+ OR start_time IS DISTINCT FROM $4::time OR end_time IS DISTINCT FROM $5::time)
+ FROM tdbm_extra_teachings WHERE extra_class_id = $1 FOR UPDATE`,
+		entry.ExtraClassID, sectionID, entry.ClassDate, entry.StartTime, entry.EndTime).Scan(&stale); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	if stale {
+		return 0, nil
+	}
+	n, err := s.insertTDBMMakeup(ctx, tx, sectionID, kindNeeded, entry, nil)
+	if err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	// The row itself, and its twins filed under the course's other codes (see
-	// loadTDBMCandidates): one sitting, one makeup.
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE tdbm_extra_teachings t SET applied_makeup_id = $1
-		FROM tdbm_extra_teachings e
-		WHERE e.extra_class_id = $2
-		  AND (t.extra_class_id = e.extra_class_id
-		       OR (t.section_id = e.section_id AND t.class_date = e.class_date
-		           AND t.start_time IS NOT DISTINCT FROM e.start_time
-		           AND t.end_time IS NOT DISTINCT FROM e.end_time
-		           AND t.applied_makeup_id IS NULL AND t.opt_status <> 'C'))`,
-		makeupID, entry.ExtraClassID); err != nil {
-		return 1, err
-	}
-	if err := s.aud.Log(ctx, audit.Entry{
-		Action: "makeup.auto_fill_from_tdbm", Entity: "section", EntityID: sectionID.String(),
-		Note: fmt.Sprintf("original=%s kind=%s makeup=%s %s-%s (extra_class_id=%d)",
-			kindNeeded.HolidayDate, kindNeeded.Kind, entry.ClassDate, entry.StartTime, entry.EndTime, entry.ExtraClassID),
-	}); err != nil {
-		log.Printf("tdbm: auto-fill audit log err extra_class_id=%d err=%v", entry.ExtraClassID, err)
-	}
-	return 1, nil
+	return n, nil
 }
 
 // loadUnresolvedPeriods is UnresolvedMakeupsSQL (course_window.go) widened
@@ -988,7 +868,7 @@ func (s *TDBMService) applyOneMakeup(ctx context.Context, sectionID uuid.UUID, k
 // function's own header comment on why three copies already drifted once.
 func (s *TDBMService) loadUnresolvedPeriods(ctx context.Context, academicYear, semester int) ([]unresolvedPeriod, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT sx.id, TO_CHAR(h.holiday_date,'YYYY-MM-DD'), sch.kind
+		SELECT DISTINCT sx.id, TO_CHAR(h.holiday_date,'YYYY-MM-DD'), sch.kind, TO_CHAR(sch.start_time,'HH24:MI')
 		FROM teaching_courses tc
 		JOIN academic_terms term ON term.id = tc.term_id
 		JOIN sections sx ON sx.teaching_course_id = tc.id
@@ -1001,7 +881,7 @@ func (s *TDBMService) loadUnresolvedPeriods(ctx context.Context, academicYear, s
 		WHERE term.academic_year = $1 AND term.semester = $2
 		  AND tc.exported_at IS NULL
 		  AND m.id IS NULL
-		ORDER BY sx.id, h.holiday_date, sch.start_time`,
+		ORDER BY 1, 2, 4`,
 		academicYear, semester)
 	if err != nil {
 		return nil, err
@@ -1010,7 +890,7 @@ func (s *TDBMService) loadUnresolvedPeriods(ctx context.Context, academicYear, s
 	out := []unresolvedPeriod{}
 	for rows.Next() {
 		var u unresolvedPeriod
-		if err := rows.Scan(&u.SectionID, &u.HolidayDate, &u.Kind); err != nil {
+		if err := rows.Scan(&u.SectionID, &u.HolidayDate, &u.Kind, new(string)); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -1236,9 +1116,15 @@ type TDBMExtraTeaching struct {
 	// holiday is this compensating for", which TDBM itself never says (see
 	// AutoFillMakeupSchedules' doc comment). Both nil when this entry hasn't
 	// been auto-filled yet (no clean 1:1 pairing found, or still pending).
-	OriginalHolidayDate *string `json:"original_holiday_date,omitempty"`
-	OriginalHolidayName *string `json:"original_holiday_name,omitempty"`
-	SyncedAt            string  `json:"synced_at"`
+	OriginalHolidayDate *string           `json:"original_holiday_date,omitempty"`
+	OriginalHolidayName *string           `json:"original_holiday_name,omitempty"`
+	MatchedSectionID    *uuid.UUID        `json:"matched_section_id,omitempty"`
+	OriginalKind        *string           `json:"original_kind,omitempty"`
+	MatchMethod         string            `json:"match_method"`
+	ResolutionReason    string            `json:"resolution_reason"`
+	MatchOptions        []TDBMMatchOption `json:"match_options"`
+	courseExported      bool
+	SyncedAt            string `json:"synced_at"`
 }
 
 // ListExtraTeachings returns every tdbm_extra_teachings row for one term,
@@ -1258,7 +1144,9 @@ func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, seme
 		       t.duration_minutes, t.course_code, t.owner_teacher_name,
 		       t.section_label, t.semester_type, t.opt_status,
 		       tc.code, tc.name_th, sec.sec_no,
-		       TO_CHAR(m.original_date,'YYYY-MM-DD'), h.name_th,
+		       TO_CHAR(m.original_date,'YYYY-MM-DD'), h.name_th, sec.id, m.kind,
+ CASE WHEN m.note LIKE 'เจ้าหน้าที่จับคู่จาก TDBM%' THEN 'manual'
+      WHEN m.id IS NOT NULL THEN 'automatic' ELSE '' END, tc.exported_at IS NOT NULL,
 		       TO_CHAR(t.synced_at, 'YYYY-MM-DD"T"HH24:MI:SS')
 		FROM tdbm_extra_teachings t
 		LEFT JOIN teaching_courses tc ON tc.id = t.teaching_course_id
@@ -1284,10 +1172,84 @@ func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, seme
 			&e.DurationMinutes, &e.CourseCode, &e.OwnerTeacherName,
 			&e.SectionLabel, &e.SemesterType, &e.OptStatus,
 			&e.MatchedCourseCode, &e.MatchedCourseName, &e.MatchedSecNo,
-			&e.OriginalHolidayDate, &e.OriginalHolidayName, &e.SyncedAt); err != nil {
+			&e.OriginalHolidayDate, &e.OriginalHolidayName, &e.MatchedSectionID, &e.OriginalKind, &e.MatchMethod, &e.courseExported, &e.SyncedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	options, err := tdbmMatchOptions(ctx, s.pool, academicYear, semester)
+	if err != nil {
+		return nil, err
+	}
+	pendingSittings := map[uuid.UUID]map[string]bool{}
+	pendingDates := map[uuid.UUID]map[string]bool{}
+	for _, e := range out {
+		if e.MatchedSectionID == nil || e.OriginalHolidayDate != nil || e.OptStatus == "C" {
+			continue
+		}
+		sec := *e.MatchedSectionID
+		if pendingSittings[sec] == nil {
+			pendingSittings[sec] = map[string]bool{}
+			pendingDates[sec] = map[string]bool{}
+		}
+		st, et := "", ""
+		if e.StartTime != nil {
+			st = *e.StartTime
+		}
+		if e.EndTime != nil {
+			et = *e.EndTime
+		}
+		pendingSittings[sec][e.ClassDate+"/"+st+"/"+et] = true
+		pendingDates[sec][e.ClassDate] = true
+	}
+	for i := range out {
+		e := &out[i]
+		e.MatchOptions = []TDBMMatchOption{}
+		switch {
+		case e.OriginalHolidayDate != nil:
+			continue
+		case e.OptStatus == "C":
+			e.ResolutionReason = "รายการถูกยกเลิกใน TDBM"
+		case e.MatchedSectionID == nil:
+			e.ResolutionReason = "ยังจับคู่วิชาและกลุ่มเรียนไม่ได้ กรุณาตรวจสอบข้อมูลวิชาและกลุ่ม"
+		case e.courseExported:
+			e.ResolutionReason = "รายวิชาถูกล็อกหลังส่งออกเอกสารแล้ว"
+		case e.StartTime == nil || e.EndTime == nil || *e.StartTime >= *e.EndTime:
+			e.ResolutionReason = "ข้อมูลช่วงเวลาสอนจาก TDBM ไม่ครบหรือไม่ถูกต้อง"
+		default:
+			e.MatchOptions = options[*e.MatchedSectionID]
+			if e.MatchOptions == nil {
+				e.MatchOptions = []TDBMMatchOption{}
+			}
+			available := 0
+			for _, o := range e.MatchOptions {
+				if !o.Blocked {
+					available++
+				}
+			}
+			if len(e.MatchOptions) == 0 {
+				e.ResolutionReason = "ไม่พบคาบวันหยุดที่ยังว่าง ตรวจสอบตารางเรียน ช่วงวันที่รายวิชา หรือวันชดเชยที่กำหนดไว้แล้ว"
+			} else if available == 0 {
+				e.ResolutionReason = "คาบเดิมมีชั่วโมงที่ส่งหรืออนุมัติแล้ว ต้องตีกลับก่อนจับคู่"
+			} else {
+				holidayDates := map[string]bool{}
+				for _, o := range e.MatchOptions {
+					holidayDates[o.OriginalDate] = true
+				}
+				switch {
+				case len(holidayDates) > 1 || len(pendingDates[*e.MatchedSectionID]) > 1:
+					e.ResolutionReason = "มีวันหยุดหรือวันชดเชยหลายวัน ต้องเลือกคาบเดิมเพื่อป้องกันการจับคู่ผิดวัน"
+				case len(e.MatchOptions) != len(pendingSittings[*e.MatchedSectionID]):
+					e.ResolutionReason = "จำนวนคาบวันหยุดกับรายการชดเชยไม่ตรงกัน กรุณาเลือกจับคู่รายคาบ"
+				default:
+					e.ResolutionReason = "ต้องเลือกคาบวันหยุดเดิม เนื่องจาก TDBM ไม่ระบุว่าชดเชยแทนคาบใด"
+				}
+			}
+		}
+	}
+	return out, nil
 }

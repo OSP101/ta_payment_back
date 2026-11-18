@@ -127,7 +127,7 @@ func monthClosedForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUI
 // covers workDate in 'exported' or 'finance_sent'. It is the month-level
 // replacement for the course-wide exported_at lock on paths (makeups) where
 // one exported month must not freeze the rest of the term.
-func assertMonthNotExportedForCourse(ctx context.Context, pool *pgxpool.Pool, tcID uuid.UUID, workDate string) error {
+func assertMonthNotExportedForCourse(ctx context.Context, pool querier, tcID uuid.UUID, workDate string) error {
 	var label string
 	err := pool.QueryRow(ctx, `
 		SELECT sp.label
