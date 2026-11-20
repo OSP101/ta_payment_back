@@ -464,8 +464,8 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		a := in.Assignments[i]
 		rid := uuid.New()
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id, is_late, submitted_by, batch_id)
-			 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5,$6,$7,$8)`,
+			`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at, window_id, is_late, submitted_by, batch_id, workload_rule_version)
+			 VALUES ($1,$2,$3,$4::reimburse_scope,'submitted',NOW(),$5,$6,$7,$8,2)`,
 			rid, in.TeachingCourseID, lecturerID, in.ReimburseScope, windowID, isLate, onBehalfOf(actor, lecturerID), batchID); err != nil {
 			return nil, err
 		}
@@ -517,11 +517,18 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 			}
 		}
 
+		if err := snapshotRequestCalculation(ctx, tx, rid, actor, "submitted"); err != nil {
+			return nil, err
+		}
+
 		one := in
 		one.Assignments = []AssignmentInput{a}
 		one.Counts = nil
 		res, n, err := s.decideNew(ctx, tx, actor, rid, termID, one)
 		if err != nil {
+			return nil, err
+		}
+		if err := snapshotRequestCalculation(ctx, tx, rid, actor, "initial_decision"); err != nil {
 			return nil, err
 		}
 		taID := a.TAID
@@ -999,14 +1006,21 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 	}
 	defer tx.Rollback(ctx)
 
-	var taID, sectionID uuid.UUID
+	var taID, sectionID, reqID uuid.UUID
 	var level string
+	// Lock the parent first, matching decisions and section additions. This also
+	// serializes snapshots when different sections are edited concurrently.
 	if err := tx.QueryRow(ctx, `
-		SELECT ta_id, section_id, level::text FROM ta_request_assignments WHERE id = $1 FOR UPDATE`,
-		assignmentID).Scan(&taID, &sectionID, &level); err != nil {
+		SELECT a.ta_id, a.section_id, a.level::text, a.request_id
+		FROM ta_request_assignments a JOIN ta_requests r ON r.id=a.request_id
+		WHERE a.id=$1 FOR UPDATE OF r`,
+		assignmentID).Scan(&taID, &sectionID, &level, &reqID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errors.New("ไม่พบ assignment นี้")
 		}
+		return err
+	}
+	if err := snapshotRequestCalculation(ctx, tx, reqID, actor, "before_workload_edit"); err != nil {
 		return err
 	}
 	name := s.taName(ctx, taID)
@@ -1074,6 +1088,9 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 		EntityID: assignmentID.String(), Before: before, After: in,
 		Note: fmt.Sprintf("%s (Sec %s)", name, secNo),
 	}); err != nil {
+		return err
+	}
+	if err := snapshotRequestCalculation(ctx, tx, reqID, actor, "workload_edited"); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -1481,9 +1498,8 @@ func countInGroup(groups map[uuid.UUID]int, group int) int {
 }
 
 // billableWeeklyTotal sums a TA's declared hours across their sections, counting
-// each co-taught group once. Used for the daily-feasibility check and for the
-// graduate 10–12 hour rule, both of which describe time the person actually
-// spends — not time multiplied by how many groups were in the room.
+// each co-taught group once. Used for payable-time feasibility and legacy
+// eligibility only. New eligibility totals include every section.
 func billableWeeklyTotal(sectionIDs []uuid.UUID, per map[uuid.UUID]WorkloadInput, groups map[uuid.UUID]int, level string) float64 {
 	seen := map[int]bool{}
 	var total float64
@@ -1956,8 +1972,9 @@ type TACandidate struct {
 	// When AlreadyInCourse: the live request the TA is on (newest if several)
 	// and every section of this course they already cover. The form uses them
 	// to add sections to that request (AddSections) instead of refusing the TA.
-	ExistingRequestID *uuid.UUID  `json:"existing_request_id,omitempty"`
-	HeldSectionIDs    []uuid.UUID `json:"held_section_ids,omitempty"`
+	ExistingWorkloadRuleVersion int         `json:"existing_workload_rule_version,omitempty"`
+	ExistingRequestID           *uuid.UUID  `json:"existing_request_id,omitempty"`
+	HeldSectionIDs              []uuid.UUID `json:"held_section_ids,omitempty"`
 }
 
 // Candidates lists every TA with their approved-course count in the given
@@ -2026,7 +2043,7 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 		return out, nil
 	}
 	held, err := s.pool.Query(ctx, `
-		SELECT a.ta_id, a.section_id, r.id
+		SELECT a.ta_id, a.section_id, r.id, r.workload_rule_version
 		FROM ta_request_assignments a
 		JOIN ta_requests r ON r.id = a.request_id
 		WHERE r.teaching_course_id = $1
@@ -2039,7 +2056,8 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 	defer held.Close()
 	for held.Next() {
 		var taID, secID, reqID uuid.UUID
-		if err := held.Scan(&taID, &secID, &reqID); err != nil {
+		var ruleVersion int
+		if err := held.Scan(&taID, &secID, &reqID, &ruleVersion); err != nil {
 			return nil, err
 		}
 		i, ok := idx[taID]
@@ -2047,6 +2065,7 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 			continue
 		}
 		out[i].HeldSectionIDs = append(out[i].HeldSectionIDs, secID)
+		out[i].ExistingWorkloadRuleVersion = ruleVersion
 		out[i].ExistingRequestID = &reqID // ordered by submitted_at: newest wins
 	}
 	return out, held.Err()
@@ -2088,8 +2107,9 @@ func (s *TARequestService) reservedCourseCount(ctx context.Context, q querier, t
 // slip past the 3-course cap.
 func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) ([]DecisionCheck, bool, error) {
 	var courseID uuid.UUID
+	var workloadRuleVersion int
 	if err := tx.QueryRow(ctx,
-		`SELECT teaching_course_id FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&courseID); err != nil {
+		`SELECT teaching_course_id, workload_rule_version FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID).Scan(&courseID, &workloadRuleVersion); err != nil {
 		return nil, false, err
 	}
 	var termID uuid.UUID
@@ -2260,12 +2280,11 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		// Workload total range.
 		var totOK bool
 		var totMsg string
-		// Co-taught sections describe one sitting, so their declared hours are
-		// the same hours seen from several groups. Counting each row would
-		// inflate a graduate TA past the 10–12 rule for doing nothing extra.
+		// New requests sum every declared section for eligibility. Legacy
+		// requests keep their original rule on every subsequent recheck.
 		countedGroups := map[int]bool{}
 		countOnce := func(a asgRow) bool {
-			if a.coGroup == 0 {
+			if workloadRuleVersion >= 2 || a.coGroup == 0 {
 				return true
 			}
 			if countedGroups[a.coGroup] {

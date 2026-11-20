@@ -229,15 +229,16 @@ func TestWorkload_SeparateSlotsAreNotCotaught(t *testing.T) {
 	}
 }
 
-// A graduate TA must land in 10–12 h/week. Co-taught sections describe the
-// same hours, so covering two groups in one sitting must not double the total
-// and push a compliant declaration out of range.
-func TestWorkload_CotaughtHoursCountOnceForGradRange(t *testing.T) {
+// New requests count all section declarations toward the graduate range,
+// while retaining co-taught grouping for downstream billing.
+func TestWorkload_CotaughtHoursSumEverySectionForGradRange(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{Level: "master"})
+	rf.exec(`UPDATE users SET study_level='master' WHERE id=$1`, rf.TAID)
 	same := rf.addSection("02", 1) // same slot as section 01
+	rf.addTAClass(0, "07:00", "08:00")
 
-	// 11 h/week declared for each group — one sitting, so the person works 11.
-	grad := WorkloadInput{HelpTeachHrs: 3, PrepHrs: 3, GradeHrs: 3, OtherHrs: 2}
+	// 5.5 h/week per section gives an 11-hour eligibility declaration.
+	grad := WorkloadInput{HelpTeachHrs: 2, PrepHrs: 1.5, GradeHrs: 2}
 	in := rf.inputFor([]SectionWorkload{
 		{SectionID: rf.SectionID, Workload: grad},
 		{SectionID: same, Workload: grad},
@@ -252,10 +253,10 @@ func TestWorkload_CotaughtHoursCountOnceForGradRange(t *testing.T) {
 			continue
 		}
 		if !c.Passed {
-			t.Fatalf("co-taught hours were counted twice, pushing the total out of 10–12: %s", c.Message)
+			t.Fatalf("all-section eligibility total must pass: %s", c.Message)
 		}
 		if !strings.Contains(c.Message, "11.00") {
-			t.Errorf("weekly total should be 11.00 (counted once), got: %s", c.Message)
+			t.Errorf("weekly total should be 11.00 (both sections), got: %s", c.Message)
 		}
 	}
 }

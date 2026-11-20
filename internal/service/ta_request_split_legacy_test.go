@@ -12,8 +12,9 @@ func (rf *requestFixture) legacyFromBatch(res *CreateResult, status string) uuid
 	keep, other := res.Requests[0].ID, res.Requests[1].ID
 	rf.exec(`UPDATE ta_request_assignments SET request_id = $1 WHERE request_id = $2`, keep, other)
 	rf.exec(`DELETE FROM ta_request_counts WHERE request_id = $1`, other)
-	rf.exec(`DELETE FROM ta_requests WHERE id = $1`, other)
-	rf.exec(`UPDATE ta_requests SET batch_id = NULL, status = $2::ta_request_status,
+	// Retain the empty shell and its immutable evidence from fixture creation.
+	rf.exec(`UPDATE ta_requests SET status='cancelled', decided_by=$2 WHERE id=$1`, other, rf.LecturerID)
+	rf.exec(`UPDATE ta_requests SET workload_rule_version=1, batch_id = NULL, status = $2::ta_request_status,
 	           reject_reason = CASE WHEN $2 = 'rejected' THEN 'ta2 Test ยังไม่ได้ระบุภาระงาน' END,
 	           decided_at = CASE WHEN $2 = 'rejected' THEN NOW() END, decided_by = NULL
 	         WHERE id = $1`, keep, status)
@@ -75,7 +76,7 @@ func TestSplitLegacy_ApprovesTheTAWhoPasses(t *testing.T) {
 	}
 	var total int
 	if err := rf.Pool.QueryRow(rf.ctx,
-		`SELECT COUNT(*) FROM ta_requests WHERE teaching_course_id = $1`, rf.CourseID).Scan(&total); err != nil {
+		`SELECT COUNT(*) FROM ta_requests WHERE teaching_course_id = $1 AND status <> 'cancelled'`, rf.CourseID).Scan(&total); err != nil {
 		t.Fatal(err)
 	}
 	if total != 2 {

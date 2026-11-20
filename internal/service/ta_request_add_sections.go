@@ -66,9 +66,10 @@ func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, pri
 
 	var courseID uuid.UUID
 	var status string
+	var workloadRuleVersion int
 	if err := tx.QueryRow(ctx,
-		`SELECT teaching_course_id, status::text FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID,
-	).Scan(&courseID, &status); err != nil {
+		`SELECT teaching_course_id, status::text, workload_rule_version FROM ta_requests WHERE id = $1 FOR UPDATE`, reqID,
+	).Scan(&courseID, &status, &workloadRuleVersion); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, errors.New("ไม่พบคำขอนี้")
 		}
@@ -238,6 +239,9 @@ func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, pri
 	}
 	total := billableWeeklyTotal(all, per, groups, level)
 	if isGrad {
+		if workloadRuleVersion >= 2 {
+			total = declaredWeeklyTotal(all, per, level)
+		}
 		if total > 12+0.001 {
 			return nil, fmt.Errorf("รวมแล้ว %s มีภาระงาน %.2f ชม./สัปดาห์ เกิน 12 ชม. ตามระเบียบบัณฑิตศึกษา", name, total)
 		}
@@ -245,6 +249,9 @@ func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, pri
 		return nil, err
 	}
 
+	if err := snapshotRequestCalculation(ctx, tx, reqID, actor, "before_add_sections"); err != nil {
+		return nil, err
+	}
 	for _, sid := range added {
 		aid := uuid.New()
 		if _, err := tx.Exec(ctx,
@@ -302,6 +309,9 @@ func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, pri
 		Note:  fmt.Sprintf("ta=%s sec=%s", in.TAID, strings.Join(labels, ",")),
 		After: in,
 	}); err != nil {
+		return nil, err
+	}
+	if err := snapshotRequestCalculation(ctx, tx, reqID, actor, "sections_added"); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
