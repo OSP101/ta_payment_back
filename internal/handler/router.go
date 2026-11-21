@@ -243,6 +243,7 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 		AuditRead(aud, "user.record.view", "user", "id"), editGuard, uh.Get)
 	authed.Patch("/users/:id", adminOrStaff, editGuard, uh.Update)
 	authed.Post("/users/:id/reset-password", adminOrStaff, editGuard, uh.ResetPassword)
+	authed.Post("/users/:id/ta-data/reset", adminOrStaff, editGuard, uh.ResetTAData)
 	authed.Post("/users/:id/send-credentials", heavyLimiter, RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), editGuard, uh.SendCredentials)
 	authed.Post("/users/:id/deactivate", adminOrStaff, editGuard, uh.Deactivate)
 	authed.Post("/users/:id/activate", adminOrStaff, editGuard, uh.Activate)

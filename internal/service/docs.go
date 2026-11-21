@@ -765,9 +765,12 @@ func (s *DocsService) Upload(ctx context.Context, userID uuid.UUID, kind, filena
 	}
 	size = savedSize
 
-	newRound := 1
-	if prevRound > 0 {
-		newRound = prevRound + 1
+	// A staff reset can retire the current row before its replacement arrives.
+	// Count history too so that replacement never restarts at round 1.
+	var newRound int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(round),0)+1 FROM ta_documents WHERE user_id=$1 AND kind=$2`, userID, kind).Scan(&newRound); err != nil {
+		_ = s.store.Delete(key)
+		return uuid.Nil, err
 	}
 
 	// Three-step supersede so we satisfy both constraints in the schema:

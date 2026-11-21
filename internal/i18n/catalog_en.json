@@ -2098,5 +2098,13 @@
  "มีผู้จับคู่คาบนี้แล้ว กรุณาโหลดข้อมูลใหม่": "This session has already been matched. Reload the data.",
  "เจ้าหน้าที่จับคู่คาบชดเชยจาก TDBM": "Staff matched make-up sessions from TDBM",
  "นำเข้าประวัติการเป็น TA": "Imported prior TA history",
- "รวมรายวิชาที่มีอยู่แล้ว": "Merged existing courses"
+ "รวมรายวิชาที่มีอยู่แล้ว": "Merged existing courses",
+ "รีเซ็ตข้อมูลผู้ช่วยสอน": "Reset TA data",
+ "กรุณาเลือกข้อมูลที่ต้องการรีเซ็ต": "Select the data to reset",
+ "รายการเอกสารไม่ถูกต้อง": "Invalid document selection",
+ "รายการเอกสารไม่ถูกต้องหรือซ้ำกัน": "Invalid or duplicate document selection",
+ "กรุณาเลือกภาคเรียนและปีการศึกษาที่ต้องการรีเซ็ตตารางเรียน": "Select a semester and academic year to reset the timetable",
+ "กรุณาระบุเหตุผลที่รีเซ็ต ไม่เกิน 1,000 ตัวอักษร": "Enter a reason for the reset, up to 1,000 characters",
+ "ไม่พบภาคเรียนและปีการศึกษาที่เลือก": "The selected semester and academic year could not be found",
+ "เจ้าหน้าที่ส่งออกเอกสารเบิกจ่ายของภาคเรียนนี้แล้ว ไม่สามารถรีเซ็ตตารางเรียนได้": "Payout documents have been exported for this term. The timetable cannot be reset."
 }

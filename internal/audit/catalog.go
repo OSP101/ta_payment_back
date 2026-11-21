@@ -202,6 +202,7 @@ var catalog = map[string]ActionInfo{
 	"appointment_order.reprint":           ok("พิมพ์คำสั่งแต่งตั้งซ้ำ", CatPayment),
 
 	// ── TA profile and documents ────────────────────────────────────────────
+	"ta_data.reset":             ok("รีเซ็ตข้อมูลผู้ช่วยสอน", CatDocs),
 	"ta_profile.submit":         ok("ส่งประวัติและเอกสารให้ตรวจ", CatDocs),
 	"ta_profile.review":         ok("ตรวจประวัติผู้ช่วยสอน", CatDocs),
 	"ta_profile.approve_all":    ok("อนุมัติเอกสารผู้ช่วยสอนทั้งชุด", CatDocs),
