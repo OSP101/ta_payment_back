@@ -30,7 +30,7 @@ func ConcurrentEdits(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		method := c.Method()
 		actor := UserID(c)
-		if actor == uuid.Nil || editReadOnlyCommand(c.Path()) {
+		if actor == uuid.Nil || editReadOnlyRequest(c) {
 			return c.Next()
 		}
 		primary, readScopes := editScopes(c, pool)
@@ -221,6 +221,15 @@ func editErrorStatus(err error) int {
 
 // These POSTs only preview/reveal data, mint short-lived download tokens, or
 // maintain session/read markers. Repeating them is intentional and safe.
+func editReadOnlyRequest(c *fiber.Ctx) bool {
+	// The same merge endpoint previews until commit=1, matching the handler.
+	// A successful preview must not consume the intent used to inspect again.
+	if c.Method() == fiber.MethodPost && strings.HasSuffix(c.Route().Path, "/teaching-courses/:id/merge-existing") && c.Query("commit") != "1" {
+		return true
+	}
+	return editReadOnlyCommand(c.Path())
+}
+
 func editReadOnlyCommand(path string) bool {
 	for _, suffix := range []string{"/auth/heartbeat", "/me/citizen-id/reveal", "/me/creditor-form/preview.pdf", "/mail-settings/preview", "/mail-settings/check", "/announcements/preview-audience", "/zip-token", "/download-all-token", "/suppliers.xlsx", "/reprint", "/read", "/read-all", "/me/enrollment-scope"} {
 		if strings.HasSuffix(path, suffix) {

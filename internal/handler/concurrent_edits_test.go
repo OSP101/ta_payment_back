@@ -133,6 +133,46 @@ func TestCommandReceiptPreventsDuplicatePostWithoutStoringPayload(t *testing.T) 
 	}
 }
 
+func TestExistingMergePreviewCanRepeatWithoutConsumingCommitIntent(t *testing.T) {
+	pool := testutil.NewPool(t)
+	actor := uuid.New()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO users(id,email,first_name,last_name) VALUES($1,$2,'test','actor')`, actor, actor.String()+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	app := fiber.New(fiber.Config{ErrorHandler: ErrorHandler})
+	app.Use(func(c *fiber.Ctx) error { c.Locals(string(CtxUserID), actor); return c.Next() })
+	previews, commits := 0, 0
+	app.Post("/api/v1/teaching-courses/:id/merge-existing", ConcurrentEdits(pool, "secret"), func(c *fiber.Ctx) error {
+		if c.Query("commit") == "1" {
+			commits++
+		} else {
+			previews++
+		}
+		return c.JSON(fiber.Map{"token": "preview", "blockers": []string{}})
+	})
+	path := "/api/v1/teaching-courses/" + uuid.NewString() + "/merge-existing"
+	key := uuid.NewString()
+	body := `{"source_id":"` + uuid.NewString() + `"}`
+	for _, step := range []struct {
+		query string
+		want  int
+	}{{"", 200}, {"", 200}, {"?commit=0", 200}, {"?commit=true", 200}, {"?commit=1", 200}, {"?commit=1", 409}, {"", 200}} {
+		req := httptest.NewRequest("POST", path+step.query, strings.NewReader(body))
+		req.Header.Set("Idempotency-Key", key)
+		res, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != step.want {
+			t.Fatalf("query %q: got %d, want %d", step.query, res.StatusCode, step.want)
+		}
+	}
+	if previews != 5 || commits != 1 {
+		t.Fatalf("previews=%d commits=%d", previews, commits)
+	}
+}
+
 func TestConcurrentEditRoutesStayCovered(t *testing.T) {
 	file, e := parser.ParseFile(token.NewFileSet(), "router.go", nil, 0)
 	if e != nil {
