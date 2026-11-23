@@ -484,6 +484,12 @@ func editScopes(c *fiber.Ctx, pool *pgxpool.Pool) (string, []string) {
 		scope = "course:" + course
 	}
 	read := []string{scope}
+	// A term filter selects the term scope above, but the response still shows
+	// courses that the user can edit. Preserve their collection snapshot too.
+	// An individual course read must not refresh all the other courses.
+	if c.Method() == fiber.MethodGet && root == "teaching-courses" && course == "" {
+		read = append(read, "course:*")
+	}
 	// Aggregate review screens read course data across a term; the token is
 	// checked against the individual course's transaction when it is edited.
 	if c.Method() == fiber.MethodGet && (root == "worklog" || root == "submission-periods" || root == "ta-requests" || root == "exports" || root == "document-progress" || root == "terms" || root == "staff") {

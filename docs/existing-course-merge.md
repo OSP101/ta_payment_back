@@ -36,6 +36,25 @@ merge action never deletes them to get past this guard.
 
 Verification:
 
+- A term-filtered course list must return both its term edit snapshot and
+  `course:*`. Returning only the term snapshot makes a subsequent merge commit
+  fail with HTTP 428 even when its preview token is valid. Single-course reads
+  must not refresh the collection snapshot. Preview POSTs remain repeatable;
+  `commit=1` retains concurrency, stale-view and duplicate-command checks.
+- `TEST_DATABASE_URL=... go test ./internal/handler -run 'Test(TeachingCourseListSnapshot|ExistingMergeFullRouter)' -count=1 -v`
+  exercises the production router with real JWT/session authentication,
+  account/role guards, edit middleware and PostgreSQL. It repeats previews with
+  the same intent and verifies commit results (45 regular / 35 special), source
+  removal and duplicate commit rejection.
+- `RUN_MERGE_BROWSER=1 TEST_DATABASE_URL=... go test ./internal/handler -run '^TestExistingMergeBrowserIntegration$' -count=1 -v -timeout 10m`
+  runs the real React modal against that API and throwaway database, with no
+  merge-response mocks. Desktop Chrome, mobile Chrome and WebKit/iPhone each
+  select both tracks, inspect three times, tap the visible confirmation,
+  commit and verify the refreshed course list. Requires frontend dependencies,
+  Chrome, Playwright WebKit (`npx playwright install webkit`) and OpenSSL.
+  The frontend fixture uses local HTTPS, preserving production CSP behavior.
+  Test credentials and temporary routes/certificates are removed afterward.
+
 - `TEST_DATABASE_URL=... go test ./internal/service -run '^TestExistingCourseMerge' -count=1`
   uses an isolated throwaway database. Tests cover sums, separate-group identity,
   source evidence, teacher deduplication, stale data, operational references,
