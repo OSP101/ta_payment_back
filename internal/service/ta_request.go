@@ -1959,6 +1959,7 @@ type TACandidate struct {
 	FirstName           string    `json:"first_name"`
 	LastName            string    `json:"last_name"`
 	Email               string    `json:"email"`
+	StudentID           string    `json:"student_id"`
 	StudyLevel          string    `json:"study_level"`
 	ApprovedCourseCount int       `json:"approved_course_count"` // other courses this term (excl. this one)
 	AtQuota             bool      `json:"at_quota"`              // adding THIS course would exceed the cap
@@ -1980,7 +1981,27 @@ type TACandidate struct {
 // Candidates lists every TA with their approved-course count in the given
 // course's term (excluding this course), flagging those who have already hit
 // the per-term cap. Used by the request form to keep full TAs unselectable.
-func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TACandidate, error) {
+// CandidateFilter bounds search before calculating quota and timetable details.
+// IDs is a separate lookup for restoring selections, independent of search pages.
+type CandidateFilter struct {
+	Search string
+	IDs    []uuid.UUID
+	Limit  int
+	Offset int
+}
+
+func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID, filters ...CandidateFilter) ([]TACandidate, error) {
+	var f CandidateFilter
+	if len(filters) > 0 {
+		f = filters[0]
+	}
+	if f.Limit < 0 || f.Limit > 101 || f.Offset < 0 || len(f.IDs) > 100 {
+		return nil, Invalid("invalid candidate search limits")
+	}
+	search := strings.TrimSpace(f.Search)
+	// Search text is literal: '%' and '_' in an email/name are not wildcards.
+	pattern := "%" + strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(search) + "%"
+
 	var termID uuid.UUID
 	if err := s.pool.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id=$1`, tcID).Scan(&termID); err != nil {
 		return nil, err
@@ -1990,8 +2011,18 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `
+        WITH matching_users AS MATERIALIZED (
+          SELECT u.* FROM users u
+          WHERE EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id=u.id AND ur.role='ta')
+            AND ($3 = '' OR u.email ILIKE $4 OR u.first_name ILIKE $4
+              OR u.last_name ILIKE $4 OR (u.first_name || ' ' || u.last_name) ILIKE $4
+              OR COALESCE(u.student_id,'') ILIKE $4)
+            AND (COALESCE(cardinality($5::uuid[]),0)=0 OR u.id=ANY($5::uuid[]))
+          ORDER BY u.first_name, u.last_name, u.id
+          LIMIT NULLIF($6::int,0) OFFSET $7
+        )
 		SELECT u.id, COALESCE(u.first_name,''), COALESCE(u.last_name,''), u.email,
-		       COALESCE(u.study_level, 'undergrad'),
+		       COALESCE(u.student_id,''), COALESCE(u.study_level, 'undergrad'),
 		       COALESCE((
 		         SELECT COUNT(DISTINCT r.teaching_course_id)
 		         FROM ta_request_assignments a
@@ -2010,9 +2041,8 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 		       EXISTS (
 		         SELECT 1 FROM ta_class_schedules cs
 		         WHERE cs.user_id = u.id AND cs.term_id = $2)
-		FROM users u
-		WHERE EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role::text = 'ta')
-		ORDER BY u.first_name, u.last_name`, tcID, termID)
+		FROM matching_users u
+		ORDER BY u.first_name, u.last_name, u.id`, tcID, termID, search, pattern, f.IDs, f.Limit, f.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -2020,7 +2050,7 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 	out := []TACandidate{}
 	for rows.Next() {
 		var c TACandidate
-		if err := rows.Scan(&c.ID, &c.FirstName, &c.LastName, &c.Email, &c.StudyLevel,
+		if err := rows.Scan(&c.ID, &c.FirstName, &c.LastName, &c.Email, &c.StudentID, &c.StudyLevel,
 			&c.ApprovedCourseCount, &c.AlreadyInCourse, &c.HasSchedule); err != nil {
 			return nil, err
 		}
@@ -2042,6 +2072,10 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 	if len(idx) == 0 {
 		return out, nil
 	}
+	heldIDs := make([]uuid.UUID, 0, len(idx))
+	for id := range idx {
+		heldIDs = append(heldIDs, id)
+	}
 	held, err := s.pool.Query(ctx, `
 		SELECT a.ta_id, a.section_id, r.id, r.workload_rule_version
 		FROM ta_request_assignments a
@@ -2049,7 +2083,8 @@ func (s *TARequestService) Candidates(ctx context.Context, tcID uuid.UUID) ([]TA
 		WHERE r.teaching_course_id = $1
 		  AND r.status IN ('submitted', 'approved')
 		  AND a.state <> 'dropped'
-		ORDER BY r.submitted_at`, tcID)
+		AND a.ta_id = ANY($2::uuid[])
+		ORDER BY r.submitted_at`, tcID, heldIDs)
 	if err != nil {
 		return nil, err
 	}

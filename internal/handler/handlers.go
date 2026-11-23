@@ -1507,11 +1507,50 @@ func (h *TARequestHandler) Candidates(c *fiber.Ctx) error {
 			return fiber.NewError(fiber.StatusForbidden, "forbidden")
 		}
 	}
-	out, err := h.Svc.TARequest.Candidates(c.Context(), tcID)
+	// Cached pre-search clients still expect a complete collection. New clients
+	// always send limit or ids, so a backend-first rollout remains compatible.
+	if c.Query("limit") == "" && c.Query("q") == "" && c.Query("ids") == "" && c.Query("offset") == "" {
+		out, err := h.Svc.TARequest.Candidates(c.Context(), tcID)
+		if err != nil {
+			return err
+		}
+		return c.JSON(fiber.Map{"items": out, "has_more": false})
+	}
+	limit, err := strconv.Atoi(c.Query("limit", "30"))
+	if err != nil || limit < 1 || limit > 100 {
+		return fiber.NewError(fiber.StatusBadRequest, "limit must be 1..100")
+	}
+	offset, err := strconv.Atoi(c.Query("offset", "0"))
+	if err != nil || offset < 0 || offset > 100000 {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid offset")
+	}
+	f := service.CandidateFilter{Search: c.Query("q"), Limit: limit + 1, Offset: offset}
+	if len(f.Search) > 300 {
+		return fiber.NewError(fiber.StatusBadRequest, "search too long")
+	}
+	if raw := c.Query("ids"); raw != "" {
+		parts := strings.Split(raw, ",")
+		if len(parts) > 100 {
+			return fiber.NewError(fiber.StatusBadRequest, "too many ids")
+		}
+		for _, part := range parts {
+			id, parseErr := uuid.Parse(part)
+			if parseErr != nil {
+				return fiber.NewError(fiber.StatusBadRequest, "invalid candidate id")
+			}
+			f.IDs = append(f.IDs, id)
+		}
+		f.Search, f.Limit, f.Offset = "", 100, 0
+	}
+	out, err := h.Svc.TARequest.Candidates(c.Context(), tcID, f)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"items": out})
+	hasMore := len(f.IDs) == 0 && len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return c.JSON(fiber.Map{"items": out, "has_more": hasMore})
 }
 
 func (h *TARequestHandler) ListWindows(c *fiber.Ctx) error {
