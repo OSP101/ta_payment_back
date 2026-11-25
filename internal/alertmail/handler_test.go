@@ -55,3 +55,17 @@ func TestRejectsMalformedOversizedAndEmptyAlerts(t *testing.T) {
 		}
 	}
 }
+
+// A busy mailer must ask Alertmanager to retry, rather than dropping the alert.
+func TestBusyMailerReturnsRetryableStatus(t *testing.T) {
+	h := New(&sender{}, "token", []string{"admin@example.com"})
+	h.busy <- struct{}{}
+	defer func() { <-h.busy }()
+	r := httptest.NewRequest("POST", "/alerts", strings.NewReader(`{"status":"firing","alerts":[{}]}`))
+	r.Header.Set("Authorization", "Bearer token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 503 {
+		t.Fatalf("busy mailer returned %d; need retryable 503", w.Code)
+	}
+}

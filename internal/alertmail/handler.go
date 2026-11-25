@@ -48,7 +48,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case h.busy <- struct{}{}:
 		defer func() { <-h.busy }()
 	default:
-		w.WriteHeader(http.StatusTooManyRequests)
+		// Alertmanager retries 5xx; 429 is treated as an unrecoverable webhook error.
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 	var p Payload

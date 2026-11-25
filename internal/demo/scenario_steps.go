@@ -49,10 +49,17 @@ func stepTerm(ctx context.Context, svc *service.Container) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Courses and submission periods cover the whole current month. The term
+	// must include its first day even when training starts late in the month.
+	startsOn := now.AddDate(0, 0, -14)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, timeutil.Bangkok)
+	if monthStart.Before(startsOn) {
+		startsOn = monthStart
+	}
 	in := service.Term{
 		AcademicYear:    beYear,
 		Semester:        1,
-		StartsOn:        strPtr(isoDate(now.AddDate(0, 0, -14))),
+		StartsOn:        strPtr(isoDate(startsOn)),
 		EndsOn:          strPtr(isoDate(now.AddDate(0, 4, 0))),
 		MidtermStartsOn: strPtr(isoDate(now.AddDate(0, 0, 45))),
 		MidtermEndsOn:   strPtr(isoDate(now.AddDate(0, 0, 48))),

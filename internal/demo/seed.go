@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"ta-payment-back/internal/auth"
 	"ta-payment-back/internal/service"
@@ -53,6 +54,12 @@ var demoAccounts = []DemoAccount{
 // same chicken-and-egg problem (the first admin can't be created by an actor
 // who needs to already be an admin) and solves it the same way.
 func seedSlot(ctx context.Context, svc *service.Container) error {
+	return seedSlotWithExec(ctx, svc.Pool.Exec)
+}
+
+// The claim/reset transaction supplies its own connection so a failed seed
+// rolls back the truncation and ownership change as well as the accounts.
+func seedSlotWithExec(ctx context.Context, execFn func(context.Context, string, ...any) (pgconn.CommandTag, error)) error {
 	hash, err := auth.HashPassword(DemoPassword)
 	if err != nil {
 		return err
@@ -80,14 +87,14 @@ func seedSlot(ctx context.Context, svc *service.Container) error {
 				break
 			}
 		}
-		if _, err := svc.Pool.Exec(ctx,
+		if _, err := execFn(ctx,
 			`INSERT INTO users (id, email, first_name, last_name, password_hash, is_active, profile_completed, must_change_password, study_level)
 			 VALUES ($1,$2,$3,$4,$5,TRUE,TRUE,FALSE,$6::study_level)`,
 			id, acc.Email, firstName, lastName, hash, studyLevel); err != nil {
 			return fmt.Errorf("seed user %s: %w", acc.Email, err)
 		}
 		for _, r := range acc.Roles {
-			if _, err := svc.Pool.Exec(ctx,
+			if _, err := execFn(ctx,
 				`INSERT INTO user_roles (user_id, role) VALUES ($1,$2::role_code)`, id, r); err != nil {
 				return fmt.Errorf("seed role %s/%s: %w", acc.Email, r, err)
 			}
@@ -108,7 +115,7 @@ func seedSlot(ctx context.Context, svc *service.Container) error {
 	// cmd/seed/main.go uses, so a demo slot behaves like a freshly-seeded
 	// real deployment instead of erroring out the moment staff touch
 	// anything budget-related.
-	if _, err := svc.Pool.Exec(ctx, `INSERT INTO pay_rates (id, effective_from,
+	if _, err := execFn(ctx, `INSERT INTO pay_rates (id, effective_from,
 	                    undergrad_regular, undergrad_special,
 	                    graduate_regular, graduate_special_lumpsum,
 	                    ug_lecture_hours_per_credit, ug_lab_hours_per_credit,
@@ -138,7 +145,7 @@ func seedSlot(ctx context.Context, svc *service.Container) error {
 	// empty" never ran and a fresh slot had no signer at all — step 6 and the
 	// presentation dataset both failed with "ยังไม่มีผู้ลงนาม". Fill the vacant
 	// dean seat first; insert only if there is no seat to fill.
-	tag, err := svc.Pool.Exec(ctx, `
+	tag, err := execFn(ctx, `
 		UPDATE admin_officers
 		   SET academic_prefix = 'ผู้ช่วยศาสตราจารย์ ดร.', full_name = 'สมมติ ตัวอย่างดี', is_active = TRUE
 		 WHERE title = 'คณบดีวิทยาลัยการคอมพิวเตอร์' AND NOT is_active AND full_name = ''
@@ -147,7 +154,7 @@ func seedSlot(ctx context.Context, svc *service.Container) error {
 		return fmt.Errorf("seed admin_officers: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := svc.Pool.Exec(ctx,
+		if _, err := execFn(ctx,
 			`INSERT INTO admin_officers (id, academic_prefix, full_name, title, is_active)
 			 SELECT gen_random_uuid(), 'ผู้ช่วยศาสตราจารย์ ดร.', 'สมมติ ตัวอย่างดี', 'คณบดีวิทยาลัยการคอมพิวเตอร์', TRUE
 			 WHERE NOT EXISTS (SELECT 1 FROM admin_officers WHERE is_active)`); err != nil {

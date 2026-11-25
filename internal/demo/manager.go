@@ -330,16 +330,15 @@ func (m *Manager) Claim(ctx context.Context, ownerEmail string) (*Slot, Tier, er
 		}
 		return nil, "", err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, "", err
-	}
-
 	slot, err := m.slotByIndex(claimedIndex)
 	if err != nil {
 		return nil, "", err
 	}
-	if err := m.resetSlotData(ctx, slot); err != nil {
+	if err := m.resetSlotDataTx(ctx, tx, slot); err != nil {
 		return nil, "", fmt.Errorf("demo: seeding newly-claimed slot %d: %w", claimedIndex, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, "", err
 	}
 	return slot, tier, nil
 }
@@ -352,22 +351,44 @@ func (m *Manager) Claim(ctx context.Context, ownerEmail string) (*Slot, Tier, er
 // doc comment on that Exec call) so both go through the identical
 // lookup-and-touch-activity logic.
 func (m *Manager) resumeOwnedSlot(ctx context.Context, ownerEmail string) (*Slot, error, bool) {
-	var existing *int
-	if err := m.mainPool.QueryRow(ctx,
-		`SELECT slot_index FROM demo_workspaces WHERE owner_email = $1`, ownerEmail,
-	).Scan(&existing); err != nil && !isNoRows(err) {
+	tx, err := m.mainPool.Begin(ctx)
+	if err != nil {
 		return nil, err, true
 	}
-	if existing == nil {
+	defer tx.Rollback(ctx)
+	var index int
+	err = tx.QueryRow(ctx, `SELECT slot_index FROM public.demo_workspaces WHERE owner_email=$1 FOR UPDATE`, ownerEmail).Scan(&index)
+	if isNoRows(err) {
 		return nil, nil, false
 	}
-	slot, err := m.slotByIndex(*existing)
-	if err == nil {
-		// Best-effort: a resume is activity too, but failing to record that
-		// must never block the resume itself.
-		_, _ = m.mainPool.Exec(ctx, `UPDATE demo_workspaces SET last_active_at=NOW() WHERE slot_index=$1`, *existing)
+	if err != nil {
+		return nil, err, true
 	}
-	return slot, err, true
+	slot, err := m.slotByIndex(index)
+	if err != nil {
+		return nil, err, true
+	}
+	// Before atomic claims, a failed initial seed left a claimed but empty
+	// slot. Repair that exact state on re-entry; preserve populated workspaces.
+	var hasUsers bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+pgxIdentifier(slot.SchemaName, "users")+`)`).Scan(&hasUsers); err != nil {
+		return nil, err, true
+	}
+	if !hasUsers {
+		if err := m.resetSlotDataTx(ctx, tx, slot); err != nil {
+			return nil, err, true
+		}
+		if _, err := tx.Exec(ctx, `UPDATE public.demo_workspaces SET last_reset_at=NOW() WHERE slot_index=$1`, index); err != nil {
+			return nil, err, true
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE public.demo_workspaces SET last_active_at=NOW() WHERE slot_index=$1`, index); err != nil {
+		return nil, err, true
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err, true
+	}
+	return slot, nil, true
 }
 
 // isUniqueViolation reports whether err is a Postgres unique_violation
@@ -506,14 +527,39 @@ func (m *Manager) slotByIndex(i int) (*Slot, error) {
 // slot.SchemaName; information_schema.tables is filtered to exactly that
 // schema, so the table list itself can't name one that would.
 func (m *Manager) resetSlotData(ctx context.Context, slot *Slot) error {
+	tx, err := slot.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := m.resetSlotDataTx(ctx, tx, slot); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (m *Manager) resetSlotDataTx(ctx context.Context, tx pgx.Tx, slot *Slot) error {
+	if err := assertDemoSlot(ctx, slot); err != nil {
+		return err
+	}
+	// A claim transaction starts on the registry pool. Pin all unqualified
+	// seed SQL to this slot; explicit registry writes stay in public.
+	if _, err := tx.Exec(ctx, `SELECT set_config('search_path', $1, true)`, quoteIdent(slot.SchemaName)+",public"); err != nil {
+		return err
+	}
 	tables, err := slotTableNames(ctx, slot)
 	if err != nil {
 		return err
 	}
-	if err := truncateTables(ctx, slot.Pool.Exec, slot.SchemaName, tables); err != nil {
+	if err := truncateTables(ctx, tx, slot.SchemaName, tables); err != nil {
 		return fmt.Errorf("truncating slot %d: %w", slot.Index, err)
 	}
-	return seedSlot(ctx, slot.Container)
+	// The registry pool is reused across schemas. Describe/statement caches
+	// retain enum parameter OIDs from the previous slot (e.g. study_level).
+	// Infer parameter types per execution instead of reusing those OIDs.
+	return seedSlotWithExec(ctx, func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+		return tx.Exec(ctx, sql, append([]any{pgx.QueryExecModeExec}, args...)...)
+	})
 }
 
 // slotTableNames lists every real table in slot's schema — everything
@@ -554,12 +600,19 @@ func tableNamesInSchema(ctx context.Context, pool *pgxpool.Pool, schema string) 
 // slot schema was created by replaying the migrations with search_path
 // pinned to that schema alone — their REFERENCES clauses resolved only
 // within it, so none of them point at public or at another slot; CASCADE
-// here can never leave schema. execFn is *pgxpool.Pool.Exec or pgx.Tx.Exec —
-// RestoreCheckpoint needs the transactional one so a truncate that
-// succeeds but a restore that fails rolls back together.
-func truncateTables(ctx context.Context, execFn func(context.Context, string, ...any) (pgconn.CommandTag, error), schema string, tables []string) error {
+// here can never leave schema. A transaction is required so the reset flag
+// is local and a later seed/restore failure rolls the truncation back.
+func truncateTables(ctx context.Context, tx pgx.Tx, schema string, tables []string) error {
 	if len(tables) == 0 {
 		return nil
+	}
+	// Only a transaction-local opt-in in an actual demo schema can reset
+	// calculation snapshots. The production append-only guard stays active.
+	if !demoSlotSchema.MatchString(schema) {
+		return errNotDemoSlot
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('ta_payment.demo_reset', 'on', true)`); err != nil {
+		return err
 	}
 	qualified := make([]string, len(tables))
 	for i, t := range tables {
@@ -569,7 +622,7 @@ func truncateTables(ctx context.Context, execFn func(context.Context, string, ..
 		// adds stays a plain lowercase identifier.
 		qualified[i] = pgxIdentifier(schema, t)
 	}
-	_, err := execFn(ctx, "TRUNCATE TABLE "+strings.Join(qualified, ", ")+" CASCADE")
+	_, err := tx.Exec(ctx, "TRUNCATE TABLE "+strings.Join(qualified, ", ")+" CASCADE")
 	return err
 }
 
@@ -584,5 +637,7 @@ func isNoRows(err error) bool {
 // Close is called after the HTTP server drains. It does not close the registry
 // pool (owned by main), and never drops schemas or demo data.
 func (m *Manager) Close() {
-	for _, slot := range m.slots { slot.Pool.Close() }
+	for _, slot := range m.slots {
+		slot.Pool.Close()
+	}
 }
