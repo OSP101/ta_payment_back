@@ -46,6 +46,9 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 		return nil, "", Invalid("วันที่สั่งหรือวันที่ทำการไม่ถูกต้อง กรุณาเลือกวันที่ใหม่")
 	}
 
+	// recordRound rechecks this snapshot under the same lock as request edits.
+	builtAt := time.Now()
+
 	// Load term metadata.
 	var academicYear, semLabel string
 	if err := s.pool.QueryRow(ctx, `
@@ -230,7 +233,7 @@ func (s *AppointmentOrderService) Build(ctx context.Context, actor uuid.UUID, in
 	if err != nil {
 		return nil, "", err
 	}
-	if err := s.recordRound(ctx, actor, in, round, pairs, doc); err != nil {
+	if err := s.recordRound(ctx, actor, in, round, pairs, doc, builtAt); err != nil {
 		return nil, "", err
 	}
 

@@ -245,6 +245,7 @@ var catalog = map[string]ActionInfo{
 	"ta_window.upsert":                  ok("ตั้งช่วงเปิดรับคำขอผู้ช่วยสอน", CatCourse),
 	"ta_window.delete":                  ok("ลบช่วงเปิดรับคำขอผู้ช่วยสอน", CatCourse),
 	"ta_request.add_sections":           ok("เพิ่มกลุ่มเรียนในคำขอผู้ช่วยสอน", CatCourse),
+	"ta_request.edit":                   ok("แก้ไขคำขอผู้ช่วยสอน", CatCourse),
 	"ta_request.pending_schedule":       ok("ยื่นคำขอผู้ช่วยสอนโดยรอตารางสอน", CatCourse),
 	"ta_request.update_workload":        ok("แก้ภาระงานในคำขอผู้ช่วยสอน", CatCourse),
 	"ta_request.cancel":                 warn("ยกเลิกคำขอผู้ช่วยสอน", CatCourse),

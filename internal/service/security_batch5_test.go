@@ -260,6 +260,8 @@ func TestExportBlockers_FlagApprovedHoursThatNowClashWithOwnClass(t *testing.T) 
 func gradLumpFixture(t *testing.T) (*fixture, *ExportService, float64, string, string) {
 	t.Helper()
 	f := newFixture(t, fixtureOpts{Level: "master", Track: "special"})
+	// These ledger tests require a fully funded lump, independent of budget sharing.
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, f.CourseID)
 	id := f.mustUpsert(f.entry(day(10), "09:00", "11:00", 2))
 	// The later month's row exists from the start as a draft two months on —
 	// invisible to the split until addLaterHours approves it.

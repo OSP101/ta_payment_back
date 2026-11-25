@@ -46,10 +46,12 @@ type ExistingMergeCourse struct {
 	Sections []ExistingMergeSection `json:"sections"`
 }
 type ExistingMergePreview struct {
-	Source   ExistingMergeCourse `json:"source"`
-	Target   ExistingMergeCourse `json:"target"`
-	Blockers []string            `json:"blockers"`
-	Token    string              `json:"token"`
+	Source             ExistingMergeCourse `json:"source"`
+	Target             ExistingMergeCourse `json:"target"`
+	Blockers           []string            `json:"blockers"`
+	Token              string              `json:"token"`
+	ApprovedRequestIDs []uuid.UUID         `json:"approved_request_ids,omitempty"`
+	TargetApproval     json.RawMessage     `json:"target_approval,omitempty"`
 }
 
 func existingMergeCourse(ctx context.Context, tx pgx.Tx, id uuid.UUID) (c ExistingMergeCourse, err error) {
@@ -169,12 +171,10 @@ func prepareExistingMerge(ctx context.Context, tx pgx.Tx, target uuid.UUID, in E
 		p.Blockers = append(p.Blockers, "เลือกรหัสหลักสูตรใหม่กว่าเป็นวิชาหลัก (CP ก่อน SC ก่อนรหัสตัวเลข)")
 	}
 	sectionIDs := []uuid.UUID{}
-	for _, c := range []ExistingMergeCourse{p.Target, p.Source} {
-		for _, s := range c.Sections {
-			sectionIDs = append(sectionIDs, s.ID)
-		}
+	for _, sec := range p.Source.Sections {
+		sectionIDs = append(sectionIDs, sec.ID)
 	}
-	used, e := existingMergeHasUsage(ctx, tx, "teaching_courses", ids, map[string]bool{"sections": true, "teaching_lecturers": true})
+	used, e := existingMergeHasUsage(ctx, tx, "teaching_courses", []uuid.UUID{in.SourceID}, map[string]bool{"sections": true, "teaching_lecturers": true})
 	if e != nil {
 		return p, e
 	}
@@ -183,8 +183,14 @@ func prepareExistingMerge(ctx context.Context, tx pgx.Tx, target uuid.UUID, in E
 		return p, e
 	}
 	if used || sectionUsed {
-		p.Blockers = append(p.Blockers, "มีข้อมูลการใช้งาน เช่น คำขอ TA การมอบหมาย งานเบิกจ่าย หรือข้อมูลเชื่อมโยงอยู่แล้ว กรุณาให้ผู้ดูแลตรวจรายการที่ผูกอยู่ก่อนรวม")
+		p.Blockers = append(p.Blockers, "วิชาที่จะนำมารวมมีข้อมูลการใช้งาน เช่น คำขอ TA การมอบหมาย งานเบิกจ่าย หรือข้อมูลเชื่อมโยงอยู่แล้ว กรุณาตรวจรายการที่ผูกอยู่ก่อนรวม")
 	}
+	var targetBlockers []string
+	p.TargetApproval, p.ApprovedRequestIDs, targetBlockers, err = existingMergeApprovedTarget(ctx, tx, p.Target)
+	if err != nil {
+		return p, err
+	}
+	p.Blockers = append(p.Blockers, targetBlockers...)
 	targets := map[uuid.UUID]ExistingMergeSection{}
 	totals := map[uuid.UUID]int{}
 	for _, s := range p.Target.Sections {
@@ -292,6 +298,11 @@ func (s *TeachingService) ExistingCourseMerge(ctx context.Context, actor, target
 	if err = assertActiveLecturers(ctx, tx, teacherIDs); err != nil {
 		return p, err
 	}
+	for _, id := range p.ApprovedRequestIDs {
+		if err = snapshotRequestCalculation(ctx, tx, id, actor, "before_existing_course_merge"); err != nil {
+			return p, err
+		}
+	}
 	if _, err = tx.Exec(ctx, `INSERT INTO teaching_lecturers(teaching_course_id,lecturer_id,is_primary) SELECT $1,lecturer_id,is_primary AND NOT EXISTS(SELECT 1 FROM teaching_lecturers WHERE teaching_course_id=$1 AND is_primary) FROM teaching_lecturers WHERE teaching_course_id=$2 ON CONFLICT DO NOTHING`, target, in.SourceID); err != nil {
 		return p, err
 	}
@@ -351,6 +362,11 @@ func (s *TeachingService) ExistingCourseMerge(ctx context.Context, actor, target
 	}
 	if err = s.recomputeAggregate(ctx, tx, target); err != nil {
 		return p, err
+	}
+	for _, id := range p.ApprovedRequestIDs {
+		if err = snapshotRequestCalculation(ctx, tx, id, actor, "existing_course_merged"); err != nil {
+			return p, err
+		}
 	}
 	if err = s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "teaching_course.merge_existing", Entity: "teaching_course", EntityID: target.String(), Before: p, After: in}); err != nil {
 		return p, err

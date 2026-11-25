@@ -189,6 +189,7 @@ func TestTransferCoverMonthSlices_GradLumpFollowsTheHoldersOwnHours(t *testing.T
 		f.addPeriod(ym)
 	}
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP303", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	grad := f.newTA("บัณฑิต เหมาจ่าย", "master")
 	// Three 1-hour คาบ in September, one in October: 3/4 of the term's work
 	// in September.
@@ -236,6 +237,7 @@ func TestTransferCoverMonthSlices_GradLumpWithoutHoursFallsBackToAnEvenSplit(t *
 		f.addPeriod(ym)
 	}
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP304", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	grad := f.newTA("บัณฑิต ยังไม่ลงเวลา", "master")
 	f.assignTAOn(grad, courseID, specSec, "master", nil)
 
@@ -267,6 +269,7 @@ func TestTransferCoverMonthSlices_GradLumpFollowsRealScheduleWhenAvailable(t *te
 		f.addPeriod(ym)
 	}
 	courseID, regSec, specSec := f.insertCourse(tcCourseOpts{Code: "CP305", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	// A weekly Monday lecture across the whole term. The exact per-month
 	// Monday count isn't hand-verified here (that's grad_special_schedule_test.go's
 	// job) — this test only needs the resulting split to NOT match the

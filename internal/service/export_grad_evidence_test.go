@@ -169,6 +169,7 @@ func sumSpecialRow(t *testing.T, book []byte, nMonths int) float64 {
 func TestBuildGradEvidenceWorkbook_LumpSplitsAcrossFiscalYearsWithoutDoubleBilling(t *testing.T) {
 	f := newTCFixture(t)
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP423436", Curriculum: "CY", LectureHrs: 3})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	ta := f.newTA("บัณฑิตพิเศษ", "master")
 	f.assignTA(ta, courseID, specSec, "master", nil) // เหมาจ่าย logs nothing
 
@@ -418,6 +419,7 @@ func TestBuildGradEvidenceWorkbook_ExcludesUndergradOnAMixedCourse(t *testing.T)
 func TestBuildGradEvidenceWorkbook_SpecialMonthsSumToTheLump(t *testing.T) {
 	f := newTCFixture(t)
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP363762", Curriculum: "CY", LectureHrs: 3})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	ta := f.newTA("บัณฑิตพิเศษ", "phd")
 	// No work logs at all — grad-special stopped logging entirely.
 	f.assignTA(ta, courseID, specSec, "phd", nil)

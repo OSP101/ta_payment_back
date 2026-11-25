@@ -221,6 +221,7 @@ func TestStaffCannotManageAdmin(t *testing.T) {
 
 func TestBudget_GradSpecialLumpCountedOncePerTA(t *testing.T) {
 	f := newFixture(t, fixtureOpts{})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, f.CourseID)
 	grad := f.insertUser("ta", "grad")
 	f.exec(`UPDATE users SET study_level = 'phd' WHERE id = $1`, grad)
 	req := uuid.New()

@@ -69,7 +69,7 @@ func newMergeHTTPFixture(t *testing.T) *mergeHTTPFixture {
 	return &mergeHTTPFixture{app: app, pool: pool, svc: svc, actor: actor, token: token}
 }
 
-func (f *mergeHTTPFixture) courses(t *testing.T, year int) (uuid.UUID, uuid.UUID, uuid.UUID) {
+func (f *mergeHTTPFixture) courses(t *testing.T, year int, extraRegular ...bool) (uuid.UUID, uuid.UUID, uuid.UUID) {
 	t.Helper()
 	term := uuid.New()
 	if _, err := f.pool.Exec(context.Background(), `INSERT INTO academic_terms(id,academic_year,semester) VALUES($1,$2,1)`, term, year); err != nil {
@@ -82,7 +82,11 @@ func (f *mergeHTTPFixture) courses(t *testing.T, year int) (uuid.UUID, uuid.UUID
 		}
 		return id
 	}
-	target := create("CP321004", []service.CourseSectionInput{{SecNo: "1", Track: "regular", NumStudents: 40}, {SecNo: "3", Track: "special", NumStudents: 30}})
+	targetSections := []service.CourseSectionInput{{SecNo: "1", Track: "regular", NumStudents: 40}, {SecNo: "3", Track: "special", NumStudents: 30}}
+	if len(extraRegular) > 0 && extraRegular[0] {
+		targetSections = append(targetSections, service.CourseSectionInput{SecNo: "2", Track: "regular", NumStudents: 40})
+	}
+	target := create("CP321004", targetSections)
 	source := create("SC361004", []service.CourseSectionInput{{SecNo: "1", Track: "regular", NumStudents: 5}, {SecNo: "2", Track: "special", NumStudents: 5}})
 	return term, target, source
 }
@@ -356,9 +360,57 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 	go func() { _ = f.app.Listener(listener) }()
 	t.Cleanup(func() { _ = f.app.Shutdown() })
 	cases := []map[string]any{}
-	for i, mode := range []string{"desktop", "mobile", "safari", "target-changed", "source-changed", "two-tabs", "ta-request", "reverse-main", "incompatible", "exported"} {
-		term, target, source := f.courses(t, 2569+i)
-		merged := i < 6
+	for i, mode := range []string{"desktop", "mobile", "safari", "target-changed", "source-changed", "two-tabs", "ta-request", "reverse-main", "incompatible", "exported", "approved-desktop", "approved-mobile", "approved-safari", "approved-two-tabs", "approved-target-changed", "approved-draft-time", "approved-submitted-time", "approved-reviewed-month", "approved-extra-section"} {
+		term, target, source := f.courses(t, 2569+i, mode == "approved-extra-section")
+		merged := i < 6 || (i >= 10 && i < 15) || mode == "approved-extra-section"
+		approval := map[string]any{}
+		if i >= 10 {
+			ta, rid, aid, section := uuid.New(), uuid.New(), uuid.New(), uuid.Nil
+			if err = f.pool.QueryRow(context.Background(), `SELECT id FROM sections WHERE teaching_course_id=$1 AND track='regular' AND sec_no='1' ORDER BY id LIMIT 1`, target).Scan(&section); err != nil {
+				t.Fatal(err)
+			}
+			for _, step := range []struct {
+				sql  string
+				args []any
+			}{
+				{`INSERT INTO users(id,email,first_name,last_name,is_active) VALUES($1,$2,'TA','Tester',true)`, []any{ta, ta.String() + "@example.test"}},
+				{`INSERT INTO user_roles(user_id,role) VALUES($1,'ta')`, []any{ta}},
+				{`INSERT INTO ta_requests(id,teaching_course_id,lecturer_id,reimburse_scope,status,submitted_at,decided_at,decided_by) VALUES($1,$2,$3,'both','approved',NOW(),NOW(),$3)`, []any{rid, target, f.actor}},
+				{`INSERT INTO ta_request_counts(request_id,section_id,undergrad_count) VALUES($1,$2,1)`, []any{rid, section}},
+				{`INSERT INTO ta_request_assignments(id,request_id,section_id,ta_id,level) VALUES($1,$2,$3,$4,'undergrad')`, []any{aid, rid, section, ta}},
+				{`INSERT INTO ta_workload_forms(assignment_id,attendance_hrs,check_work_hrs) VALUES($1,1,1)`, []any{aid}},
+				{`INSERT INTO course_budget_alerts(teaching_course_id) VALUES($1)`, []any{target}},
+			} {
+				if _, err = f.pool.Exec(context.Background(), step.sql, step.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			approval["request_id"] = rid
+			approval["assignment_id"] = aid
+			if mode == "approved-draft-time" || mode == "approved-submitted-time" {
+				status := "draft"
+				if mode == "approved-submitted-time" {
+					status = "submitted"
+				}
+				if _, err = f.pool.Exec(context.Background(), `INSERT INTO work_logs(assignment_id,work_date,start_time,end_time,hours,activity,status) VALUES($1,CURRENT_DATE,'09:00','10:00',1,'lecture',$2::worklog_status)`, aid, status); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "approved-reviewed-month" {
+				pid := uuid.New()
+				if _, err = f.pool.Exec(context.Background(), `INSERT INTO submission_periods(id,term_id,year_month,starts_on,due_date,label) VALUES($1,$2,'2569-06','2026-06-01','2026-07-31','test')`, pid, term); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = f.pool.Exec(context.Background(), `INSERT INTO submission_period_status(id,submission_period_id,ta_id,teaching_course_id,status,staff_reviewed_by) VALUES($1,$2,$3,$4,'staff_reviewed',$5)`, uuid.New(), pid, ta, target, f.actor); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var before string
+			if err = f.pool.QueryRow(context.Background(), `SELECT jsonb_build_object('request',to_jsonb(r),'assignment',to_jsonb(a),'workload',to_jsonb(w))::text FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE r.id=$1`, rid).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			approval["before"] = before
+		}
 		switch mode {
 		case "ta-request":
 			_, err = f.pool.Exec(context.Background(), `INSERT INTO ta_requests(teaching_course_id,lecturer_id,reimburse_scope) VALUES($1,$2,'both')`, source, f.actor)
@@ -370,7 +422,11 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cases = append(cases, map[string]any{"mode": mode, "term": term, "target": target, "source": source, "merged": merged})
+		regularBefore, regularAfter := 40, 45
+		if mode == "approved-extra-section" {
+			regularBefore, regularAfter = 80, 85
+		}
+		cases = append(cases, map[string]any{"mode": mode, "term": term, "target": target, "source": source, "merged": merged, "approval": approval, "regular_before": regularBefore, "regular_after": regularAfter})
 	}
 	manifest := map[string]any{"api": fmt.Sprintf("http://%s", listener.Addr()), "token": f.token, "cases": cases}
 	path := filepath.Join(t.TempDir(), "production-fixture.json")
@@ -400,11 +456,32 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 			t.Fatal(err)
 		}
 		if c["merged"].(bool) {
-			if count != 0 || regular != 45 || special != 35 {
+			if count != 0 || regular != c["regular_after"].(int) || special != 35 {
 				t.Fatalf("%s: source=%d counts=%d/%d", c["mode"], count, regular, special)
 			}
-		} else if count != 1 || regular != 40 || special != 30 {
+		} else if count != 1 || regular != c["regular_before"].(int) || special != 30 {
 			t.Fatalf("blocked %s changed data: source=%d counts=%d/%d", c["mode"], count, regular, special)
+		}
+		approval := c["approval"].(map[string]any)
+		if rid, ok := approval["request_id"]; ok {
+			var after string
+			if err = f.pool.QueryRow(context.Background(), `SELECT jsonb_build_object('request',to_jsonb(r),'assignment',to_jsonb(a),'workload',to_jsonb(w))::text FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE r.id=$1`, rid).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if after != approval["before"].(string) {
+				t.Fatalf("%s changed approval, assignment or workload", c["mode"])
+			}
+			var snapshots int
+			if err = f.pool.QueryRow(context.Background(), `SELECT count(*) FROM ta_request_calculation_snapshots WHERE request_id=$1`, rid).Scan(&snapshots); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if c["merged"].(bool) {
+				want = 2
+			}
+			if snapshots != want {
+				t.Fatalf("%s: snapshot count=%d want=%d", c["mode"], snapshots, want)
+			}
 		}
 	}
 }

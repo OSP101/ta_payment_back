@@ -28,13 +28,45 @@ active course list. Student aggregates are recomputed in the same transaction.
 
 Allowed only within one term, with identical credits/hours/study level and
 with the newer curriculum code selected as main. Exported offerings are
-blocked. The FK guard blocks any operational references on either course or
-its Sections, including future tables; only base teacher/Section/timetable/
-exam rows are transferable here. Requests, assignments, payouts and related
-operational work must be reviewed through their normal processes first; the
-merge action never deletes them to get past this guard.
+blocked. The source course and its Sections must have no operational
+references; only base teacher/Section/timetable/exam rows can be transferred.
+
+The main course may retain approved TA requests, assignments, request counts
+and declared workloads, provided no subsequent work has started. Pending
+requests must be decided first. Any work log (including drafts), TA duty
+schedule, work-log correction history, reviewed/exported monthly workflow,
+payout or unknown operational reference blocks the merge. Automatically
+maintained budget-alert rows and untouched pending monthly rows do not count
+as submitted work. Rejected/cancelled request history is preserved, and is
+still checked for downstream work.
+
+The approved main course, requests, target Sections, assignments and workload
+IDs are unchanged. The merge does not add existing TAs to Sections retained as
+separate groups. Before/after calculation snapshots record the original and
+merged student counts under `before_existing_course_merge` and
+`existing_course_merged`. The approval graph is part of the preview token and
+audit evidence. Request/assignment/workload/monthly rows are locked during
+inspection and commit, so a new time entry cannot race past the final checks.
+The FK guard also checks the approval graph for future downstream tables;
+records are never deleted to get past these guards.
 
 Verification:
+
+- `TEST_DATABASE_URL=... go test ./internal/service -run '^TestExistingCourseMerge' -count=1`
+  includes approved-main preservation, pending monthly/budget-cache rows,
+  draft/submitted/approved time, duty schedules, correction history, payment
+  ledgers, monthly review, future references, stale workloads and time created
+  after preview. It compares the request/assignment/workload graph before and
+  after, checks calculation snapshots, repeated pre-time merges and source
+  request rejection. A concurrency test observes the actual PostgreSQL lock
+  wait for a new work-log insert while merge inspection holds its locks.
+- The production-page scenario suite also seeds approved main-course requests
+  on desktop, mobile Chrome and WebKit/iPhone, two tabs, stale target data,
+  existing draft/submitted time and a reviewed month. An additional three-
+  Section case matches the 120-student example (85 regular / 35 special after
+  merge). SQL assertions check that approvals, assignments and workloads are
+  byte-for-byte unchanged, with exactly two calculation snapshots per merged
+  approved request and none for blocked operations.
 
 - Reinspection must refresh `X-Edit-Views` for exactly the target and source
   course, even though it is a POST. Skipping all edit tracking for previews
@@ -52,10 +84,14 @@ Verification:
   acknowledgement, term provider, SWR cache and dynamically imported modal.
   It uses real JWT/session checks, router, services and disposable PostgreSQL
   data, without intercepting API responses or creating substitute React pages.
-  Ten scenarios cover desktop Chrome, mobile Chrome, WebKit/iPhone, target
-  changes, source changes, two tabs, a linked TA request, reversed main course,
-  incompatible credits and exported courses. Database assertions verify
-  45/35 students for successful merges and unchanged rows for blocked cases.
+  Nineteen scenarios cover desktop Chrome, mobile Chrome, WebKit/iPhone,
+  target/source changes, two tabs, linked source requests, reversed main course,
+  incompatible credits, exported courses and the approved-main cases above.
+  Database assertions verify 45/35 students (85/35 for the extra-Section case),
+  preserved approval graphs and unchanged rows for blocked cases.
+  The browser suite rejects unexpected API 404/5xx responses as well as page
+  errors. After a merge, the staff page refreshes lists and retained courses
+  without refetching the removed source course or its budget.
   Setup heartbeats keep the disposable session active during slow builds.
   A cached rerun can set `MERGE_REUSE_PRODUCTION=1`; the test verifies the
   frontend revision/diff and reuses the recorded loopback API address.

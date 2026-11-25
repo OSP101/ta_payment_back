@@ -221,6 +221,7 @@ func TestBuildTransferCoverWorkbook_GradSpecialOnlyWarnsButDoesNotBlock(t *testi
 	f := newLegacyTCFixture(t)
 	f.ensurePeriod()
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP480", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	f.newTA("เหมาจ่าย อย่างเดียว", "master")
 	grad := f.newTA("เหมาจ่าย อย่างเดียว2", "master")
 	f.assignTA(grad, courseID, specSec, "master", nil) // no work_logs at all
@@ -253,6 +254,7 @@ func TestBuildTransferCoverWorkbook_GradSpecialOnlyWarnsButDoesNotBlock(t *testi
 
 // Invalid level values are rejected outright rather than silently treated as
 // "both" or "undergrad" — a caller must say which file it wants.
+
 func TestBuildTransferCoverSheets_RejectsInvalidLevel(t *testing.T) {
 	f := newLegacyTCFixture(t)
 	if _, _, err := f.svc.buildTransferCoverSheets(f.ctx, f.termID, nil, ""); err == nil {

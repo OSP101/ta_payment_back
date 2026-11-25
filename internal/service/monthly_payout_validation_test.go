@@ -127,6 +127,7 @@ func TestMonthlyLumpFiguresAgreeAcrossClaimCoverAndBudgetSummary(t *testing.T) {
 		f.addPeriod(ym)
 	}
 	course, regular, special := f.insertCourse(tcCourseOpts{Code: "CP999001", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, course)
 	ta := f.newTA("ตรวจยอดรายเดือน", "master")
 	actor := f.actor()
 	assignment := f.assignTAOn(ta, course, special, "master", nil)

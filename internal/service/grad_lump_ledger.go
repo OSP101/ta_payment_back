@@ -139,6 +139,64 @@ func gradLumpInForce(ctx context.Context, q ledgerQuerier) (float64, error) {
 	return lumpsum, nil
 }
 
+// gradLumpAllocations divides a short special-track budget equally between
+// graduate TAs. Already exported lump bases stay fixed; new holders share only
+// what remains, so adding a TA can never revise money already sent to finance.
+func (s *ExportService) gradLumpAllocations(ctx context.Context, courseID uuid.UUID, nominal float64) (map[uuid.UUID]float64, error) {
+	holders, err := gradSpecialHolderIDs(ctx, s.pool, courseID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[uuid.UUID]float64{}
+	if len(holders) == 0 {
+		return out, nil
+	}
+	budget, err := (&BudgetService{pool: s.pool}).compute(ctx, courseID, false)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT ta_id, MAX(lump_basis)::float8 FROM grad_lump_ledger WHERE teaching_course_id=$1 GROUP BY ta_id`, courseID)
+	if err != nil {
+		return nil, err
+	}
+	fixed := map[uuid.UUID]float64{}
+	var committed float64
+	for rows.Next() {
+		var id uuid.UUID
+		var amount float64
+		if err := rows.Scan(&id, &amount); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		fixed[id] = amount
+		committed += amount
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	open := 0
+	for _, id := range holders {
+		if _, ok := fixed[id]; !ok {
+			open++
+		}
+	}
+	share := nominal
+	// Zero is an empty budget, not permission to pay an unlimited lump.
+	if open > 0 {
+		share = math.Min(nominal, math.Floor(math.Max(0, budget.TermPaySpecial-committed)*100/float64(open))/100)
+	}
+	for _, id := range holders {
+		if amount, ok := fixed[id]; ok {
+			out[id] = amount
+		} else {
+			out[id] = share
+		}
+	}
+	return out, nil
+}
+
 // computeGradLumpSnapshot splits every current holder's lump once.
 func (s *ExportService) computeGradLumpSnapshot(ctx context.Context, courseID uuid.UUID) (*GradLumpSnapshot, error) {
 	snap := &GradLumpSnapshot{
