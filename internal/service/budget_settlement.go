@@ -626,7 +626,14 @@ func (s *ExportService) settleAs(
 	if pr.GradSpecialTermCap > 0 && gradLump > pr.GradSpecialTermCap {
 		gradLump = pr.GradSpecialTermCap
 	}
-	committedSpecial := gradLump * float64(gradSpecialTAs)
+	allocations, err := s.gradLumpAllocations(ctx, courseID, gradLump)
+	if err != nil {
+		return nil, err
+	}
+	committedSpecial := 0.0
+	for _, amount := range allocations {
+		committedSpecial += amount
+	}
 
 	// Concurrent-section spill (B2, ประกาศ): when the regular pool runs out, the
 	// regular-rate pay for hours a TA worked on BOTH tracks at the same clock
@@ -688,12 +695,12 @@ func (s *ExportService) settleAs(
 		for _, ta := range holders {
 			// Dated by the holder's own approved special-track hours (or the
 			// forecast's not-yet-rejected ones), never by the settlement mode.
-			byMonth, err := s.gradLumpByMonth(ctx, courseID, ta, gradLump,
+			byMonth, err := s.gradLumpByMonth(ctx, courseID, ta, allocations[ta],
 				sittingsCTE != mergedSittingsForecastCTE)
 			if err != nil {
 				return nil, err
 			}
-			p := PersonSettlement{TAID: ta, LumpBaht: gradLump, Months: []MonthSettlement{}}
+			p := PersonSettlement{TAID: ta, LumpBaht: allocations[ta], Months: []MonthSettlement{}}
 			for ym, amt := range byMonth {
 				p.Months = append(p.Months, MonthSettlement{YearMonth: ym, Baht: amt, PaidBaht: amt, Paid: true})
 				out.Special.CommittedByMonth[ym] += amt
@@ -1537,7 +1544,9 @@ func (s *ExportService) claimCostByTASlot(
 	ctx context.Context, courseID uuid.UUID, pr PayRate, sittingsCTE string,
 ) ([]taSlotCost, error) {
 	cacheKey := ledgerCacheKey{s.pool, courseID, pr, sittingsCTE}
-	if cached, ok := cachedLedger(ctx, cacheKey); ok { return cached, nil }
+	if cached, ok := cachedLedger(ctx, cacheKey); ok {
+		return cached, nil
+	}
 	rows, err := s.pool.Query(ctx, `WITH`+sittingsCTE+`,`+b2OverlapCTE(b2StatusFilter(sittingsCTE))+`,
 	sit AS (
 	    SELECT ta_id, work_date, start_time, end_time,
@@ -1611,7 +1620,9 @@ func (s *ExportService) claimCostByTASlot(
 	// An exported month is priced from what its document said, not from the
 	// rate in force (export_month_ledger.go).
 	costs, err := s.frozenCostsFor(ctx, courseID, out)
-	if err == nil { cacheLedger(ctx, cacheKey, costs) }
+	if err == nil {
+		cacheLedger(ctx, cacheKey, costs)
+	}
 	return costs, err
 }
 

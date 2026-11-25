@@ -831,7 +831,7 @@ func TestCourseSummaryPreview_DatesTheGradSpecialLumpByTheHoldersOwnHours(t *tes
 	f := newCSFixture(t)
 	courseID := f.insertCourse(csCourseOpts{
 		Code: "CP600003", NameTH: "Grad Special Test", Credits: 3, LectureHrs: 2, LabHrs: 0, SelfHrs: 4,
-		NumSpecial: 20, Curriculum: "CS",
+		NumSpecial: 1000, Curriculum: "CS",
 	})
 	f.addSubmissionPeriod("2569-06", "2026-06-01", "2026-07-31", "มิถุนายน 2569")
 	f.addSubmissionPeriod("2569-07", "2026-07-01", "2026-08-31", "กรกฎาคม 2569")

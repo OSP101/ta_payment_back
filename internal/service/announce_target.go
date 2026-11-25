@@ -20,6 +20,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -57,13 +58,10 @@ func (r AudienceRule) IsEmpty() bool {
 	return len(r.Roles) == 0 && len(r.CourseIDs) == 0 && len(r.UserIDs) == 0 && len(r.Filters) == 0
 }
 
-// IsEveryone reports the deliberate "all four roles, nothing narrowing" rule.
+// IsEveryone is retained for the preview wire format. Term-specific TA
+// membership means selecting all roles never promises every student account.
 func (r AudienceRule) IsEveryone() bool {
-	seen := map[string]bool{}
-	for _, role := range r.Roles {
-		seen[role] = true
-	}
-	return len(seen) == len(validAudienceRoles) && len(r.CourseIDs) == 0 && len(r.Filters) == 0
+	return false // TA membership is term-specific; all roles does not mean every account.
 }
 
 // announceFilter is one narrowing condition: a label for the composer and the
@@ -75,6 +73,16 @@ type announceFilter struct {
 	// simple AND without multiplying rows.
 	SQL string
 }
+
+// TA accounts are provisioned to students faculty-wide. Membership comes from
+// a lecturer's submitted request, including requests awaiting approval.
+const announcementTASQL = `EXISTS (
+ SELECT 1 FROM ta_request_assignments membership
+ JOIN ta_requests request ON request.id = membership.request_id
+ JOIN teaching_courses course ON course.id = request.teaching_course_id
+ WHERE membership.ta_id = u.id AND membership.state <> 'dropped'
+ AND request.status IN ('submitted', 'approved') AND course.term_id = $1
+)`
 
 // announceFilters is the closed set. A name outside it is refused at save time:
 // an unknown filter that silently matched everyone would send an announcement
@@ -98,7 +106,7 @@ var announceFilters = map[string]announceFilter{
 		      )`,
 	},
 	"ta_no_assignment": {
-		Label: "ยังไม่ได้รับมอบหมายวิชา",
+		Label: "ยังไม่มีคำขอที่อนุมัติในเทอมนี้",
 		SQL: `EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role = 'ta')
 		      AND NOT EXISTS (
 		        SELECT 1 FROM ta_request_assignments a
@@ -194,17 +202,26 @@ func validateRule(r AudienceRule) error {
 // Returns SQL plus its args. $1 is always the term id, so every filter can use
 // it without the caller tracking positions.
 func resolveAudienceSQL(r AudienceRule, termID uuid.UUID) (string, []any) {
-	// $1 is the term id, bound ONLY when a selected filter actually mentions
-	// it — "ยังส่งเอกสารไม่ครบ" has no term in its query, for instance.
+	// Bind the term only when membership, courses, or conditions use it.
 	// Passing an unused parameter makes Postgres refuse the query outright
 	// ("could not determine data type of parameter $1"), because nothing in
 	// the text tells it what type to expect.
 	args := []any{}
-	usesTerm := false
+	usesTerm := len(r.CourseIDs) > 0 || len(r.Roles) > 0
+	for _, role := range r.Roles {
+		if role == "ta" {
+			usesTerm = true
+		}
+	}
 	for _, f := range r.Filters {
 		if def, ok := announceFilters[f]; ok && strings.Contains(def.SQL, "$1") {
 			usesTerm = true
 			break
+		}
+	}
+	for _, f := range r.Filters {
+		if strings.HasPrefix(f, "ta_") {
+			usesTerm = true
 		}
 	}
 	if usesTerm {
@@ -222,7 +239,8 @@ func resolveAudienceSQL(r AudienceRule, termID uuid.UUID) (string, []any) {
 	var group []string
 	if len(r.Roles) > 0 {
 		group = append(group, `EXISTS (SELECT 1 FROM user_roles ur
-		                              WHERE ur.user_id = u.id AND ur.role::text = ANY(`+add(r.Roles)+`))`)
+		                              WHERE ur.user_id = u.id AND ur.role::text = ANY(`+add(r.Roles)+`)
+                                  AND (ur.role <> 'ta' OR `+announcementTASQL+`))`)
 	}
 	if len(r.CourseIDs) > 0 {
 		ids := add(r.CourseIDs)
@@ -230,10 +248,12 @@ func resolveAudienceSQL(r AudienceRule, termID uuid.UUID) (string, []any) {
 		// TAs actually appointed to it (a dropped assignment is not on it).
 		group = append(group, `(
 			EXISTS (SELECT 1 FROM teaching_lecturers tl
-			         WHERE tl.lecturer_id = u.id AND tl.teaching_course_id = ANY(`+ids+`))
+			         JOIN teaching_courses tc ON tc.id = tl.teaching_course_id
+			         WHERE tl.lecturer_id = u.id AND tc.term_id = $1 AND tl.teaching_course_id = ANY(`+ids+`))
 			OR EXISTS (SELECT 1 FROM ta_request_assignments a
-			             JOIN ta_requests r2 ON r2.id = a.request_id AND r2.status = 'approved'
-			            WHERE a.ta_id = u.id AND a.state <> 'dropped'
+			             JOIN ta_requests r2 ON r2.id = a.request_id AND r2.status IN ('submitted', 'approved')
+                         JOIN teaching_courses tc ON tc.id = r2.teaching_course_id
+			            WHERE a.ta_id = u.id AND a.state <> 'dropped' AND tc.term_id = $1
 			              AND r2.teaching_course_id = ANY(`+ids+`))
 		)`)
 	}
@@ -242,6 +262,9 @@ func resolveAudienceSQL(r AudienceRule, termID uuid.UUID) (string, []any) {
 		// would be a bug, and matching nobody is the safe direction.
 		if def, ok := announceFilters[f]; ok {
 			group = append(group, "("+def.SQL+")")
+			if strings.HasPrefix(f, "ta_") {
+				group = append(group, announcementTASQL)
+			}
 		} else {
 			group = append(group, "FALSE")
 		}
@@ -287,12 +310,12 @@ func (s *AnnounceService) activeTermID(ctx context.Context, given *uuid.UUID) (u
 	err := s.pool.QueryRow(ctx, `
 		SELECT id FROM academic_terms
 		 ORDER BY is_active DESC, academic_year DESC, semester DESC LIMIT 1`).Scan(&id)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		// A fresh install has no terms. Course/condition filters then match
 		// nobody, which is correct: there is nothing to be behind on yet.
 		return uuid.Nil, nil
 	}
-	return id, nil
+	return id, err
 }
 
 // ResolveAudience lists the people a rule selects, right now.
@@ -360,10 +383,10 @@ func (s *AnnounceService) storedRule(ctx context.Context, q interface {
 	return r, err
 }
 
-// sameAudience reports whether two rules select by the same things. The frozen
-// term is left out: it is filled in by the first publish, not by the officer.
+// sameAudience includes the selected term, so changing cohort refreshes recipients.
 func sameAudience(a, b AudienceRule) bool {
-	return sameSet(a.Roles, b.Roles) && sameSet(a.Filters, b.Filters) &&
+	sameTerm := (a.TermID == nil && b.TermID == nil) || (a.TermID != nil && b.TermID != nil && *a.TermID == *b.TermID)
+	return sameTerm && sameSet(a.Roles, b.Roles) && sameSet(a.Filters, b.Filters) &&
 		sameSet(a.CourseIDs, b.CourseIDs) && sameSet(a.UserIDs, b.UserIDs)
 }
 
@@ -408,6 +431,7 @@ func (s *AnnounceService) syncAudience(ctx context.Context, id uuid.UUID) error 
 		_, _ = s.pool.Exec(ctx, `UPDATE announcements SET target_term_id=$2 WHERE id=$1 AND target_term_id IS NULL`, id, term)
 	}
 
+	rule.TermID = &term
 	members, err := s.ResolveAudience(ctx, rule)
 	if err != nil {
 		return err

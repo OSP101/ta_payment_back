@@ -24,8 +24,8 @@ func workloadCheck(t *testing.T, checks []DecisionCheck, passed bool, total stri
 
 func TestWorkloadPolicy_NewGraduateBoundaries(t *testing.T) {
 	for _, level := range []string{"master", "phd"} {
-		for _, total := range []float64{9, 10, 12, 13} {
-			t.Run(fmt.Sprintf("%s/%.0f", level, total), func(t *testing.T) {
+		for _, total := range []float64{0, 0.5, 3, 9, 10, 12, 12.5, 13} {
+			t.Run(fmt.Sprintf("%s/%.1f", level, total), func(t *testing.T) {
 				rf := newRequestFixture(t, fixtureOpts{Level: level})
 				rf.exec(`UPDATE users SET study_level=$2::study_level WHERE id=$1`, rf.TAID, level)
 				rf.addTAClass(0, "07:00", "08:00")
@@ -37,7 +37,7 @@ func TestWorkloadPolicy_NewGraduateBoundaries(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				workloadCheck(t, res.Checks, total >= 10 && total <= 12, fmt.Sprintf("%.2f", total))
+				workloadCheck(t, res.Checks, total <= 12, fmt.Sprintf("%.2f", total))
 			})
 		}
 	}
@@ -93,13 +93,17 @@ func TestWorkloadPolicy_UndergradRawInputsAreImmutable(t *testing.T) {
 			Workload  WorkloadInput     `json:"workload"`
 			Schedules []json.RawMessage `json:"schedules"`
 		} `json:"sections"`
-		Rates json.RawMessage `json:"pay_rates"`
+		Rates  json.RawMessage            `json:"pay_rates"`
+		Limits map[string]json.RawMessage `json:"eligibility_limits"`
 	}
 	if err := json.Unmarshal(original, &doc); err != nil {
 		t.Fatal(err)
 	}
 	if doc.Version != 2 || len(doc.Sections) != 2 || len(doc.Sections[0].Schedules) == 0 || len(doc.Rates) == 0 {
 		t.Fatalf("incomplete source snapshot: %s", original)
+	}
+	if string(doc.Limits["graduate_min"]) != "null" || string(doc.Limits["graduate_max"]) != "12" {
+		t.Fatalf("wrong graduate thresholds: %+v", doc.Limits)
 	}
 	total := doc.Sections[0].Workload.AttendanceHrs + doc.Sections[1].Workload.AttendanceHrs
 	if total != 5 {

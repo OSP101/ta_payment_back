@@ -55,6 +55,18 @@ func newTargetWorld(t *testing.T) *targetWorld {
 	f.exec(`INSERT INTO teaching_lecturers (teaching_course_id, lecturer_id, is_primary)
 	        VALUES ($1, $2, TRUE)`, w.courseA, w.lecturer)
 
+	// Both fixture TAs have real submitted requests, on a separate course so
+	// individual tests can still set up courseA independently.
+	cohort, sec, req := uuid.New(), uuid.New(), uuid.New()
+	f.exec(`INSERT INTO teaching_courses (id, term_id, code, name_th, level, credits, lecture_hrs, num_students)
+ VALUES ($1,$2,'CP102','Cohort','undergrad',3,3,30)`, cohort, w.term)
+	f.exec(`INSERT INTO sections (id, teaching_course_id, sec_no, track) VALUES ($1,$2,'1','regular')`, sec, cohort)
+	f.exec(`INSERT INTO ta_requests (id, teaching_course_id, lecturer_id, reimburse_scope, status, submitted_at)
+ VALUES ($1,$2,$3,'both','approved',NOW())`, req, cohort, w.lecturer)
+	for _, ta := range []uuid.UUID{w.taReady, w.taBehind} {
+		f.exec(`INSERT INTO ta_request_assignments (id, request_id, section_id, ta_id, level)
+ VALUES (gen_random_uuid(),$1,$2,$3,'undergrad')`, req, sec, ta)
+	}
 	return w
 }
 
@@ -204,8 +216,8 @@ func TestAudience_EmptyRuleSelectsNobodyAndSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreviewAudience: %v", err)
 	}
-	if !all.Everyone || all.Total < 4 {
-		t.Errorf("all four roles = %d people, everyone=%v; want the whole fixture, flagged", all.Total, all.Everyone)
+	if all.Everyone || all.Total < 4 {
+		t.Errorf("all four roles = %d people, everyone=%v; want fixture members without claiming every student account", all.Total, all.Everyone)
 	}
 }
 
@@ -270,5 +282,61 @@ func TestAudience_FeedShowsExactlyWhoWasTargeted(t *testing.T) {
 	}
 	if seenBy(w.lecturer) {
 		t.Error("a lecturer outside the target can see a TA-only announcement")
+	}
+}
+
+func TestAudience_TAMembershipUsesSubmittedRequestsAndSelectedTerm(t *testing.T) {
+	w := newTargetWorld(t)
+	student := w.user("ta", "student-with-no-request")
+	for _, status := range []string{"draft", "submitted", "approved", "rejected", "cancelled"} {
+		w.exec(`UPDATE ta_requests SET status=$1::ta_request_status`, status)
+		for _, rule := range []AudienceRule{{Roles: []string{"ta"}}, {Filters: []string{"ta_missing_documents"}}, {Filters: []string{"ta_missing_schedule"}}, {Filters: []string{"ta_no_assignment"}}} {
+			got := w.resolve(t, rule)
+			want := status == "submitted" || status == "approved"
+			if rule.Filters != nil && rule.Filters[0] == "ta_no_assignment" {
+				want = status == "submitted"
+			}
+			if got[w.taBehind] != want || got[student] {
+				t.Fatalf("status=%s rule=%+v got=%v", status, rule, got)
+			}
+		}
+	}
+	w.exec(`UPDATE ta_requests SET status='approved'`)
+	w.exec(`UPDATE ta_request_assignments SET state='dropped' WHERE ta_id=$1`, w.taBehind)
+	got := w.resolve(t, AudienceRule{Roles: []string{"ta"}})
+	if got[w.taBehind] || !got[w.taReady] {
+		t.Fatal("dropped assignments must be excluded")
+	}
+	other := uuid.New()
+	w.exec(`INSERT INTO academic_terms (id, academic_year, semester) VALUES ($1,2570,1)`, other)
+	if got := w.resolve(t, AudienceRule{Roles: []string{"ta"}, TermID: &other}); len(got) != 0 {
+		t.Fatalf("wrong term: %v", got)
+	}
+	// Explicit named recipients remain a deliberate override.
+	if got := w.resolve(t, AudienceRule{UserIDs: []uuid.UUID{student}}); !got[student] {
+		t.Fatal("named person was filtered out")
+	}
+}
+
+func TestAnnouncement_ChangingTermRefreshesRecipients(t *testing.T) {
+	w := newTargetWorld(t)
+	other := uuid.New()
+	w.exec(`INSERT INTO academic_terms (id, academic_year, semester) VALUES ($1,2570,1)`, other)
+	in := UpsertInput{Title: "Term audience", Body: "Content", Audience: []string{"ta", "staff"}, TargetTermID: &w.term, PublishedAt: past(), SendEmail: boolPtr(false)}
+	id, err := w.svc.Upsert(w.ctx, w.officer, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.ID = id
+	in.TargetTermID = &other
+	if _, err = w.svc.Upsert(w.ctx, w.officer, in); err != nil {
+		t.Fatal(err)
+	}
+	a, err := w.svc.Get(w.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AudienceCount != 1 || *a.Recipients[0].UserID != w.officer {
+		t.Fatalf("old term retained: %+v", a.Recipients)
 	}
 }

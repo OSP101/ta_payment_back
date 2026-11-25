@@ -175,6 +175,10 @@ type BudgetSnapshot struct {
 //
 // Graduate TA compensation is FLAT (lump-sum), not computed by this formula.
 func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSnapshot, error) {
+	return s.compute(ctx, tcID, true)
+}
+
+func (s *BudgetService) compute(ctx context.Context, tcID uuid.UUID, includeUsed bool) (*BudgetSnapshot, error) {
 	snap := &BudgetSnapshot{TeachingCourseID: tcID}
 	err := s.pool.QueryRow(ctx, `
 		SELECT tc.num_students, tc.num_students_regular, tc.num_students_special,
@@ -275,6 +279,9 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 	// (B2), and the undergrad-special monthly cap applies. Summing raw
 	// work_log hours here double-counted co-taught sections, so the lecturer
 	// card and the executive dashboard disagreed with the settlement.
+	if !includeUsed {
+		return snap, nil
+	}
 	var pr PayRate
 	if err := s.pool.QueryRow(ctx, `
 		SELECT undergrad_regular, undergrad_special, graduate_regular_hourly,
@@ -306,7 +313,13 @@ func (s *BudgetService) Compute(ctx context.Context, tcID uuid.UUID) (*BudgetSna
 			if pr.GradSpecialTermCap > 0 && lump > pr.GradSpecialTermCap {
 				lump = pr.GradSpecialTermCap
 			}
-			snap.UsedBahtSpecial += float64(holders) * lump
+			allocations, err := (&ExportService{pool: s.pool}).gradLumpAllocations(ctx, tcID, lump)
+			if err != nil {
+				return nil, err
+			}
+			for _, amount := range allocations {
+				snap.UsedBahtSpecial += amount
+			}
 		}
 	}
 	snap.UsedBaht = snap.UsedBahtRegular + snap.UsedBahtSpecial

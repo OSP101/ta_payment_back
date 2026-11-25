@@ -712,6 +712,9 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockRequestTerm(ctx, tx, reqID); err != nil {
+		return err
+	}
 
 	var status, rejectReason string
 	var decidedByNull bool
@@ -722,6 +725,14 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 	}
 	clashRejected := status == "rejected" && decidedByNull && isClashRejectReason(rejectReason)
 	if status != "approved" && !clashRejected {
+		return nil
+	}
+	// A timetable correction must not remove a person already named on an order.
+	var issued bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM appointment_order_items i JOIN ta_requests r ON r.teaching_course_id=i.teaching_course_id WHERE r.id=$1 AND i.ta_id=$2)`, reqID, taID).Scan(&issued); err != nil {
+		return err
+	}
+	if issued {
 		return nil
 	}
 	notices, err := s.applyClashOutcomeFor(ctx, tx, reqID, taID, true)
@@ -745,7 +756,7 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 		if _, err := tx.Exec(ctx, `
 			UPDATE ta_requests SET
 			  status = 'approved', decided_at = NOW(), decided_by = NULL,
-			  reject_reason = NULL, updated_at = NOW()
+			  reject_reason = NULL, updated_at = clock_timestamp()
 			WHERE id = $1`, reqID); err != nil {
 			return err
 		}
@@ -754,7 +765,7 @@ func (s *TARequestService) recheckApproved(ctx context.Context, reqID, taID uuid
 		if _, err := tx.Exec(ctx, `
 			UPDATE ta_requests SET
 			  status = 'rejected', decided_at = NOW(), decided_by = NULL,
-			  reject_reason = $1, updated_at = NOW()
+			  reject_reason = $1, updated_at = clock_timestamp()
 			WHERE id = $2`, reason, reqID); err != nil {
 			return err
 		}
@@ -811,6 +822,9 @@ func (s *TARequestService) finalize(ctx context.Context, reqID, termID uuid.UUID
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockRequestTerm(ctx, tx, reqID); err != nil {
+		return err
+	}
 
 	// Re-read status inside the tx so two concurrent finalisers (the TA's save
 	// and the sweep) cannot both decide the same request.
@@ -862,7 +876,7 @@ func (s *TARequestService) finalize(ctx context.Context, reqID, termID uuid.UUID
 	if _, err := tx.Exec(ctx, `
 		UPDATE ta_requests SET
 		  status = $1::ta_request_status, decided_at = NOW(), decided_by = NULL,
-		  reject_reason = NULLIF($2, ''), decision_checks = $3::jsonb, updated_at = NOW()
+		  reject_reason = NULLIF($2, ''), decision_checks = $3::jsonb, updated_at = clock_timestamp()
 		WHERE id = $4`, verdict, reason, checksJSON, reqID); err != nil {
 		return err
 	}

@@ -203,6 +203,14 @@ func (s *ExportService) gradLumpSplit(
 	}
 	if frozen.any() {
 		lump = frozen.basis
+	} else {
+		allocations, err := s.gradLumpAllocations(ctx, courseID, lump)
+		if err != nil {
+			return nil, 0, err
+		}
+		if amount, ok := allocations[taID]; ok {
+			lump = amount
+		}
 	}
 	if lump <= 0 {
 		return map[string]float64{}, lump, nil

@@ -96,6 +96,7 @@ func TestMonthlyGraduateSpecialPayableWithoutSubmission(t *testing.T) {
 	f.addPeriod("2569-06")
 	f.addPeriod("2569-07")
 	course, _, special := f.insertCourse(tcCourseOpts{Code: "CPGRADMONTH", Curriculum: "CY", LectureHrs: 100, Level: "graduate"})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, course)
 	ta := f.newTA("เหมาจ่าย", "master")
 	f.assignTAOn(ta, course, special, "master", nil)
 	ids, err := f.svc.PayoutMonthCourses(f.ctx, f.termID, "2026-06")

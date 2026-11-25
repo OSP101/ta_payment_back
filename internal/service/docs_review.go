@@ -772,6 +772,22 @@ func mergePDFs(readers []io.ReadSeeker) (out []byte, err error) {
 	return buf.Bytes(), nil
 }
 
+// imageDocumentPDF supports historical JPEG/PNG uploads in a per-person PDF.
+func imageDocumentPDF(data []byte) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = nil
+			err = fmt.Errorf("image import failed: %v", r)
+		}
+	}()
+	var buf bytes.Buffer
+	conf := pdfcpuModel.NewDefaultConfiguration()
+	if err := pdfcpuAPI.ImportImages(nil, &buf, []io.Reader{bytes.NewReader(data)}, nil, conf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // setPDFDocInfo overwrites the merged PDF's Info dictionary (Title, Author,
 // Subject, Creator) so "Document Properties" in a PDF reader shows something
 // meaningful for this system instead of whatever the first source file (a
@@ -830,9 +846,7 @@ func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]b
 	return s.buildDocsBundle(ctx, docIDs, "")
 }
 
-// BuildAllApprovedBundle merges the bulk set. Same packing as BuildDocsZip; only
-// the filename differs, because a file holding many people cannot be named after
-// whichever of them happened to sort first.
+// BuildAllApprovedBundle creates a ZIP containing one merged PDF per TA.
 // The actor is taken so the hand-off can be recorded HERE rather than in the
 // handler. The recording is what stops the "อย่าลืมดาวน์โหลด" reminder nagging
 // about files already saved, and leaving it to the caller made it a convention
@@ -843,7 +857,7 @@ func (s *DocsService) BuildDocsZip(ctx context.Context, docIDs []uuid.UUID) ([]b
 func (s *DocsService) BuildAllApprovedBundle(ctx context.Context, actor uuid.UUID, docIDs []uuid.UUID, taCount int) ([]byte, string, error) {
 	stem := fmt.Sprintf("เอกสารเบิกจ่าย_อนุมัติแล้ว_%dคน_%s",
 		taCount, timeutil.Now().Format("20060102"))
-	body, name, err := s.buildDocsBundle(ctx, docIDs, stem)
+	body, name, err := s.buildPeopleZip(ctx, docIDs, stem)
 	if err != nil {
 		return nil, "", err
 	}
@@ -851,6 +865,73 @@ func (s *DocsService) BuildAllApprovedBundle(ctx context.Context, actor uuid.UUI
 		return nil, "", err
 	}
 	return body, name, nil
+}
+
+// buildPeopleZip keeps each person's documents together, without combining
+// different people's private documents into the same PDF.
+func (s *DocsService) buildPeopleZip(ctx context.Context, docIDs []uuid.UUID, stem string) ([]byte, string, error) {
+	if len(docIDs) == 0 {
+		return nil, "", Invalid("ไม่พบเอกสารที่จะดาวน์โหลด")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT user_id, id FROM ta_documents WHERE id = ANY($1) ORDER BY user_id, id`, docIDs)
+	if err != nil {
+		return nil, "", err
+	}
+	groups := map[uuid.UUID][]uuid.UUID{}
+	var order []uuid.UUID
+	for rows.Next() {
+		var user, doc uuid.UUID
+		if err := rows.Scan(&user, &doc); err != nil {
+			rows.Close()
+			return nil, "", err
+		}
+		if _, ok := groups[user]; !ok {
+			order = append(order, user)
+		}
+		groups[user] = append(groups[user], doc)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, "", err
+	}
+	if len(order) == 0 {
+		return nil, "", NotFound("ไม่พบเอกสารที่จะดาวน์โหลด")
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	names := map[string]bool{}
+	for _, user := range order {
+		var complete bool
+		if err := s.pool.QueryRow(ctx, `SELECT NOT EXISTS(SELECT unnest(ta_required_doc_kinds($1)) EXCEPT SELECT kind FROM ta_documents WHERE user_id=$1 AND id=ANY($2))`, user, groups[user]).Scan(&complete); err != nil {
+			return nil, "", err
+		}
+		if !complete {
+			return nil, "", Conflict("เอกสารของ TA ไม่ครบ 3 อย่าง กรุณาตรวจสอบก่อนดาวน์โหลด")
+		}
+		body, name, err := s.buildDocsBundle(ctx, groups[user], "")
+		if err != nil {
+			return nil, "", err
+		}
+		if !bytes.HasPrefix(body, []byte("%PDF")) {
+			return nil, "", Invalid("รวมเอกสารเป็น PDF ไม่สำเร็จ กรุณาตรวจสอบไฟล์ของ TA แต่ละคน")
+		}
+		if names[name] {
+			return nil, "", Conflict("ชื่อไฟล์ TA ซ้ำกัน กรุณาตรวจสอบรหัสนักศึกษาและชื่อก่อนส่งออก")
+		}
+		names[name] = true
+		w, err := zw.Create(name)
+		if err != nil {
+			return nil, "", err
+		}
+		if _, err := w.Write(body); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), stem + ".zip", nil
 }
 
 // buildDocsBundle is the shared implementation. stemOverride names the output
@@ -904,6 +985,9 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 		return nil, "", err
 	}
 	rows.Close()
+	if len(entries) != len(docIDs) {
+		return nil, "", NotFound("ไม่พบเอกสารที่เลือกครบทุกไฟล์")
+	}
 	if len(entries) == 0 {
 		return nil, "", &UserError{Status: 404, Msg: "ไม่พบเอกสารที่จะดาวน์โหลด"}
 	}
@@ -938,6 +1022,12 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 		if err != nil {
 			return nil, "", err
 		}
+		if !bytes.HasPrefix(data, []byte("%PDF")) {
+			if converted, err := imageDocumentPDF(data); err == nil {
+				data = converted
+				e.filename = e.kind + ".pdf"
+			}
+		}
 		files = append(files, loaded{entry: e, data: data})
 	}
 
@@ -954,10 +1044,9 @@ func (s *DocsService) buildDocsBundle(ctx context.Context, docIDs []uuid.UUID, s
 	// three prints and three chances to mislay one. Uploads are PDF-only now
 	// (see acceptedDocMIMEs), so in practice every set merges.
 	//
-	// Rows predating that rule may still be JPEG/PNG, and merging those would
-	// need rasterising into pages — out of scope here. Rather than silently
-	// dropping them, fall back to the ZIP for that set: a complete archive in
-	// the older shape beats an incomplete book.
+	// Historical JPEG/PNG uploads are converted to PDF pages above. A malformed
+	// source still falls back to originals for an individual download; a bulk
+	// export refuses it rather than silently omit part of a person’s PDF.
 	allPDF := true
 	for _, f := range files {
 		// Checked on bytes, not on the stored MIME column, which records only

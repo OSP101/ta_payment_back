@@ -2,7 +2,7 @@
 
 New requests created by the application use `ta_requests.workload_rule_version = 2`.
 For eligibility, sum each section's declared workload for the TA's level, including
-sections taught simultaneously. Graduate declarations must remain within 10–12
+sections taught simultaneously. Graduate declarations have no minimum and must not exceed 12
 hours/week; undergraduates still need a positive total and per-section caps.
 Payable-time feasibility, worklogs, rates, estimates, and settlement keep their
 existing shared-session billing rules. A declared workload total is not a promise
@@ -20,6 +20,9 @@ transaction as the operation. A failure to store evidence rolls the operation ba
 The application records submission before clash handling, the initial decision,
 and before/after workload edits and section additions. Workloads remain separate
 per section; deduplication never overwrites the original declaration.
+
+New snapshots record `graduate_min: null` and `graduate_max: 12`; existing snapshots
+retain their original thresholds.
 
 Each snapshot contains its schema version, workload rule version, billing rule
 identifier, eligibility thresholds, request/decision state, assignments and co-taught

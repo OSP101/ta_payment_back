@@ -98,11 +98,12 @@ func (s *AnnounceService) deliver(ctx context.Context, id uuid.UUID, retryFailed
 	var (
 		title, body, category string
 		publishedAt           *time.Time
+		sendEmail             bool
 	)
 	if err := s.pool.QueryRow(ctx, `
-		SELECT title, body, category, published_at
+		SELECT title, body, category, published_at, send_email
 		  FROM announcements WHERE id = $1`, id).Scan(
-		&title, &body, &category, &publishedAt); err != nil {
+		&title, &body, &category, &publishedAt, &sendEmail); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return res, ErrNotFound
 		}
@@ -153,7 +154,9 @@ func (s *AnnounceService) deliver(ctx context.Context, id uuid.UUID, retryFailed
 		// so a failure is written on that person's row and the loop goes on.
 		// A row that already failed has its bell line; only the email is retried.
 		var sendErr error
-		if t.status == "failed" {
+		if !sendEmail {
+			sendErr = s.notify.writeInApp(ctx, t.userID, subject, preview, nilStr(&link))
+		} else if t.status == "failed" {
 			sendErr = s.notify.SendEmailOnly(ctx, t.userID, subject, preview, link)
 		} else {
 			sendErr = s.notify.SendChecked(ctx, t.userID, subject, preview, link)
@@ -201,11 +204,12 @@ func (s *AnnounceService) RemindUnread(ctx context.Context, actor, id uuid.UUID)
 		title, body, category  string
 		publishedAt, expiresAt *time.Time
 		remindedAt             *time.Time
+		sendEmail              bool
 	)
 	if err := s.pool.QueryRow(ctx, `
-		SELECT title, body, category, published_at, expires_at, reminded_at
+		SELECT title, body, category, published_at, expires_at, reminded_at, send_email
 		  FROM announcements WHERE id = $1`, id).Scan(
-		&title, &body, &category, &publishedAt, &expiresAt, &remindedAt); err != nil {
+		&title, &body, &category, &publishedAt, &expiresAt, &remindedAt, &sendEmail); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, ErrNotFound
 		}
@@ -254,7 +258,11 @@ func (s *AnnounceService) RemindUnread(ctx context.Context, actor, id uuid.UUID)
 	preview := truncateRunes(announceBodyPlain(body), 240)
 	link := "/announcements/" + id.String()
 	for _, u := range ids {
-		s.notify.Send(ctx, u, subject, preview, link)
+		if sendEmail {
+			s.notify.Send(ctx, u, subject, preview, link)
+		} else if err := s.notify.writeInApp(ctx, u, subject, preview, nilStr(&link)); err != nil {
+			return 0, err
+		}
 	}
 	return len(ids), nil
 }

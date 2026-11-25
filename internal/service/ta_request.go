@@ -165,6 +165,68 @@ func (s *TARequestService) CreateOnBehalf(ctx context.Context, actor, lecturerID
 }
 
 func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
+	return s.createOrEdit(ctx, actor, lecturerID, in, uuid.Nil)
+}
+
+// EditInput returns only the caller's own request in the form's input shape.
+func (s *TARequestService) EditInput(ctx context.Context, actor, reqID uuid.UUID) (*CreateTARequestInput, error) {
+	var in CreateTARequestInput
+	var owner uuid.UUID
+	if err := s.pool.QueryRow(ctx, `SELECT lecturer_id, teaching_course_id, reimburse_scope::text FROM ta_requests WHERE id=$1`, reqID).Scan(&owner, &in.TeachingCourseID, &in.ReimburseScope); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, NotFound("ไม่พบคำขอนี้")
+		}
+		return nil, err
+	}
+	if owner != actor {
+		return nil, Forbidden("คุณไม่ใช่เจ้าของคำขอนี้")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT a.ta_id, a.level::text, array_agg(a.section_id ORDER BY a.section_id), jsonb_agg(jsonb_build_object('section_id',a.section_id,'workload',COALESCE(to_jsonb(w),'{}'::jsonb)) ORDER BY a.section_id) FROM ta_request_assignments a LEFT JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE a.request_id=$1 GROUP BY a.ta_id,a.level`, reqID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a AssignmentInput
+		var raw []byte
+		if err := rows.Scan(&a.TAID, &a.Level, &a.SectionIDs, &raw); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &a.SectionWorkloads); err != nil {
+			return nil, err
+		}
+		in.Assignments = append(in.Assignments, a)
+	}
+	return &in, rows.Err()
+}
+
+// Edit validates a replacement with the same rules as Create. The old request
+// remains intact if validation fails; cancellation and replacement commit together.
+func (s *TARequestService) Edit(ctx context.Context, actor, reqID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
+	return s.createOrEdit(ctx, actor, actor, in, reqID)
+}
+
+func (s *TARequestService) createOrEdit(ctx context.Context, actor, lecturerID uuid.UUID, in CreateTARequestInput, editID uuid.UUID) (*CreateResult, error) {
+	if editID != uuid.Nil {
+		var owner, course uuid.UUID
+		var people int
+		if err := s.pool.QueryRow(ctx, `SELECT lecturer_id, teaching_course_id, (SELECT COUNT(DISTINCT ta_id) FROM ta_request_assignments WHERE request_id=$1) FROM ta_requests WHERE id=$1`, editID).Scan(&owner, &course, &people); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, NotFound("ไม่พบคำขอนี้")
+			}
+			return nil, err
+		}
+		if owner != actor {
+			return nil, Forbidden("คุณไม่ใช่เจ้าของคำขอนี้")
+		}
+		if course != in.TeachingCourseID {
+			return nil, Invalid("เปลี่ยนรายวิชาของคำขอไม่ได้")
+		}
+		if len(in.Assignments) != 1 || people != 1 {
+			return nil, Invalid("แก้ไขได้เฉพาะคำขอรายบุคคล ครั้งละหนึ่งรายชื่อ TA")
+		}
+	}
+
 	if in.TeachingCourseID == uuid.Nil {
 		return nil, ErrInvalidInput
 	}
@@ -271,9 +333,9 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 				SELECT 1 FROM ta_request_assignments a2
 				JOIN ta_requests r2 ON r2.id = a2.request_id
 				WHERE a2.ta_id = $1 AND r2.teaching_course_id = $2
-				  AND r2.status IN ('submitted', 'approved')
+				  AND r2.status IN ('submitted', 'approved') AND r2.id <> $3
 				  AND a2.state <> 'dropped'
-			)`, a.TAID, in.TeachingCourseID).Scan(&alreadyActive); err != nil {
+			)`, a.TAID, in.TeachingCourseID, editID).Scan(&alreadyActive); err != nil {
 			return nil, err
 		}
 		if alreadyActive {
@@ -368,7 +430,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 				return nil, err
 			}
 			// Each group's hours are bounded by how long that group actually
-			// meets. Undergrad only; grad hours follow the 10–12 total rule
+			// meets. Undergrad only; grad hours follow the 12-hour ceiling rule
 			// inside autoDecide.
 			if level == "undergrad" {
 				if err := validateUndergradSectionCaps(w, name, secNo, weekly[secID]); err != nil {
@@ -389,7 +451,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		// Undergrad only (2026 meeting correction): the request-submission gate
 		// used to also refuse a grad TA whose sections' real timetable exceeded
 		// grad_regular_daily_hour_cap (6 ชม./วัน), but graduate students are
-		// bound only by the 10–12 ชม./สัปดาห์ total (checked in autoDecide) —
+		// bound only by the 12 ชม./สัปดาห์ ceiling (checked in autoDecide) —
 		// the daily-hour cap belongs to the WORKLOG entry point instead
 		// (worklog.go's validateGradRegularClassWindow), not request submission.
 		if level == "undergrad" {
@@ -423,6 +485,9 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockTermRequests(ctx, tx, termID); err != nil {
+		return nil, err
+	}
 	batchID := uuid.New()
 
 	// autoDecide takes a per-TA advisory lock, and every request here holds it
@@ -444,6 +509,28 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 	for _, i := range order {
 		ta := in.Assignments[i].TAID
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, ta.String()); err != nil {
+			return nil, err
+		}
+	}
+	if editID != uuid.Nil {
+		var owner uuid.UUID
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT lecturer_id, status::text FROM ta_requests WHERE id=$1 FOR UPDATE`, editID).Scan(&owner, &status); err != nil {
+			return nil, err
+		}
+		if owner != actor {
+			return nil, Forbidden("คุณไม่ใช่เจ้าของคำขอนี้")
+		}
+		if !cancellableStatuses[status] {
+			return nil, Conflict("คำขอนี้ไม่อยู่ในสถานะที่แก้ไขได้")
+		}
+		if err := assertRequestMutable(ctx, tx, editID); err != nil {
+			return nil, err
+		}
+		if err := snapshotRequestCalculation(ctx, tx, editID, actor, "before_request_edit"); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE ta_requests SET status='cancelled', decided_at=NOW(), decided_by=$2, reject_reason='แก้ไขคำขอและส่งข้อมูลฉบับใหม่', updated_at=clock_timestamp() WHERE id=$1`, editID, actor); err != nil {
 			return nil, err
 		}
 	}
@@ -528,6 +615,14 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		if err != nil {
 			return nil, err
 		}
+		if editID != uuid.Nil && res.Status == "rejected" {
+			return nil, Invalid(res.RejectReason)
+		}
+		if editID != uuid.Nil {
+			if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: &actor, Action: "ta_request.edit", Entity: "ta_request", EntityID: editID.String(), After: map[string]any{"replacement_request_id": rid}}); err != nil {
+				return nil, err
+			}
+		}
 		if err := snapshotRequestCalculation(ctx, tx, rid, actor, "initial_decision"); err != nil {
 			return nil, err
 		}
@@ -541,6 +636,12 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
+	}
+	if editID != uuid.Nil {
+		var replacedPerson bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM ta_request_assignments WHERE request_id=$1 AND ta_id<>$2)`, editID, in.Assignments[0].TAID).Scan(&replacedPerson); err == nil && replacedPerson {
+			s.notifyTAsCancelled(ctx, editID)
+		}
 	}
 	for i, r := range results {
 		s.notifyClashOutcome(ctx, r.ID, notices[i])
@@ -591,7 +692,7 @@ func (s *TARequestService) decideNew(ctx context.Context, tx pgx.Tx, actor, rid,
 			return nil, nil, err
 		}
 		if _, err := tx.Exec(ctx,
-			`UPDATE ta_requests SET decision_checks = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+			`UPDATE ta_requests SET decision_checks = $1::jsonb, updated_at = clock_timestamp() WHERE id = $2`,
 			checksJSON, rid); err != nil {
 			return nil, nil, err
 		}
@@ -720,6 +821,43 @@ var statusLabelTH = map[string]string{
 	"rejected": "ปฏิเสธ", "cancelled": "ยกเลิกแล้ว",
 }
 
+// lockTermRequests serializes request changes with appointment generation.
+// Issuing an order rechecks its rendered snapshot under this lock, so an
+// intervening edit cannot leave the printed document and ledger disagreeing.
+func lockTermRequests(ctx context.Context, tx pgx.Tx, termID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text,175))`, termID.String())
+	return err
+}
+
+func lockRequestTerm(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) error {
+	var termID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT tc.term_id FROM ta_requests r JOIN teaching_courses tc ON tc.id=r.teaching_course_id WHERE r.id=$1`, reqID).Scan(&termID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return NotFound("ไม่พบคำขอนี้")
+		}
+		return err
+	}
+	return lockTermRequests(ctx, tx, termID)
+}
+
+// assertRequestMutable is used inside the transaction holding the request lock.
+func assertRequestMutable(ctx context.Context, tx pgx.Tx, reqID uuid.UUID) error {
+	var blocked bool
+	if err := tx.QueryRow(ctx, `
+ WITH r AS (SELECT teaching_course_id FROM ta_requests WHERE id=$1),
+ tas AS (SELECT ta_id FROM ta_request_assignments WHERE request_id=$1)
+ SELECT EXISTS(SELECT 1 FROM work_logs wl JOIN ta_request_assignments a ON a.id=wl.assignment_id WHERE a.request_id=$1)
+ OR EXISTS(SELECT 1 FROM appointment_order_items i, r WHERE i.teaching_course_id=r.teaching_course_id AND i.ta_id IN (SELECT ta_id FROM tas))
+ OR EXISTS(SELECT 1 FROM grad_lump_ledger g, r WHERE g.teaching_course_id=r.teaching_course_id AND g.ta_id IN (SELECT ta_id FROM tas))
+ OR EXISTS(SELECT 1 FROM submission_period_status st, r WHERE st.teaching_course_id=r.teaching_course_id AND st.ta_id IN (SELECT ta_id FROM tas) AND st.status IN ('exported','finance_sent'))`, reqID).Scan(&blocked); err != nil {
+		return err
+	}
+	if blocked {
+		return Conflict("แก้ไขไม่ได้ เพราะออกใบแต่งตั้ง มีการลงเวลาทำงาน หรือส่งออกเอกสารเบิกจ่ายของ TA คนนี้แล้ว")
+	}
+	return nil
+}
+
 // Cancel withdraws a lecturer's own request while nothing downstream depends
 // on it yet — the answer to "แก้ไข/ยกเลิกคำขอที่ส่งไปแล้วได้ไหม" (10/08/2026
 // feedback): there is no separate edit path, because editing a request that
@@ -767,6 +905,9 @@ func (s *TARequestService) cancel(ctx context.Context, actor uuid.UUID, privileg
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockRequestTerm(ctx, tx, reqID); err != nil {
+		return err
+	}
 
 	var owner uuid.UUID
 	var status string
@@ -1005,6 +1146,16 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	var parent uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT request_id FROM ta_request_assignments WHERE id=$1`, assignmentID).Scan(&parent); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return NotFound("ไม่พบ assignment นี้")
+		}
+		return err
+	}
+	if err := lockRequestTerm(ctx, tx, parent); err != nil {
+		return err
+	}
 
 	var taID, sectionID, reqID uuid.UUID
 	var level string
@@ -1019,6 +1170,13 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 			return errors.New("ไม่พบ assignment นี้")
 		}
 		return err
+	}
+	var issued bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM appointment_order_items i JOIN ta_requests r ON r.teaching_course_id=i.teaching_course_id WHERE r.id=$1 AND i.ta_id=$2)`, reqID, taID).Scan(&issued); err != nil {
+		return err
+	}
+	if issued {
+		return Conflict("แก้ไขไม่ได้ เพราะออกใบแต่งตั้งให้ TA คนนี้แล้ว")
 	}
 	if err := snapshotRequestCalculation(ctx, tx, reqID, actor, "before_workload_edit"); err != nil {
 		return err
@@ -1091,6 +1249,9 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 		return err
 	}
 	if err := snapshotRequestCalculation(ctx, tx, reqID, actor, "workload_edited"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ta_requests SET updated_at=clock_timestamp() WHERE id=$1`, reqID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -1404,7 +1565,7 @@ func validateInClassDuties(w WorkloadInput, byKind kindClash, name, secLabel str
 //
 // other_hrs/prep_hrs themselves stay accepted here and uncapped — confirmed
 // with the office (2026-09-11) that lecturers still need them to reach the
-// graduate school's 10-12 ชม./สัปดาห์ regulation total on the request form,
+// graduate school's 12 ชม./สัปดาห์ ceiling on the request form,
 // they're just administrative from this point on: never turned into a
 // worklog duty card, a loggable activity, or a pay calculation. Only
 // grade_hrs (the one field that DOES stay loggable, via DutyReview) needs a
@@ -2337,11 +2498,11 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 				}
 				tot += a.wl.HelpTeachHrs + a.wl.PrepHrs + a.wl.GradeHrs + a.wl.OtherHrs
 			}
-			totOK = tot >= 10 && tot <= 12
+			totOK = tot <= 12
 			if totOK {
-				totMsg = fmt.Sprintf("%s ภาระงานรวม %.2f ชม./สัปดาห์ (อยู่ในช่วง 10–12)", t.name, tot)
+				totMsg = fmt.Sprintf("%s ภาระงานรวม %.2f ชม./สัปดาห์ (ไม่เกิน 12)", t.name, tot)
 			} else {
-				totMsg = fmt.Sprintf("%s ภาระงาน %.2f ชม./สัปดาห์ ไม่อยู่ในช่วง 10–12 ตามระเบียบบัณฑิตศึกษา", t.name, tot)
+				totMsg = fmt.Sprintf("%s ภาระงาน %.2f ชม./สัปดาห์ เกิน 12 ชม./สัปดาห์ ตามระเบียบบัณฑิตศึกษา", t.name, tot)
 			}
 		} else {
 			var tot float64
@@ -2492,7 +2653,10 @@ const requestSummarySelect = `
 	       r.status::text IN ('submitted','approved') AND NOT EXISTS (
 	           SELECT 1 FROM work_logs wl
 	           JOIN ta_request_assignments a ON a.id = wl.assignment_id
-	           WHERE a.request_id = r.id),
+	           WHERE a.request_id = r.id)
+ AND NOT EXISTS (SELECT 1 FROM appointment_order_items i JOIN ta_request_assignments a ON a.ta_id=i.ta_id WHERE a.request_id=r.id AND i.teaching_course_id=r.teaching_course_id)
+ AND NOT EXISTS (SELECT 1 FROM grad_lump_ledger g JOIN ta_request_assignments a ON a.ta_id=g.ta_id WHERE a.request_id=r.id AND g.teaching_course_id=r.teaching_course_id)
+ AND NOT EXISTS (SELECT 1 FROM submission_period_status st JOIN ta_request_assignments a ON a.ta_id=st.ta_id WHERE a.request_id=r.id AND st.teaching_course_id=r.teaching_course_id AND st.status IN ('exported','finance_sent')),
 	       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), ''),
 	       COALESCE((SELECT string_agg(DISTINCT tu.first_name || ' ' || tu.last_name, ', ')
 	                 FROM ta_request_assignments ta JOIN users tu ON tu.id = ta.ta_id
@@ -2612,7 +2776,10 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		       r.status::text IN ('submitted','approved') AND NOT EXISTS (
 		           SELECT 1 FROM work_logs wl
 		           JOIN ta_request_assignments a ON a.id = wl.assignment_id
-		           WHERE a.request_id = r.id),
+		           WHERE a.request_id = r.id)
+ AND NOT EXISTS (SELECT 1 FROM appointment_order_items i JOIN ta_request_assignments a ON a.ta_id=i.ta_id WHERE a.request_id=r.id AND i.teaching_course_id=r.teaching_course_id)
+ AND NOT EXISTS (SELECT 1 FROM grad_lump_ledger g JOIN ta_request_assignments a ON a.ta_id=g.ta_id WHERE a.request_id=r.id AND g.teaching_course_id=r.teaching_course_id)
+ AND NOT EXISTS (SELECT 1 FROM submission_period_status st JOIN ta_request_assignments a ON a.ta_id=st.ta_id WHERE a.request_id=r.id AND st.teaching_course_id=r.teaching_course_id AND st.status IN ('exported','finance_sent')),
 		       COALESCE((SELECT sb.first_name || ' ' || sb.last_name FROM users sb WHERE sb.id = r.submitted_by), ''),
 		       COALESCE((SELECT string_agg(DISTINCT tu.first_name || ' ' || tu.last_name, ', ')
 		                 FROM ta_request_assignments ta JOIN users tu ON tu.id = ta.ta_id

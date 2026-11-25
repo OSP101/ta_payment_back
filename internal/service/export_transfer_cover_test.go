@@ -352,6 +352,7 @@ func TestBuildTransferCoverSheets_UsesSettledShareNotRawTotal(t *testing.T) {
 func TestBuildTransferCoverSheets_GradSpecialLumpIsFlatNotMultipliedByMonths(t *testing.T) {
 	f := newLegacyTCFixture(t)
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP888", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 
 	ta := f.newTA("นายบัณฑิต เรียนดี", "master")
 	// No work_logs at all — grad-special TAs no longer log anything themselves;
@@ -375,10 +376,13 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsFlatNotMultipliedByMonths(t *
 // Two special-track courses in the same term must each pay their own flat
 // lump independently — there is no cross-course aggregate cap (a TA on 2
 // courses gets 2×lump, not a shared 12,000 split between them).
+
 func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *testing.T) {
 	f := newLegacyTCFixture(t)
 	c1, _, spec1 := f.insertCourse(tcCourseOpts{Code: "CP888", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, c1)
 	c2, _, spec2 := f.insertCourse(tcCourseOpts{Code: "CP889", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, c2)
 
 	ta := f.newTA("นายบัณฑิต สองวิชา", "master")
 	f.assignTA(ta, c1, spec1, "master", nil)
@@ -403,6 +407,7 @@ func TestBuildTransferCoverSheets_GradSpecialLumpIsPerCourseNotAggregated(t *tes
 
 // A row that nets to zero (the pool has nothing left after the committed lump)
 // must not appear at all — a 0.00 line is not something finance transfers.
+
 func TestBuildTransferCoverSheets_ZeroNetRowExcluded(t *testing.T) {
 	f := newLegacyTCFixture(t)
 	f.termID = uuid.New()

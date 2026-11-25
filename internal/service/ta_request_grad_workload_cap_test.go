@@ -29,7 +29,7 @@ func TestGradWorkload_ReviewHoursOverCapRejected(t *testing.T) {
 }
 
 // other_hrs/prep_hrs are still accepted (and uncapped here) — the office
-// wants lecturers able to reach the 10-12h/week regulation total without
+// wants lecturers able to reach the 12h/week regulation total without
 // being forced to inflate ช่วยสอน. What must NOT happen is these hours
 // becoming loggable/payable — that's enforced separately, in
 // loadAssignmentContext (authz.go): see TestGradAssignmentContext_OtherIsNeverLoggable.
@@ -42,7 +42,7 @@ func TestGradWorkload_OtherAndPrepHoursAccepted(t *testing.T) {
 
 func TestGradWorkload_HelpTeachAloneIsUnbounded(t *testing.T) {
 	// help_teach_hrs (ช่วยสอน) is untouched by this change — only the total
-	// (validated elsewhere, in autoDecide's 10-12h rule) bounds it.
+	// (validated elsewhere, in autoDecide's 12h rule) bounds it.
 	w := WorkloadInput{HelpTeachHrs: 12, GradeHrs: 0}
 	if err := validateGradWorkloadCaps(w, "ผู้ช่วย ทดสอบ", "1"); err != nil {
 		t.Fatalf("help_teach_hrs alone must not be capped by validateGradWorkloadCaps: %v", err)
@@ -51,7 +51,7 @@ func TestGradWorkload_HelpTeachAloneIsUnbounded(t *testing.T) {
 
 // TestGradAssignmentContext_OtherIsNeverLoggable is the DB-backed companion
 // to the pure-function tests above: even when a grad assignment's workload
-// form declares other_hrs/prep_hrs > 0 (now allowed again, for the 10-12h
+// form declares other_hrs/prep_hrs > 0 (now allowed again, for the 12h
 // regulation total), loadAssignmentContext must still report AllowOther =
 // false and WeeklyCapOther = 0 — those fields are administrative only and
 // must never open a loggable/payable "other" activity for a grad TA.

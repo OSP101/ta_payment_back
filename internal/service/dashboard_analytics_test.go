@@ -276,6 +276,7 @@ func TestAnalyticsMonthlyCarriesTheDatedLump(t *testing.T) {
 		f.addPeriod(ym)
 	}
 	courseID, _, specSec := f.insertCourse(tcCourseOpts{Code: "CP305", Curriculum: "CY", LectureHrs: 100})
+	f.exec(`UPDATE teaching_courses SET num_students_special=1000 WHERE id=$1`, courseID)
 	grad := f.newTA("บัณฑิต เหมาจ่าย", "master")
 	f.assignTAOn(grad, courseID, specSec, "master",
 		[]string{"2026-09-07", "2026-09-14", "2026-09-21", "2026-10-05"})

@@ -407,6 +407,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), editGuard, rh.Detail)
 	// Staff may file for a lecturer (lecturer_id in the body) — 03/10/2026.
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.Create)
+	authed.Get("/ta-requests/:id/edit", RequireRole(rbac.RoleLecturer), editGuard, rh.EditInput)
+	authed.Put("/ta-requests/:id", RequireRole(rbac.RoleLecturer), editGuard, rh.Edit)
 	authed.Post("/ta-requests/:id/cancel", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.Cancel)
 	authed.Post("/ta-requests/:id/sections", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.AddSections)
 	// Workload correction — staff/admin only. Cancel above refuses once

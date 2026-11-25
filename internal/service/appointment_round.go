@@ -286,7 +286,7 @@ func (s *AppointmentOrderService) skippedCourses(ctx context.Context, termID uui
 // stored without its ledger row would be reprinted in the next round.
 func (s *AppointmentOrderService) recordRound(
 	ctx context.Context, actor uuid.UUID, in AppointmentOrderInput,
-	round int, pairs []AppointmentCandidate, doc docxgen.AppointmentOrderData,
+	round int, pairs []AppointmentCandidate, doc docxgen.AppointmentOrderData, builtAt time.Time,
 ) error {
 	snapshot, err := json.Marshal(doc)
 	if err != nil {
@@ -297,6 +297,18 @@ func (s *AppointmentOrderService) recordRound(
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockTermRequests(ctx, tx, in.TermID); err != nil {
+		return err
+	}
+	for _, p := range pairs {
+		var changed bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id WHERE r.teaching_course_id=$1 AND a.ta_id=$2 AND r.updated_at>$3)`, p.TeachingCourseID, p.TAID, builtAt).Scan(&changed); err != nil {
+			return err
+		}
+		if changed {
+			return Conflict("รายชื่อหรือภาระงานเปลี่ยนระหว่างจัดทำใบแต่งตั้ง กรุณาสร้างเอกสารใหม่")
+		}
+	}
 
 	orderID := uuid.New()
 	var signer *uuid.UUID
