@@ -30,11 +30,23 @@ func ConcurrentEdits(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		method := c.Method()
 		actor := UserID(c)
-		if actor == uuid.Nil || editReadOnlyRequest(c) {
+		mergePreview := editMergePreview(c)
+		if actor == uuid.Nil || (editReadOnlyRequest(c) && !mergePreview) {
 			return c.Next()
 		}
 		primary, readScopes := editScopes(c, pool)
-		if method == fiber.MethodGet || method == fiber.MethodHead {
+		if mergePreview {
+			// The preview displays both courses. Refresh only those exact views,
+			// so reinspection can recover after either course changed without
+			// claiming the user reviewed every other course in the collection.
+			var in struct {
+				SourceID uuid.UUID `json:"source_id"`
+			}
+			if json.Unmarshal(c.Body(), &in) == nil && in.SourceID != uuid.Nil {
+				readScopes = append(readScopes, "course:"+in.SourceID.String())
+			}
+		}
+		if method == fiber.MethodGet || method == fiber.MethodHead || mergePreview {
 			var snapshot string
 			if err := pool.QueryRow(c.Context(), `SELECT pg_current_snapshot()::text`).Scan(&snapshot); err != nil {
 				return err
@@ -224,10 +236,11 @@ func editErrorStatus(err error) int {
 func editReadOnlyRequest(c *fiber.Ctx) bool {
 	// The same merge endpoint previews until commit=1, matching the handler.
 	// A successful preview must not consume the intent used to inspect again.
-	if c.Method() == fiber.MethodPost && strings.HasSuffix(c.Route().Path, "/teaching-courses/:id/merge-existing") && c.Query("commit") != "1" {
-		return true
-	}
-	return editReadOnlyCommand(c.Path())
+	return editMergePreview(c) || editReadOnlyCommand(c.Path())
+}
+
+func editMergePreview(c *fiber.Ctx) bool {
+	return c.Method() == fiber.MethodPost && strings.HasSuffix(c.Route().Path, "/teaching-courses/:id/merge-existing") && c.Query("commit") != "1"
 }
 
 func editReadOnlyCommand(path string) bool {

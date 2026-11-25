@@ -33,7 +33,13 @@ func checkpointSchemaName(slot *Slot) string {
 // (คอมเมนต์เดิมของ RestoreCheckpoint บอกแบบนั้น แต่โค้ดจริงย้อนทุกตารางรวม
 // sessions ด้วย — ดู DEMO-04) mfa_challenges ไปด้วยเหตุผลเดียวกัน: มันคือ
 // สถานะของ 2FA challenge ที่กำลังเปิดอยู่ตอนนี้ ไม่ใช่ข้อมูลของฉาก
-var checkpointExcludedTables = map[string]bool{"sessions": true, "mfa_challenges": true}
+// Edit versions are derived by restore-time triggers, and edit command IDs
+// belong to current requests. Replaying them causes duplicate keys and may
+// reuse a response from before the restore.
+var checkpointExcludedTables = map[string]bool{
+	"sessions": true, "mfa_challenges": true,
+	"edit_resource_versions": true, "edit_commands": true,
+}
 
 func withoutCheckpointExcludedTables(tables []string) []string {
 	out := make([]string, 0, len(tables))
@@ -109,6 +115,8 @@ func (m *Manager) RestoreCheckpoint(ctx context.Context, slot *Slot) error {
 	if err != nil {
 		return err
 	}
+	// Apply exclusions to checkpoints saved by older releases, too.
+	tables = withoutCheckpointExcludedTables(tables)
 
 	tx, err := slot.Pool.Begin(ctx)
 	if err != nil {
@@ -116,7 +124,7 @@ func (m *Manager) RestoreCheckpoint(ctx context.Context, slot *Slot) error {
 	}
 	defer tx.Rollback(ctx)
 
-	if err := truncateTables(ctx, tx.Exec, slot.SchemaName, tables); err != nil {
+	if err := truncateTables(ctx, tx, slot.SchemaName, tables); err != nil {
 		return err
 	}
 

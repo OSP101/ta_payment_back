@@ -10,7 +10,7 @@ import (
 // (master/phd) TA just because some day's real timetable exceeds
 // grad_regular_daily_hour_cap (6 ชม./วัน) — that check now belongs only to
 // the worklog entry point (worklog.go's validateGradRegularClassWindow), not
-// to Create(). Grad submission is bound only by the 10–12 ชม./สัปดาห์ total.
+// to Create(). Grad submission is bound only by the 12 ชม./สัปดาห์ ceiling.
 // Undergrad is unaffected: enforceDailyHourFeasibility must still run for
 // them.
 

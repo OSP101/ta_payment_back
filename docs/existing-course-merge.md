@@ -36,6 +36,34 @@ merge action never deletes them to get past this guard.
 
 Verification:
 
+- Reinspection must refresh `X-Edit-Views` for exactly the target and source
+  course, even though it is a POST. Skipping all edit tracking for previews
+  leaves old exact snapshots from the staff page's course/budget reads in
+  memory: a preview can return 200 with no blockers while every commit still
+  returns 409 after another edit. Preview reads now advance those two snapshots
+  without consuming command receipts or refreshing unrelated courses.
+- `TEST_DATABASE_URL=... go test ./internal/handler -run '^TestExistingMergeReinspection' -count=1 -v`
+  verifies recovery after concurrent target changes and missing client
+  snapshots. A successful preview must return only the two reviewed course
+  snapshots; stale commits are still rejected before reinspection.
+- `RUN_MERGE_PRODUCTION=1 TEST_DATABASE_URL=... go test ./internal/handler -run '^TestExistingMergeProductionPageScenarios$' -count=1 -v -timeout 35m`
+  builds the optimized standalone app with `npm run build`, then enters the
+  actual `/staff/teaching?term=...` page, including the staff layout, Beta
+  acknowledgement, term provider, SWR cache and dynamically imported modal.
+  It uses real JWT/session checks, router, services and disposable PostgreSQL
+  data, without intercepting API responses or creating substitute React pages.
+  Ten scenarios cover desktop Chrome, mobile Chrome, WebKit/iPhone, target
+  changes, source changes, two tabs, a linked TA request, reversed main course,
+  incompatible credits and exported courses. Database assertions verify
+  45/35 students for successful merges and unchanged rows for blocked cases.
+  Setup heartbeats keep the disposable session active during slow builds.
+  A cached rerun can set `MERGE_REUSE_PRODUCTION=1`; the test verifies the
+  frontend revision/diff and reuses the recorded loopback API address.
+  On 2026-11-24, the production-page suite reproduced a persistent 409 after
+  target changes (9/10 scenarios passed before the fix); all 10 passed after
+  preview snapshots were refreshed. This is a local test environment result,
+  not a production deployment verification.
+
 - A term-filtered course list must return both its term edit snapshot and
   `course:*`. Returning only the term snapshot makes a subsequent merge commit
   fail with HTTP 428 even when its preview token is valid. Single-course reads

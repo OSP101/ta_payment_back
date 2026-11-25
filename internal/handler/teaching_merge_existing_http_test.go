@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,8 +205,82 @@ func TestExistingMergeFullRouterWorkflow(t *testing.T) {
 	}
 }
 
-// Opt-in test runs the real React modal against this full API router and real
-// PostgreSQL. No merge HTTP responses are mocked and production is never used.
+// Reinspection must recover from stale or missing client edit snapshots.
+func TestExistingMergeReinspectionRefreshesOnlyReviewedCourseSnapshots(t *testing.T) {
+	for _, mode := range []string{"concurrent-target-edit", "missing-client-snapshot"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newMergeHTTPFixture(t)
+			term, target, source := f.courses(t, 2569)
+			views := map[string]string{}
+			call := func(method, path string, body any, want int) ([]byte, map[string]string) {
+				t.Helper()
+				raw, _ := json.Marshal(body)
+				header, _ := json.Marshal(views)
+				req := httptest.NewRequest(method, "/api/v1"+path, bytes.NewReader(raw))
+				req.Header.Set("Authorization", "Bearer "+f.token)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Edit-Views", string(header))
+				req.Header.Set("Idempotency-Key", uuid.NewString())
+				res, err := f.app.Test(req, 10000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer res.Body.Close()
+				data, _ := io.ReadAll(res.Body)
+				if res.StatusCode != want {
+					t.Fatalf("%s: got %d want %d: %s", path, res.StatusCode, want, data)
+				}
+				updated := map[string]string{}
+				_ = json.Unmarshal([]byte(res.Header.Get("X-Edit-Views")), &updated)
+				for scope, token := range updated {
+					views[scope] = token
+				}
+				return data, updated
+			}
+			call("GET", "/teaching-courses?term_id="+term.String(), nil, 200)
+			path := "/teaching-courses/" + target.String() + "/merge-existing"
+			in := service.ExistingMergeInput{SourceID: source}
+			data, _ := call("POST", path, in, 200)
+			var p service.ExistingMergePreview
+			if err := json.Unmarshal(data, &p); err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range p.Source.Sections {
+				for _, dst := range p.Target.Sections {
+					if s.Track == dst.Track {
+						id := dst.ID
+						in.Mappings = append(in.Mappings, service.ExistingMergeMapping{Source: s.ID, Target: &id})
+					}
+				}
+			}
+			data, _ = call("POST", path, in, 200)
+			if err := json.Unmarshal(data, &p); err != nil {
+				t.Fatal(err)
+			}
+			in.Token = p.Token
+			in.Confirmed = true
+			if mode == "concurrent-target-edit" {
+				if _, err := f.pool.Exec(context.Background(), `UPDATE teaching_courses SET name_th='Changed after inspection' WHERE id=$1`, target); err != nil {
+					t.Fatal(err)
+				}
+				call("POST", path+"?commit=1", in, 409)
+			} else {
+				views = map[string]string{}
+			}
+			data, updated := call("POST", path, in, 200)
+			if len(updated) != 2 || updated["course:"+target.String()] == "" || updated["course:"+source.String()] == "" {
+				t.Fatalf("preview must refresh exactly the two reviewed courses, got scopes %v", updated)
+			}
+			if err := json.Unmarshal(data, &p); err != nil {
+				t.Fatal(err)
+			}
+			in.Token = p.Token
+			call("POST", path+"?commit=1", in, 200)
+		})
+	}
+}
+
+// Opt-in browser/API integration against an isolated PostgreSQL database.
 func TestExistingMergeBrowserIntegration(t *testing.T) {
 	if os.Getenv("RUN_MERGE_BROWSER") != "1" {
 		t.Skip("set RUN_MERGE_BROWSER=1 for browser/API integration")
@@ -245,6 +320,91 @@ func TestExistingMergeBrowserIntegration(t *testing.T) {
 		var n int
 		if err = f.pool.QueryRow(context.Background(), `SELECT count(*) FROM teaching_courses WHERE id=$1`, c["source"]).Scan(&n); err != nil || n != 0 {
 			t.Fatalf("%s source still active: %d %v", c["name"], n, err)
+		}
+	}
+}
+
+// This suite enters the actual staff page in the optimized standalone build,
+// including its layouts, SWR cache, term provider and dynamically loaded modal.
+func TestExistingMergeProductionPageScenarios(t *testing.T) {
+	if os.Getenv("RUN_MERGE_PRODUCTION") != "1" {
+		t.Skip("set RUN_MERGE_PRODUCTION=1 for production-page scenario tests")
+	}
+	f := newMergeHTTPFixture(t)
+	address := "127.0.0.1:0"
+	if os.Getenv("MERGE_REUSE_PRODUCTION") == "1" {
+		data, err := os.ReadFile("/tmp/merge-production-build-meta.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var meta struct {
+			API string `json:"api"`
+		}
+		if err = json.Unmarshal(data, &meta); err != nil {
+			t.Fatal(err)
+		}
+		u, err := url.Parse(meta.API)
+		if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" {
+			t.Fatal("invalid cached test API address")
+		}
+		address = u.Host
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = f.app.Listener(listener) }()
+	t.Cleanup(func() { _ = f.app.Shutdown() })
+	cases := []map[string]any{}
+	for i, mode := range []string{"desktop", "mobile", "safari", "target-changed", "source-changed", "two-tabs", "ta-request", "reverse-main", "incompatible", "exported"} {
+		term, target, source := f.courses(t, 2569+i)
+		merged := i < 6
+		switch mode {
+		case "ta-request":
+			_, err = f.pool.Exec(context.Background(), `INSERT INTO ta_requests(teaching_course_id,lecturer_id,reimburse_scope) VALUES($1,$2,'both')`, source, f.actor)
+		case "incompatible":
+			_, err = f.pool.Exec(context.Background(), `UPDATE teaching_courses SET credits=4 WHERE id=$1`, source)
+		case "exported":
+			_, err = f.pool.Exec(context.Background(), `UPDATE teaching_courses SET exported_at=NOW() WHERE id=$1`, source)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases = append(cases, map[string]any{"mode": mode, "term": term, "target": target, "source": source, "merged": merged})
+	}
+	manifest := map[string]any{"api": fmt.Sprintf("http://%s", listener.Addr()), "token": f.token, "cases": cases}
+	path := filepath.Join(t.TempDir(), "production-fixture.json")
+	data, _ := json.Marshal(manifest)
+	if err = os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	front, err := filepath.Abs("../../../ta_payment_front")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", "scripts/merge-existing.production.browser.test.mjs", path)
+	cmd.Dir = front
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err = cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cases {
+		var count, regular, special int
+		if err = f.pool.QueryRow(context.Background(), `SELECT count(*) FROM teaching_courses WHERE id=$1`, c["source"]).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.pool.QueryRow(context.Background(), `SELECT num_students_regular,num_students_special FROM teaching_courses WHERE id=$1`, c["target"]).Scan(&regular, &special); err != nil {
+			t.Fatal(err)
+		}
+		if c["merged"].(bool) {
+			if count != 0 || regular != 45 || special != 35 {
+				t.Fatalf("%s: source=%d counts=%d/%d", c["mode"], count, regular, special)
+			}
+		} else if count != 1 || regular != 40 || special != 30 {
+			t.Fatalf("blocked %s changed data: source=%d counts=%d/%d", c["mode"], count, regular, special)
 		}
 	}
 }

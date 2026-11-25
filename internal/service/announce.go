@@ -49,6 +49,7 @@ type Announcement struct {
 	AnnouncedAt   *time.Time `json:"announced_at,omitempty"`
 	CreatedAt     *time.Time `json:"created_at,omitempty"`
 	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+	SendEmail     bool       `json:"send_email"`
 	// IsPublic opens the announcement to readers with no account, through the
 	// share link. Publishing state still applies: a public draft is not visible.
 	IsPublic        bool                     `json:"is_public"`
@@ -140,7 +141,7 @@ func (s *AnnounceService) List(ctx context.Context, f ListFilter) ([]Announcemen
 	                       cover_image_key, published_at, expires_at,
 	                       announced_at, created_at, updated_at, is_public,
 	                       target_course_ids, target_user_ids, target_filters, target_term_id,
-	                       reminded_at
+	                       reminded_at, send_email
 	                FROM announcements`)
 	args := []any{}
 	where := []string{}
@@ -181,7 +182,7 @@ func (s *AnnounceService) List(ctx context.Context, f ListFilter) ([]Announcemen
 			&a.CoverImageKey, &a.PublishedAt, &a.ExpiresAt,
 			&a.AnnouncedAt, &a.CreatedAt, &a.UpdatedAt, &a.IsPublic,
 			&a.TargetCourseIDs, &a.TargetUserIDs, &a.TargetFilters, &a.TargetTermID,
-			&a.RemindedAt,
+			&a.RemindedAt, &a.SendEmail,
 		); err != nil {
 			return nil, err
 		}
@@ -258,14 +259,14 @@ func (s *AnnounceService) Get(ctx context.Context, id uuid.UUID) (*Announcement,
 		       cover_image_key, published_at, expires_at,
 		       announced_at, created_at, updated_at, is_public,
 		       target_course_ids, target_user_ids, target_filters, target_term_id,
-		       reminded_at
+		       reminded_at, send_email
 		FROM announcements WHERE id = $1
 	`, id).Scan(
 		&a.ID, &a.Title, &a.Body, &a.Category, &a.Audience, &a.Pinned,
 		&a.CoverImageKey, &a.PublishedAt, &a.ExpiresAt,
 		&a.AnnouncedAt, &a.CreatedAt, &a.UpdatedAt, &a.IsPublic,
 		&a.TargetCourseIDs, &a.TargetUserIDs, &a.TargetFilters, &a.TargetTermID,
-		&a.RemindedAt,
+		&a.RemindedAt, &a.SendEmail,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -367,7 +368,8 @@ type UpsertInput struct {
 	// recipient ledger. A plain bool/slice would read as "clear it", so
 	// pinning an announcement would silently switch off its share link and
 	// delete everyone still queued for email. nil means "leave as it is".
-	IsPublic *bool `json:"is_public"`
+	IsPublic  *bool `json:"is_public"`
+	SendEmail *bool `json:"send_email"`
 	// Targeting. Audience above is the role part; these narrow it further.
 	// Recipients are always people who hold an account — an announcement is a
 	// system notice, and a stranger's inbox is not somewhere it belongs.
@@ -474,11 +476,11 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 				id, title, body, category, audience, pinned,
 				cover_image_key, published_at, expires_at, is_public,
 				target_course_ids, target_user_ids, target_filters, target_term_id,
-				created_by, updated_by
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
+				created_by, updated_by, send_email
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,$16)
 		`, in.ID, title, body, category, aud, in.Pinned,
 			in.CoverImageKey, in.PublishedAt, in.ExpiresAt, in.IsPublic != nil && *in.IsPublic,
-			nonNil(rule.CourseIDs), nonNil(rule.UserIDs), nonNil(rule.Filters), in.TargetTermID, actor)
+			nonNil(rule.CourseIDs), nonNil(rule.UserIDs), nonNil(rule.Filters), in.TargetTermID, actor, in.SendEmail == nil || *in.SendEmail)
 	} else {
 		tag, execErr := tx.Exec(ctx, `
 			UPDATE announcements
@@ -489,11 +491,11 @@ func (s *AnnounceService) Upsert(ctx context.Context, actor uuid.UUID, in Upsert
 			       target_user_ids=COALESCE($12, target_user_ids),
 			       target_filters=COALESCE($13, target_filters),
 			       target_term_id=COALESCE($14, target_term_id),
-			       updated_by=$15, updated_at=NOW()
+			       updated_by=$15, updated_at=NOW(), send_email=COALESCE($16, send_email)
 			 WHERE id=$1
 		`, in.ID, title, body, category, aud, in.Pinned,
 			in.CoverImageKey, in.PublishedAt, in.ExpiresAt, in.IsPublic,
-			in.TargetCourseIDs, in.TargetUserIDs, in.TargetFilters, in.TargetTermID, actor)
+			in.TargetCourseIDs, in.TargetUserIDs, in.TargetFilters, in.TargetTermID, actor, in.SendEmail)
 		err = execErr
 		if err == nil && tag.RowsAffected() == 0 {
 			return uuid.Nil, ErrNotFound

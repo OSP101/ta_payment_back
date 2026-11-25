@@ -170,7 +170,7 @@ func TestPublicGet_OnlyOpensWhatStaffDeliberatelyShared(t *testing.T) {
 
 	mk := func(name string, in UpsertInput) uuid.UUID {
 		in.Title, in.Body, in.Category = name, "เนื้อหา", "info"
-		in.Audience = []string{"ta"}
+		in.Audience = []string{"staff"}
 		id, err := f.svc.Upsert(f.ctx, actor, in)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -326,5 +326,41 @@ func TestDeliver_RefusesWhileUnpublished(t *testing.T) {
 	}
 	if _, err := w.svc.Deliver(w.ctx, id); err == nil {
 		t.Fatal("a draft must not be delivered")
+	}
+}
+
+func TestAnnouncement_InAppOnlyNeverSendsEmailIncludingReminders(t *testing.T) {
+	w := newTargetWorld(t)
+	in := UpsertInput{Title: "Internal", Body: "Content", Audience: []string{"ta"}, TargetTermID: &w.term, PublishedAt: past(), SendEmail: boolPtr(false)}
+	id, err := w.svc.Upsert(w.ctx, w.officer, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.svc.Redeliver(w.ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.svc.RemindUnread(w.ctx, w.officer, id); err != nil {
+		t.Fatal(err)
+	}
+	var app, email int
+	if err = w.svc.pool.QueryRow(w.ctx, `SELECT COUNT(*) FILTER (WHERE channel='in_app'),COUNT(*) FILTER (WHERE channel='email') FROM notifications WHERE link=$1`, "/announcements/"+id.String()).Scan(&app, &email); err != nil {
+		t.Fatal(err)
+	}
+	if app != 4 || email != 0 {
+		t.Fatalf("app=%d email=%d", app, email)
+	}
+	// Omitted channel on a pin/edit must retain the saved choice.
+	in.ID = id
+	in.SendEmail = nil
+	in.Pinned = true
+	if _, err = w.svc.Upsert(w.ctx, w.officer, in); err != nil {
+		t.Fatal(err)
+	}
+	a, err := w.svc.Get(w.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.SendEmail {
+		t.Fatal("pin enabled email")
 	}
 }

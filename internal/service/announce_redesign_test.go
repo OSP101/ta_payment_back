@@ -289,7 +289,7 @@ func TestDeliver_RecordsAnEmailThatDidNotGoOut(t *testing.T) {
 
 	id, err := f.svc.Upsert(f.ctx, officer, UpsertInput{
 		Title: "ประกาศ", Body: "เนื้อหา", Category: "info",
-		Audience: []string{"ta"}, PublishedAt: past(),
+		TargetUserIDs: &[]uuid.UUID{ta}, PublishedAt: past(),
 	})
 	if err != nil {
 		t.Fatalf("Upsert: %v", err)

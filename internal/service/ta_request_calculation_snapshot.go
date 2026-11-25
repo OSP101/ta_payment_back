@@ -28,7 +28,7 @@ func snapshotRequestCalculation(ctx context.Context, tx pgx.Tx, requestID, actor
             'schema_version', 1,
             'workload_rule_version', r.workload_rule_version,
             'billing_rule', 'merged_sittings_by_track_activity_v1',
-            'eligibility_limits', jsonb_build_object('graduate_min',10,'graduate_max',12,'undergraduate_min_exclusive',0),
+            'eligibility_limits', jsonb_build_object('graduate_min',NULL,'graduate_max',12,'undergraduate_min_exclusive',0),
             'request', to_jsonb(r),
             'course', (SELECT to_jsonb(tc) FROM teaching_courses tc WHERE tc.id=r.teaching_course_id),
             'term', (SELECT to_jsonb(t) FROM academic_terms t JOIN teaching_courses tc ON tc.term_id=t.id WHERE tc.id=r.teaching_course_id),

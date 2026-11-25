@@ -368,7 +368,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 				return nil, err
 			}
 			// Each group's hours are bounded by how long that group actually
-			// meets. Undergrad only; grad hours follow the 10–12 total rule
+			// meets. Undergrad only; grad hours follow the 12-hour ceiling rule
 			// inside autoDecide.
 			if level == "undergrad" {
 				if err := validateUndergradSectionCaps(w, name, secNo, weekly[secID]); err != nil {
@@ -389,7 +389,7 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 		// Undergrad only (2026 meeting correction): the request-submission gate
 		// used to also refuse a grad TA whose sections' real timetable exceeded
 		// grad_regular_daily_hour_cap (6 ชม./วัน), but graduate students are
-		// bound only by the 10–12 ชม./สัปดาห์ total (checked in autoDecide) —
+		// bound only by the 12 ชม./สัปดาห์ ceiling (checked in autoDecide) —
 		// the daily-hour cap belongs to the WORKLOG entry point instead
 		// (worklog.go's validateGradRegularClassWindow), not request submission.
 		if level == "undergrad" {
@@ -1404,7 +1404,7 @@ func validateInClassDuties(w WorkloadInput, byKind kindClash, name, secLabel str
 //
 // other_hrs/prep_hrs themselves stay accepted here and uncapped — confirmed
 // with the office (2026-09-11) that lecturers still need them to reach the
-// graduate school's 10-12 ชม./สัปดาห์ regulation total on the request form,
+// graduate school's 12 ชม./สัปดาห์ ceiling on the request form,
 // they're just administrative from this point on: never turned into a
 // worklog duty card, a loggable activity, or a pay calculation. Only
 // grade_hrs (the one field that DOES stay loggable, via DutyReview) needs a
@@ -2337,11 +2337,11 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 				}
 				tot += a.wl.HelpTeachHrs + a.wl.PrepHrs + a.wl.GradeHrs + a.wl.OtherHrs
 			}
-			totOK = tot >= 10 && tot <= 12
+			totOK = tot <= 12
 			if totOK {
-				totMsg = fmt.Sprintf("%s ภาระงานรวม %.2f ชม./สัปดาห์ (อยู่ในช่วง 10–12)", t.name, tot)
+				totMsg = fmt.Sprintf("%s ภาระงานรวม %.2f ชม./สัปดาห์ (ไม่เกิน 12)", t.name, tot)
 			} else {
-				totMsg = fmt.Sprintf("%s ภาระงาน %.2f ชม./สัปดาห์ ไม่อยู่ในช่วง 10–12 ตามระเบียบบัณฑิตศึกษา", t.name, tot)
+				totMsg = fmt.Sprintf("%s ภาระงาน %.2f ชม./สัปดาห์ เกิน 12 ชม./สัปดาห์ ตามระเบียบบัณฑิตศึกษา", t.name, tot)
 			}
 		} else {
 			var tot float64

@@ -25,7 +25,7 @@ type AddSectionsInput struct {
 // has logged hours — the very moment a lecturer is most likely to want to hand
 // over another group. The new sections are appended to the EXISTING request,
 // not filed as a second one, because every per-request rule reads the TA's
-// sections together: the daily-hour feasibility, the graduate 10–12 total and
+// sections together: the daily-hour feasibility, the graduate 12-hour ceiling and
 // the co-taught "billed once" grouping. A second request would let a TA pass
 // each of them twice.
 //
