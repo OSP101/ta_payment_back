@@ -52,6 +52,7 @@ type ExistingMergePreview struct {
 	Token              string              `json:"token"`
 	ApprovedRequestIDs []uuid.UUID         `json:"approved_request_ids,omitempty"`
 	TargetApproval     json.RawMessage     `json:"target_approval,omitempty"`
+	ImportReferences   json.RawMessage     `json:"import_references,omitempty"`
 }
 
 func existingMergeCourse(ctx context.Context, tx pgx.Tx, id uuid.UUID) (c ExistingMergeCourse, err error) {
@@ -174,16 +175,20 @@ func prepareExistingMerge(ctx context.Context, tx pgx.Tx, target uuid.UUID, in E
 	for _, sec := range p.Source.Sections {
 		sectionIDs = append(sectionIDs, sec.ID)
 	}
-	used, e := existingMergeHasUsage(ctx, tx, "teaching_courses", []uuid.UUID{in.SourceID}, map[string]bool{"sections": true, "teaching_lecturers": true})
+	used, e := existingMergeHasUsage(ctx, tx, "teaching_courses", []uuid.UUID{in.SourceID}, map[string]bool{"sections": true, "teaching_lecturers": true, "tdbm_extra_teachings": true})
 	if e != nil {
 		return p, e
 	}
-	sectionUsed, e := existingMergeHasUsage(ctx, tx, "sections", sectionIDs, map[string]bool{"section_schedules": true, "exam_schedules": true})
+	sectionUsed, e := existingMergeHasUsage(ctx, tx, "sections", sectionIDs, map[string]bool{"section_schedules": true, "exam_schedules": true, "tdbm_extra_teachings": true})
 	if e != nil {
 		return p, e
 	}
 	if used || sectionUsed {
 		p.Blockers = append(p.Blockers, "วิชาที่จะนำมารวมมีข้อมูลการใช้งาน เช่น คำขอ TA การมอบหมาย งานเบิกจ่าย หรือข้อมูลเชื่อมโยงอยู่แล้ว กรุณาตรวจรายการที่ผูกอยู่ก่อนรวม")
+	}
+	p.ImportReferences, err = existingMergeImportReferences(ctx, tx, p.Target, p.Source)
+	if err != nil {
+		return p, err
 	}
 	var targetBlockers []string
 	p.TargetApproval, p.ApprovedRequestIDs, targetBlockers, err = existingMergeApprovedTarget(ctx, tx, p.Target)
@@ -309,7 +314,15 @@ func (s *TeachingService) ExistingCourseMerge(ctx context.Context, actor, target
 	if _, err = tx.Exec(ctx, `UPDATE teaching_lecturers SET is_primary=true WHERE teaching_course_id=$1 AND lecturer_id=(SELECT lecturer_id FROM teaching_lecturers WHERE teaching_course_id=$2 AND is_primary LIMIT 1) AND NOT EXISTS(SELECT 1 FROM teaching_lecturers WHERE teaching_course_id=$1 AND is_primary)`, target, in.SourceID); err != nil {
 		return p, err
 	}
+	if _, err = tx.Exec(ctx, `UPDATE tdbm_extra_teachings SET teaching_course_id=$1 WHERE teaching_course_id=$2`, target, in.SourceID); err != nil {
+		return p, err
+	}
 	for _, m := range in.Mappings {
+		if m.Target != nil {
+			if _, err = tx.Exec(ctx, `UPDATE tdbm_extra_teachings SET teaching_course_id=$1,section_id=$2 WHERE section_id=$3`, target, *m.Target, m.Source); err != nil {
+				return p, err
+			}
+		}
 		if m.Target == nil {
 			var secNo string
 			for _, s := range p.Source.Sections {
@@ -331,6 +344,7 @@ func (s *TeachingService) ExistingCourseMerge(ctx context.Context, actor, target
 	}
 	codes := append([]string{p.Source.Code}, p.Source.AltCodes...)
 	evidence, _ := json.Marshal(p)
+	mappingEvidence, _ := json.Marshal(in.Mappings)
 	entered := func(track string) bool {
 		present, known := false, true
 		for _, c := range []ExistingMergeCourse{p.Target, p.Source} {
@@ -354,7 +368,7 @@ func (s *TeachingService) ExistingCourseMerge(ctx context.Context, actor, target
 		return present && known
 	}
 	regularEntered, specialEntered := entered("regular"), entered("special")
-	if _, err = tx.Exec(ctx, `UPDATE teaching_courses dst SET alt_codes=ARRAY(SELECT DISTINCT c FROM unnest(dst.alt_codes||$2::text[]) c WHERE c<>dst.code ORDER BY c),reg_source=dst.reg_source||src.reg_source||jsonb_build_array(jsonb_build_object('existing_course_merge',$4::jsonb)),num_students_regular_entered=$5,num_students_special_entered=$6,updated_at=now() FROM teaching_courses src WHERE dst.id=$1 AND src.id=$3`, target, codes, in.SourceID, evidence, regularEntered, specialEntered); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE teaching_courses dst SET alt_codes=ARRAY(SELECT DISTINCT c FROM unnest(dst.alt_codes||$2::text[]) c WHERE c<>dst.code ORDER BY c),reg_source=dst.reg_source||src.reg_source||jsonb_build_array(jsonb_build_object('existing_course_merge',$4::jsonb,'section_mappings',$7::jsonb)),num_students_regular_entered=$5,num_students_special_entered=$6,updated_at=now() FROM teaching_courses src WHERE dst.id=$1 AND src.id=$3`, target, codes, in.SourceID, evidence, regularEntered, specialEntered, mappingEvidence); err != nil {
 		return p, err
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM teaching_courses WHERE id=$1`, in.SourceID); err != nil {

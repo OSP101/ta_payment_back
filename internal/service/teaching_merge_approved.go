@@ -90,8 +90,8 @@ func existingMergeApprovedTarget(ctx context.Context, tx pgx.Tx, target Existing
 		ids     []uuid.UUID
 		allowed map[string]bool
 	}{
-		{"teaching_courses", []uuid.UUID{target.ID}, map[string]bool{"sections": true, "teaching_lecturers": true, "ta_requests": true, "course_budget_alerts": true, "submission_period_status": true}},
-		{"sections", sectionIDs, map[string]bool{"section_schedules": true, "exam_schedules": true, "ta_request_counts": true, "ta_request_assignments": true}},
+		{"teaching_courses", []uuid.UUID{target.ID}, map[string]bool{"sections": true, "teaching_lecturers": true, "ta_requests": true, "course_budget_alerts": true, "submission_period_status": true, "tdbm_extra_teachings": true, "ta_request_drafts": true}},
+		{"sections", sectionIDs, map[string]bool{"section_schedules": true, "exam_schedules": true, "ta_request_counts": true, "ta_request_assignments": true, "tdbm_extra_teachings": true}},
 		{"ta_requests", requestIDs, map[string]bool{"ta_request_counts": true, "ta_request_assignments": true, "ta_request_calculation_snapshots": true}},
 		{"ta_request_assignments", assignmentIDs, map[string]bool{"ta_workload_forms": true}},
 		{"ta_workload_forms", workloadIDs, nil},

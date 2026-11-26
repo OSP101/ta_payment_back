@@ -29,7 +29,8 @@ active course list. Student aggregates are recomputed in the same transaction.
 Allowed only within one term, with identical credits/hours/study level and
 with the newer curriculum code selected as main. Exported offerings are
 blocked. The source course and its Sections must have no operational
-references; only base teacher/Section/timetable/exam rows can be transferred.
+references; base teacher/Section/timetable/exam rows and passive TDBM staging
+matches can be transferred. Applied makeup schedules still block the merge.
 
 The main course may retain approved TA requests, assignments, request counts
 and declared workloads, provided no subsequent work has started. Pending
@@ -39,6 +40,28 @@ payout or unknown operational reference blocks the merge. Automatically
 maintained budget-alert rows and untouched pending monthly rows do not count
 as submitted work. Rejected/cancelled request history is preserved, and is
 still checked for downstream work.
+
+A personal, unsent request draft on the retained main course is preserved;
+it does not count as time or downstream approval activity. Source request
+drafts and submitted source requests remain blockers. Passive TDBM matches on
+both courses are locked and included in the preview token/audit. On commit,
+source course/Section references follow the explicit Section mapping without
+deleting the TDBM records or rewriting their original course codes and times.
+The mapping is retained in `reg_source.section_mappings`; later TDBM syncs use
+it before matching by Section number. This matters when SC section 2 is folded
+into CP section 3 while CP also has an unrelated regular section 2.
+
+On 2026-11-26, the real 2/2569 CP321004/SC361004 incident had 32 passive TDBM
+matches and one retained request draft. The previous generic FK guard counted
+these as operational work and produced both blockers shown in the user's
+screenshots. The original registrar `.xls` is now imported through the real
+REG review/commit flow in regression tests, with four approved requests and
+eight assignments. Sanitized TDBM fixture rows retain the actual dates, times,
+statuses and Section labels. A pre-fix overlay reproduces both original
+blockers. The fixed service produces 85 regular + 35 special students while
+preserving approvals, workloads, draft and TDBM evidence. A preview-only
+check against live data with the patched service returned zero blockers and
+120 students; it did not commit a merge or deploy the patched backend.
 
 The approved main course, requests, target Sections, assignments and workload
 IDs are unchanged. The merge does not add existing TAs to Sections retained as
@@ -84,11 +107,14 @@ Verification:
   acknowledgement, term provider, SWR cache and dynamically imported modal.
   It uses real JWT/session checks, router, services and disposable PostgreSQL
   data, without intercepting API responses or creating substitute React pages.
-  Nineteen scenarios cover desktop Chrome, mobile Chrome, WebKit/iPhone,
+  Twenty-two scenarios (when the real term-2 registrar workbook is available)
+  cover desktop Chrome, mobile Chrome, WebKit/iPhone,
   target/source changes, two tabs, linked source requests, reversed main course,
   incompatible credits, exported courses and the approved-main cases above.
   Database assertions verify 45/35 students (85/35 for the extra-Section case),
-  preserved approval graphs and unchanged rows for blocked cases.
+  preserved approval graphs and unchanged rows for blocked cases. The real
+  term-2 cases additionally compare all four requests/eight workloads, 32
+  retained TDBM matches, the request draft and eight calculation snapshots.
   The browser suite rejects unexpected API 404/5xx responses as well as page
   errors. After a merge, the staff page refreshes lists and retained courses
   without refetching the removed source course or its budget.

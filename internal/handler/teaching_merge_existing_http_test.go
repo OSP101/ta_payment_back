@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -360,13 +361,27 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 	go func() { _ = f.app.Listener(listener) }()
 	t.Cleanup(func() { _ = f.app.Shutdown() })
 	cases := []map[string]any{}
-	for i, mode := range []string{"desktop", "mobile", "safari", "target-changed", "source-changed", "two-tabs", "ta-request", "reverse-main", "incompatible", "exported", "approved-desktop", "approved-mobile", "approved-safari", "approved-two-tabs", "approved-target-changed", "approved-draft-time", "approved-submitted-time", "approved-reviewed-month", "approved-extra-section"} {
-		term, target, source := f.courses(t, 2569+i, mode == "approved-extra-section")
-		merged := i < 6 || (i >= 10 && i < 15) || mode == "approved-extra-section"
+	modes := []string{"desktop", "mobile", "safari", "target-changed", "source-changed", "two-tabs", "ta-request", "reverse-main", "incompatible", "exported", "approved-desktop", "approved-mobile", "approved-safari", "approved-two-tabs", "approved-target-changed", "approved-draft-time", "approved-submitted-time", "approved-reviewed-month", "approved-extra-section"}
+	realFile := os.Getenv("MERGE_REAL_REGISTRAR_FILE")
+	if realFile == "" {
+		realFile = "../../../docs/รายวิชาที่เปิดสอนภาค 2-2569.xls"
+	}
+	if _, err := os.Stat(realFile); err == nil {
+		modes = append(modes, "approved-real-term2-desktop", "approved-real-term2-mobile", "approved-real-term2-safari")
+	}
+	for i, mode := range modes {
+		realTerm2 := strings.Contains(mode, "real-term2")
+		var term, target, source uuid.UUID
+		if realTerm2 {
+			term, target, source = f.realTerm2Courses(t, 2569+i)
+		} else {
+			term, target, source = f.courses(t, 2569+i, mode == "approved-extra-section")
+		}
+		merged := i < 6 || (i >= 10 && i < 15) || mode == "approved-extra-section" || realTerm2
 		approval := map[string]any{}
 		if i >= 10 {
 			ta, rid, aid, section := uuid.New(), uuid.New(), uuid.New(), uuid.Nil
-			if err = f.pool.QueryRow(context.Background(), `SELECT id FROM sections WHERE teaching_course_id=$1 AND track='regular' AND sec_no='1' ORDER BY id LIMIT 1`, target).Scan(&section); err != nil {
+			if err = f.pool.QueryRow(context.Background(), `SELECT id FROM sections WHERE teaching_course_id=$1 AND track='regular' AND sec_no::int=1 ORDER BY id LIMIT 1`, target).Scan(&section); err != nil {
 				t.Fatal(err)
 			}
 			for _, step := range []struct {
@@ -405,8 +420,11 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if realTerm2 {
+				f.seedRealTerm2References(t, term, target, source, 2569+i, i)
+			}
 			var before string
-			if err = f.pool.QueryRow(context.Background(), `SELECT jsonb_build_object('request',to_jsonb(r),'assignment',to_jsonb(a),'workload',to_jsonb(w))::text FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE r.id=$1`, rid).Scan(&before); err != nil {
+			if err = f.pool.QueryRow(context.Background(), `SELECT COALESCE(jsonb_agg(jsonb_build_object('request',to_jsonb(r),'assignment',to_jsonb(a),'workload',to_jsonb(w)) ORDER BY r.id,a.id),'[]'::jsonb)::text FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE r.teaching_course_id=$1`, target).Scan(&before); err != nil {
 				t.Fatal(err)
 			}
 			approval["before"] = before
@@ -423,7 +441,7 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 			t.Fatal(err)
 		}
 		regularBefore, regularAfter := 40, 45
-		if mode == "approved-extra-section" {
+		if mode == "approved-extra-section" || realTerm2 {
 			regularBefore, regularAfter = 80, 85
 		}
 		cases = append(cases, map[string]any{"mode": mode, "term": term, "target": target, "source": source, "merged": merged, "approval": approval, "regular_before": regularBefore, "regular_after": regularAfter})
@@ -462,22 +480,39 @@ func TestExistingMergeProductionPageScenarios(t *testing.T) {
 		} else if count != 1 || regular != c["regular_before"].(int) || special != 30 {
 			t.Fatalf("blocked %s changed data: source=%d counts=%d/%d", c["mode"], count, regular, special)
 		}
+		if strings.Contains(c["mode"].(string), "real-term2") {
+			var refs, drafts, requests, assignments, linkedSpecial int
+			if err = f.pool.QueryRow(context.Background(), `SELECT
+  (SELECT count(*) FROM tdbm_extra_teachings WHERE teaching_course_id=$1 AND section_id IS NOT NULL),
+  (SELECT count(*) FROM ta_request_drafts WHERE teaching_course_id=$1),
+  (SELECT count(*) FROM ta_requests WHERE teaching_course_id=$1 AND status='approved'),
+  (SELECT count(*) FROM ta_request_assignments a JOIN ta_requests r ON r.id=a.request_id WHERE r.teaching_course_id=$1),
+  (SELECT count(*) FROM tdbm_extra_teachings x JOIN sections sec ON sec.id=x.section_id WHERE x.teaching_course_id=$1 AND x.course_code='SC361004' AND x.section_label='กลุ่มที่ 2' AND sec.track='special')`, c["target"]).Scan(&refs, &drafts, &requests, &assignments, &linkedSpecial); err != nil {
+				t.Fatal(err)
+			}
+			if refs != 32 || drafts != 1 || requests != 4 || assignments != 8 || linkedSpecial != 8 {
+				t.Fatalf("%s lost references: tdbm=%d draft=%d requests=%d assignments=%d special=%d", c["mode"], refs, drafts, requests, assignments, linkedSpecial)
+			}
+		}
 		approval := c["approval"].(map[string]any)
-		if rid, ok := approval["request_id"]; ok {
+		if _, ok := approval["request_id"]; ok {
 			var after string
-			if err = f.pool.QueryRow(context.Background(), `SELECT jsonb_build_object('request',to_jsonb(r),'assignment',to_jsonb(a),'workload',to_jsonb(w))::text FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE r.id=$1`, rid).Scan(&after); err != nil {
+			if err = f.pool.QueryRow(context.Background(), `SELECT COALESCE(jsonb_agg(jsonb_build_object('request',to_jsonb(r),'assignment',to_jsonb(a),'workload',to_jsonb(w)) ORDER BY r.id,a.id),'[]'::jsonb)::text FROM ta_requests r JOIN ta_request_assignments a ON a.request_id=r.id JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE r.teaching_course_id=$1`, c["target"]).Scan(&after); err != nil {
 				t.Fatal(err)
 			}
 			if after != approval["before"].(string) {
 				t.Fatalf("%s changed approval, assignment or workload", c["mode"])
 			}
 			var snapshots int
-			if err = f.pool.QueryRow(context.Background(), `SELECT count(*) FROM ta_request_calculation_snapshots WHERE request_id=$1`, rid).Scan(&snapshots); err != nil {
+			if err = f.pool.QueryRow(context.Background(), `SELECT count(*) FROM ta_request_calculation_snapshots WHERE request_id IN (SELECT id FROM ta_requests WHERE teaching_course_id=$1)`, c["target"]).Scan(&snapshots); err != nil {
 				t.Fatal(err)
 			}
 			want := 0
 			if c["merged"].(bool) {
 				want = 2
+				if strings.Contains(c["mode"].(string), "real-term2") {
+					want = 8
+				}
 			}
 			if snapshots != want {
 				t.Fatalf("%s: snapshot count=%d want=%d", c["mode"], snapshots, want)

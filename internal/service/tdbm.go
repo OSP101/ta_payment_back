@@ -556,7 +556,7 @@ func (s *TDBMService) resolveSectionMatches(ctx context.Context, academicYear, s
 		SET section_id = m.sec_id
 		FROM (
 			SELECT t2.extra_class_id,
-			       (SELECT sec.id FROM sections sec
+			       COALESCE((`+existingMergeTDBMSectionMatch+`), (SELECT sec.id FROM sections sec
 			        WHERE sec.teaching_course_id = t2.teaching_course_id
 			          AND (`+secNoMatches("sec")+`)
 			          AND (`+trackOK+`
@@ -566,7 +566,7 @@ func (s *TDBMService) resolveSectionMatches(ctx context.Context, academicYear, s
 			                     AND s2.id <> sec.id
 			                     AND (`+secNoMatches("s2")+`)))
 			        ORDER BY `+trackOK+` DESC
-			        LIMIT 1) AS sec_id
+			        LIMIT 1)) AS sec_id
 			FROM tdbm_extra_teachings t2
 			WHERE t2.academic_year = $1 AND t2.semester = $2
 		) m
