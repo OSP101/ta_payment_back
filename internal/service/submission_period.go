@@ -30,8 +30,7 @@ type SubmissionPeriod struct {
 	ID     uuid.UUID `json:"id"`
 	TermID uuid.UUID `json:"term_id" validate:"required"`
 	// YearMonth is CHAR(7) in the DB ("2569-06") — len matches that column
-	// exactly; the "<academic_year>-MM" shape itself is still checked by
-	// Upsert against the term's academic_year, which a struct tag can't know.
+	// exactly; Upsert normalizes calendar Buddhist years to the academic key.
 	YearMonth        string `json:"year_month" validate:"required,len=7"`
 	StartsOn         string `json:"starts_on" validate:"required"`     // "2569-06-01" — window opens
 	DueDate          string `json:"due_date" validate:"required"`      // "2569-07-31" — window closes
@@ -166,11 +165,9 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 	if in.StartsOn >= in.DueDate {
 		return nil, Invalid("วันเปิดรอบต้องมาก่อนวันครบกำหนด")
 	}
-	// year_month MUST be "<academic_year>-<MM>" (Buddhist academic year + 2-digit
-	// month). The finance-lock join in period_lock.go matches
-	// `academic_year || '-' || to_char(work_date,'MM')`, so a typo like "2569-6"
-	// or a Gregorian "2026-06" would silently never match and the month could
-	// never lock/close. Reject it up front instead of failing invisibly later.
+	// Persist the academic-year key used by finance locks. Staff may enter the
+	// calendar Buddhist year after New Year (e.g. 2570-01 in term 2569);
+	// normalize it before validation and before comparing signed-off periods.
 	var acadYear int
 	if err := s.pool.QueryRow(ctx,
 		`SELECT academic_year FROM academic_terms WHERE id=$1`, in.TermID).Scan(&acadYear); err != nil {
@@ -179,7 +176,9 @@ func (s *SubmissionPeriodService) Upsert(ctx context.Context, actor uuid.UUID, i
 		}
 		return nil, err
 	}
-	if !validYearMonth(in.YearMonth, acadYear) {
+	var valid bool
+	in.YearMonth, valid = normalizePeriodYearMonth(in.YearMonth, acadYear, in.StartsOn)
+	if !valid {
 		return nil, Invalid(fmt.Sprintf("รูปแบบเดือนไม่ถูกต้อง ต้องเป็น %d-MM (เช่น %d-06)", acadYear, acadYear))
 	}
 	if in.RemindDaysBefore <= 0 {
@@ -282,6 +281,21 @@ func validYearMonth(ym string, acadYear int) bool {
 	}
 	mm, err := strconv.Atoi(parts[1])
 	return err == nil && mm >= 1 && mm <= 12
+}
+
+// Accept the following calendar year's Buddhist month only when it agrees
+// with the opening date. Keep legacy academic keys valid: submission windows
+// may deliberately open in a different month from the work being claimed.
+func normalizePeriodYearMonth(ym string, acadYear int, startsOn string) (string, bool) {
+	if validYearMonth(ym, acadYear) {
+		return ym, true
+	}
+	start, err := time.Parse("2006-01-02", startsOn)
+	if err != nil || !validYearMonth(ym, acadYear+1) ||
+		ym != fmt.Sprintf("%04d-%02d", start.Year()+543, start.Month()) {
+		return ym, false
+	}
+	return fmt.Sprintf("%d-%02d", acadYear, start.Month()), true
 }
 
 // BulkCreateForTerm generates one submission period per calendar month the

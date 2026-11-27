@@ -972,16 +972,20 @@ func (s *DocsService) Review(ctx context.Context, actor, docID uuid.UUID, approv
 			status, reason, actor, docID).Scan(&rejUserID); err != nil {
 			return err
 		}
-		// An approved profile promises that every current required document is
-		// approved; rejecting one breaks that promise, so the profile must leave
-		// 'approved' too — exactly what RejectBatch already does. Without this
-		// the TA is told to fix a document but Upload refuses them (profile
-		// still approved), and the profile sits in the approved bucket where no
-		// officer is looking for work.
+		// Every rejection returns the profile and its current submission for
+		// correction, including a first submission still awaiting review.
 		if _, err := tx.Exec(ctx, `
 			UPDATE ta_profiles
 			   SET status='needs_fix', reject_reason=$2, verified_at=NOW(), verified_by=$3
-			 WHERE user_id=$1 AND status='approved'`,
+			 WHERE user_id=$1`,
+			rejUserID, reason, actor); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE ta_profile_submissions
+			   SET status='needs_fix', reject_reason=$2, reviewed_at=NOW(), reviewed_by=$3
+			 WHERE user_id=$1
+			   AND round=(SELECT current_round FROM ta_profiles WHERE user_id=$1)`,
 			rejUserID, reason, actor); err != nil {
 			return err
 		}
@@ -1357,7 +1361,12 @@ func (s *DocsService) ListReview(ctx context.Context, bucket string) ([]PendingP
 		SELECT u.id, u.first_name || ' ' || u.last_name, u.email,
 		       -- No profile row yet: a distinct status rather than an empty
 		       -- string, so the FE can say "ยังไม่เริ่ม" instead of showing blank.
-		       COALESCE(p.status::text, 'not_started'),
+		       CASE WHEN p.status = 'submitted' AND EXISTS (
+		           SELECT 1 FROM ta_documents returned
+		           WHERE returned.user_id = u.id AND returned.superseded_at IS NULL
+		             AND returned.kind = ANY(ta_required_doc_kinds(u.id))
+		             AND returned.status IN ('rejected','needs_fix')
+		       ) THEN 'needs_fix' ELSE COALESCE(p.status::text, 'not_started') END,
 		       COALESCE(p.current_round, 1), p.completed_at, p.verified_at,
 		       d.earliest_expires_at, COALESCE(d.all_deleted, FALSE),
 		       COALESCE(dl.used, 0), COALESCE(dl.ever, FALSE), `+docsIn+`,

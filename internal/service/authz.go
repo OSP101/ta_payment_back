@@ -132,14 +132,13 @@ func courseAccess(ctx context.Context, pool *pgxpool.Pool, actor, tcID uuid.UUID
 //   - undergrad: attendance_hrs → lecture, lab_hrs → lab,
 //     check_work_hrs → review, ug_other_hrs → other
 //   - grad (master/phd): help_teach_hrs → lecture+lab, grade_hrs → review.
-//     AllowOther is always false — other_hrs/prep_hrs exist only to satisfy
-//     the graduate school's 10-12h/week regulation total on the request
-//     form and are never loggable or payable (see loadAssignmentContext).
+//     other_hrs → other, prep_hrs → prep, each with its own weekly cap.
 //
 // If no workload form exists yet (older data or partial setup) all flags
 // default to true so existing flows don't break — the scope gate above is
 // still enforced.
 type assignmentContext struct {
+	AssignmentID     uuid.UUID
 	TeachingCourseID uuid.UUID
 	SectionID        uuid.UUID
 	TAID             uuid.UUID
@@ -151,6 +150,7 @@ type assignmentContext struct {
 	AllowLab         bool
 	AllowReview      bool
 	AllowOther       bool
+	AllowPrep        bool
 	// Weekly hour caps per activity, derived from the workload form. Same
 	// mapping as TAAssignment (undergrad: attendance/lab/check_work/ug_other;
 	// grad: help_teach shared for lecture+lab, grade, other+prep). Zero when
@@ -160,6 +160,7 @@ type assignmentContext struct {
 	WeeklyCapLab           float64
 	WeeklyCapReview        float64
 	WeeklyCapOther         float64
+	WeeklyCapPrep          float64
 	WeeklyLectureLabShared bool
 	HasWorkloadForm        bool
 	// WeeklyTotalHours is the sum of the declared weekly workload hours. Times
@@ -182,7 +183,7 @@ type assignmentContext struct {
 }
 
 func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID uuid.UUID) (*assignmentContext, error) {
-	var ac assignmentContext
+	ac := assignmentContext{AssignmentID: assignmentID}
 	// LEFT JOIN ta_workload_forms so an assignment without a workload row
 	// still returns; COALESCE ensures NULL numeric fields don't blow up the
 	// comparison and get treated as "no hours declared" (which then falls
@@ -254,15 +255,8 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		ac.AllowLecture = help > 0
 		ac.AllowLab = help > 0
 		ac.AllowReview = grade > 0
-		// other_hrs/prep_hrs ("อื่นๆ"/"เตรียมการสอน") are declared purely to
-		// satisfy the graduate school's 10-12 ชม./สัปดาห์ regulation total on
-		// the lecturer's request form — confirmed with the office
-		// (2026-09-11) that they must NOT translate into anything loggable
-		// or payable. AllowOther is hardcoded false (not other>0||prep>0) so
-		// neither the worklog duty-schedule system (declaredDutyHours,
-		// worklog.go, already grad-review-only) nor a manual "เพิ่มรายการ"
-		// entry can ever create an "other"-activity work_log for a grad TA.
-		ac.AllowOther = false
+		ac.AllowOther = other > 0
+		ac.AllowPrep = prep > 0
 		// help_teach is a combined cap: lecture + lab weekly total must stay
 		// under it (not each independently). WeeklyLectureLabShared=true tells
 		// enforcement to sum the two activities before comparing.
@@ -270,11 +264,10 @@ func loadAssignmentContext(ctx context.Context, pool *pgxpool.Pool, assignmentID
 		ac.WeeklyCapLab = help
 		ac.AttendanceDutyHrs = attendanceDutyHours
 		ac.WeeklyCapReview = grade
-		ac.WeeklyCapOther = 0
+		ac.WeeklyCapOther = other
+		ac.WeeklyCapPrep = prep
 		ac.WeeklyLectureLabShared = true
-		// other/prep excluded — they're not loggable, so they must not
-		// inflate the term ceiling that bounds total logged hours either.
-		ac.WeeklyTotalHours = help + grade
+		ac.WeeklyTotalHours = help + grade + other + prep
 	}
 	return &ac, nil
 }

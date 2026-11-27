@@ -1,0 +1,2 @@
+DROP VIEW ta_assignment_schedules;
+DROP TABLE ta_assignment_session_exclusions;

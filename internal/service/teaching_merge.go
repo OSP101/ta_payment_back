@@ -170,8 +170,10 @@ func (s *TeachingService) mergeCourseCode(ctx context.Context, actor, targetID u
 		if err := validateSectionSchedules(sec.Schedules, lecHrs, labHrs); err != nil {
 			return err
 		}
-		if sec.Curriculum != nil && *sec.Curriculum != "" && !validCurriculum(*sec.Curriculum) {
-			return Invalid("หลักสูตรไม่ถูกต้อง")
+		if sec.Curriculum != nil && *sec.Curriculum != "" {
+			if err := s.validateCurriculum(ctx, *sec.Curriculum); err != nil {
+				return err
+			}
 		}
 	}
 	tx, err := s.pool.Begin(ctx)

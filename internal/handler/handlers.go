@@ -1402,7 +1402,11 @@ func (h *TARequestHandler) EditInput(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
-	in, err := h.Svc.TARequest.EditInput(c.Context(), UserID(c), id)
+	load := h.Svc.TARequest.EditInput
+	if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		load = h.Svc.TARequest.EditInputOnBehalf
+	}
+	in, err := load(c.Context(), UserID(c), id)
 	if err != nil {
 		return err
 	}
@@ -1418,7 +1422,11 @@ func (h *TARequestHandler) Edit(c *fiber.Ctx) error {
 	if err := Bind(c, &in); err != nil {
 		return err
 	}
-	result, err := h.Svc.TARequest.Edit(c.Context(), UserID(c), id, in)
+	edit := h.Svc.TARequest.Edit
+	if rbac.Has(Roles(c), rbac.RoleAdmin, rbac.RoleStaff) {
+		edit = h.Svc.TARequest.EditOnBehalf
+	}
+	result, err := edit(c.Context(), UserID(c), id, in)
 	if err != nil {
 		return err
 	}
@@ -1513,7 +1521,15 @@ func (h *TARequestHandler) PreviewConflicts(c *fiber.Ctx) error {
 	if err != nil {
 		return err // see Create — never echo a raw internal error as the 500 body
 	}
-	return c.JSON(fiber.Map{"conflicts": out})
+	response := fiber.Map{"conflicts": out}
+	if c.Query("include_schedule") == "1" {
+		details, err := h.Svc.TARequest.PreviewConflictSchedule(c.Context(), taID, tcID)
+		if err != nil {
+			return err
+		}
+		response["schedule"] = details
+	}
+	return c.JSON(response)
 }
 
 // Candidates lists selectable TAs for a course's request form, each with their
@@ -4301,12 +4317,10 @@ type TDBMHandler struct{ Svc *service.Container }
 // deliberately UNAUTHENTICATED (decided 2026-09-15, reversing an earlier
 // shared-secret design): the body is only ever
 // {"event":"...","type":"holidays"|"extra-teachings"} and is never trusted
-// for anything beyond "something changed, sync now" — whatever it says (or
-// even an empty/malformed body), the response is the same full re-sync of the
-// active term. The worst an unauthenticated caller can do is make us pull
-// TDBM's own public read API one extra time; there is no write this endpoint
-// can be tricked into making on our data, so a secret was judged not worth
-// the operational cost of provisioning and rotating one.
+// beyond "something changed, sync now". The existing route is retained for
+// compatibility. All data is read from MariaDB, never from the webhook body
+// or the retired public API. A full snapshot covers all locally used terms,
+// including edits to older terms and multi-row changes behind a single ping.
 //
 // Answers immediately; the pull itself runs in the background via
 // TriggerAsync so TDBM's request doesn't sit open for however long two
@@ -4340,7 +4354,9 @@ func (h *TDBMHandler) SyncNow(c *fiber.Ctx) error {
 // server logs.
 func (h *TDBMHandler) SyncLog(c *fiber.Ctx) error {
 	limit, _ := strconv.Atoi(c.Query("limit", "50"))
-	out, err := h.Svc.TDBM.RecentSyncLog(c.Context(), limit)
+	year, _ := strconv.Atoi(c.Query("academic_year", "0"))
+	semester, _ := strconv.Atoi(c.Query("semester", "0"))
+	out, err := h.Svc.TDBM.RecentSyncLog(c.Context(), limit, year, semester)
 	if err != nil {
 		return err
 	}

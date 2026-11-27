@@ -32,7 +32,7 @@ type AddSectionsInput struct {
 // Nothing already on the request changes except the co-taught grouping, which
 // is recomputed over the combined set (a new section taught with an old one is
 // the same sitting). The new rows are judged with the same clash rule a fresh
-// request gets; a cross-course clash refuses the whole call with no rows written.
+// request gets: only colliding meetings are excluded, preserving the rest.
 func (s *TARequestService) AddSections(ctx context.Context, lecturerID, reqID uuid.UUID, in AddSectionsInput) (*CreateResult, error) {
 	return s.addSections(ctx, lecturerID, false, reqID, in)
 }
@@ -202,11 +202,6 @@ func (s *TARequestService) addSections(ctx context.Context, actor uuid.UUID, pri
 		}
 		if dropped {
 			return nil, fmt.Errorf("Sec %s เคยถูกตัดออกจากคำขอนี้เพราะตรงกับตารางเรียนของ %s ทุกคาบ จึงเพิ่มซ้ำไม่ได้", secNo, name)
-		}
-		// A clash with another course the TA assists blocks a fresh request;
-		// it blocks this too.
-		if err := s.checkCrossRequestConflict(ctx, tx, in.TAID, sid, termID, courseID, reqID, []string{"approved"}, name); err != nil {
-			return nil, err
 		}
 		added = append(added, sid)
 	}

@@ -255,8 +255,19 @@ func TestListReview_RejectedDocumentStillCountsAsSubmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok := listIDs(t, svc, "pending")[ta]; !ok {
+	if row, ok := listIDs(t, svc, "pending")[ta]; !ok {
 		t.Error("a TA with a rejected document dropped out of the queue")
+	} else if row.Status != "needs_fix" {
+		t.Errorf("status = %q, want needs_fix", row.Status)
+	}
+	// Older single-file rejections left the profile submitted. Saving profile
+	// details can also set it submitted before a replacement PDF is uploaded.
+	if _, err := svc.pool.Exec(ctx,
+		`UPDATE ta_profiles SET status='submitted' WHERE user_id=$1`, ta); err != nil {
+		t.Fatal(err)
+	}
+	if row := listIDs(t, svc, "pending")[ta]; row.Status != "needs_fix" || row.RevisionPending {
+		t.Fatalf("unreplaced rejection must still display needs_fix: %+v", row)
 	}
 }
 

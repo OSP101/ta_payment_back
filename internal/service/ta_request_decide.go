@@ -517,6 +517,13 @@ func (s *TARequestService) applyClashOutcomeFor(ctx context.Context, tx pgx.Tx, 
 		notices[a.taID] = append(notices[a.taID], reason)
 		notices[a.taID] = append(notices[a.taID], stripped...)
 	}
+	crossNotices, err := s.applyCrossSessionOutcome(ctx, tx, reqID, onlyTA)
+	if err != nil {
+		return nil, err
+	}
+	for ta, lines := range crossNotices {
+		notices[ta] = append(notices[ta], lines...)
+	}
 	return notices, nil
 }
 
@@ -862,7 +869,10 @@ func (s *TARequestService) finalize(ctx context.Context, reqID, termID uuid.UUID
 	var reason string
 	switch {
 	case surviving == 0:
-		reason = clashRejectReason
+		reason, err = clashRejectionReason(ctx, tx, reqID)
+		if err != nil {
+			return err
+		}
 	case passed:
 		verdict = "approved"
 	default:

@@ -70,7 +70,7 @@ type claimSheetRow struct {
 
 func claimNote(activity string, makeup bool) string {
 	base := map[string]string{
-		"lecture": "เช็คชื่อ", "lab": "สอนปฏิบัติ", "review": "ตรวจงาน", "other": "งานอื่นๆ",
+		"lecture": "เช็คชื่อ", "lab": "สอนปฏิบัติ", "review": "ตรวจงาน", "other": "งานอื่นๆ", "prep": "เตรียมการสอน",
 	}[activity]
 	if base == "" {
 		base = activity

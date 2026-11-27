@@ -1,9 +1,7 @@
 package service
 
 import (
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"context"
 	"strings"
 	"testing"
 
@@ -15,11 +13,20 @@ import (
 // holiday or makeup entered by hand.
 
 func (f *fixture) tdbmWith(holidays []tdbmHolidayRow) *TDBMService {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(holidays)
-	}))
-	f.t.Cleanup(srv.Close)
-	return &TDBMService{pool: f.Pool, aud: audit.New(f.Pool), apiBase: srv.URL}
+	for i := range holidays {
+		if holidays[i].Status == "" {
+			holidays[i].Status = "A"
+		}
+	}
+	return &TDBMService{pool: f.Pool, aud: audit.New(f.Pool), source: tdbmSourceFunc(func(context.Context, int, int) (tdbmSnapshot, error) {
+		return tdbmSnapshot{Holidays: holidays}, nil
+	})}
+}
+
+type tdbmSourceFunc func(context.Context, int, int) (tdbmSnapshot, error)
+
+func (f tdbmSourceFunc) Snapshot(ctx context.Context, y, s int) (tdbmSnapshot, error) {
+	return f(ctx, y, s)
 }
 
 func TestTDBMSyncHolidays_ClearsDraftsAndSkipsSentDays(t *testing.T) {
@@ -68,6 +75,7 @@ func TestTDBMAutoFillMakeup_FollowsSittingRules(t *testing.T) {
 
 	// Only a draft on the original sitting: makeup filed, draft removed.
 	draft := f.insertLog(next, "lab", "draft", "13:00", "16:00")
+	f.reviewEntry(2, day(28), "13:00", "16:00")
 	n, err = s.applyOneMakeup(f.ctx, f.SectionID,
 		unresolvedPeriod{SectionID: f.SectionID, HolidayDate: next, Kind: "lab"},
 		tdbmCandidate{ExtraClassID: 2, SectionID: f.SectionID, ClassDate: day(28), StartTime: "13:00", EndTime: "16:00"})

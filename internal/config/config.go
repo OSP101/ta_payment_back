@@ -68,14 +68,14 @@ type Config struct {
 	Port        string
 	DatabaseURL string
 	// AutoMigrate is disabled in the hardened stack: a separate owner job runs DDL.
-	AutoMigrate bool
+	AutoMigrate        bool
 	AsyncNotifications bool
-	JWTSecret   string
-	JWTIssuer   string
-	JWTLifetime time.Duration
-	CORSOrigins string
-	UploadDir   string
-	MaxUploadMB int
+	JWTSecret          string
+	JWTIssuer          string
+	JWTLifetime        time.Duration
+	CORSOrigins        string
+	UploadDir          string
+	MaxUploadMB        int
 	// AppEnv gates production-only hardening (see main.go's ClamAV startup
 	// check). Anything other than "production" is treated as a dev/staging
 	// box where those checks would just get in the way.
@@ -189,12 +189,14 @@ type Config struct {
 	// challenged at login regardless of this flag. Flip back to true (or
 	// unset it) once real enrolment is ready to be required again.
 	MFAMandatoryEnforced bool
-	// TDBM (tdbm.computing.kku.ac.th) — the college's own teaching-compensation
-	// system. Source of truth for holidays and lecturer-filed makeup ("สอนชดเชย")
-	// submissions; see docs/TDBM-API-requirements.md. Public read API, no key.
-	// POST /tdbm-webhook (TDBM → us) is deliberately unauthenticated too — see
-	// TDBMHandler.Webhook's doc comment.
-	TDBMAPIBaseURL string
+	// TDBM is read directly from MariaDB. The existing webhook only wakes
+	// the synchronizer; there is no HTTP API fallback.
+	TDBMDBHost     string
+	TDBMDBPort     int
+	TDBMDBName     string
+	TDBMDBUser     string
+	TDBMDBPassword string
+	TDBMDBTLS      string
 	// RegKKUBaseURL is the registrar's class-information site, read (never
 	// written) for real enrolment counts — see internal/regkku. Production
 	// must reach the new HTTPS API. Empty = reg4.kku.ac.th/regapiweb1/api/th.
@@ -274,18 +276,18 @@ func Load() (Config, error) {
 	}
 
 	c := Config{
-		Port:        env("PORT", "8080"),
-		DatabaseURL: resolveDatabaseURL(),
-		AutoMigrate: envBool("AUTO_MIGRATE", true),
+		Port:               env("PORT", "8080"),
+		DatabaseURL:        resolveDatabaseURL(),
+		AutoMigrate:        envBool("AUTO_MIGRATE", true),
 		AsyncNotifications: envBool("ASYNC_NOTIFICATIONS", false),
-		JWTSecret:   env("JWT_SECRET", ""),
-		JWTIssuer:   env("JWT_ISSUER", "ta-payment"),
-		CORSOrigins: env("CORS_ORIGINS", "http://localhost:3000"),
-		UploadDir:   env("UPLOAD_DIR", "./data/uploads"),
-		AppEnv:      env("APP_ENV", "development"),
-		SMTPHost:    env("SMTP_HOST", ""),
-		SMTPUser:    env("SMTP_USER", ""),
-		SMTPPass:    env("SMTP_PASS", ""),
+		JWTSecret:          env("JWT_SECRET", ""),
+		JWTIssuer:          env("JWT_ISSUER", "ta-payment"),
+		CORSOrigins:        env("CORS_ORIGINS", "http://localhost:3000"),
+		UploadDir:          env("UPLOAD_DIR", "./data/uploads"),
+		AppEnv:             env("APP_ENV", "development"),
+		SMTPHost:           env("SMTP_HOST", ""),
+		SMTPUser:           env("SMTP_USER", ""),
+		SMTPPass:           env("SMTP_PASS", ""),
 		// MAILER_FROM (the university's sheet) > EMAIL_FROM (the other KKU
 		// systems' name, may be "Name <addr>") > MAIL_FROM (this system's old one).
 		MailFrom:             env("MAILER_FROM", env("EMAIL_FROM", env("MAIL_FROM", "no-reply@coco.kku.ac.th"))),
@@ -304,7 +306,12 @@ func Load() (Config, error) {
 		TADocsEncKey:         env("TA_DOCS_ENC_KEY", ""),
 		PIIEncKey:            env("PII_ENC_KEY", ""),
 		TOTPEncKey:           env("TOTP_ENC_KEY", ""),
-		TDBMAPIBaseURL:       env("TDBM_API_BASE_URL", "https://tdbm.computing.kku.ac.th/api"),
+		TDBMDBHost:           env("TDBM_DB_HOST", ""),
+		TDBMDBPort:           envInt("TDBM_DB_PORT", 3306),
+		TDBMDBName:           env("TDBM_DB_NAME", "cp_tdbm"),
+		TDBMDBUser:           env("TDBM_DB_USER", ""),
+		TDBMDBPassword:       env("TDBM_DB_PASSWORD", ""),
+		TDBMDBTLS:            env("TDBM_DB_TLS", "false"),
 		RegKKUBaseURL:        env("REG_KKU_BASE_URL", ""),
 		RegKKULegacyBaseURL:  env("REG_KKU_LEGACY_BASE_URL", ""),
 		ClamAVAddr:           env("CLAMAV_ADDR", ""),

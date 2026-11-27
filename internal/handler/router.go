@@ -309,6 +309,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	// ขอใช้ TA, ปะหน้าจ่ายตรง) print under, plus the course-group review flow
 	// for courses taught under more than one registrar code.
 	authed.Get("/curricula", editGuard, th.ListCurricula)
+	authed.Post("/curricula", adminOrStaff, editGuard, th.CreateCurriculum)
+	authed.Delete("/curricula/:code", adminOrStaff, editGuard, th.DeleteCurriculum)
 	authed.Patch("/curricula/:code", adminOrStaff, editGuard, th.UpdateCurriculum)
 	// Contact block at the foot of every notification e-mail.
 	dph := &DocumentPolicyHandler{Svc: svc}
@@ -407,8 +409,8 @@ func MountAPI(api fiber.Router, svc *service.Container, tokens *auth.TokenServic
 	authed.Get("/ta-requests/:id", RequireRole(rbac.RoleAdmin, rbac.RoleStaff, rbac.RoleLecturer), editGuard, rh.Detail)
 	// Staff may file for a lecturer (lecturer_id in the body) — 03/10/2026.
 	authed.Post("/ta-requests", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.Create)
-	authed.Get("/ta-requests/:id/edit", RequireRole(rbac.RoleLecturer), editGuard, rh.EditInput)
-	authed.Put("/ta-requests/:id", RequireRole(rbac.RoleLecturer), editGuard, rh.Edit)
+	authed.Get("/ta-requests/:id/edit", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.EditInput)
+	authed.Put("/ta-requests/:id", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.Edit)
 	authed.Post("/ta-requests/:id/cancel", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.Cancel)
 	authed.Post("/ta-requests/:id/sections", RequireRole(rbac.RoleLecturer, rbac.RoleAdmin, rbac.RoleStaff), editGuard, rh.AddSections)
 	// Workload correction — staff/admin only. Cancel above refuses once

@@ -17,58 +17,24 @@ import (
 // The hour caps and the baht cap agree by construction — 7×40 = 280 and 6×50 =
 // 300 — so neither alone is redundant, and both have to hold.
 //
-// The entry gate's side of this is covered in worklog_baseline_test.go. What is
-// covered HERE is the request gate, which became load-bearing on 05/08/2026:
-// the declared-hours ceiling moved from the credit notation to the section's
-// real timetable, and a real timetable can be longer than the credits implied.
-// A group meeting 8 hours in one day would now accept an 8-hour declaration on
-// the ceiling alone — enforceDailyHourFeasibility is what refuses it, and until
-// now nothing tested that function at all.
-
-// A ป.ตรี ภาคปกติ group may not meet more than 7 hours in one day.
-func TestAnnouncedLimit_UndergradRegularDailyHoursIs7(t *testing.T) {
-	f := newCapFixture(t)
-	sec := f.addSection("1", [3]string{"lecture", "08:00", "16:00"}) // 8 hours, one day
-
-	err := f.svc.enforceDailyHourFeasibility(f.ctx, []uuid.UUID{sec}, "undergrad", "ผู้ช่วย ทดสอบ", 8)
-	if err == nil {
-		t.Fatal("8 hours in one day exceeds the announced 7 ชม./วัน for ป.ตรี ภาคปกติ")
-	}
-	if !strings.Contains(err.Error(), "7.0") {
-		t.Fatalf("the refusal should quote the announced cap, got %q", err)
-	}
-
-	// Exactly 7 is allowed — the cap is inclusive.
-	f2 := newCapFixture(t)
-	sec2 := f2.addSection("1", [3]string{"lecture", "08:00", "15:00"}) // 7 hours
-	if err := f2.svc.enforceDailyHourFeasibility(f2.ctx, []uuid.UUID{sec2}, "undergrad", "ผู้ช่วย", 7); err != nil {
-		t.Fatalf("exactly 7 hours must be allowed: %v", err)
-	}
-}
-
-// ภาคพิเศษ is 6, not 7 — the tighter of the two must win for a special group.
-func TestAnnouncedLimit_UndergradSpecialDailyHoursIs6(t *testing.T) {
-	f := newCapFixture(t)
-	sec := f.addSection("1", [3]string{"lecture", "08:00", "14:30"}) // 6.5 hours
-	f.exec(`UPDATE sections SET track = 'special' WHERE id = $1`, sec)
-
-	err := f.svc.enforceDailyHourFeasibility(f.ctx, []uuid.UUID{sec}, "undergrad", "ผู้ช่วย", 6.5)
-	if err == nil {
-		t.Fatal("6.5 hours exceeds the announced 6 ชม./วัน for ภาคพิเศษ")
-	}
-	if !strings.Contains(err.Error(), "6.0") {
-		t.Fatalf("the refusal should quote 6.0, got %q", err)
-	}
-}
-
-// บัณฑิตศึกษา ภาคปกติ is also 6.
-func TestAnnouncedLimit_GraduateRegularDailyHoursIs6(t *testing.T) {
-	f := newCapFixture(t)
-	sec := f.addSection("1", [3]string{"lecture", "08:00", "15:00"}) // 7 hours
-
-	err := f.svc.enforceDailyHourFeasibility(f.ctx, []uuid.UUID{sec}, "master", "ผู้ช่วย", 7)
-	if err == nil {
-		t.Fatal("7 hours exceeds the announced 6 ชม./วัน for บัณฑิตศึกษา ภาคปกติ")
+// Request declarations are weekly. Long class timetables do not establish
+// how many hours a TA actually works on one day; worklogs enforce daily limits.
+func TestAnnouncedLimit_LongTimetableAllowsPartialDeclaredWork(t *testing.T) {
+	for _, tc := range []struct {
+		level, track string
+		limit        float64
+	}{{"undergrad", "regular", 35}, {"undergrad", "special", 30}, {"master", "regular", 30}} {
+		t.Run(tc.level+tc.track, func(t *testing.T) {
+			f := newCapFixture(t)
+			sec := f.addSection("1", [3]string{"lecture", "08:00", "16:00"})
+			f.exec(`UPDATE sections SET track=$1 WHERE id=$2`, tc.track, sec)
+			if err := f.svc.enforceDailyHourFeasibility(f.ctx, []uuid.UUID{sec}, tc.level, "ผู้ช่วย", 4); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.svc.enforceDailyHourFeasibility(f.ctx, []uuid.UUID{sec}, tc.level, "ผู้ช่วย", tc.limit+1); err == nil {
+				t.Fatal("weekly ceiling was bypassed")
+			}
+		})
 	}
 }
 

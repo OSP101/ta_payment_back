@@ -226,7 +226,7 @@ type CourseSectionInput struct {
 	// Curriculum is optional and only meaningful for the manual "add course"
 	// form — the Excel import path derives it from the registrar's ReservedFor
 	// column instead (see curriculumFromReserved). Validated against the same
-	// CHECK constraint as UpdateSection's Curriculum field.
+	// database list as UpdateSection's Curriculum field.
 	Curriculum *string           `json:"curriculum,omitempty"`
 	Schedules  []SectionSchedule `json:"schedules,omitempty"`
 	Exams      []ExamSchedule    `json:"exams,omitempty"`
@@ -297,8 +297,10 @@ func (s *TeachingService) Create(ctx context.Context, actor uuid.UUID, in Create
 		if err := validateSectionSchedules(sec.Schedules, lecHrs, labHrs); err != nil {
 			return uuid.Nil, err
 		}
-		if sec.Curriculum != nil && *sec.Curriculum != "" && !validCurriculum(*sec.Curriculum) {
-			return uuid.Nil, Invalid("หลักสูตรไม่ถูกต้อง")
+		if sec.Curriculum != nil && *sec.Curriculum != "" {
+			if err := s.validateCurriculum(ctx, *sec.Curriculum); err != nil {
+				return uuid.Nil, err
+			}
 		}
 	}
 	if err := validateCourseStudents(sectionTotal); err != nil {
@@ -801,6 +803,9 @@ func (s *TeachingService) ListForTA(ctx context.Context, taID uuid.UUID, termID 
 // Surfaced so the TA-facing course page can resolve the assignment_id needed by
 // /assignments/:id/worklog without having to peek at the /ta-requests API.
 type TAAssignment struct {
+	// Workload preserves the lecturer's declared duties and descriptions for this TA.
+	Workload *WorkloadInput `json:"workload"`
+
 	ID               uuid.UUID `json:"id"`
 	TeachingCourseID uuid.UUID `json:"teaching_course_id"`
 	CourseCode       string    `json:"course_code"`
@@ -834,6 +839,7 @@ type TAAssignment struct {
 	WeeklyCapLab           float64 `json:"weekly_cap_lab"`
 	WeeklyCapReview        float64 `json:"weekly_cap_review"`
 	WeeklyCapOther         float64 `json:"weekly_cap_other"`
+	WeeklyCapPrep          float64 `json:"weekly_cap_prep"`
 	WeeklyLectureLabShared bool    `json:"weekly_lecture_lab_shared"`
 	WeeklyCapsSet          bool    `json:"weekly_caps_set"`
 	// TermHourCeiling caps the TOTAL hours loggable for this assignment across
@@ -908,8 +914,9 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	                  ELSE COALESCE(wf.help_teach_hrs, 0) END,
 	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.check_work_hrs, 0)
 	                  ELSE COALESCE(wf.grade_hrs, 0) END,
-	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.ug_other_hrs, 0)
-	                  ELSE COALESCE(wf.other_hrs, 0) + COALESCE(wf.prep_hrs, 0) END,
+	             CASE WHEN a.level::text = 'undergrad' THEN COALESCE(wf.ug_other_hrs, 0) + COALESCE(wf.lab_other_hrs, 0)
+	                  ELSE COALESCE(wf.other_hrs, 0) END,
+	             CASE WHEN a.level::text = 'undergrad' THEN 0 ELSE COALESCE(wf.prep_hrs, 0) END,
 	             (a.level::text != 'undergrad'),
 	             (wf.id IS NOT NULL),
 	             a.state::text, a.state_reason,
@@ -931,7 +938,7 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	               WHERE wl.assignment_id = a.id AND wl.status = 'approved'),
 	             (SELECT COALESCE(SUM(wl.hours), 0) FROM work_logs wl
 	               WHERE wl.assignment_id = a.id AND wl.status <> 'rejected'),
-	             hb.lec, hb.lab, hb.rev, hb.mk, hb.oth,
+	             hb.lec, hb.lab, hb.rev, hb.mk, hb.oth, hb.prep,
 	             COALESCE((SELECT jsonb_object_agg(m, d) FROM (
 	                 SELECT to_char(wl.work_date,'YYYY-MM') AS m, to_char(MAX(wl.work_date),'YYYY-MM-DD') AS d
 	                 FROM work_logs wl
@@ -939,7 +946,8 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	                 GROUP BY 1) x), '{}'::jsonb),
 	             COALESCE((SELECT ARRAY_AGG(DISTINCT to_char(ms.makeup_date,'YYYY-MM-DD'))
 	               FROM makeup_schedules ms
-	               WHERE ms.section_id = sec.id AND NOT COALESCE(ms.waived, FALSE)), '{}')
+	               WHERE ms.section_id = sec.id AND NOT COALESCE(ms.waived, FALSE)), '{}'),
+	             to_jsonb(wf)
 	      FROM ta_request_assignments a
 	      JOIN sections sec ON sec.id = a.section_id
 	      JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
@@ -954,7 +962,8 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	              COALESCE(SUM(hours) FILTER (WHERE activity = 'lab'),     0) AS lab,
 	              COALESCE(SUM(hours) FILTER (WHERE activity = 'review'),  0) AS rev,
 	              COALESCE(SUM(hours) FILTER (WHERE activity = 'makeup'),  0) AS mk,
-	              COALESCE(SUM(hours) FILTER (WHERE activity = 'other'),   0) AS oth
+	              COALESCE(SUM(hours) FILTER (WHERE activity = 'other'),   0) AS oth,
+              COALESCE(SUM(hours) FILTER (WHERE activity = 'prep'), 0) AS prep
 	          FROM work_logs wl WHERE wl.assignment_id = a.id AND wl.status <> 'rejected'
 	      ) hb ON TRUE
 	      -- 'dropped' means every session of that section clashed with the TA's
@@ -975,17 +984,17 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 	out := []TAAssignment{}
 	for rows.Next() {
 		var a TAAssignment
-		var hLec, hLab, hRev, hMk, hOth float64
+		var hLec, hLab, hRev, hMk, hOth, hPrep float64
 		if err := rows.Scan(&a.ID, &a.TeachingCourseID, &a.CourseCode, &a.CourseName,
 			&a.SectionID, &a.SecNo, &a.Track, &a.Level, &a.ReimburseScope, &a.HasSchedule,
-			&a.WeeklyCapLecture, &a.WeeklyCapLab, &a.WeeklyCapReview, &a.WeeklyCapOther,
+			&a.WeeklyCapLecture, &a.WeeklyCapLab, &a.WeeklyCapReview, &a.WeeklyCapOther, &a.WeeklyCapPrep,
 			&a.WeeklyLectureLabShared, &a.WeeklyCapsSet, &a.State, &a.StateReason,
 			&a.UnsentCount, &a.SubmittableCount, &a.StrandedCount, &a.MonthsInReview, &a.SubmittedCount, &a.ApprovedCount, &a.HoursLogged,
-			&hLec, &hLab, &hRev, &hMk, &hOth, &a.LastSentByMonth, &a.MakeupDates); err != nil {
+			&hLec, &hLab, &hRev, &hMk, &hOth, &hPrep, &a.LastSentByMonth, &a.MakeupDates, &a.Workload); err != nil {
 			return nil, err
 		}
 		a.HoursByActivity = map[string]float64{
-			"lecture": hLec, "lab": hLab, "review": hRev, "makeup": hMk, "other": hOth,
+			"lecture": hLec, "lab": hLab, "review": hRev, "makeup": hMk, "other": hOth, "prep": hPrep,
 		}
 		out = append(out, a)
 	}
@@ -1001,7 +1010,7 @@ func (s *TeachingService) ListAssignmentsForTA(ctx context.Context, taID uuid.UU
 		if !a.WeeklyCapsSet {
 			continue
 		}
-		weeklyTotal := a.WeeklyCapReview + a.WeeklyCapOther
+		weeklyTotal := a.WeeklyCapReview + a.WeeklyCapOther + a.WeeklyCapPrep
 		if a.WeeklyLectureLabShared {
 			weeklyTotal += a.WeeklyCapLecture // help covers lecture+lab once
 		} else {
@@ -1596,8 +1605,10 @@ func (s *TeachingService) updateCourseInfo(ctx context.Context, actor, id uuid.U
 			return err
 		}
 	}
-	if in.Curriculum != nil && *in.Curriculum != "" && !validCurriculum(*in.Curriculum) {
-		return Invalid("หลักสูตรไม่ถูกต้อง")
+	if in.Curriculum != nil && *in.Curriculum != "" {
+		if err := s.validateCurriculum(ctx, *in.Curriculum); err != nil {
+			return err
+		}
 	}
 	if len(sets) == 0 && in.Curriculum == nil {
 		return nil
@@ -1825,6 +1836,15 @@ func (s *TeachingService) replaceSectionSchedules(ctx context.Context, actor, tc
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// Serialize with request creation/finalization before taking course locks.
+	// Otherwise a request could approve against the old WBA timetable.
+	var termID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT term_id FROM teaching_courses WHERE id=$1`, tcID).Scan(&termID); err != nil {
+		return err
+	}
+	if err := lockTermRequests(ctx, tx, termID); err != nil {
+		return err
+	}
 	if err := s.assertNotExported(ctx, tx, tcID); err != nil {
 		return err
 	}
@@ -1867,6 +1887,9 @@ func (s *TeachingService) replaceSectionSchedules(ctx context.Context, actor, tc
 			uuid.New(), sectionID, sch.Kind, sch.DayOfWeek, sch.StartTime, sch.EndTime, sch.Room); err != nil {
 			return err
 		}
+	}
+	if err := assertSectionRequestSchedules(ctx, tx, sectionID); err != nil {
+		return err
 	}
 	if !priv {
 		// Spend the lecturer's one write. Staff edits deliberately leave the
@@ -2042,17 +2065,8 @@ type UpdateSectionInput struct {
 	// Deliberately untagged: validator's omitempty does not treat a non-nil
 	// pointer-to-"" as empty (only a nil pointer skips the check), so a
 	// oneof tag here would reject the "clear back to unknown" sentinel this
-	// field relies on. validCurriculum() in UpdateSection is the real check.
+	// field relies on. validateCurriculum() in UpdateSection is the database check.
 	Curriculum *string `json:"curriculum,omitempty"`
-}
-
-// validCurriculum mirrors the CHECK constraint on sections.curriculum.
-func validCurriculum(v string) bool {
-	switch v {
-	case "CS", "IT", "GIS", "AI", "CY", "OTHER":
-		return true
-	}
-	return false
 }
 
 // UpdateSection edits sec_no / room / num_students on a single section.
@@ -2079,8 +2093,10 @@ func (s *TeachingService) updateSection(ctx context.Context, actor, tcID, sectio
 			return err
 		}
 	}
-	if in.Curriculum != nil && *in.Curriculum != "" && !validCurriculum(*in.Curriculum) {
-		return Invalid("หลักสูตรไม่ถูกต้อง")
+	if in.Curriculum != nil && *in.Curriculum != "" {
+		if err := s.validateCurriculum(ctx, *in.Curriculum); err != nil {
+			return err
+		}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

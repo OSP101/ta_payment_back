@@ -27,7 +27,7 @@ COPY --from=build /out/seed /app/seed
 COPY --from=build /out/migrate /app/migrate
 COPY --from=build /out/ta-accounts /app/ta-accounts
 COPY --from=build /out/alert-mailer /app/alert-mailer
-COPY migrations /app/migrations
+COPY --chown=nobody:nobody migrations /app/migrations
 COPY assets /app/assets
 # UPLOAD_DIR in compose points here; the named volume inherits this ownership
 # on first creation. Nothing under /app is writable at runtime on purpose.

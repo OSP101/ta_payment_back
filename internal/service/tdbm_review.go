@@ -132,19 +132,31 @@ func (s *TDBMService) MatchMakeups(ctx context.Context, actor uuid.UUID, in TDBM
 		var courseID uuid.UUID
 		var applied *uuid.UUID
 		var status string
+		var missing, reference bool
+		var original, originalKind, reconcileError *string
 		err := tx.QueryRow(ctx, `SELECT t.extra_class_id, t.section_id, to_char(t.class_date,'YYYY-MM-DD'),
 		 to_char(t.start_time,'HH24:MI'), to_char(t.end_time,'HH24:MI'), sx.teaching_course_id,
-		 t.applied_makeup_id, COALESCE(t.opt_status,'')
+		 t.applied_makeup_id, COALESCE(t.opt_status,''),t.source_missing,t.source_reference,
+		 t.source_original_date::text,t.source_original_kind,t.reconciliation_error
 		 FROM tdbm_extra_teachings t JOIN sections sx ON sx.id = t.section_id
 		 WHERE t.extra_class_id = $1 AND t.academic_year = $2 AND t.semester = $3 FOR UPDATE OF t`,
-			item.ExtraClassID, in.AcademicYear, in.Semester).Scan(&c.ExtraClassID, &c.SectionID, &c.ClassDate, &c.StartTime, &c.EndTime, &courseID, &applied, &status)
+			item.ExtraClassID, in.AcademicYear, in.Semester).Scan(&c.ExtraClassID, &c.SectionID, &c.ClassDate, &c.StartTime, &c.EndTime, &courseID, &applied, &status, &missing, &reference, &original, &originalKind, &reconcileError)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, Conflict("ไม่พบรายการหรือยังไม่ได้จับคู่กลุ่มเรียน กรุณาโหลดข้อมูลใหม่")
 		}
 		if err != nil {
 			return 0, err
 		}
-		if applied != nil || status == "C" || !lockedSections[c.SectionID] {
+		if reference {
+			return 0, Conflict("รายการอ้างอิงหรือรายการเดิมที่ถูกแทนที่ ใช้คาบปัจจุบันจากเอกสาร TDBM แล้ว")
+		}
+		if missing || !tdbmMakeupEligible(status) {
+			return 0, Conflict("ใช้รายการสอนชดเชยจาก TDBM เฉพาะสถานะ A และ D เท่านั้น")
+		}
+		if reconcileError != nil || (original != nil && (*original != item.OriginalDate || originalKind == nil || *originalKind != item.Kind)) {
+			return 0, Conflict(tdbmReconcileConflict)
+		}
+		if applied != nil || !lockedSections[c.SectionID] {
 			return 0, Conflict("รายการถูกจับคู่หรือยกเลิกแล้ว กรุณาโหลดข้อมูลใหม่")
 		}
 		key := fmt.Sprintf("%s/%s/%s", c.SectionID, item.OriginalDate, item.Kind)
@@ -216,7 +228,9 @@ func (s *TDBMService) insertTDBMMakeup(ctx context.Context, tx pgx.Tx, sectionID
 	}
 	if _, err := tx.Exec(ctx, `UPDATE tdbm_extra_teachings SET applied_makeup_id = $1
 	 WHERE section_id = $2 AND class_date = $3::date AND start_time = $4::time AND end_time = $5::time
-	 AND applied_makeup_id IS NULL AND opt_status <> 'C'`, id, sectionID, c.ClassDate, c.StartTime, c.EndTime); err != nil {
+	 AND applied_makeup_id IS NULL AND opt_status IN ('A','D') AND NOT source_missing AND NOT source_reference
+	 AND reconciliation_error IS NULL
+	 AND (source_original_date IS NULL OR (source_original_date=$6::date AND source_original_kind=$7))`, id, sectionID, c.ClassDate, c.StartTime, c.EndTime, p.HolidayDate, p.Kind); err != nil {
 		return 0, err
 	}
 	if err := s.aud.LogTx(ctx, tx, audit.Entry{ActorID: actor, Action: action, Entity: "section", EntityID: sectionID.String(),

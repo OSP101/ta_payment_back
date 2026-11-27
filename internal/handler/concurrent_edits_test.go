@@ -307,6 +307,8 @@ func TestEditScopeMappingsAcrossPageFamilies(t *testing.T) {
 		{"POST", "/api/v1/document-progress/checklist/:tcId", "/api/v1/document-progress/checklist/" + course, "{}", "course:" + course},
 		{"POST", "/api/v1/exports/terms/:id/monthly-payout.zip", "/api/v1/exports/terms/" + term + "/monthly-payout.zip", "{}", "term:" + term},
 		{"POST", "/api/v1/settings/admin-officers", "/api/v1/settings/admin-officers", `{"user_id":"` + user + `"}`, "table:admin_officers"},
+		{"POST", "/api/v1/curricula", "/api/v1/curricula", "{}", "curriculum:*"},
+		{"DELETE", "/api/v1/curricula/:code", "/api/v1/curricula/CS", "", "curriculum:CS"},
 		{"PATCH", "/api/v1/curricula/:code", "/api/v1/curricula/CS", "{}", "curriculum:CS"},
 		{"GET", "/api/v1/curricula", "/api/v1/curricula", "", "curriculum:*"},
 		{"POST", "/api/demo/w/:slot/teaching-courses/:id/sections", "/api/demo/w/1/teaching-courses/" + course + "/sections", "{}", "course:" + course},

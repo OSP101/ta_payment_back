@@ -168,6 +168,7 @@ var catalog = map[string]ActionInfo{
 	"makeup.unwaive":             warn("ยกเลิกการยกเว้นคาบชดเชย", CatHours),
 	"makeup.match_from_tdbm":     ok("เจ้าหน้าที่จับคู่คาบชดเชยจาก TDBM", CatHours),
 	"makeup.auto_fill_from_tdbm": system(ok("เติมคาบชดเชยอัตโนมัติจากตารางสอนชดเชย (TDBM)", CatHours)),
+	"makeup.sync_from_tdbm":      system(ok("ปรับคาบชดเชยตามฐานข้อมูล TDBM", CatHours)),
 
 	// ── Payment paperwork ───────────────────────────────────────────────────
 	"submission.staff_reviewed":           ok("เจ้าหน้าที่ตรวจผ่าน", CatPayment),
@@ -231,6 +232,8 @@ var catalog = map[string]ActionInfo{
 	"section.delete":                    warn("ลบกลุ่มเรียน", CatCourse),
 	"section.schedules.replace":         ok("แก้ตารางสอนของกลุ่มเรียน", CatCourse),
 	"section.curriculum.update":         ok("เปลี่ยนหลักสูตรของกลุ่มเรียน", CatCourse),
+	"curriculum.create":                 ok("เพิ่มหลักสูตร", CatCourse),
+	"curriculum.delete":                 ok("ลบหลักสูตร", CatCourse),
 	"curriculum.update":                 ok("แก้ไขข้อมูลหลักสูตร", CatCourse),
 	"schedule.import":                   ok("นำเข้าตารางสอน", CatCourse),
 	"term.create":                       ok("สร้างภาคการศึกษา", CatCourse),

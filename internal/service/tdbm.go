@@ -2,16 +2,12 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"regexp"
 	"strings"
 	"sync"
-	"ta-payment-back/internal/telemetry"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,67 +17,19 @@ import (
 	"ta-payment-back/internal/audit"
 )
 
-// TDBMService pulls holidays and lecturer-filed makeup-teaching submissions
-// ("สอนชดเชย") from TDBM (tdbm.computing.kku.ac.th) — the college's own,
-// and (since 2026-09-15) ONLY, system of record for both. The Bank of
-// Thailand holiday sync this replaced (HolidayService.SyncFromBOT, formerly
-// here) is gone; see docs/TDBM-API-requirements.md for why.
-//
-// Extra-teachings rows are landed in the tdbm_extra_teachings staging table
-// AND — since 2026-09-18, see AutoFillMakeupSchedules — auto-filed into
-// makeup_schedules once resolved down to a section. TDBM added course_code +
-// owner_teacher_name (2026-09-14) and then section + semester_type
-// (2026-09-15, migration 0117) to get there (see resolveCourseMatches,
-// resolveSectionMatches). Decided explicitly (2026-09-18): lecturers are
-// already required to file in TDBM, so its record is trusted as-is rather
-// than held for a staff confirmation step — see AutoFillMakeupSchedules'
-// own doc comment for the real limitation this runs into (TDBM does not say
-// WHICH holiday a submission replaces) and how it's worked around.
-//
-// DESIGN DECISION, already implemented by AutoFillMakeupSchedules: an
-// auto-filed makeup is never run back through our own holiday-overlap
-// validation (loadHolidaysInRange / holidaySet in worklog.go, AddMakeup's own
-// check) — it writes directly via pool.Exec, not through AddMakeup. TDBM's
-// date/time on a row IS the record of when the college actually held the
-// makeup class — if it happens to fall on what our public_holidays calendar
-// calls a holiday (all-day, because TDBM doesn't give us a half-day window —
-// see docs/TDBM-API-requirements.md §6.1), that is our calendar being
-// imprecise, not the makeup being invalid. TDBM's own record wins.
+// TDBMService mirrors holidays and makeup sittings from the college's MariaDB.
+// Webhooks are wake-up signals only. Every successful pull is a full term
+// snapshot, including cancelled and deleted rows. There is no HTTP fallback.
 type TDBMService struct {
-	pool    *pgxpool.Pool
-	aud     *audit.Auditor
-	apiBase string
+	pool   *pgxpool.Pool
+	aud    *audit.Auditor
+	source tdbmSource
 
-	// syncMu/syncing coalesce bursts of webhook pings (or a webhook racing the
-	// hourly scheduler tick) into one in-flight sync instead of piling up
-	// concurrent pulls against the same term. A ping that arrives while a sync
-	// is already running is dropped — the run in flight will see whatever
-	// changed, and if it lands mid-write, the next scheduler tick (or the next
-	// webhook ping) picks it up within the hour regardless.
+	// Coalesce a burst into an in-flight run and one trailing run.
 	syncMu  sync.Mutex
 	syncing bool
-	// lastWebhook throttles webhook-triggered pulls service-wide. The route is
-	// unauthenticated by decision (see TDBMHandler.Webhook) and its limiter is
-	// per IP, so many addresses could otherwise keep a sync running back to
-	// back and decide when data is re-imported.
-	lastWebhook time.Time
+	pending bool
 }
-
-// ---------------------------------------------------------------------------
-// Upstream row shapes — only the fields we consume are declared.
-//
-// tdbmHolidayRow captured against the live API on 2026-08-22 and unchanged as
-// of API_DOCUMENTATION.md (2026-09-14) — still no half-day window, still see
-// docs/TDBM-API-requirements.md for the rest of what's still asked for.
-//
-// tdbmExtraTeachingRow was REPLACED wholesale on 2026-09-14: TDBM added
-// course_code + owner_teacher_name (what we asked for) and, per
-// API_DOCUMENTATION.md, dropped every other field the old shape had —
-// detail, status, teacher_id, holiday_id, teaching_id, class_id, dbm_id,
-// etdoc_id, created_user_id, both timestamps. Confirmed against the live
-// endpoint the same day; this struct matches what actually comes back, not
-// just the doc.
-// ---------------------------------------------------------------------------
 
 type tdbmHolidayRow struct {
 	HolidayID int    `json:"holiday_id"`
@@ -102,93 +50,35 @@ type tdbmHolidayRow struct {
 }
 
 type tdbmExtraTeachingRow struct {
-	ExtraClassID int     `json:"extra_class_id"`
-	Title        *string `json:"title"`
-	ClassDate    string  `json:"class_date"`
-	StartTime    string  `json:"start_time"`
-	EndTime      string  `json:"end_time"`
-	Duration     int     `json:"duration"`
-	// CourseCode is the real REG subject code (e.g. "CP411105"); see
-	// resolveCourseMatches.
-	CourseCode *string `json:"course_code"`
-	// Section (e.g. "กลุ่มที่ 2") and SemesterType (e.g. "ภาคพิเศษ") arrived
-	// 2026-09-15, on top of CourseCode — together they resolve a submission
-	// down to one specific `sections` row instead of just the course; see
-	// resolveSectionMatches.
-	Section      *string `json:"section"`
-	SemesterType *string `json:"semester_type"`
-	// OwnerTeacherName is resolved upstream via the COURSE's owner_teacher_id,
-	// not necessarily whoever actually filed this specific submission (see
-	// API_DOCUMENTATION.md's relationship diagram: extra_teaching.class_id →
-	// classes.course_id → courses.owner_teacher_id). Close enough to use for
-	// display; not guaranteed to be "the lecturer who submitted this request"
-	// if a co-lecturer or TA filed on the owner's behalf.
+	ExtraClassID     int     `json:"extra_class_id"`
+	Title            *string `json:"title"`
+	ClassDate        string  `json:"class_date"`
+	StartTime        string  `json:"start_time"`
+	EndTime          string  `json:"end_time"`
+	Duration         int     `json:"duration"`
+	CourseCode       *string `json:"course_code"`
+	Section          *string `json:"section"`
+	SemesterType     *string `json:"semester_type"`
 	OwnerTeacherName *string `json:"owner_teacher_name"`
-	// OptStatus: P=pending, D=preparing/bundled, A=approved (counted in
-	// payments), C=cancelled/rejected (duration=0) — see
-	// API_DOCUMENTATION.md's state diagram. No CHECK constraint on the
-	// column: better to store a code we don't yet recognize than to fail the
-	// whole sync over one.
+	TeachingID       *int    `json:"source_teaching_id"`
+	ClassID          *int    `json:"source_class_id"`
+	HolidayID        *int
+	OriginalDate     *string `json:"source_original_date"`
+	OriginalStart    *string `json:"source_original_start"`
+	OriginalEnd      *string `json:"source_original_end"`
+	OriginalKind     *string
+	LatestStatusID   *int
+	SourceUpdatedAt  *string
+	StatusUpdatedAt  *string
+	DocumentID       *int `json:"source_document_id"`
+	SourceDuration   *int `json:"source_duration_minutes"`
+	Reference        bool `json:"source_reference"`
+	// Only A and D are eligible; every status is mirrored for reconciliation.
 	OptStatus string `json:"opt_status"`
 }
 
-// ---------------------------------------------------------------------------
-// Fetch — GET against the public (unauthenticated) TDBM API. Every call needs
-// the browser User-Agent below: TDBM's WAF 403s any client that doesn't send
-// one (see docs/TDBM-API-requirements.md §4) — asking them to drop this
-// requirement is on the same list as the API-key ask.
-// ---------------------------------------------------------------------------
-
-const tdbmUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-
-func (s *TDBMService) fetchJSON(ctx context.Context, path string, out any) error {
-	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	url := strings.TrimRight(s.apiBase, "/") + path
-	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return &UserError{Status: 502, Msg: "สร้างคำขอไปยัง TDBM API ไม่สำเร็จ"}
-	}
-	req.Header.Set("User-Agent", tdbmUserAgent)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := (&http.Client{Transport: telemetry.HTTPTransport{Integration: "tdbm"}}).Do(req)
-	if err != nil {
-		return &UserError{Status: 502, Msg: "ไม่สามารถติดต่อ TDBM API ได้ (network / timeout)"}
-	}
-	defer resp.Body.Close()
-
-	// 10 MB cap — the largest observed unfiltered payload was ~5.9 MB; a
-	// term-scoped pull is far smaller (see docs/TDBM-API-requirements.md §4, §8).
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return &UserError{Status: 502, Msg: "อ่านผลลัพธ์จาก TDBM API ไม่สำเร็จ"}
-	}
-	if resp.StatusCode != http.StatusOK {
-		return &UserError{Status: 502, Msg: fmt.Sprintf("TDBM API ตอบกลับผิดปกติ (%d)", resp.StatusCode)}
-	}
-	if err := json.Unmarshal(body, out); err != nil {
-		return &UserError{Status: 502, Msg: "รูปแบบข้อมูลจาก TDBM API เปลี่ยน โปรดตรวจสอบ"}
-	}
-	return nil
-}
-
-func (s *TDBMService) fetchHolidays(ctx context.Context, academicYear, semester int) ([]tdbmHolidayRow, error) {
-	var rows []tdbmHolidayRow
-	path := fmt.Sprintf("/holidays?academic_year=%d&semester=%d", academicYear, semester)
-	if err := s.fetchJSON(ctx, path, &rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-func (s *TDBMService) fetchExtraTeachings(ctx context.Context, academicYear, semester int) ([]tdbmExtraTeachingRow, error) {
-	var rows []tdbmExtraTeachingRow
-	path := fmt.Sprintf("/extra-teachings?academic_year=%d&semester=%d", academicYear, semester)
-	if err := s.fetchJSON(ctx, path, &rows); err != nil {
-		return nil, err
-	}
-	return rows, nil
+func tdbmMakeupEligible(status string) bool {
+	return status == "A" || status == "D"
 }
 
 // ---------------------------------------------------------------------------
@@ -202,10 +92,12 @@ const tdbmSyncFailureMessage = "ซิงก์ข้อมูลจาก TDBM 
 // Do not accept arbitrary Thai text: legacy rows can contain internal errors.
 var tdbmSyncBlockedPattern = regexp.MustCompile(`\Aข้ามวันหยุดจาก TDBM [0-9]+ วัน \([0-9]{4}-[0-9]{2}-[0-9]{2}(, [0-9]{4}-[0-9]{2}-[0-9]{2})*\) เพราะมีบันทึกเวลาคาบบรรยาย/ปฏิบัติการที่ส่งหรืออนุมัติแล้วในวันนั้น ให้อาจารย์ตีกลับรายการเหล่านั้นก่อน แล้วซิงก์อีกครั้ง\z`)
 
+var tdbmSyncWarningPattern = regexp.MustCompile(`\Aซิงก์ข้อมูล TDBM แล้ว แต่มี [0-9]+ รายการที่ต้องตรวจสอบคาบชดเชย\z`)
+
 // Only application-owned messages may leave the sync service. This
 // also protects historical log rows containing raw SQL, URLs or credentials.
 func publicTDBMSyncError(msg string) string {
-	if msg == "" || tdbmSyncBlockedPattern.MatchString(msg) {
+	if msg == "" || msg == tdbmReconcileConflict || tdbmSyncBlockedPattern.MatchString(msg) || tdbmSyncWarningPattern.MatchString(msg) {
 		return msg
 	}
 	return tdbmSyncFailureMessage
@@ -223,8 +115,10 @@ type TDBMSyncResult struct {
 	// resolve to a teaching_course via course_code; see resolveCourseMatches.
 	// Zero-value for every other resource, and not written to the log row for
 	// those (see logSync).
-	Matched int    `json:"matched,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Matched   int    `json:"matched,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Warning   string `json:"warning,omitempty"`
+	Conflicts int    `json:"conflicts,omitempty"`
 }
 
 // logSync writes one tdbm_sync_log row for a completed (or failed) resource
@@ -238,6 +132,10 @@ func (s *TDBMService) logSync(ctx context.Context, resource, triggerKind string,
 		if errMsg == "" {
 			errMsg = tdbmSyncFailureMessage
 		}
+	} else if tdbmSyncWarningPattern.MatchString(r.Warning) {
+		// Keep compatibility with existing sync history storage. The read
+		// boundary exposes this application-owned message as a warning.
+		errMsg = r.Warning
 	}
 	var yearArg, semArg any
 	if year > 0 {
@@ -274,15 +172,21 @@ func (s *TDBMService) logSync(ctx context.Context, resource, triggerKind string,
 func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, academicYear, semester int) TDBMSyncResult {
 	started := time.Now()
 	res := TDBMSyncResult{Resource: "holidays", AcademicYear: academicYear, Semester: semester}
-	rows, err := s.fetchHolidays(ctx, academicYear, semester)
+	snapshot, err := s.snapshot(ctx, academicYear, semester)
 	if err != nil {
 		res.Error = tdbmSyncFailureMessage
 		s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
 		return res
 	}
-	res.Fetched = len(rows)
+	return s.syncHolidayRows(ctx, triggerKind, academicYear, semester, snapshot)
+}
 
+func (s *TDBMService) syncHolidayRows(ctx context.Context, triggerKind string, academicYear, semester int, snapshot tdbmSnapshot) TDBMSyncResult {
+	started := time.Now()
+	rows := snapshot.Holidays
+	res := TDBMSyncResult{Resource: "holidays", AcademicYear: academicYear, Semester: semester, Fetched: len(rows)}
 	var blocked []string
+	activeHolidayIDs := make([]int, 0, len(rows))
 	for _, r := range rows {
 		// h_type is undocumented upstream (docs/TDBM-API-requirements.md §3.2),
 		// but confirmed with the college: 'D' is an exam day, not a holiday.
@@ -290,9 +194,13 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 		// worklog entry and count toward the lecturer makeup reminder — and
 		// staff already have a separate mandatory manual entry for real
 		// holidays, so there is nothing for this sync to reconcile against.
-		if r.HType == "D" {
+		if r.HType != "E" || r.Status != "A" {
 			res.Skipped++
 			continue
+		}
+		// A malformed but still-present active holiday is not a deletion.
+		if r.HolidayID > 0 {
+			activeHolidayIDs = append(activeHolidayIDs, r.HolidayID)
 		}
 		if r.HolidayID == 0 || strings.TrimSpace(r.HDate) == "" || strings.TrimSpace(r.Title) == "" {
 			res.Skipped++
@@ -369,6 +277,13 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 			res.Inserted++
 		}
 	}
+	if snapshot.StartDate != "" && snapshot.EndDate != "" {
+		if err := s.removeAbsentHolidays(ctx, snapshot.StartDate, snapshot.EndDate, activeHolidayIDs); err != nil {
+			res.Error = tdbmReconcileConflict
+			s.logSync(ctx, "holidays", triggerKind, academicYear, semester, started, res, err)
+			return res
+		}
+	}
 	if len(blocked) > 0 {
 		warn := fmt.Errorf("ข้ามวันหยุดจาก TDBM %d วัน (%s) เพราะมีบันทึกเวลาคาบบรรยาย/ปฏิบัติการที่ส่งหรืออนุมัติแล้วในวันนั้น ให้อาจารย์ตีกลับรายการเหล่านั้นก่อน แล้วซิงก์อีกครั้ง",
 			len(blocked), strings.Join(blocked, ", "))
@@ -387,18 +302,19 @@ func (s *TDBMService) SyncHolidays(ctx context.Context, triggerKind string, acad
 func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string, academicYear, semester int) TDBMSyncResult {
 	started := time.Now()
 	res := TDBMSyncResult{Resource: "extra-teachings", AcademicYear: academicYear, Semester: semester}
-	rows, err := s.fetchExtraTeachings(ctx, academicYear, semester)
+	snapshot, err := s.snapshot(ctx, academicYear, semester)
 	if err != nil {
 		res.Error = tdbmSyncFailureMessage
 		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
 		return res
 	}
-	res.Fetched = len(rows)
-	if len(rows) == 0 {
-		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, nil)
-		return res
-	}
+	return s.syncExtraRows(ctx, triggerKind, academicYear, semester, snapshot.Extra)
+}
 
+func (s *TDBMService) syncExtraRows(ctx context.Context, triggerKind string, academicYear, semester int, rows []tdbmExtraTeachingRow) TDBMSyncResult {
+	rows = tdbmNormalizeReferences(rows)
+	started := time.Now()
+	res := TDBMSyncResult{Resource: "extra-teachings", AcademicYear: academicYear, Semester: semester, Fetched: len(rows)}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		res.Error = tdbmSyncFailureMessage
@@ -407,33 +323,52 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 	}
 	defer tx.Rollback(ctx)
 
+	seen := make([]int, 0, len(rows))
 	for _, r := range rows {
-		if r.ExtraClassID == 0 || strings.TrimSpace(r.ClassDate) == "" {
-			res.Skipped++
-			continue
+		if r.ExtraClassID <= 0 {
+			res.Error = tdbmSyncFailureMessage
+			s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, errors.New("invalid upstream identity"))
+			return res
 		}
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO tdbm_extra_teachings (
-				extra_class_id, academic_year, semester, title, class_date, start_time, end_time,
-				duration_minutes, course_code, owner_teacher_name, section_label, semester_type, opt_status, synced_at)
-			VALUES ($1,$2,$3,$4,$5::date,NULLIF($6,'')::time,NULLIF($7,'')::time,$8,$9,$10,$11,$12,$13,NOW())
-			ON CONFLICT (extra_class_id) DO UPDATE
-			   SET title = EXCLUDED.title, class_date = EXCLUDED.class_date,
-			       start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time,
-			       duration_minutes = EXCLUDED.duration_minutes, course_code = EXCLUDED.course_code,
-			       owner_teacher_name = EXCLUDED.owner_teacher_name, section_label = EXCLUDED.section_label,
-			       semester_type = EXCLUDED.semester_type, opt_status = EXCLUDED.opt_status,
-			       synced_at = NOW()`,
-			r.ExtraClassID, academicYear, semester, r.Title, r.ClassDate, r.StartTime, r.EndTime,
-			r.Duration, r.CourseCode, r.OwnerTeacherName, r.Section, r.SemesterType, r.OptStatus)
+		seen = append(seen, r.ExtraClassID)
+		var inserted bool
+		err := tx.QueryRow(ctx, `
+		 INSERT INTO tdbm_extra_teachings (extra_class_id,academic_year,semester,title,class_date,start_time,end_time,
+		 duration_minutes,course_code,owner_teacher_name,section_label,semester_type,opt_status,
+		 source_teaching_id,source_class_id,source_holiday_id,source_original_date,source_original_start,source_original_end,
+		 source_original_kind,source_latest_status_id,source_updated_at,source_status_updated_at,source_missing,synced_at,source_document_id,source_duration_minutes,source_reference)
+		 VALUES ($1,$2,$3,$4,NULLIF($5,'')::date,NULLIF($6,'')::time,NULLIF($7,'')::time,$8,$9,$10,$11,$12,$13,
+		 $14,$15,$16,$17::date,$18::time,$19::time,$20,$21,$22::timestamptz,$23::timestamptz,FALSE,now(),$24,$25,$26)
+		 ON CONFLICT(extra_class_id) DO UPDATE SET academic_year=EXCLUDED.academic_year,semester=EXCLUDED.semester,
+		 title=EXCLUDED.title,class_date=EXCLUDED.class_date,start_time=EXCLUDED.start_time,end_time=EXCLUDED.end_time,
+		 duration_minutes=EXCLUDED.duration_minutes,course_code=EXCLUDED.course_code,owner_teacher_name=EXCLUDED.owner_teacher_name,
+		 section_label=EXCLUDED.section_label,semester_type=EXCLUDED.semester_type,opt_status=EXCLUDED.opt_status,
+		 source_teaching_id=EXCLUDED.source_teaching_id,source_class_id=EXCLUDED.source_class_id,source_holiday_id=EXCLUDED.source_holiday_id,
+		 source_original_date=EXCLUDED.source_original_date,source_original_start=EXCLUDED.source_original_start,
+		 source_original_end=EXCLUDED.source_original_end,source_original_kind=EXCLUDED.source_original_kind,
+		 source_latest_status_id=EXCLUDED.source_latest_status_id,source_updated_at=EXCLUDED.source_updated_at,
+		 source_status_updated_at=EXCLUDED.source_status_updated_at,source_missing=FALSE,synced_at=now(),
+		 source_document_id=EXCLUDED.source_document_id,source_duration_minutes=EXCLUDED.source_duration_minutes,source_reference=EXCLUDED.source_reference
+		 RETURNING (xmax=0)`, r.ExtraClassID, academicYear, semester, r.Title, r.ClassDate, r.StartTime, r.EndTime, r.Duration,
+			r.CourseCode, r.OwnerTeacherName, r.Section, r.SemesterType, r.OptStatus, r.TeachingID, r.ClassID, r.HolidayID,
+			r.OriginalDate, r.OriginalStart, r.OriginalEnd, r.OriginalKind, r.LatestStatusID, r.SourceUpdatedAt, r.StatusUpdatedAt, r.DocumentID, r.SourceDuration, r.Reference).Scan(&inserted)
 		if err != nil {
 			res.Error = tdbmSyncFailureMessage
 			s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
 			return res
 		}
-		if tag.RowsAffected() > 0 {
+		if inserted {
 			res.Inserted++
+		} else {
+			res.Updated++
 		}
+	}
+	// Only a successfully read, complete snapshot may mark absent rows missing.
+	if _, err := tx.Exec(ctx, `UPDATE tdbm_extra_teachings SET source_missing=TRUE,synced_at=now()
+	 WHERE academic_year=$1 AND semester=$2 AND NOT(extra_class_id=ANY($3))`, academicYear, semester, seen); err != nil {
+		res.Error = tdbmSyncFailureMessage
+		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
+		return res
 	}
 	if err := tx.Commit(ctx); err != nil {
 		res.Error = tdbmSyncFailureMessage
@@ -446,10 +381,16 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 	// they were (possibly stale) until the next sync tries again.
 	courseMatched, err := s.resolveCourseMatches(ctx, academicYear, semester)
 	if err != nil {
+		res.Error = tdbmSyncFailureMessage
 		log.Printf("tdbm: resolve course matches (%d/%d) err=%v", academicYear, semester, err)
+		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
+		return res
 	}
 	if sectionMatched, err := s.resolveSectionMatches(ctx, academicYear, semester); err != nil {
+		res.Error = tdbmSyncFailureMessage
 		log.Printf("tdbm: resolve section matches (%d/%d) err=%v", academicYear, semester, err)
+		s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, err)
+		return res
 	} else {
 		// Matched is the section-level count, not the course-level one: that's
 		// the number staff actually care about — "how many of these can we act
@@ -462,12 +403,24 @@ func (s *TDBMService) SyncExtraTeachings(ctx context.Context, triggerKind string
 		academicYear, semester, courseMatched, res.Fetched, res.Matched, res.Fetched)
 
 	if filled, err := s.AutoFillMakeupSchedules(ctx, academicYear, semester); err != nil {
+		res.Error = tdbmSyncFailureMessage
 		log.Printf("tdbm: auto-fill makeup schedules (%d/%d) err=%v", academicYear, semester, err)
 	} else if filled > 0 {
 		log.Printf("tdbm: auto-filled %d makeup_schedules row(s) from TDBM (%d/%d)", filled, academicYear, semester)
 	}
 
-	s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, nil)
+	var conflicts int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM tdbm_extra_teachings WHERE academic_year=$1 AND semester=$2 AND reconciliation_error IS NOT NULL`, academicYear, semester).Scan(&conflicts); err != nil {
+		res.Error = tdbmSyncFailureMessage
+	} else if conflicts > 0 {
+		res.Conflicts = conflicts
+		res.Warning = fmt.Sprintf("ซิงก์ข้อมูล TDBM แล้ว แต่มี %d รายการที่ต้องตรวจสอบคาบชดเชย", conflicts)
+	}
+	var runErr error
+	if res.Error != "" {
+		runErr = errors.New(res.Error)
+	}
+	s.logSync(ctx, "extra-teachings", triggerKind, academicYear, semester, started, res, runErr)
 	return res
 }
 
@@ -698,12 +651,14 @@ func entryDurationMins(c tdbmCandidate) int {
 	return et - st
 }
 
-// AutoFillMakeupSchedules only fills a section with one unresolved holiday
-// group and one TDBM date group. Multiple dates have no authoritative link in
-// the upstream feed: leave them for staff review instead of pairing by date
-// order (or assuming a makeup on a holiday replaces that same holiday).
-// Previously applied links are preserved for review, never silently rewritten.
+// AutoFillMakeupSchedules reconciles exact MariaDB original sittings first.
+// Legacy staged rows without source metadata retain the previous conservative
+// review behavior until their first authoritative MariaDB snapshot arrives.
 func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear, semester int) (int, error) {
+	directFilled, err := s.reconcileMakeups(ctx, academicYear, semester)
+	if err != nil {
+		return 0, err
+	}
 	// A twin of an already-filed sitting (the same makeup filed under the
 	// course's other code — see loadTDBMCandidates) points at that makeup
 	// too, so the TDBM page stops listing it as unmatched.
@@ -711,8 +666,10 @@ func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear,
 		UPDATE tdbm_extra_teachings t SET applied_makeup_id = f.applied_makeup_id
 		FROM tdbm_extra_teachings f
 		WHERE t.academic_year = $1 AND t.semester = $2
-		  AND t.applied_makeup_id IS NULL AND t.opt_status <> 'C'
+		  AND t.applied_makeup_id IS NULL AND t.opt_status IN ('A','D')
+		  AND NOT t.source_missing AND NOT t.source_reference AND t.source_teaching_id IS NULL AND t.source_class_id IS NULL AND t.reconciliation_error IS NULL
 		  AND f.applied_makeup_id IS NOT NULL
+		  AND f.opt_status IN ('A','D') AND NOT f.source_missing AND NOT f.source_reference AND f.reconciliation_error IS NULL
 		  AND f.section_id = t.section_id AND f.class_date = t.class_date
 		  AND f.start_time IS NOT DISTINCT FROM t.start_time
 		  AND f.end_time IS NOT DISTINCT FROM t.end_time`, academicYear, semester); err != nil {
@@ -723,14 +680,14 @@ func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear,
 		return 0, err
 	}
 	if len(unresolved) == 0 {
-		return 0, nil
+		return directFilled, nil
 	}
 	candidates, err := s.loadTDBMCandidates(ctx, academicYear, semester)
 	if err != nil {
 		return 0, err
 	}
 	if len(candidates) == 0 {
-		return 0, nil
+		return directFilled, nil
 	}
 
 	bySectionHolidays := map[uuid.UUID][]holidayGroup{}
@@ -764,7 +721,7 @@ func (s *TDBMService) AutoFillMakeupSchedules(ctx context.Context, academicYear,
 		}
 		filled += s.pairAndApply(ctx, sectionID, groups[0], clusters[0])
 	}
-	return filled, nil
+	return directFilled + filled, nil
 }
 
 // pairAndApply applies the only remaining holiday/date group pair.
@@ -841,11 +798,13 @@ func (s *TDBMService) applyOneMakeup(ctx context.Context, sectionID uuid.UUID, k
 	}
 	// A sync may have cancelled or re-matched the entry since candidates loaded.
 	var stale bool
-	if err := tx.QueryRow(ctx, `SELECT (opt_status = 'C' OR applied_makeup_id IS NOT NULL
+	if err := tx.QueryRow(ctx, `SELECT (source_missing OR source_reference OR reconciliation_error IS NOT NULL OR COALESCE(opt_status,'') NOT IN ('A','D') OR applied_makeup_id IS NOT NULL
  OR section_id IS DISTINCT FROM $2 OR class_date IS DISTINCT FROM $3::date
  OR start_time IS DISTINCT FROM $4::time OR end_time IS DISTINCT FROM $5::time)
  FROM tdbm_extra_teachings WHERE extra_class_id = $1 FOR UPDATE`,
-		entry.ExtraClassID, sectionID, entry.ClassDate, entry.StartTime, entry.EndTime).Scan(&stale); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		entry.ExtraClassID, sectionID, entry.ClassDate, entry.StartTime, entry.EndTime).Scan(&stale); errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	} else if err != nil {
 		return 0, err
 	}
 	if stale {
@@ -922,7 +881,8 @@ func (s *TDBMService) loadTDBMCandidates(ctx context.Context, academicYear, seme
 			WHERE t.academic_year = $1 AND t.semester = $2
 			  AND t.section_id IS NOT NULL
 			  AND t.applied_makeup_id IS NULL
-			  AND t.opt_status <> 'C'
+			  AND t.opt_status IN ('A','D') AND NOT t.source_missing AND NOT t.source_reference
+			  AND t.source_teaching_id IS NULL AND t.source_class_id IS NULL AND t.reconciliation_error IS NULL
 			  AND NOT EXISTS (
 			      SELECT 1 FROM tdbm_extra_teachings tw
 			      WHERE tw.section_id = t.section_id AND tw.class_date = t.class_date
@@ -948,74 +908,94 @@ func (s *TDBMService) loadTDBMCandidates(ctx context.Context, academicYear, seme
 	return out, rows.Err()
 }
 
-// SyncAll runs holidays and extra-teachings for the currently active academic
-// term (academic_terms.is_active — migration 0066 guarantees at most one). A
-// failure in one resource does not stop the other: a bad extra-teachings pull
-// should not also cost that run's holiday sync.
-//
-// triggerKind is "webhook" (TDBM POSTed /tdbm-webhook), "scheduler" (hourly
-// safety-net sweep — see internal/scheduler), or "manual" (staff clicked the
-// button). Purely a label carried into tdbm_sync_log.
+// SyncAll reads each locally used term once. The advisory transaction lock
+// serializes manual, scheduled and webhook syncs across backend processes.
 func (s *TDBMService) SyncAll(ctx context.Context, triggerKind string) ([]TDBMSyncResult, error) {
-	year, semester, err := s.activeTerm(ctx)
+	guard, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	results := []TDBMSyncResult{
-		s.SyncHolidays(ctx, triggerKind, year, semester),
-		s.SyncExtraTeachings(ctx, triggerKind, year, semester),
+	defer guard.Rollback(context.Background())
+	var acquired bool
+	if err = guard.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(736264219)`).Scan(&acquired); err != nil {
+		return nil, err
 	}
-	for _, r := range results {
-		if r.Error != "" {
-			log.Printf("tdbm: sync %s failed: %s", r.Resource, r.Error)
-		} else {
-			log.Printf("tdbm: sync %s ok fetched=%d inserted=%d skipped=%d", r.Resource, r.Fetched, r.Inserted, r.Skipped)
+	if !acquired {
+		return nil, Conflict("กำลังซิงก์ข้อมูล TDBM กรุณารอสักครู่")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT academic_year,semester FROM academic_terms trm
+	 WHERE is_active OR EXISTS(SELECT 1 FROM teaching_courses tc WHERE tc.term_id=trm.id)
+	 OR EXISTS(SELECT 1 FROM tdbm_extra_teachings t WHERE t.academic_year=trm.academic_year AND t.semester=trm.semester)
+	 ORDER BY academic_year DESC,semester DESC`)
+	if err != nil {
+		return nil, err
+	}
+	type term struct{ year, semester int }
+	var terms []term
+	for rows.Next() {
+		var t term
+		if err = rows.Scan(&t.year, &t.semester); err != nil {
+			rows.Close()
+			return nil, err
 		}
+		terms = append(terms, t)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	var results []TDBMSyncResult
+	for _, t := range terms {
+		started := time.Now()
+		snapshot, err := s.snapshot(ctx, t.year, t.semester)
+		if err != nil {
+			for _, resource := range []string{"holidays", "extra-teachings"} {
+				r := TDBMSyncResult{Resource: resource, AcademicYear: t.year, Semester: t.semester, Error: tdbmSyncFailureMessage}
+				s.logSync(ctx, resource, triggerKind, t.year, t.semester, started, r, err)
+				results = append(results, r)
+			}
+			continue
+		}
+		results = append(results, s.syncHolidayRows(ctx, triggerKind, t.year, t.semester, snapshot), s.syncExtraRows(ctx, triggerKind, t.year, t.semester, snapshot.Extra))
 	}
 	return results, nil
 }
 
-// TriggerAsync kicks off SyncAll in the background and returns immediately —
-// what POST /tdbm-webhook calls so it can answer TDBM's request fast instead
-// of holding the connection open for however long three upstream pulls take.
-// A ping that arrives while a sync is already in flight is dropped; see the
-// syncing field's doc comment.
-// webhookSyncCooldown is the least time between two webhook-triggered pulls.
-const webhookSyncCooldown = 2 * time.Minute
-
+// TriggerAsync returns immediately and coalesces bursts into a trailing pull,
+// so a change committed during the current snapshot is not dropped.
 func (s *TDBMService) TriggerAsync(triggerKind string) {
 	s.syncMu.Lock()
 	if s.syncing {
+		s.pending = true
 		s.syncMu.Unlock()
-		log.Printf("tdbm: sync already in flight, dropping %s trigger", triggerKind)
 		return
-	}
-	if triggerKind == "webhook" {
-		if time.Since(s.lastWebhook) < webhookSyncCooldown {
-			s.syncMu.Unlock()
-			log.Printf("tdbm: webhook within %s of the last one, dropping", webhookSyncCooldown)
-			return
-		}
-		s.lastWebhook = time.Now()
 	}
 	s.syncing = true
 	s.syncMu.Unlock()
-
 	if !backgroundJobs.start(func(parent context.Context) {
-		defer func() {
+		for {
+			ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+			_, err := s.SyncAll(ctx, triggerKind)
+			cancel()
+			if err != nil {
+				log.Printf("tdbm: async sync (%s) failed", triggerKind)
+			}
 			s.syncMu.Lock()
+			if s.pending && parent.Err() == nil {
+				s.pending = false
+				s.syncMu.Unlock()
+				continue
+			}
 			s.syncing = false
+			s.pending = false
 			s.syncMu.Unlock()
-		}()
-		ctx, cancel := context.WithTimeout(parent, 90*time.Second)
-		defer cancel()
-		if _, err := s.SyncAll(ctx, triggerKind); err != nil {
-			log.Printf("tdbm: async sync (%s) err=%v", triggerKind, err)
+			return
 		}
 	}) {
 		s.syncMu.Lock()
 		s.syncing = false
+		s.pending = false
 		s.syncMu.Unlock()
 		log.Printf("tdbm: background worker capacity unavailable")
 	}
@@ -1037,21 +1017,27 @@ type TDBMSyncLogEntry struct {
 	// TDBMSyncResult.Matched. NULL (omitted) for every other resource.
 	Matched    *int    `json:"matched,omitempty"`
 	Error      *string `json:"error,omitempty"`
+	Warning    *string `json:"warning,omitempty"`
 	StartedAt  string  `json:"started_at"`
 	FinishedAt *string `json:"finished_at,omitempty"`
 }
 
-func (s *TDBMService) RecentSyncLog(ctx context.Context, limit int) ([]TDBMSyncLogEntry, error) {
+func (s *TDBMService) RecentSyncLog(ctx context.Context, limit int, term ...int) ([]TDBMSyncLogEntry, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
+	}
+	year, semester := 0, 0
+	if len(term) == 2 {
+		year, semester = term[0], term[1]
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, resource, trigger_kind, academic_year, semester, fetched, inserted, updated, skipped, matched, error,
 		       TO_CHAR(started_at, 'YYYY-MM-DD"T"HH24:MI:SS'),
 		       TO_CHAR(finished_at, 'YYYY-MM-DD"T"HH24:MI:SS')
 		FROM tdbm_sync_log
+		WHERE ($2::int=0 OR (academic_year=$2 AND semester=$3))
 		ORDER BY created_at DESC
-		LIMIT $1`, limit)
+		LIMIT $1`, limit, year, semester)
 	if err != nil {
 		return nil, err
 	}
@@ -1067,7 +1053,12 @@ func (s *TDBMService) RecentSyncLog(ctx context.Context, limit int) ([]TDBMSyncL
 		// Old rows may contain raw driver errors from before error sanitization.
 		if e.Error != nil {
 			msg := publicTDBMSyncError(*e.Error)
-			e.Error = &msg
+			if tdbmSyncWarningPattern.MatchString(msg) || msg == tdbmReconcileConflict {
+				e.Warning = &msg
+				e.Error = nil
+			} else {
+				e.Error = &msg
+			}
 		}
 		e.FinishedAt = finished
 		out = append(out, e)
@@ -1075,9 +1066,7 @@ func (s *TDBMService) RecentSyncLog(ctx context.Context, limit int) ([]TDBMSyncL
 	return out, rows.Err()
 }
 
-// activeTerm resolves the currently active academic term — the scope every
-// sync method runs against (see SyncAll). Factored out because ListExtraTeachings
-// needs the same "no active term" fallback when the caller doesn't specify one.
+// activeTerm supplies the default scope for staff list requests.
 func (s *TDBMService) activeTerm(ctx context.Context) (year, semester int, err error) {
 	err = s.pool.QueryRow(ctx, `SELECT academic_year, semester FROM academic_terms WHERE is_active = true LIMIT 1`).
 		Scan(&year, &semester)
@@ -1095,16 +1084,24 @@ func (s *TDBMService) activeTerm(ctx context.Context) (year, semester int, err e
 // real data and where each row landed — matched to an exact section, matched
 // to a course only (section_label didn't resolve), or not matched at all.
 type TDBMExtraTeaching struct {
-	ExtraClassID     int     `json:"extra_class_id"`
-	ClassDate        string  `json:"class_date"`
-	StartTime        *string `json:"start_time,omitempty"`
-	EndTime          *string `json:"end_time,omitempty"`
-	DurationMinutes  int     `json:"duration_minutes"`
-	CourseCode       *string `json:"course_code,omitempty"`
-	OwnerTeacherName *string `json:"owner_teacher_name,omitempty"`
-	SectionLabel     *string `json:"section_label,omitempty"`
-	SemesterType     *string `json:"semester_type,omitempty"`
-	OptStatus        string  `json:"opt_status"`
+	ExtraClassID        int     `json:"extra_class_id"`
+	ClassDate           string  `json:"class_date"`
+	StartTime           *string `json:"start_time,omitempty"`
+	EndTime             *string `json:"end_time,omitempty"`
+	DurationMinutes     int     `json:"duration_minutes"`
+	CourseCode          *string `json:"course_code,omitempty"`
+	OwnerTeacherName    *string `json:"owner_teacher_name,omitempty"`
+	SectionLabel        *string `json:"section_label,omitempty"`
+	SemesterType        *string `json:"semester_type,omitempty"`
+	OptStatus           string  `json:"opt_status"`
+	SourceMissing       bool    `json:"source_missing"`
+	SourceReference     bool    `json:"source_reference"`
+	SourceOriginalDate  *string `json:"source_original_date,omitempty"`
+	SourceOriginalKind  *string `json:"source_original_kind,omitempty"`
+	ReconciliationError *string `json:"reconciliation_error,omitempty"`
+	AppliedMakeupDate   *string `json:"applied_makeup_date,omitempty"`
+	AppliedStartTime    *string `json:"applied_start_time,omitempty"`
+	AppliedEndTime      *string `json:"applied_end_time,omitempty"`
 	// Matched* are populated only when resolveCourseMatches / resolveSectionMatches
 	// found a row in OUR OWN data — never trust CourseCode/SectionLabel above as
 	// already-verified against our schema, they are TDBM's raw text.
@@ -1129,7 +1126,7 @@ type TDBMExtraTeaching struct {
 
 // ListExtraTeachings returns every tdbm_extra_teachings row for one term,
 // newest class_date first, with match info joined in. academicYear==0 uses
-// the active term (same resolution as SyncAll).
+// the active term.
 func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, semester int) ([]TDBMExtraTeaching, error) {
 	if academicYear == 0 {
 		var err error
@@ -1139,10 +1136,12 @@ func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, seme
 		}
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT t.extra_class_id, TO_CHAR(t.class_date,'YYYY-MM-DD'),
+		SELECT t.extra_class_id, COALESCE(TO_CHAR(t.class_date,'YYYY-MM-DD'),''),
 		       TO_CHAR(t.start_time,'HH24:MI'), TO_CHAR(t.end_time,'HH24:MI'),
 		       t.duration_minutes, t.course_code, t.owner_teacher_name,
-		       t.section_label, t.semester_type, t.opt_status,
+		       t.section_label, t.semester_type, COALESCE(t.opt_status,''),t.source_missing,t.source_reference,
+		       t.source_original_date::text,t.source_original_kind,t.reconciliation_error,
+		       to_char(m.makeup_date,'YYYY-MM-DD'),to_char(m.start_time,'HH24:MI'),to_char(m.end_time,'HH24:MI'),
 		       tc.code, tc.name_th, sec.sec_no,
 		       TO_CHAR(m.original_date,'YYYY-MM-DD'), h.name_th, sec.id, m.kind,
  CASE WHEN m.note LIKE 'เจ้าหน้าที่จับคู่จาก TDBM%' THEN 'manual'
@@ -1170,7 +1169,8 @@ func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, seme
 		var e TDBMExtraTeaching
 		if err := rows.Scan(&e.ExtraClassID, &e.ClassDate, &e.StartTime, &e.EndTime,
 			&e.DurationMinutes, &e.CourseCode, &e.OwnerTeacherName,
-			&e.SectionLabel, &e.SemesterType, &e.OptStatus,
+			&e.SectionLabel, &e.SemesterType, &e.OptStatus, &e.SourceMissing, &e.SourceReference, &e.SourceOriginalDate, &e.SourceOriginalKind, &e.ReconciliationError,
+			&e.AppliedMakeupDate, &e.AppliedStartTime, &e.AppliedEndTime,
 			&e.MatchedCourseCode, &e.MatchedCourseName, &e.MatchedSecNo,
 			&e.OriginalHolidayDate, &e.OriginalHolidayName, &e.MatchedSectionID, &e.OriginalKind, &e.MatchMethod, &e.courseExported, &e.SyncedAt); err != nil {
 			return nil, err
@@ -1188,7 +1188,7 @@ func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, seme
 	pendingSittings := map[uuid.UUID]map[string]bool{}
 	pendingDates := map[uuid.UUID]map[string]bool{}
 	for _, e := range out {
-		if e.MatchedSectionID == nil || e.OriginalHolidayDate != nil || e.OptStatus == "C" {
+		if e.MatchedSectionID == nil || e.OriginalHolidayDate != nil || e.SourceMissing || e.SourceReference || e.ReconciliationError != nil || !tdbmMakeupEligible(e.OptStatus) {
 			continue
 		}
 		sec := *e.MatchedSectionID
@@ -1210,16 +1210,26 @@ func (s *TDBMService) ListExtraTeachings(ctx context.Context, academicYear, seme
 		e := &out[i]
 		e.MatchOptions = []TDBMMatchOption{}
 		switch {
-		case e.OriginalHolidayDate != nil:
-			continue
+		case e.SourceReference:
+			e.ResolutionReason = "รายการอ้างอิงหรือรายการเดิมที่ถูกแทนที่ ใช้คาบปัจจุบันจากเอกสาร TDBM แล้ว"
+		case e.ReconciliationError != nil:
+			e.ResolutionReason = *e.ReconciliationError
+		case e.SourceMissing:
+			e.ResolutionReason = "ไม่พบรายการนี้ในฐานข้อมูล TDBM แล้ว"
 		case e.OptStatus == "C":
 			e.ResolutionReason = "รายการถูกยกเลิกใน TDBM"
+		case !tdbmMakeupEligible(e.OptStatus):
+			e.ResolutionReason = "ใช้รายการสอนชดเชยจาก TDBM เฉพาะสถานะ A และ D เท่านั้น"
+		case e.OriginalHolidayDate != nil:
+			continue
 		case e.MatchedSectionID == nil:
 			e.ResolutionReason = "ยังจับคู่วิชาและกลุ่มเรียนไม่ได้ กรุณาตรวจสอบข้อมูลวิชาและกลุ่ม"
 		case e.courseExported:
 			e.ResolutionReason = "รายวิชาถูกล็อกหลังส่งออกเอกสารแล้ว"
 		case e.StartTime == nil || e.EndTime == nil || *e.StartTime >= *e.EndTime:
 			e.ResolutionReason = "ข้อมูลช่วงเวลาสอนจาก TDBM ไม่ครบหรือไม่ถูกต้อง"
+		case e.SourceOriginalDate != nil:
+			e.ResolutionReason = "รอซิงก์คาบเดิมที่ระบุในฐานข้อมูล TDBM"
 		default:
 			e.MatchOptions = options[*e.MatchedSectionID]
 			if e.MatchOptions == nil {

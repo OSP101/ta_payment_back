@@ -38,6 +38,7 @@ func snapshotRequestCalculation(ctx context.Context, tx pgx.Tx, requestID, actor
                     'assignment', to_jsonb(a),
                     'workload', (SELECT to_jsonb(w) FROM ta_workload_forms w WHERE w.assignment_id=a.id),
                     'section', to_jsonb(sec),
+                    'excluded_sessions', COALESCE((SELECT jsonb_agg(to_jsonb(e) ORDER BY e.schedule_id) FROM ta_assignment_session_exclusions e WHERE e.assignment_id=a.id), '[]'::jsonb),
                     'schedules', COALESCE((SELECT jsonb_agg(to_jsonb(ss) ORDER BY ss.day_of_week, ss.start_time, ss.id) FROM section_schedules ss WHERE ss.section_id=sec.id), '[]'::jsonb)
                 ) ORDER BY a.ta_id, a.section_id)
                 FROM ta_request_assignments a JOIN sections sec ON sec.id=a.section_id

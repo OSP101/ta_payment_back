@@ -15,6 +15,24 @@ func (h *TeachingHandler) ListCurricula(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
+func (h *TeachingHandler) CreateCurriculum(c *fiber.Ctx) error {
+	var in service.CreateCurriculumInput
+	if err := Bind(c, &in); err != nil {
+		return err
+	}
+	out, err := h.Svc.Teaching.CreateCurriculum(c.Context(), UserID(c), in)
+	if err != nil {
+		return err
+	}
+	return c.Status(fiber.StatusCreated).JSON(out)
+}
+func (h *TeachingHandler) DeleteCurriculum(c *fiber.Ctx) error {
+	if err := h.Svc.Teaching.DeleteCurriculum(c.Context(), UserID(c), c.Params("code")); err != nil {
+		return err
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
 func (h *TeachingHandler) UpdateCurriculum(c *fiber.Ctx) error {
 	var in service.UpdateCurriculumInput
 	if err := Bind(c, &in); err != nil {
@@ -32,10 +50,8 @@ func (h *TeachingHandler) UpdateSectionCurriculum(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid id")
 	}
 	var body struct {
-		// Mirrors validSectionCurricula (service/curriculum.go) — the CHECK
-		// constraint's actual value set, kept here as a first-line 400 instead
-		// of a round trip to the service's own Invalid() check.
-		Curriculum string `json:"curriculum" validate:"required,oneof=CS IT GIS AI CY OTHER KKBS"`
+		// The service validates against the current curricula table.
+		Curriculum string `json:"curriculum" validate:"required,max=40"`
 	}
 	if err := Bind(c, &body); err != nil {
 		return err

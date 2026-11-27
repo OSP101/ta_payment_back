@@ -364,7 +364,7 @@ func approvedSessionImpact(ctx context.Context, tx pgx.Tx, userID, termID uuid.U
 		  JOIN ta_requests r       ON r.id = a.request_id AND r.status = 'approved'
 		  JOIN sections sec        ON sec.id = a.section_id
 		  JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		  JOIN section_schedules ss ON ss.section_id = a.section_id
+		  JOIN ta_assignment_schedules ss ON ss.assignment_id = a.id
 		 WHERE a.ta_id = $1 AND tc.term_id = $2 AND a.state <> 'dropped'
 		 ORDER BY tc.code, sec.sec_no, ss.day_of_week, ss.start_time`, userID, termID)
 	if err != nil {

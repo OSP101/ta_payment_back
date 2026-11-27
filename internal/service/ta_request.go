@@ -170,6 +170,15 @@ func (s *TARequestService) create(ctx context.Context, actor, lecturerID uuid.UU
 
 // EditInput returns only the caller's own request in the form's input shape.
 func (s *TARequestService) EditInput(ctx context.Context, actor, reqID uuid.UUID) (*CreateTARequestInput, error) {
+	return s.editInput(ctx, actor, reqID, false)
+}
+
+// EditInputOnBehalf is for staff/admin handlers after role authorization.
+func (s *TARequestService) EditInputOnBehalf(ctx context.Context, actor, reqID uuid.UUID) (*CreateTARequestInput, error) {
+	return s.editInput(ctx, actor, reqID, true)
+}
+
+func (s *TARequestService) editInput(ctx context.Context, actor, reqID uuid.UUID, privileged bool) (*CreateTARequestInput, error) {
 	var in CreateTARequestInput
 	var owner uuid.UUID
 	if err := s.pool.QueryRow(ctx, `SELECT lecturer_id, teaching_course_id, reimburse_scope::text FROM ta_requests WHERE id=$1`, reqID).Scan(&owner, &in.TeachingCourseID, &in.ReimburseScope); err != nil {
@@ -178,7 +187,7 @@ func (s *TARequestService) EditInput(ctx context.Context, actor, reqID uuid.UUID
 		}
 		return nil, err
 	}
-	if owner != actor {
+	if owner != actor && !privileged {
 		return nil, Forbidden("คุณไม่ใช่เจ้าของคำขอนี้")
 	}
 	rows, err := s.pool.Query(ctx, `SELECT a.ta_id, a.level::text, array_agg(a.section_id ORDER BY a.section_id), jsonb_agg(jsonb_build_object('section_id',a.section_id,'workload',COALESCE(to_jsonb(w),'{}'::jsonb)) ORDER BY a.section_id) FROM ta_request_assignments a LEFT JOIN ta_workload_forms w ON w.assignment_id=a.id WHERE a.request_id=$1 GROUP BY a.ta_id,a.level`, reqID)
@@ -206,6 +215,24 @@ func (s *TARequestService) Edit(ctx context.Context, actor, reqID uuid.UUID, in 
 	return s.createOrEdit(ctx, actor, actor, in, reqID)
 }
 
+// EditOnBehalf preserves the request's lecturer and records the officer as
+// the actor. Callers must authorize staff/admin before using this entry point.
+func (s *TARequestService) EditOnBehalf(ctx context.Context, actor, reqID uuid.UUID, in CreateTARequestInput) (*CreateResult, error) {
+	var lecturerID uuid.UUID
+	if err := s.pool.QueryRow(ctx, `SELECT lecturer_id FROM ta_requests WHERE id=$1`, reqID).Scan(&lecturerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, NotFound("ไม่พบคำขอนี้")
+		}
+		return nil, err
+	}
+	res, err := s.createOrEdit(ctx, actor, lecturerID, in, reqID)
+	if err != nil {
+		return nil, err
+	}
+	s.notifyFiledOnBehalf(ctx, actor, lecturerID, in.TeachingCourseID, "แก้ไขคำขอผู้ช่วยสอน")
+	return res, nil
+}
+
 func (s *TARequestService) createOrEdit(ctx context.Context, actor, lecturerID uuid.UUID, in CreateTARequestInput, editID uuid.UUID) (*CreateResult, error) {
 	if editID != uuid.Nil {
 		var owner, course uuid.UUID
@@ -216,7 +243,7 @@ func (s *TARequestService) createOrEdit(ctx context.Context, actor, lecturerID u
 			}
 			return nil, err
 		}
-		if owner != actor {
+		if owner != lecturerID {
 			return nil, Forbidden("คุณไม่ใช่เจ้าของคำขอนี้")
 		}
 		if course != in.TeachingCourseID {
@@ -518,7 +545,7 @@ func (s *TARequestService) createOrEdit(ctx context.Context, actor, lecturerID u
 		if err := tx.QueryRow(ctx, `SELECT lecturer_id, status::text FROM ta_requests WHERE id=$1 FOR UPDATE`, editID).Scan(&owner, &status); err != nil {
 			return nil, err
 		}
-		if owner != actor {
+		if owner != lecturerID {
 			return nil, Forbidden("คุณไม่ใช่เจ้าของคำขอนี้")
 		}
 		if !cancellableStatuses[status] {
@@ -744,7 +771,10 @@ func (s *TARequestService) decideNew(ctx context.Context, tx pgx.Tx, actor, rid,
 	var reason string
 	switch {
 	case surviving == 0:
-		reason = clashRejectReason
+		reason, err = clashRejectionReason(ctx, tx, rid)
+		if err != nil {
+			return nil, nil, err
+		}
 	case passed:
 		verdict = "approved"
 	default:
@@ -1204,6 +1234,10 @@ func (s *TARequestService) UpdateAssignmentWorkload(ctx context.Context, actor, 
 		}
 	}
 
+	if err := checkExcludedSessionWorkload(ctx, tx, assignmentID, taID, sectionID, in); err != nil {
+		return err
+	}
+
 	before, err := scanWorkloadForm(tx.QueryRow(ctx,
 		`SELECT `+workloadFormColumns+` FROM ta_workload_forms WHERE assignment_id = $1`, assignmentID))
 	hadBefore := true
@@ -1549,27 +1583,9 @@ func validateInClassDuties(w WorkloadInput, byKind kindClash, name, secLabel str
 	return nil
 }
 
-// validateGradWorkloadCaps enforces the graduate-TA equivalent of
-// validateUndergradSectionCaps: grade_hrs (ตรวจการบ้าน) is capped at a flat
-// gradReviewHourCap ชม./สัปดาห์ system-wide.
-//
-// grade_hrs used to share a duty-schedule pool with other_hrs/prep_hrs that
-// the worklog UI then displayed as TWO independent "งานอื่นๆ" cards, each
-// showing the full pool value as if it were its own budget — letting a TA
-// nominate up to 2× the real combined cap, a self-inconsistency that could
-// block approval of hours the system itself generated. The fix removes the
-// "other" duty concept from the WORKLOG system for grad TAs entirely
-// (declaredDutyHours, worklog.go, and AllowOther/WeeklyCapOther in
-// loadAssignmentContext, authz.go) rather than just correcting the display
-// math.
-//
-// other_hrs/prep_hrs themselves stay accepted here and uncapped — confirmed
-// with the office (2026-09-11) that lecturers still need them to reach the
-// graduate school's 12 ชม./สัปดาห์ ceiling on the request form,
-// they're just administrative from this point on: never turned into a
-// worklog duty card, a loggable activity, or a pay calculation. Only
-// grade_hrs (the one field that DOES stay loggable, via DutyReview) needs a
-// cap here.
+// validateGradWorkloadCaps caps graduate grading at gradReviewHourCap.
+// Preparation and other duties have separate declared weekly budgets in the
+// worklog system; the combined graduate workload ceiling is validated elsewhere.
 func validateGradWorkloadCaps(w WorkloadInput, name, secLabel string) error {
 	if w.GradeHrs > gradReviewHourCap+0.001 {
 		return fmt.Errorf(
@@ -1691,16 +1707,10 @@ var thaiDayNames = [7]string{"อาทิตย์", "จันทร์", "อ
 // มีเพดานไม่งั้นภาระงานที่กรอกจะกระจายลงบันทึกเวลาจริงไม่ได้.
 const workingDaysPerWeek = 5
 
-// enforceDailyHourFeasibility rejects a request whose declared workload could
-// never be recorded as legal work logs under ประกาศ 731/2565 + 1080/2565
-// (ป.ตรี ปกติ ≤7 ชม./วัน, ป.ตรี พิเศษ ≤6, บัณฑิต ปกติ ≤6).
-//
-// Two things must hold, because the auto-generated work logs SILENTLY DROP any
-// occurrence that would breach the daily cap — the TA would just lose payable
-// hours with no error anywhere:
-//  1. per class day: the scheduled hours of every section this TA covers on the
-//     same weekday must fit inside one day's cap;
-//  2. per week: total declared hours ≤ daily cap × working days.
+// enforceDailyHourFeasibility bounds the declared WEEKLY workload. A section's
+// complete timetable is not a TA's daily work: the TA may cover only part of a
+// session or perform grading outside class. Actual daily caps belong to worklog
+// validation, not to the request's selection of sections.
 func (s *TARequestService) enforceDailyHourFeasibility(
 	ctx context.Context, sectionIDs []uuid.UUID, level, name string, declaredWeekly float64,
 ) error {
@@ -1720,88 +1730,20 @@ func (s *TARequestService) enforceDailyHourFeasibility(
 	if !haveRates {
 		return Invalid("ยังไม่ได้ตั้งอัตราค่าตอบแทนในระบบ ตรวจเพดานชั่วโมงตามประกาศไม่ได้ จึงยังส่งคำขอไม่ได้")
 	}
-	isGrad := level == "master" || level == "phd"
-	// Hours per weekday must be the UNION of the occupied time, not the sum of
-	// each section's length. Co-taught sections meet in one room at one time —
-	// summing them would report a TA as working 12 hours for a single 6-hour
-	// sitting and refuse a request that is perfectly legal. The CTE chain below
-	// is the standard merge-intervals: order the slots, start a new "island"
-	// whenever a slot begins after every previous one has ended, then measure
-	// each island once.
-	rows, err := s.pool.Query(ctx, `
-		WITH latest AS (SELECT * FROM `+payRatesInForce+`),
-		slots AS (
-		    SELECT ss.day_of_week AS dow, ss.start_time AS st, ss.end_time AS en
-		    FROM section_schedules ss
-		    WHERE ss.section_id = ANY($1)
-		),
-		ordered AS (
-		    SELECT dow, st, en,
-		           MAX(en) OVER (PARTITION BY dow ORDER BY st, en
-		                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_end
-		    FROM slots
-		),
-		islands AS (
-		    SELECT dow, st, en,
-		           SUM(CASE WHEN prev_end IS NULL OR st > prev_end THEN 1 ELSE 0 END)
-		               OVER (PARTITION BY dow ORDER BY st, en ROWS UNBOUNDED PRECEDING) AS island
-		    FROM ordered
-		),
-		merged AS (
-		    SELECT dow, island, MIN(st) AS st, MAX(en) AS en
-		    FROM islands GROUP BY dow, island
-		),
-		day_hours AS (
-		    SELECT dow, SUM(EXTRACT(EPOCH FROM (en - st)) / 3600.0) AS hrs
-		    FROM merged GROUP BY dow
-		),
-		day_caps AS (
-		    SELECT ss.day_of_week AS dow,
-		           MIN(CASE
-		               WHEN NOT $2 AND sec.track = 'regular' THEN pr.ug_regular_daily_hour_cap
-		               WHEN NOT $2 AND sec.track = 'special' THEN pr.ug_special_daily_hour_cap
-		               WHEN $2 AND sec.track = 'regular' THEN pr.grad_regular_daily_hour_cap
-		               ELSE 24
-		           END) AS day_cap
-		    FROM section_schedules ss
-		    JOIN sections sec ON sec.id = ss.section_id
-		    CROSS JOIN latest pr
-		    WHERE ss.section_id = ANY($1)
-		    GROUP BY ss.day_of_week
-		)
-		SELECT h.dow, h.hrs, c.day_cap
-		FROM day_hours h JOIN day_caps c ON c.dow = h.dow`, sectionIDs, isGrad)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
 
-	minCap := 0.0
-	for rows.Next() {
-		var dow int
-		var hrs, dayCap float64
-		if err := rows.Scan(&dow, &hrs, &dayCap); err != nil {
-			return err
-		}
-		if minCap == 0 || dayCap < minCap {
-			minCap = dayCap
-		}
-		if hrs > dayCap+0.01 {
-			day := "—"
-			if dow >= 0 && dow < 7 {
-				day = thaiDayNames[dow]
-			}
-			return Invalid(fmt.Sprintf(
-				"%s รับ section ที่เรียนวัน%sรวม %.1f ชม. เกินเพดาน %.1f ชม./วัน ตามประกาศ "+
-					"กรุณาลด section ของวันนั้น มิฉะนั้นบันทึกเวลาจะลงได้ไม่ครบ",
-				name, day, hrs, dayCap))
-		}
-	}
-	if err := rows.Err(); err != nil {
+	var minCap float64
+	if err := s.pool.QueryRow(ctx, `
+  SELECT COALESCE(MIN(CASE
+    WHEN $2 AND sec.track='regular' THEN pay_rates.grad_regular_daily_hour_cap
+    WHEN $2 THEN 24
+    WHEN sec.track='special' THEN pay_rates.ug_special_daily_hour_cap
+    ELSE pay_rates.ug_regular_daily_hour_cap END),0)
+  FROM sections sec CROSS JOIN `+payRatesInForce+` WHERE sec.id=ANY($1)`,
+		sectionIDs, level == "master" || level == "phd").Scan(&minCap); err != nil {
 		return err
 	}
 	if minCap <= 0 {
-		return nil // ไม่มีตารางเรียน (WBA) — ถูกบล็อกไปแล้วก่อนหน้านี้
+		return nil
 	}
 	weeklyCap := minCap * workingDaysPerWeek
 	if declaredWeekly > weeklyCap+0.01 {
@@ -1878,7 +1820,7 @@ type SectionConflict struct {
 	SectionID uuid.UUID `json:"section_id"`
 	Messages  []string  `json:"messages"`
 	// BlockedKinds names the session kinds ("lecture" / "lab") whose every
-	// meeting collides with this TA's own timetable. The form disables only the
+	// meeting collides with an own class or another TA course. The form disables only the
 	// matching in-class duty — เช็คชื่อ for lecture, สอนปฏิบัติการ for lab —
 	// and leaves grading and other work available, because those are done
 	// outside the session.
@@ -1886,12 +1828,10 @@ type SectionConflict struct {
 	// A section may appear in the result with an empty BlockedKinds: a partial
 	// collision is worth warning about but costs the TA nothing.
 	BlockedKinds []string `json:"blocked_kinds"`
-	// CrossConflict marks an overlap with a DIFFERENT course the TA already
-	// assists. Unlike a collision with their own class, this one still blocks
-	// the request: both sides are teaching commitments, so it cannot be
-	// resolved by dropping sessions from this request. The form keeps refusing
-	// to submit on this — and only this.
-	CrossConflict bool `json:"cross_conflict"`
+	// CrossConflict identifies cross-course collisions. It is informational:
+	// only those meetings are excluded, while other meetings remain selectable.
+	CrossConflict  bool               `json:"cross_conflict"`
+	AvailableHours map[string]float64 `json:"available_hours,omitempty"`
 }
 
 // PreviewConflicts checks the given TA against every section of the given
@@ -1905,11 +1845,7 @@ type SectionConflict struct {
 // discovering it only after clicking Send.
 func (s *TARequestService) PreviewConflicts(ctx context.Context, taID, teachingCourseID uuid.UUID) ([]SectionConflict, error) {
 	name := s.taName(ctx, taID)
-	var termID uuid.UUID
-	if err := s.pool.QueryRow(ctx,
-		`SELECT term_id FROM teaching_courses WHERE id = $1`, teachingCourseID).Scan(&termID); err != nil {
-		return nil, err
-	}
+
 	rows, err := s.pool.Query(ctx,
 		`SELECT id FROM sections WHERE teaching_course_id = $1`, teachingCourseID)
 	if err != nil {
@@ -1936,13 +1872,21 @@ func (s *TARequestService) PreviewConflicts(ctx context.Context, taID, teachingC
 		if err := s.checkOwnClassConflict(ctx, s.pool, taID, sid, name); err != nil {
 			msgs = append(msgs, err.Error())
 		}
-		// Passing uuid.Nil for excludeRequestID is fine here — we're not
-		// filing a request yet, so no ID to exclude.
-		if err := s.checkCrossRequestConflict(ctx, s.pool, taID, sid, termID, teachingCourseID, uuid.Nil, []string{"approved"}, name); err != nil {
-			msgs = append(msgs, err.Error())
-			cross = true
+		crossClashes, err := crossSessionClashes(ctx, s.pool, taID, sid, uuid.Nil)
+		if err != nil {
+			return nil, err
 		}
-		byKind, err := sectionClashByKind(ctx, s.pool, taID, sid)
+		cross = len(crossClashes) > 0
+		// Stable output keeps warnings and tests readable across reloads.
+		ids := make([]string, 0, len(crossClashes))
+		for id := range crossClashes {
+			ids = append(ids, id.String())
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			msgs = append(msgs, crossClashes[uuid.MustParse(id)]...)
+		}
+		byKind, availableHours, err := sectionAvailabilityByKind(ctx, s.pool, taID, sid, crossClashes)
 		if err != nil {
 			return nil, err
 		}
@@ -1954,7 +1898,7 @@ func (s *TARequestService) PreviewConflicts(ctx context.Context, taID, teachingC
 		}
 		if len(msgs) > 0 || len(blocked) > 0 {
 			out = append(out, SectionConflict{
-				SectionID: sid, Messages: msgs, BlockedKinds: blocked, CrossConflict: cross,
+				SectionID: sid, Messages: msgs, BlockedKinds: blocked, CrossConflict: cross, AvailableHours: availableHours,
 			})
 		}
 	}
@@ -2073,14 +2017,9 @@ func (s *TARequestService) checkCrossRequestConflict(ctx context.Context, q quer
 			AND orq.teaching_course_id <> $4
 			AND orq.id <> $6
 		JOIN teaching_courses otc ON otc.id = orq.teaching_course_id AND otc.term_id = $3
-		JOIN section_schedules oss ON oss.section_id = oa.section_id
+		JOIN ta_assignment_schedules oss ON oss.assignment_id = oa.id
 		WHERE ss.section_id = $2
-		  -- Blocking when EITHER side is a lab, not only the requested one. A lab
-		  -- is a fixed commitment whichever course it belongs to, so a lecture
-		  -- duty here that lands on a lab the TA already runs elsewhere is still
-		  -- a double booking — exempting lectures on both sides would have let
-		  -- exactly that through.
-		  AND ('lab' IN (ss.kind, oss.kind))
+		  AND oa.state <> 'dropped'
 		  AND oss.day_of_week = ss.day_of_week
 		  AND oss.start_time < ss.end_time
 		  AND ss.start_time < oss.end_time`,
@@ -2530,16 +2469,15 @@ func (s *TARequestService) autoDecide(ctx context.Context, tx pgx.Tx, reqID uuid
 		// lecturers asked for ("ทับแค่บางคาบก็สอนได้บางคาบ"). Rejecting here as
 		// well would throw away the sections that are still perfectly workable.
 		//
-		// cross_conflict below stays blocking — an overlap with a DIFFERENT
-		// course the TA already assists cannot be resolved by dropping sessions
-		// from this request, because both sides are teaching commitments.
+		// Cross-course overlaps also remove only the colliding meetings.
+		// applyCrossSessionOutcome persists those exclusions before this check.
 		if err := s.checkOwnClassConflict(ctx, tx, a.taID, a.secID, a.name); err != nil {
 			addWarn("own_conflict", a.name, "", err.Error(), false)
 		} else {
 			add("own_conflict", a.name, fmt.Sprintf("%s เวลาสอนไม่ทับซ้อนกับตารางเรียนของตัวเอง", a.name), "", true)
 		}
 		if err := s.checkCrossRequestConflict(ctx, tx, a.taID, a.secID, termID, courseID, reqID, []string{"approved"}, a.name); err != nil {
-			add("cross_conflict", a.name, "", err.Error(), false)
+			addWarn("cross_conflict", a.name, "", "ตัดเฉพาะคาบที่ชนกับวิชาอื่นแล้ว คาบที่ไม่ชนและงานนอกคาบยังขอได้", false)
 		} else {
 			add("cross_conflict", a.name, fmt.Sprintf("%s เวลาสอนไม่ทับซ้อนกับวิชาอื่นที่เป็นผู้ช่วยสอนอยู่", a.name), "", true)
 		}
@@ -2722,18 +2660,19 @@ func (s *TARequestService) ListAll(ctx context.Context) ([]TARequestSummary, err
 // ---------------------------------------------------------------------------
 
 type TARequestAssignmentDetail struct {
-	SectionNo           string    `json:"section_no"`
-	TAID                uuid.UUID `json:"ta_id"`
-	TAName              string    `json:"ta_name"`
-	Email               string    `json:"email"`
-	StudentID           *string   `json:"student_id,omitempty"`
-	Level               string    `json:"level"`
-	TotalHrs            float64   `json:"total_hrs"`
-	ProfileStatus       string    `json:"profile_status"`
-	HasSchedule         bool      `json:"has_schedule"`
-	ApprovedCourseCount int       `json:"approved_course_count"`
-	CourseCap           int       `json:"course_cap"` // per-term cap from ตั้งค่า, see maxCoursesPerTerm
-	Warnings            []string  `json:"warnings"`
+	SectionNo           string         `json:"section_no"`
+	TAID                uuid.UUID      `json:"ta_id"`
+	TAName              string         `json:"ta_name"`
+	Email               string         `json:"email"`
+	StudentID           *string        `json:"student_id,omitempty"`
+	Level               string         `json:"level"`
+	TotalHrs            float64        `json:"total_hrs"`
+	Workload            *WorkloadInput `json:"workload"`
+	ProfileStatus       string         `json:"profile_status"`
+	HasSchedule         bool           `json:"has_schedule"`
+	ApprovedCourseCount int            `json:"approved_course_count"`
+	CourseCap           int            `json:"course_cap"` // per-term cap from ตั้งค่า, see maxCoursesPerTerm
+	Warnings            []string       `json:"warnings"`
 	// State and StateReason expose the per-section outcome of the deferred
 	// decision: 'active', 'trimmed' (some sessions clash with the TA's own
 	// timetable) or 'dropped' (all of them do). Without surfacing these the
@@ -2840,7 +2779,7 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		       +COALESCE(w.lab_other_hrs,0),
 		       COALESCE(p.status::text, 'pending'),
 		       EXISTS (SELECT 1 FROM ta_class_schedules cs WHERE cs.user_id = a.ta_id AND cs.term_id = $2),
-		       a.section_id, a.state::text, a.state_reason
+		       a.section_id, a.state::text, a.state_reason, to_jsonb(w)
 		FROM ta_request_assignments a
 		JOIN sections sec ON sec.id = a.section_id
 		JOIN users u ON u.id = a.ta_id
@@ -2858,11 +2797,18 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 	var checks []pendingCheck
 	for arows.Next() {
 		var a TARequestAssignmentDetail
+		var workloadRaw []byte
 		var secID uuid.UUID
 		if err := arows.Scan(&a.SectionNo, &a.TAID, &a.TAName, &a.Email, &a.StudentID, &a.Level, &a.TotalHrs,
-			&a.ProfileStatus, &a.HasSchedule, &secID, &a.State, &a.StateReason); err != nil {
+			&a.ProfileStatus, &a.HasSchedule, &secID, &a.State, &a.StateReason, &workloadRaw); err != nil {
 			arows.Close()
 			return nil, err
+		}
+		if len(workloadRaw) > 0 {
+			if err := json.Unmarshal(workloadRaw, &a.Workload); err != nil {
+				arows.Close()
+				return nil, err
+			}
 		}
 		a.Warnings = []string{}
 		d.Assignments = append(d.Assignments, a)
@@ -2897,8 +2843,14 @@ func (s *TARequestService) Detail(ctx context.Context, reqID uuid.UUID) (*TARequ
 		if err := s.checkOwnClassConflict(ctx, s.pool, c.taID, c.secID, a.TAName); err != nil {
 			a.Warnings = append(a.Warnings, "เวลาสอนทับซ้อนกับตารางเรียนของ TA")
 		}
-		if err := s.checkCrossRequestConflict(ctx, s.pool, c.taID, c.secID, termID, d.TeachingCourseID, reqID, []string{"approved"}, a.TAName); err != nil {
-			a.Warnings = append(a.Warnings, "เวลาสอนทับซ้อนกับวิชาอื่นที่เป็นผู้ช่วยสอนอยู่")
+		var excludedReasons *string
+		if err := s.pool.QueryRow(ctx, `SELECT string_agg(e.reason,E'\n' ORDER BY e.schedule_id)
+          FROM ta_assignment_session_exclusions e JOIN ta_request_assignments x ON x.id=e.assignment_id
+          WHERE x.request_id=$1 AND x.ta_id=$2 AND x.section_id=$3`, reqID, c.taID, c.secID).Scan(&excludedReasons); err != nil {
+			return nil, err
+		}
+		if excludedReasons != nil {
+			a.Warnings = append(a.Warnings, *excludedReasons)
 		}
 	}
 	return &d, nil

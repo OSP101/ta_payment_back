@@ -359,6 +359,8 @@ type activityGate struct {
 	AllowLab     bool
 	AllowReview  bool
 	AllowOther   bool
+	AllowPrep    bool
+	Graduate     bool
 }
 
 // maxRowHours caps a single work_log row. Kept in sync with the frontend's
@@ -486,6 +488,10 @@ func validateWorkLogEntry(
 	// wasn't declared, the makeup shouldn't exist either — approximate that
 	// by treating makeup like lecture+lab: allowed if either is allowed.
 	switch w.Activity {
+	case "prep":
+		if !gate.AllowPrep {
+			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงเตรียมการสอนในคำขอ")
+		}
 	case "lecture":
 		if !gate.AllowLecture {
 			return Invalid("อาจารย์ไม่ได้ระบุชั่วโมงเช็คชื่อบรรยายในคำขอ ลง 'บรรยาย' ไม่ได้")
@@ -574,7 +580,7 @@ func validateWorkLogEntry(
 	case "review":
 		// Intentional no-op — reviewing homework can happen on any date.
 	case "other":
-		if isHoliday && !isMakeupDay {
+		if !gate.Graduate && isHoliday && !isMakeupDay {
 			// parent_kind is validated non-nil above for activity="other".
 			if w.ParentKind != nil && *w.ParentKind == "lab" {
 				return Invalid(fmt.Sprintf(
@@ -646,7 +652,7 @@ type WorkLog struct {
 	// switches branch on; migration 0018 additionally CHECKs that
 	// activity='other' implies parent_kind is set (still service-only, tags
 	// can't express a cross-field rule).
-	Activity string `json:"activity" validate:"required,oneof=lecture lab review makeup other"`
+	Activity string `json:"activity" validate:"required,oneof=lecture lab review makeup other prep"`
 	// ParentKind ties an activity='other' row to the session type it belongs to
 	// (lecture|lab) so the per-session credit-hour cap can be enforced.
 	// NULL for lecture/lab/review/makeup rows. oneof mirrors migration 0018's
@@ -707,6 +713,8 @@ func autoNoteFor(activity string, shifted bool) string {
 		base = "ตรวจงาน"
 	case "makeup":
 		base = "ชดเชย"
+	case "prep":
+		base = "เตรียมการสอน"
 	case "other":
 		base = "งานอื่นๆ"
 	default:
@@ -1115,7 +1123,7 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 	var schs []sch
 	rows, err := s.pool.Query(ctx,
 		`SELECT kind, day_of_week, start_time::text, end_time::text,
-		 EXTRACT(EPOCH FROM (end_time - start_time))/3600 FROM section_schedules WHERE section_id=$1`, sectionID)
+		 EXTRACT(EPOCH FROM (end_time - start_time))/3600 FROM ta_assignment_schedules WHERE assignment_id=$1`, assignmentID)
 	if err != nil {
 		return nil, err
 	}
@@ -1662,8 +1670,23 @@ func (s *WorkLogService) Generate(ctx context.Context, actor, assignmentID uuid.
 				continue
 			}
 			r.activity = "review"
+		case DutyPrep:
+			if !ac.AllowPrep {
+				continue
+			}
+			r.activity = "prep"
+		case DutyGradOther:
+			if ac.Level == "undergrad" || !ac.AllowOther {
+				continue
+			}
+			r.activity = "other"
+			parent := "lecture"
+			if ac.ReimburseScope == "lab" {
+				parent = "lab"
+			}
+			r.parentKind = &parent
 		case DutyOtherLecture, DutyOtherLab:
-			if !ac.AllowOther {
+			if ac.Level != "undergrad" || !ac.AllowOther {
 				continue
 			}
 			r.activity = "other"
@@ -1876,18 +1899,24 @@ func generateEmptyReason(kept, closed []string, termMonths int, hasSchedule, had
 //	other_lecture → activity='other', parent_kind=lecture (อื่น ๆ ของบรรยาย)
 //	other_lab     → activity='other', parent_kind=lab     (อื่น ๆ ของปฏิบัติการ)
 const (
+	DutyPrep         = "prep"
+	DutyGradOther    = "grad_other"
 	DutyReview       = "review"
 	DutyOtherLecture = "other_lecture"
 	DutyOtherLab     = "other_lab"
 )
 
 func validDutyKind(k string) bool {
-	return k == DutyReview || k == DutyOtherLecture || k == DutyOtherLab
+	return k == DutyPrep || k == DutyGradOther || k == DutyReview || k == DutyOtherLecture || k == DutyOtherLab
 }
 
 // dutyKindTH names the duty the way the request form does, for error messages.
 func dutyKindTH(k string) string {
 	switch k {
+	case DutyPrep:
+		return "เตรียมการสอน"
+	case DutyGradOther:
+		return "อื่น ๆ"
 	case DutyReview:
 		return "ช่วยตรวจงาน"
 	case DutyOtherLecture:
@@ -1912,7 +1941,7 @@ type TAReviewSchedule struct {
 type TAReviewScheduleInput struct {
 	// Kind mirrors migration 0067's CHECK (kind IN ('review','other_lecture',
 	// 'other_lab')) / validDutyKind below.
-	Kind string `json:"kind" validate:"required,oneof=review other_lecture other_lab"`
+	Kind string `json:"kind" validate:"required,oneof=review other_lecture other_lab prep grad_other"`
 	// DayOfWeek mirrors migration 0025's CHECK (day_of_week BETWEEN 0 AND 6);
 	// validateReviewInput below re-checks it anyway (own Thai message), so
 	// this is a redundant but non-conflicting first-line check.
@@ -1947,6 +1976,9 @@ func validateReviewInput(in TAReviewScheduleInput) error {
 	if e <= s {
 		return Invalid("เวลาสิ้นสุดต้องหลังเวลาเริ่ม")
 	}
+	if (in.Kind == DutyPrep || in.Kind == DutyGradOther) && float64(e-s)/60 > maxRowHours {
+		return Invalid("ช่วงเวลางานต้องไม่เกิน 7 ชั่วโมงต่อรายการ กรุณาแบ่งเป็นหลายช่วงเวลา")
+	}
 	return nil
 }
 
@@ -1969,9 +2001,8 @@ type TAReviewScheduleList struct {
 }
 
 // declaredDutyHours maps each duty kind to the weekly hours the lecturer
-// declared for this assignment. Grad TAs only ever get DutyReview (from
-// grade_hrs, capped at gradReviewHourCap by validateGradWorkloadCaps) — see
-// the grad branch below for why other/prep are read but unused.
+// declared for this assignment. Graduate preparation and other work each
+// have one independent budget; undergraduate duties remain split by session.
 func (s *WorkLogService) declaredDutyHours(ctx context.Context, assignmentID uuid.UUID) (map[string]float64, error) {
 	var level string
 	var grade, other, prep, check, ugOther, labOther float64
@@ -1991,16 +2022,7 @@ func (s *WorkLogService) declaredDutyHours(ctx context.Context, assignmentID uui
 		return nil, err
 	}
 	if level == "master" || level == "phd" {
-		// Grad TAs no longer get an "other" duty at all (confirmed with the
-		// office, 2026-09-11): other_hrs/prep_hrs are now rejected at
-		// creation time (validateGradWorkloadCaps), so other/prep here are
-		// always 0 for new assignments — omitting the keys entirely (rather
-		// than returning 0-valued ones) makes both the worklog page's
-		// declared[k] > 0 card filter and enforceReviewCap's "not declared"
-		// rejection do the right thing with no further changes.
-		return map[string]float64{
-			DutyReview: grade,
-		}, nil
+		return map[string]float64{DutyReview: grade, DutyPrep: prep, DutyGradOther: other}, nil
 	}
 	return map[string]float64{
 		DutyReview:       check,
@@ -2160,7 +2182,7 @@ func (s *WorkLogService) ScheduleBusyBlocks(ctx context.Context, actor, assignme
 		JOIN ta_requests r2 ON r2.id = a2.request_id AND r2.status = 'approved'
 		JOIN sections sec2 ON sec2.id = a2.section_id
 		JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id AND tc2.term_id = $2
-		JOIN section_schedules ss ON ss.section_id = sec2.id
+		JOIN ta_assignment_schedules ss ON ss.assignment_id = a2.id
 		WHERE a2.ta_id = $1`, taID, termID)
 	if err != nil {
 		return nil, err
@@ -2323,7 +2345,7 @@ func (s *WorkLogService) enforceReviewNoConflict(ctx context.Context, assignment
 			JOIN ta_requests r2 ON r2.id = a2.request_id AND r2.status = 'approved'
 			JOIN sections sec2 ON sec2.id = a2.section_id
 			JOIN teaching_courses tc2 ON tc2.id = sec2.teaching_course_id AND tc2.term_id = $2
-			JOIN section_schedules ss ON ss.section_id = sec2.id
+			JOIN ta_assignment_schedules ss ON ss.assignment_id = a2.id
 			WHERE a2.ta_id = $1
 			  AND ss.day_of_week = $3
 			  AND ss.start_time < $5::time AND ss.end_time > $4::time
@@ -2698,6 +2720,10 @@ func (s *WorkLogService) enforceWeeklyActivityCap(ctx context.Context, ac *assig
 		cap = ac.WeeklyCapReview
 		activities = []string{"review"}
 		labelTH = "ตรวจงาน"
+	case "prep":
+		cap = ac.WeeklyCapPrep
+		activities = []string{"prep"}
+		labelTH = "เตรียมการสอน"
 	case "other":
 		cap = ac.WeeklyCapOther
 		activities = []string{"other"}
@@ -2893,6 +2919,7 @@ func weeklyCapBuckets(ac *assignmentContext) []weeklyCapBucket {
 			weeklyCapBucket{ac.WeeklyCapLab, []string{"lab"}, "ปฏิบัติการ"})
 	}
 	buckets = append(buckets,
+		weeklyCapBucket{ac.WeeklyCapPrep, []string{"prep"}, "เตรียมการสอน"},
 		weeklyCapBucket{ac.WeeklyCapReview, []string{"review"}, "ตรวจงาน"},
 		weeklyCapBucket{ac.WeeklyCapOther, []string{"other"}, "อื่นๆ"})
 	return buckets
@@ -3433,10 +3460,12 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 		kind     string
 		startMin int
 		endMin   int
+		excluded bool
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT kind, day_of_week, TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI')
-		FROM section_schedules WHERE section_id = $1`, ac.SectionID)
+		SELECT kind, day_of_week, TO_CHAR(start_time,'HH24:MI'), TO_CHAR(end_time,'HH24:MI'),
+        EXISTS(SELECT 1 FROM ta_assignment_session_exclusions e WHERE e.assignment_id=$2 AND e.schedule_id=ss.id)
+		FROM section_schedules ss WHERE section_id = $1`, ac.SectionID, ac.AssignmentID)
 	if err != nil {
 		return err
 	}
@@ -3445,7 +3474,8 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 	for rows.Next() {
 		var kind, st, et string
 		var dow int
-		if err := rows.Scan(&kind, &dow, &st, &et); err != nil {
+		var excluded bool
+		if err := rows.Scan(&kind, &dow, &st, &et, &excluded); err != nil {
 			return err
 		}
 		stm, ok1 := parseHM(st)
@@ -3453,7 +3483,7 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 		if !ok1 || !ok2 {
 			continue
 		}
-		grid = append(grid, slot{time.Weekday(dow), kind, stm, etm})
+		grid = append(grid, slot{time.Weekday(dow), kind, stm, etm, excluded})
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -3477,7 +3507,7 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 		}
 	}
 	for _, g := range grid {
-		if g.day == d.Weekday() && kindMatches(g.kind) {
+		if !g.excluded && g.day == d.Weekday() && kindMatches(g.kind) {
 			consider(g.startMin, g.endMin)
 		}
 	}
@@ -3496,7 +3526,7 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 		}
 		// No explicit window: the คาบ runs its usual length on its usual clock.
 		for _, g := range grid {
-			if g.day == mw.origWeekday && g.kind == mw.kind {
+			if !g.excluded && g.day == mw.origWeekday && g.kind == mw.kind {
 				consider(g.startMin, g.endMin)
 			}
 		}
@@ -3679,6 +3709,8 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		AllowLab:     ac.AllowLab,
 		AllowReview:  ac.AllowReview,
 		AllowOther:   ac.AllowOther,
+		AllowPrep:    ac.AllowPrep,
+		Graduate:     ac.Level == "master" || ac.Level == "phd",
 		// "today" must be Thailand's calendar day, not the host's. On a UTC
 		// server time.Now() still reports yesterday until 07:00 local, which
 		// would reopen a month the back-date rule should already have closed.
@@ -3739,7 +3771,7 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	}
 
 	// Q&A rule 2 — "อื่นๆ" per session ≤ credit hours of parent kind.
-	if w.Activity == "other" && w.ParentKind != nil {
+	if ac.Level == "undergrad" && w.Activity == "other" && w.ParentKind != nil {
 		capHrs, err := s.otherActivityCapHours(ctx, w.AssignmentID, *w.ParentKind)
 		if err == nil && capHrs > 0 && w.Hours > capHrs+0.01 {
 			kindTH := "บรรยาย"
@@ -4860,6 +4892,8 @@ func (s *WorkLogService) validateOnBehalfWrite(ctx context.Context, ac *assignme
 		AllowLab:     ac.AllowLab,
 		AllowReview:  ac.AllowReview,
 		AllowOther:   ac.AllowOther,
+		AllowPrep:    ac.AllowPrep,
+		Graduate:     ac.Level == "master" || ac.Level == "phd",
 		// periodOpen is irrelevant here: todayRef is already the zero value
 		// below (staff/lecturer override, per the comment on that param),
 		// which disables the calendar rule outright regardless of what's
@@ -4928,7 +4962,7 @@ func (s *WorkLogService) validateOnBehalfWrite(ctx context.Context, ac *assignme
 	if err := s.enforceTermHourCeiling(ctx, ac, w.AssignmentID, w.ID, w.Hours); err != nil {
 		return err
 	}
-	if w.Activity == "other" && w.ParentKind != nil {
+	if ac.Level == "undergrad" && w.Activity == "other" && w.ParentKind != nil {
 		capHrs, err := s.otherActivityCapHours(ctx, w.AssignmentID, *w.ParentKind)
 		if err == nil && capHrs > 0 && w.Hours > capHrs+0.01 {
 			kindTH := "บรรยาย"

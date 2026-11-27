@@ -41,6 +41,9 @@ func CurriculumTH(code string) string {
 	case "OTHER":
 		return "คณะอื่น ๆ"
 	}
+	if code != "" {
+		return code
+	}
 	return "ยังไม่ระบุ"
 }
 

@@ -94,3 +94,32 @@ func TestReview_CannotApproveRejectedDocument(t *testing.T) {
 		wantUserErr(t, err, 409)
 	}
 }
+
+func TestReview_RejectSubmittedDocumentUpdatesProfileAndSubmission(t *testing.T) {
+	svc, ta, docs := autoApproveFixture(t)
+	ctx := context.Background()
+	officer := reviewOfficer(t, svc)
+	const reason = "ยังไม่เซ็นชื่อ"
+	if err := svc.Review(ctx, officer, docs["creditor_form"], false, reason); err != nil {
+		t.Fatal(err)
+	}
+	// Reviewing the other files must not undo the return for correction.
+	for _, kind := range []string{"national_id", "bank_book"} {
+		if err := svc.Review(ctx, officer, docs[kind], true, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, table := range []string{"ta_profiles", "ta_profile_submissions"} {
+		var status, gotReason string
+		if err := svc.pool.QueryRow(ctx, `SELECT status::text, COALESCE(reject_reason, '') FROM `+table+` WHERE user_id=$1`, ta).Scan(&status, &gotReason); err != nil {
+			t.Fatal(err)
+		}
+		if status != "needs_fix" || gotReason != reason {
+			t.Errorf("%s: status=%q reason=%q, want needs_fix and %q", table, status, gotReason, reason)
+		}
+	}
+	row := listIDs(t, svc, "pending")[ta]
+	if row.Status != "needs_fix" || row.RevisionPending {
+		t.Fatalf("queue row = %+v, want returned for correction", row)
+	}
+}

@@ -116,7 +116,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 		sessions: c.Sessions, notify: c.Notify, store: store,
 	}
 	c.Enrollments = &EnrollmentService{pool: pool, aud: auditor}
-	c.TDBM = &TDBMService{pool: pool, aud: auditor, apiBase: cfg.TDBMAPIBaseURL}
+	c.TDBM = &TDBMService{pool: pool, aud: auditor, source: &tdbmMariaDBSource{cfg: cfg}}
 	c.RegEnrolment = NewRegEnrolmentService(pool, cfg.RegKKUBaseURL, cfg.RegKKULegacyBaseURL)
 	// Back-reference, set after both exist (same pattern as WorkLog.export
 	// above): lets a course/section write trigger an immediate re-match

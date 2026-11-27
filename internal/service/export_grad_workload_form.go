@@ -39,17 +39,9 @@ type GradWorkloadForm struct {
 	Doc      []byte
 }
 
-// workloadActivityRow maps a work_logs.activity onto the three lines the form
-// prints.
-//
-// The mapping is forced by the data model, and one edge deserves naming:
-// activity='other' covers BOTH เตรียมการสอน (prep_hrs) and อื่นๆ (other_hrs)
-// for graduate TAs — loadAssignmentContext authorizes the activity from either
-// field and the work log records only the activity, so the two cannot be told
-// apart afterwards. They are printed as เตรียมการสอน because that is the line
-// the college's form has and the overwhelmingly common case; a TA whose hours
-// were genuinely "อื่นๆ" is still credited the same hours at the same rate, so
-// no money moves on the label.
+// workloadActivityRow maps worklog activities onto the college form's three
+// printed lines. Preparation uses an explicit activity; other/legacy duties
+// retain the existing placement on the preparation line of this fixed form.
 func workloadActivityRow(activity string) string {
 	switch activity {
 	case "lecture", "lab":

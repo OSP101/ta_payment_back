@@ -11,8 +11,8 @@ import (
 // grad_regular_daily_hour_cap (6 ชม./วัน) — that check now belongs only to
 // the worklog entry point (worklog.go's validateGradRegularClassWindow), not
 // to Create(). Grad submission is bound only by the 12 ชม./สัปดาห์ ceiling.
-// Undergrad is unaffected: enforceDailyHourFeasibility must still run for
-// them.
+// Undergraduates retain the weekly feasibility check, using declared work
+// rather than the selected sections’ complete timetable.
 
 // addEightHourSection creates a section whose ONE weekday session runs 8
 // hours straight — long enough to exceed both the grad (6h) and undergrad
@@ -45,8 +45,8 @@ func TestCreate_GradTA_NotBlockedByDailyHourFeasibility(t *testing.T) {
 	}
 }
 
-// Undergrad must still be refused — only the grad exemption changed.
-func TestCreate_UndergradTA_StillBlockedByDailyHourFeasibility(t *testing.T) {
+// Section timetable length must not be mistaken for an undergraduate TA’s actual work.
+func TestCreate_UndergradTA_NotBlockedBySectionTimetableLength(t *testing.T) {
 	rf := newRequestFixture(t, fixtureOpts{Level: "undergrad"})
 	fri := rf.addEightHourSection("02", 5) // Friday, 8h — over the 7h undergrad daily cap
 
@@ -54,7 +54,7 @@ func TestCreate_UndergradTA_StillBlockedByDailyHourFeasibility(t *testing.T) {
 		{SectionID: fri, Workload: WorkloadInput{AttendanceHrs: 7}},
 	}, "undergrad")
 
-	if _, err := rf.Req.Create(rf.ctx, rf.LecturerID, in); err == nil {
-		t.Fatal("an undergrad request over the daily-hour cap must still be refused at submission")
+	if _, err := rf.Req.Create(rf.ctx, rf.LecturerID, in); err != nil {
+		t.Fatalf("a long section timetable must not block request submission: %v", err)
 	}
 }

@@ -257,7 +257,11 @@ func trustedREGSourceLecturers(raw string, matched []uuid.UUID, unmatched []stri
 	return len(officerTokens(raw)) > 0
 }
 
-func validateREGReviewWithTrustedMatches(r *REGReview, trusted map[string][]uuid.UUID) {
+func validateREGReviewWithTrustedMatches(r *REGReview, trusted map[string][]uuid.UUID, curricula ...map[string]bool) {
+	allowed := validSectionCurricula
+	if len(curricula) > 0 {
+		allowed = curricula[0]
+	}
 	r.Issues = []REGIssue{}
 	r.Ready = true
 	names := map[string][]string{}
@@ -346,7 +350,7 @@ func validateREGReviewWithTrustedMatches(r *REGReview, trusted map[string][]uuid
 					warn("zero", "warning", countLabel+"เป็น 0 คน กรุณายืนยัน", 0)
 				}
 			}
-			if !validSectionCurricula[sec.Curriculum] {
+			if !allowed[sec.Curriculum] {
 				warn("curriculum", "error", "ระบุกลุ่มหลักสูตรก่อนนำเข้า (OTHER สำหรับคณะอื่นหรือกลุ่มทั่วไป)", sec.Curriculum)
 			}
 			if len(curriculumTokenRE.FindAllString(sec.ReservedFor, -1)) > 1 {
@@ -531,7 +535,15 @@ func (s *TeachingService) prepareREGReview(ctx context.Context, term uuid.UUID, 
 			trustedLecturers[c.Code] = matched
 		}
 	}
-	validateREGReviewWithTrustedMatches(r, trustedLecturers)
+	curricula, err := s.ListCurricula(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	allowed := map[string]bool{}
+	for _, cur := range curricula {
+		allowed[cur.Code] = true
+	}
+	validateREGReviewWithTrustedMatches(r, trustedLecturers, allowed)
 	for i, c := range r.Courses {
 		if c.Skip {
 			continue

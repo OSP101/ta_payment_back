@@ -143,7 +143,7 @@ func (s *TeachingService) BuildTimetableForm(
 		  JOIN ta_requests r ON r.id = a.request_id AND r.status = 'approved'
 		  JOIN sections sec ON sec.id = a.section_id
 		  JOIN teaching_courses tc ON tc.id = sec.teaching_course_id
-		  JOIN section_schedules sch ON sch.section_id = sec.id
+		  JOIN ta_assignment_schedules sch ON sch.assignment_id = a.id
 		 WHERE a.ta_id = $1 AND tc.term_id = $2 AND a.state <> 'dropped'
 		 ORDER BY sch.day_of_week, sch.start_time, tc.code`, taID, termID)
 	if err != nil {
