@@ -2141,5 +2141,19 @@
  "ไม่มีภาระงานที่ทำได้เหลือหลังตัดคาบที่ชนกับวิชาอื่น กรุณาเลือกคาบที่ไม่ชน หรือระบุงานตรวจ/งานอื่นนอกคาบ": "No declared work remains after excluding meetings that overlap another TA course. Select available meetings or specify grading or other work outside class.",
  "ตัดเฉพาะคาบที่ชนกับวิชาอื่นแล้ว คาบที่ไม่ชนและงานนอกคาบยังขอได้": "Only meetings that overlap another TA course have been excluded. Other meetings and work outside class remain available.",
  "อาจารย์ไม่ได้ระบุชั่วโมงเตรียมการสอนในคำขอ": "Your lecturer did not assign teaching preparation hours in the request.",
- "ช่วงเวลางานต้องไม่เกิน 7 ชั่วโมงต่อรายการ กรุณาแบ่งเป็นหลายช่วงเวลา": "Each duty time slot must be at most 7 hours. Please split it into multiple slots."
+ "ช่วงเวลางานต้องไม่เกิน 7 ชั่วโมงต่อรายการ กรุณาแบ่งเป็นหลายช่วงเวลา": "Each duty time slot must be at most 7 hours. Please split it into multiple slots.",
+  "วันที่คาบเรียนเดิม": "Original class date",
+  "กำลังตรวจสอบวันหยุดและข้อมูลชดเชย กรุณารอสักครู่": "Checking holidays and make-up sessions. Please wait.",
+  "วันหยุดนี้ยังไม่มีข้อมูลชดเชยที่ใช้งานได้ จึงลงเวลาเบิกคาบนี้ไม่ได้": "This holiday has no usable make-up session. These class hours cannot be claimed.",
+  "เวลาที่ลงต้องอยู่ในช่วงชดเชย {start}–{end}": "Logged hours must fall within the make-up window {start}–{end}.",
+  "บันทึกเป็นวันที่ {date}": "Save for {date}",
+  "วันนี้เป็นวันชดเชยที่อาจารย์กำหนด ระบบจะใช้ช่วงเวลาชดเชย": "This is the scheduled make-up date. The make-up time window will be used.",
+  "วันที่เลือกเป็นวันหยุด ระบบจะลงเป็นวันชดเชยแทน": "The selected date is a holiday. This entry will use the make-up date.",
+  "บันทึกวันที่ {date} เวลา {start}–{end} ตามที่อาจารย์กำหนด สำหรับคาบเดิมวันที่ {original}": "Record on {date}, {start}–{end}, as scheduled by the lecturer, for the original class on {original}.",
+  "คาบนี้ระบุว่าไม่มีการชดเชย จึงลงเวลาเบิกคาบนี้ไม่ได้": "This class is marked as having no make-up. Its hours cannot be claimed.",
+  "ข้อมูลวันชดเชยไม่ครบหรือไม่ชัดเจน จึงยังลงเวลาเบิกคาบนี้ไม่ได้": "Make-up details are incomplete or ambiguous. These class hours cannot be claimed yet.",
+  "วันหยุดนี้ยังไม่มีข้อมูลชดเชย จึงลงเวลาเบิกคาบนี้ไม่ได้": "This holiday has no make-up session. These class hours cannot be claimed.",
+  "ตรวจสอบข้อมูลกับอาจารย์และรอซิงก์ข้อมูล TDBM ก่อนลงเวลา": "Check the details with the lecturer and wait for TDBM to sync before logging these hours.",
+  "ข้อมูลวันชดเชยเปลี่ยนแล้ว กรุณาโหลดข้อมูลใหม่และตรวจสอบวันที่กับเวลาก่อนบันทึก": "The make-up session changed. Reload and check the date and times before saving.",
+  "โหลดข้อมูลวันหยุดและชดเชยไม่สำเร็จ กรุณารีเฟรชแล้วลองใหม่": "Could not load holidays and make-up sessions. Refresh and try again."
 }

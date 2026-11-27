@@ -210,16 +210,17 @@ func (s *WorkLogService) loadHolidaysInRange(ctx context.Context, start, end tim
 	return out, rows.Err()
 }
 
-// loadMakeupIndex loads every filed makeup for a section into both direction
-// maps needed by the validator. Time-of-day is ignored here — the validator
-// gates on the date bucket only; time-vs-schedule checks happen at makeup
-// creation, not on each worklog Upsert.
+// loadMakeupIndex keeps original periods and actual windows by class kind.
+// A same-day replacement must not block its own authorized time window, and
+// moving a lecture must not cancel an unrelated lab on the same date.
 func (s *WorkLogService) loadMakeupIndex(ctx context.Context, sectionID uuid.UUID) (makeupIndex, error) {
 	idx := makeupIndex{
-		byOriginal: map[string][]time.Time{},
-		byMakeup:   map[string]bool{},
-		waived:     map[string]bool{},
-		onDate:     map[string][]makeupWindow{},
+		byOriginal:     map[string][]time.Time{},
+		byOriginalKind: map[string]map[string][]time.Time{},
+		waivedKind:     map[string]map[string]bool{},
+		byMakeup:       map[string]bool{},
+		waived:         map[string]bool{},
+		onDate:         map[string][]makeupWindow{},
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT original_date, makeup_date, kind,
@@ -244,10 +245,18 @@ func (s *WorkLogService) loadMakeupIndex(ctx context.Context, sectionID uuid.UUI
 		ok := orig.Format("2006-01-02")
 		if mk == nil {
 			idx.waived[ok] = true
+			if idx.waivedKind[ok] == nil {
+				idx.waivedKind[ok] = map[string]bool{}
+			}
+			idx.waivedKind[ok][kind] = true
 			continue
 		}
 		mkey := mk.Format("2006-01-02")
 		idx.byOriginal[ok] = append(idx.byOriginal[ok], *mk)
+		if idx.byOriginalKind[ok] == nil {
+			idx.byOriginalKind[ok] = map[string][]time.Time{}
+		}
+		idx.byOriginalKind[ok][kind] = append(idx.byOriginalKind[ok][kind], *mk)
 		idx.byMakeup[mkey] = true
 		win := makeupWindow{kind: kind, origWeekday: orig.Weekday()}
 		if st != nil && en != nil {
@@ -324,9 +333,11 @@ func (h holidaySet) overlapping(date string, startMin, endMin int) (holidayWindo
 // byOriginal — a zero time.Time there renders as "ย้ายไปเป็นวันชดเชย 0001-01-01"
 // — and they are the reason every scan on this table has to be NULL-tolerant.
 type makeupIndex struct {
-	byOriginal map[string][]time.Time
-	byMakeup   map[string]bool
-	waived     map[string]bool
+	byOriginal     map[string][]time.Time
+	byOriginalKind map[string]map[string][]time.Time
+	waivedKind     map[string]map[string]bool
+	byMakeup       map[string]bool
+	waived         map[string]bool
 	// onDate indexes the filed makeups BY THE DATE THEY LAND ON, with the window
 	// the lecturer picked. validateClassWindow needs it: a makeup is the one
 	// legitimate way for duty hours to fall outside the section's weekly grid, so
@@ -530,7 +541,28 @@ func validateWorkLogEntry(
 	dkey := w.WorkDate
 	holiday, isHoliday := holidays.overlapping(dkey, sm, em)
 	isMakeupDay := mk.byMakeup[dkey]
-	shiftedTo, isMovedAway := mk.byOriginal[dkey]
+	shiftedTo, isMovedAway := mk.originalDates(dkey, w.Activity)
+	if w.Activity == "lecture" || w.Activity == "lab" {
+		if mk.onDate != nil {
+			isMakeupDay = false
+			for _, mw := range mk.onDate[dkey] {
+				if mw.kind == w.Activity {
+					isMakeupDay = true
+					break
+				}
+			}
+		}
+		// Incoming and same-date makeups are checked against their actual windows.
+		if isMakeupDay {
+			isMovedAway = false
+		}
+		for _, date := range shiftedTo {
+			if date.Format("2006-01-02") == dkey {
+				isMovedAway = false
+				break
+			}
+		}
+	}
 
 	switch w.Activity {
 	case "lecture", "lab":
@@ -538,7 +570,7 @@ func validateWorkLogEntry(
 		// there are no duty hours to bill on it. Checked before the closure branch
 		// because it is the more specific answer — and it still holds if the
 		// closure itself is later edited away.
-		if mk.waived[dkey] {
+		if mk.kindWaived(dkey, w.Activity) && !isMakeupDay {
 			return Invalid(fmt.Sprintf(
 				"คาบของวันที่ %s ถูกระบุว่า “ไม่มีการชดเชย” จึงไม่มีชั่วโมงปฏิบัติงานให้ลงเวลา", dkey))
 		}
@@ -638,9 +670,11 @@ type WorkLog struct {
 	// inputs parseHM's looser Sscanf-based parser still accepts (e.g. "9:5"),
 	// which would be a real behaviour change, not just an earlier version of
 	// the same check.
-	WorkDate  string `json:"work_date" validate:"required"`
-	StartTime string `json:"start_time" validate:"required"`
-	EndTime   string `json:"end_time" validate:"required"`
+	WorkDate         string     `json:"work_date" validate:"required"`
+	OriginalWorkDate *string    `json:"original_work_date,omitempty" validate:"omitempty,datetime=2006-01-02"`
+	MakeupID         *uuid.UUID `json:"makeup_id,omitempty"`
+	StartTime        string     `json:"start_time" validate:"required"`
+	EndTime          string     `json:"end_time" validate:"required"`
 	// Hours gets a first-line "not negative" check even though
 	// validateWorkLogEntry fully re-validates it (> 0, <= maxRowHours, and
 	// must equal the start/end span) — gte=0 can never conflict with those
@@ -3491,7 +3525,7 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 	// A section with no timetable at all cannot be graded against one. Staff not
 	// having entered it yet must not become a wall the TA cannot climb — the
 	// caps still bound the claim.
-	if len(grid) == 0 {
+	if len(grid) == 0 && len(mk.onDate[w.WorkDate]) == 0 {
 		return nil
 	}
 
@@ -3507,7 +3541,8 @@ func (s *WorkLogService) validateClassWindow(ctx context.Context, ac *assignment
 		}
 	}
 	for _, g := range grid {
-		if !g.excluded && g.day == d.Weekday() && kindMatches(g.kind) {
+		_, cancelled := mk.originalDates(w.WorkDate, g.kind)
+		if !g.excluded && !cancelled && !mk.kindWaived(w.WorkDate, g.kind) && g.day == d.Weekday() && kindMatches(g.kind) {
 			consider(g.startMin, g.endMin)
 		}
 	}
@@ -3680,6 +3715,9 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 	if err != nil {
 		return uuid.Nil, err
 	}
+	if err := validateManualMakeupChoice(ctx, s.pool, ac, w, false); err != nil {
+		return uuid.Nil, err
+	}
 	if err := s.assertOwnScheduleForCourse(ctx, ac); err != nil {
 		return uuid.Nil, err
 	}
@@ -3843,6 +3881,9 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		if err := writeAudited(ctx, s.pool, s.aud,
 			audit.Entry{ActorID: &actor, Action: "worklog.create", Entity: "work_log", EntityID: w.ID.String(), After: w},
 			func(tx pgx.Tx) error {
+				if err := validateManualMakeupChoice(ctx, tx, ac, w, true); err != nil {
+					return err
+				}
 				_, err := tx.Exec(ctx,
 					`INSERT INTO work_logs (id, assignment_id, work_date, start_time, end_time, hours, activity, parent_kind, room, note, status)
 					 VALUES ($1,$2,$3::date,$4::time,$5::time,$6,$7,$8,$9,$10,'draft')`,
@@ -3863,6 +3904,9 @@ func (s *WorkLogService) Upsert(ctx context.Context, actor uuid.UUID, w WorkLog)
 		audit.Entry{ActorID: &actor, Action: "worklog.update", Entity: "work_log", EntityID: w.ID.String()},
 		"work_logs", w.ID,
 		func(tx pgx.Tx) error {
+			if err := validateManualMakeupChoice(ctx, tx, ac, w, true); err != nil {
+				return err
+			}
 			tag, err := tx.Exec(ctx,
 				`UPDATE work_logs SET work_date=$1::date, start_time=$2::time, end_time=$3::time, hours=$4, activity=$5, parent_kind=$6, room=$7, note=$8, status='draft'
 				 WHERE id=$9 AND assignment_id=$10 AND status IN ('draft','rejected')`,
