@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"image/color"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -357,5 +360,58 @@ func TestSSO_ExchangeRequiresTheLoginNonce(t *testing.T) {
 	}
 	if cleared == nil || cleared.Value != "" {
 		t.Errorf("nonce not consumed: %v", cleared)
+	}
+}
+
+func TestSSOExchangeProfilePhoto(t *testing.T) {
+	for _, photo := range []string{"none", "saved", "missing"} {
+		t.Run(photo, func(t *testing.T) {
+			kku := fakeSSONext(t, "photo@kkumail.com")
+			defer kku.Close()
+			app, svc := newSSOApp(t, kku.URL)
+			ctx := context.Background()
+			id := uuid.New()
+			_, err := svc.Pool.Exec(ctx, `INSERT INTO users (id, email, first_name, last_name, is_active) VALUES ($1, 'photo@kkumail.com', 'Photo', 'User', TRUE)`, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want string
+			if photo != "none" {
+				jpeg, err := normalizeAvatar(pngBytes(t, 8, 8, color.NRGBA{R: 100, A: 255}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				key, _, err := svc.Storage.Save("avatars", "profile.jpg", bytes.NewReader(jpeg))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := svc.Users.SetAvatar(ctx, id, id, key); err != nil {
+					t.Fatal(err)
+				}
+				if photo == "missing" {
+					if err := svc.Storage.Delete(key); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					want = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpeg)
+				}
+			}
+			res, body := postJSON(t, app, "/auth/sso/exchange", `{"code":"live-code"}`, ssoNonce(t))
+			if res.StatusCode != 200 {
+				t.Fatalf("exchange status = %d", res.StatusCode)
+			}
+			got, _ := body["avatar_url"].(string)
+			if got != want {
+				t.Errorf("profile photo mismatch: got %d bytes, want %d", len(got), len(want))
+			}
+			if res.Header.Get("Cache-Control") != "no-store" {
+				t.Error("confirmation must not be cached")
+			}
+			ticket, _ := body["ticket"].(string)
+			res, _ = postJSON(t, app, "/auth/sso/confirm", `{"ticket":"`+ticket+`"}`)
+			if res.StatusCode != 200 {
+				t.Fatalf("confirm status = %d", res.StatusCode)
+			}
+		})
 	}
 }

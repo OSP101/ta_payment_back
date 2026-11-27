@@ -103,7 +103,7 @@ func NewContainer(pool *pgxpool.Pool, store storage.Store, mailer *mail.Mailer, 
 	c.Users.mfa = c.MFA
 	c.Docs.mfa = c.MFA
 	c.WorkLog.mfa = c.MFA
-	c.SSO = &SSOService{users: c.Users, aud: auditor}
+	c.SSO = &SSOService{users: c.Users, aud: auditor, store: store}
 	if cfg.SSOEnabled {
 		c.SSO.client = &ssonext.Client{
 			LoginBase: cfg.SSOLoginBase, APIBase: cfg.SSOAPIBase,

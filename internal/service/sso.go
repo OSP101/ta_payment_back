@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"ta-payment-back/internal/audit"
 	"ta-payment-back/internal/ssonext"
+	"ta-payment-back/internal/storage"
 )
 
 // SSOService is the KKU SSONext login path. It is deliberately two steps on
@@ -41,6 +43,7 @@ import (
 type SSOService struct {
 	client *ssonext.Client
 	users  *UserService
+	store  storage.Store
 	aud    *audit.Auditor
 
 	mu      sync.Mutex
@@ -68,6 +71,7 @@ type SSOPending struct {
 	Email     string `json:"email"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
+	AvatarURL string `json:"avatar_url,omitempty"`
 }
 
 var (
@@ -152,7 +156,31 @@ func (s *SSOService) Exchange(ctx context.Context, code, ip, userAgent string) (
 		ActorID: &u.ID, Action: "auth.sso_matched", Entity: "user",
 		EntityID: u.ID.String(), IP: ip, UserAgent: userAgent,
 	})
-	return &SSOPending{Ticket: ticket, Email: id.Email, FirstName: u.FirstName, LastName: u.LastName}, nil
+	return &SSOPending{Ticket: ticket, Email: id.Email, FirstName: u.FirstName, LastName: u.LastName, AvatarURL: s.confirmAvatar(ctx, u)}, nil
+}
+
+// confirmAvatar embeds only the matched account's normalized JPEG. The normal
+// avatar endpoint requires a session, which does not exist until confirmation.
+// Missing/unreadable pictures must never prevent login; the UI shows initials.
+func (s *SSOService) confirmAvatar(ctx context.Context, u *User) string {
+	if u.AvatarURL == nil || s.store == nil {
+		return ""
+	}
+	key, err := s.users.AvatarKey(ctx, u.ID)
+	if err != nil || !strings.HasPrefix(key, "avatars/") || strings.Contains(key, "..") {
+		return ""
+	}
+	rc, err := s.store.Open(key)
+	if err != nil {
+		return ""
+	}
+	defer rc.Close()
+	const maxBytes = 2 << 20
+	body, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
+	if err != nil || len(body) == 0 || len(body) > maxBytes {
+		return ""
+	}
+	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(body)
 }
 
 // Redeem is step 2: the confirm click. Single use — the ticket is deleted
